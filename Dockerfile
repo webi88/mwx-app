@@ -3,6 +3,10 @@ FROM python:3.11-slim
 # Evita prompts interactivos de debconf/apt durante el build.
 ENV DEBIAN_FRONTEND=noninteractive
 
+# Railway NO tiene IPv6. Hosts como Supabase resuelven a IPv6 (AAAA) y eso
+# provoca "Network is unreachable" al conectar por IPv6. Forzamos preferir IPv4.
+RUN echo "precedence ::ffff:0:0/96  100" >> /etc/gai.conf
+
 WORKDIR /app
 
 # Dependencias del sistema: Chrome + Xvfb (pantalla virtual) + supervisord.

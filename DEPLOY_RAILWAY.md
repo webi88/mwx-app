@@ -39,9 +39,17 @@ El proyecto corre en **un único contenedor** en Railway que levanta a la vez:
 | `SMARTPROXY_*` | tus credenciales Smartproxy (o el proxy residencial que uses) |
 
 > En Supabase: **Project Settings → Database → Connection string** → usa la
-> cadena de **puerto 5432** (conexión directa). El código ya añade
-> `sslmode=require` automáticamente si no viene en la URL. No pongas `.env`
-> en el repo.
+> cadena de **puerto 5432**. El código ya añade `sslmode=require` automáticamente
+> si no viene en la URL. No pongas `.env` en el repo.
+>
+> ⚠️ **IPv6 en Railway**: Railway no tiene IPv6, y la conexión directa de
+> Supabase (`db.xxx.supabase.co`) puede resolver a IPv6 y dar
+> `Network is unreachable`. Dos soluciones (el Dockerfile ya incluye la #1):
+> 1. *(ya aplicada)* El Dockerfile fuerza IPv4 vía `/etc/gai.conf`.
+> 2. *(alternativa)* Usa la cadena de **Session pooler** de Supabase
+>    (`aws-0-<region>.pooler.supabase.com:5432`), que es solo IPv4.
+>    **No uses el Transaction pooler (6543)** con SQLAlchemy (rompe
+>    `CREATE TABLE`/migraciones).
 
 ## Paso 2 — Crear el servicio
 
