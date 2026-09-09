@@ -113,16 +113,18 @@ def _seccion_asistente_ia(usuario: dict):
         celulas = CelulasManager().obtener_celulas()
         if celulas:
             cel_opts = {c.nombre: c.id for c in celulas}
-            sel_cel = st.selectbox("Célula", list(cel_opts), key="sb_ia_celula")
+            sel_cel_nombre = st.selectbox("Célula", list(cel_opts), key="sb_ia_celula")
+            sel_cel_id = cel_opts[sel_cel_nombre]
         else:
-            sel_cel = None
+            sel_cel_id = None
         
         clientes = CelulasManager().obtener_clientes()
         if clientes:
             cli_opts = {"(Sin cliente)": None, **{c.nombre: c.id for c in clientes}}
-            sel_cli = st.selectbox("Cliente", list(cli_opts), key="sb_ia_cliente")
+            sel_cli_nombre = st.selectbox("Cliente", list(cli_opts), key="sb_ia_cliente")
+            sel_cli_id = cli_opts[sel_cli_nombre]
         else:
-            sel_cli = None
+            sel_cli_id = None
         
         contexto = st.text_area("Contexto / copy adicional", height=80, key="sb_ia_contexto")
         cantidad = st.number_input("Cantidad", 1, 20, 5, key="sb_ia_cant")
@@ -130,8 +132,8 @@ def _seccion_asistente_ia(usuario: dict):
         if st.button("✨ Generar Contenido", key="sb_btn_ia"):
             st.session_state["web_generar_contenido"] = {
                 "tipo": tipo_map[st.session_state["sb_ia_formato"]],
-                "celula_id": sel_cel,
-                "cliente_id": sel_cli,
+                "celula_id": sel_cel_id,
+                "cliente_id": sel_cli_id,
                 "contexto": contexto,
                 "cantidad": int(cantidad),
             }
