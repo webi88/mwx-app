@@ -1,5 +1,8 @@
 FROM python:3.11-slim
 
+# Evita prompts interactivos de debconf/apt durante el build.
+ENV DEBIAN_FRONTEND=noninteractive
+
 WORKDIR /app
 
 # Dependencias del sistema: Chrome + Xvfb (pantalla virtual) + supervisord.
@@ -13,8 +16,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Google Chrome estable (para la automatización Selenium).
-RUN wget -q -O - https://dl-ssl.google.com/linux/linux_signing_key.pub | apt-key add - \
-    && echo "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main" > /etc/apt/sources.list.d/google.list \
+# 'apt-key' fue eliminado en Debian 13 (Trixie), por eso usamos un keyring
+# firmado con signed-by= + gpg --dearmor en lugar de `apt-key add -`.
+RUN wget -q -O /tmp/google-chrome.pub https://dl-ssl.google.com/linux/linux_signing_key.pub \
+    && mkdir -p /usr/share/keyrings \
+    && gpg --dearmor < /tmp/google-chrome.pub > /usr/share/keyrings/google-chrome.gpg \
+    && echo "deb [arch=amd64 signed-by=/usr/share/keyrings/google-chrome.gpg] http://dl.google.com/linux/chrome/deb/ stable main" > /etc/apt/sources.list.d/google-chrome.list \
     && apt-get update \
     && apt-get install -y --no-install-recommends google-chrome-stable \
     && rm -rf /var/lib/apt/lists/*
