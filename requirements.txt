@@ -3,7 +3,7 @@ streamlit==1.41.1
 
 # Database (SQLite local / PostgreSQL en Supabase)
 sqlalchemy==2.0.35
-psycopg2-binary==2.9.9
+psycopg2-binary>=2.9.9
 
 # Scheduler
 apscheduler==3.10.4

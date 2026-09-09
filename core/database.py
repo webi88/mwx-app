@@ -18,7 +18,9 @@ if _database_url.startswith("sqlite:///") and not _database_url.startswith("sqli
 _ES_SQLITE = "sqlite" in _database_url
 
 if _ES_SQLITE:
-    _connect_args = {"check_same_thread": False}
+    # timeout: espera ante bloqueos de SQLite (dashboard y scheduler arrancan
+    # a la vez y pueden pisarse en create_all). Evita "database is locked".
+    _connect_args = {"check_same_thread": False, "timeout": 30}
 else:
     _connect_args = {}
     if "sslmode" not in _database_url:
@@ -74,6 +76,18 @@ def init_db():
     # Importa los modelos para que queden registrados en Base.metadata antes
     # de create_all, sin importar el orden en que se llame desde fuera.
     import core.models  # noqa: F401
+
+    if not _ES_SQLITE:
+        # Validación temprana: si la URL es PostgreSQL y falta el driver,
+        # damos un error claro en vez de un ModuleNotFoundError opaco.
+        try:
+            import psycopg2  # noqa: F401
+        except ImportError:
+            logger.error(
+                "DATABASE_URL es PostgreSQL pero falta el driver. "
+                "Instala: pip install psycopg2-binary"
+            )
+            raise
 
     Base.metadata.create_all(bind=engine)
     _migrar_columnas()
