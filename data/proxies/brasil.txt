@@ -1,0 +1,2 @@
+# Proxy Bright Data ISP — IP fija de Brasil (200.234.190.162)
+http://brd-customer-hl_4a380726-zone-x_cuentas-country-br:br37z9xtottj@brd.superproxy.io:44445

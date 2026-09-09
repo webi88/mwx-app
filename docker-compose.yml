@@ -1,0 +1,24 @@
+version: '3.8'
+
+services:
+  # Dashboard web (Streamlit) + scheduler, igual que en Railway (supervisord).
+  # Sin bot de Telegram: la interfaz es el dashboard web.
+  app:
+    build: .
+    container_name: gestor-redes-dashboard
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+      - ./config:/app/config
+    ports:
+      - "8501:8501"
+    environment:
+      - TZ=America/Mexico_City
+      - PORT=8501
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"

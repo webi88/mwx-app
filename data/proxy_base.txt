@@ -1,0 +1,4 @@
+# Base de proxy Bright Data ISP (IPs residenciales estáticas)
+# Formato: http://user:pass@host:port
+# El sistema añadirá -country-XX y -session-XXX al usuario (convención Bright Data).
+http://brd-customer-hl_4a380726-zone-x_cuentas:br37z9xtottj@brd.superproxy.io:44445

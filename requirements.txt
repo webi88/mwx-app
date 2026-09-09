@@ -1,0 +1,39 @@
+# Web Dashboard
+streamlit==1.41.1
+
+# Database (SQLite local / PostgreSQL en Supabase)
+sqlalchemy==2.0.35
+psycopg2-binary==2.9.9
+
+# Scheduler
+apscheduler==3.10.4
+
+# Selenium & Browser Automation
+selenium==4.25.0
+undetected-chromedriver==3.5.5
+webdriver-manager==4.0.2
+curl-cffi==0.7.4
+
+# AI - OpenAI
+openai==0.28.0
+
+# HTTP & Web
+requests==2.32.3
+httpx==0.28.1
+feedparser==6.0.11
+
+# Image Processing
+Pillow==10.4.0
+
+# Excel export
+openpyxl==3.1.5
+
+# Utilities
+python-dotenv==1.0.1
+pydantic==2.9.2
+pydantic-settings==2.5.2
+faker==30.0.0
+pyperclip==1.9.0
+
+# Logging
+loguru==0.7.2

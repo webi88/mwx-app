@@ -1,0 +1,21 @@
+# Entorno local / pesado / secretos (NO van a la imagen de Railway)
+.venv/
+venv/
+__pycache__/
+*.pyc
+.git/
+.gitignore
+.env
+.DS_Store
+*.md
+
+# Datos de runtime (se recrean en el volumen persistente de Railway)
+data/cookies/
+data/perfiles_chrome/
+data/temp/
+data/logs/
+data/reportes/
+data/avatars/
+data/bin/
+data/gestor_redes.db
+data/proxies/quemados.txt
