@@ -1,4 +1,5 @@
 import streamlit as st
+from loguru import logger
 from core.database import get_db_session
 from core.models import Cliente
 from core.registro import registrar_accion
@@ -138,9 +139,10 @@ def _publicar_hilo():
                     resultados["detalles"].append(f"❌ @{cuenta.usuario}")
                     registrar_accion(cuenta.usuario, "hilo", "fallido", "", "publicar_hilo")
             except Exception as e:
+                logger.exception(f"Error publicando hilo en @{cuenta.usuario}: {e}")
                 resultados["fallidos"] += 1
-                resultados["detalles"].append(f"❌ @{cuenta.usuario}: {str(e)[:50]}")
-                registrar_accion(cuenta.usuario, "hilo", "fallido", "", str(e)[:120])
+                resultados["detalles"].append(f"❌ @{cuenta.usuario}: {str(e)[:400]}")
+                registrar_accion(cuenta.usuario, "hilo", "fallido", "", str(e)[:400])
         
         mostrar_resultados(resultados)
 
@@ -297,9 +299,10 @@ def _mostrar_posts_generados():
                     resultados["detalles"].append(f"❌ @{cuenta.usuario}")
                     registrar_accion(cuenta.usuario, "mantenimiento", "fallido", "", "publicar_tweet")
             except Exception as e:
+                logger.exception(f"Error publicando en @{cuenta.usuario}: {e}")
                 resultados["fallidos"] += 1
-                resultados["detalles"].append(f"❌ @{cuenta.usuario}: {str(e)[:50]}")
-                registrar_accion(cuenta.usuario, "mantenimiento", "fallido", "", str(e)[:120])
+                resultados["detalles"].append(f"❌ @{cuenta.usuario}: {str(e)[:400]}")
+                registrar_accion(cuenta.usuario, "mantenimiento", "fallido", "", str(e)[:400])
         
         mostrar_resultados(resultados)
 

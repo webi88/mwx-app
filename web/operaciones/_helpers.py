@@ -97,10 +97,10 @@ def ejecutar_en_cuentas(cuentas: list[Cuenta], accion, plataforma: str = "twitte
                 resultados["detalles"].append(detalle)
                 registrar_accion(cuenta.usuario, tipo, "fallido", "", detalle)
         except Exception as e:
-            logger.error(f"Error en @{cuenta.usuario}: {e}")
+            logger.exception(f"Error en @{cuenta.usuario}: {e}")
             resultados["fallidos"] += 1
-            resultados["detalles"].append(f"❌ @{cuenta.usuario}: {str(e)[:50]}")
-            registrar_accion(cuenta.usuario, tipo, "fallido", "", str(e)[:120])
+            resultados["detalles"].append(f"❌ @{cuenta.usuario}: {str(e)[:400]}")
+            registrar_accion(cuenta.usuario, tipo, "fallido", "", str(e)[:400])
         
         if progreso and total > 0:
             progreso.progress((i + 1) / total)
