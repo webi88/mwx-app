@@ -28,6 +28,7 @@ class TwitterBot:
         self._ua_persistente = None
         self.ultima_url_publicada = ""
         self.ultimo_error = ""
+        self._proxy_cache = None
     
     def _obtener_proxy(self) -> str:
         try:
@@ -56,6 +57,51 @@ class TwitterBot:
         except Exception as e:
             logger.warning(f"No se pudo guardar el proxy de {self.usuario}: {e}")
 
+    def _guardar_cookies_json(self, cookies: list) -> None:
+        """Persiste las cookies derivadas en `cookies_json` de la cuenta."""
+        try:
+            from core.database import get_db_session
+            from core.models import Cuenta
+            with get_db_session() as db:
+                cuenta = db.query(Cuenta).filter(Cuenta.usuario == self.usuario).first()
+                if cuenta is not None:
+                    cuenta.cookies_json = cookies
+        except Exception as e:
+            logger.warning(f"No se pudieron guardar las cookies de {self.usuario}: {e}")
+
+    def _derivar_cookies(self) -> Optional[list]:
+        """Construye auth_token + ct0 para cuentas importadas sin cookies.
+
+        Visita x.com por un proxy operativo para capturar el `ct0` que emite X
+        y lo combina con el `auth_token` guardado en BD. Así el bot puede
+        iniciar sesión sin que el usuario tenga que pegar cookies."""
+        try:
+            from core.database import get_db_session
+            from core.models import Cuenta
+            with get_db_session() as db:
+                cuenta = db.query(Cuenta).filter(Cuenta.usuario == self.usuario).first()
+                auth_token = (cuenta.auth_token or "").strip() if cuenta else ""
+        except Exception as e:
+            logger.warning(f"No se pudo leer el auth_token de {self.usuario}: {e}")
+            return None
+
+        if not auth_token:
+            self.ultimo_error = "la cuenta no tiene auth_token para derivar cookies"
+            return None
+
+        from plataformas.twitter.session_validator import obtener_ct0, cookies_minimas
+
+        proxy = self._proxy_para_x()
+        ct0 = obtener_ct0(proxy=proxy)
+        if not ct0:
+            self.ultimo_error = "no se pudo obtener ct0 de x.com (proxy/token invalido)"
+            return None
+
+        cookies = cookies_minimas(auth_token, ct0)
+        self._guardar_cookies_json(cookies)
+        logger.info(f"Cookies derivadas (auth_token + ct0) para {self.usuario}")
+        return cookies
+
     def _proxy_para_x(self) -> str:
         """Devuelve un proxy que SI alcanza x.com.
 
@@ -65,11 +111,15 @@ class TwitterBot:
         rota la sesion hasta encontrar una operativa. El proxy resultante se
         guarda en la cuenta para dar estabilidad en las siguientes ejecuciones.
         """
+        if self._proxy_cache:
+            return self._proxy_cache
+
         proxy = self._obtener_proxy()
         if not proxy:
             return ""
         pm = ProxyManager()
         if "_session-" not in proxy:
+            self._proxy_cache = proxy
             return proxy
 
         intentos = int(os.environ.get("PROXY_X_INTENTOS", "5"))
@@ -78,6 +128,7 @@ class TwitterBot:
                 if i:
                     logger.info(f"Proxy de {self.usuario} OK tras {i} rotacion(es)")
                     self._guardar_proxy(proxy)
+                self._proxy_cache = proxy
                 return proxy
             logger.warning(
                 f"Proxy de {self.usuario} no alcanza x.com; rotando sesion "
@@ -86,6 +137,7 @@ class TwitterBot:
             proxy = pm.refrescar_sesion(proxy)
 
         logger.error(f"Ningun proxy alcanzo x.com para {self.usuario}; se usara el ultimo")
+        self._proxy_cache = proxy
         return proxy
 
     def _obtener_ua_consistente(self) -> str:
@@ -235,7 +287,11 @@ class TwitterBot:
             logger.error(f"Error leyendo cookies_json de {self.usuario}: {e}")
 
         if not cookies_json:
-            self.ultimo_error = "la cuenta no tiene cookies guardadas"
+            logger.info(f"{self.usuario} sin cookies: derivando auth_token + ct0...")
+            cookies_json = self._derivar_cookies()
+
+        if not cookies_json:
+            self.ultimo_error = self.ultimo_error or "la cuenta no tiene cookies ni auth_token usable"
             logger.warning(f"No hay cookies_json para {self.usuario}")
             return False
 
