@@ -91,6 +91,39 @@ def init_db():
 
     Base.metadata.create_all(bind=engine)
     _migrar_columnas()
+    _resincronizar_secuencias()
+
+
+def _resincronizar_secuencias():
+    """Pone al día las secuencias SERIAL/IDENTITY en PostgreSQL.
+
+    Al migrar filas desde SQLite con `id` explícito, la secuencia de PostgreSQL
+    se queda por detrás del `MAX(id)` y los siguientes INSERT fallan con
+    'duplicate key value violates unique constraint'. Ajusta cada secuencia a
+    max(id)+1 para que vuelva a autoincrementar correctamente."""
+    if _ES_SQLITE:
+        return
+    from sqlalchemy import text
+
+    try:
+        with engine.begin() as conn:
+            for tabla in Base.metadata.tables.values():
+                if "id" not in tabla.columns:
+                    continue
+                try:
+                    conn.execute(
+                        text(
+                            f"SELECT setval(pg_get_serial_sequence('{tabla.name}', 'id'), "
+                            f"COALESCE((SELECT MAX(id) FROM {tabla.name}), 0) + 1, false)"
+                        )
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"No se pudo resincronizar la secuencia de {tabla.name}: {e}"
+                    )
+        logger.info("Secuencias de PostgreSQL resincronizadas")
+    except Exception as e:
+        logger.warning(f"No se pudieron resincronizar las secuencias: {e}")
 
 
 def _migrar_columnas():
