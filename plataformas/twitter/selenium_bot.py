@@ -91,6 +91,7 @@ class TwitterBot:
             options.add_argument("--disable-dev-shm-usage")
             options.add_argument("--disable-gpu")
             options.add_argument("--disable-software-rasterizer")
+            options.add_argument("--disable-quic")
             options.add_argument(f"--user-data-dir={perfil}")
             options.add_argument(f"--user-agent={self._obtener_ua_consistente()}")
             

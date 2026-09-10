@@ -66,7 +66,7 @@ class LocalForwardProxy:
             else:
                 self._forward_plain(client, data)
         except Exception as e:
-            logger.debug(f"Forward proxy handle error: {e}")
+            logger.error(f"Forward proxy error: {type(e).__name__}: {e}")
         finally:
             self._discard(client)
 
@@ -90,9 +90,17 @@ class LocalForwardProxy:
             buf += chunk
         client.sendall(buf)
 
-        status_line = buf.split(b"\r\n", 1)[0]
-        if b" 200" not in status_line:
+        status_line_bytes = buf.split(b"\r\n", 1)[0]
+        if b" 200" not in status_line_bytes:
+            logger.error(
+                f"El proxy rechazo el tunel a {hostport}: "
+                f"{status_line_bytes.decode('latin-1', 'ignore')} | {buf[:500]!r}"
+            )
             return
+        logger.debug(
+            f"Tunel establecido -> {hostport} "
+            f"({status_line_bytes.decode('latin-1', 'ignore')})"
+        )
 
         # bytes extra que el cliente pudo enviar junto al CONNECT (TLS hello)
         partes = data.split(b"\r\n\r\n", 1)
