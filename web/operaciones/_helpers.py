@@ -93,7 +93,10 @@ def ejecutar_en_cuentas(cuentas: list[Cuenta], accion, plataforma: str = "twitte
                 registrar_accion(cuenta.usuario, tipo, "exito", url, "")
             else:
                 resultados["fallidos"] += 1
+                motivo = getattr(bot, "ultimo_error", "") or ""
                 detalle = f"❌ @{cuenta.usuario}"
+                if motivo:
+                    detalle += f": {motivo[:400]}"
                 resultados["detalles"].append(detalle)
                 registrar_accion(cuenta.usuario, tipo, "fallido", "", detalle)
         except Exception as e:

@@ -42,6 +42,20 @@ def obtener_chromedriver(version_mayor: Optional[int] = None) -> str:
     return str(destino)
 
 
+def _headless_por_defecto() -> bool:
+    """Decide el modo de Chrome por defecto segun el entorno.
+
+    En un servidor Linux sin pantalla (Railway/Docker) Chrome visible no puede
+    arrancar salvo que exista Xvfb + DISPLAY. Si NO hay DISPLAY y no estamos en
+    Windows, forzamos headless para que Selenium funcione aunque el usuario
+    olvide definir HEADLESS=true. Si hay DISPLAY (Xvfb), se puede usar Chrome
+    visible, que es mas fiable/stealth con undetected-chromedriver.
+    """
+    if os.name == "nt":
+        return False
+    return not os.environ.get("DISPLAY")
+
+
 def detectar_chrome_version() -> Optional[int]:
     """Devuelve la version mayor de Chrome instalada (ej. 151 -> 151).
     Usa el registro de Windows en Windows, y el binario en Linux/macOS."""
@@ -98,7 +112,7 @@ class Settings(BaseSettings):
     
     # Selenium
     chrome_driver_path: Optional[str] = None
-    headless: bool = Field(default=False, env="HEADLESS")
+    headless: bool = Field(default_factory=_headless_por_defecto, env="HEADLESS")
     max_browsers: int = Field(default=3, env="MAX_BROWSERS")
     
     # Rate Limiting

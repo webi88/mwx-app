@@ -79,8 +79,9 @@ class MotorActivacion:
 
             bot = TwitterBot(cuenta.usuario)
             if not bot.login_con_cookies():
-                logger.warning(f"Login fallido para @{cuenta.usuario}")
-                return (cuenta.usuario, False, "login fallido", "")
+                motivo = getattr(bot, "ultimo_error", "") or "login fallido"
+                logger.warning(f"Login fallido para @{cuenta.usuario}: {motivo}")
+                return (cuenta.usuario, False, motivo[:120], "")
 
             res = bot.solo_retwittear(
                 [url],

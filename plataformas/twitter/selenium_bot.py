@@ -27,6 +27,7 @@ class TwitterBot:
         self.ua_config_path = resolver_ruta("data/perfiles_chrome/ua_config.txt")
         self._ua_persistente = None
         self.ultima_url_publicada = ""
+        self.ultimo_error = ""
     
     def _obtener_proxy(self) -> str:
         try:
@@ -72,11 +73,25 @@ class TwitterBot:
         return ua
     
     def iniciar_driver(self, pantalla_externa: bool = False) -> bool:
+        self.ultimo_error = ""
         try:
+            perfil = settings.profiles_dir / self.usuario
+            os.makedirs(perfil, exist_ok=True)
+            # Limpia bloqueos huerfanos de un Chrome cerrado a la fuerza (en el
+            # volumen persistente de Railway quedan tras cada reinicio y
+            # provocan "user data directory is already in use").
+            for lock in ("SingletonLock", "SingletonCookie", "SingletonSocket"):
+                try:
+                    os.remove(perfil / lock)
+                except OSError:
+                    pass
+
             options = uc.ChromeOptions()
             options.add_argument("--no-sandbox")
             options.add_argument("--disable-dev-shm-usage")
-            options.add_argument(f"--user-data-dir={settings.profiles_dir / self.usuario}")
+            options.add_argument("--disable-gpu")
+            options.add_argument("--disable-software-rasterizer")
+            options.add_argument(f"--user-data-dir={perfil}")
             options.add_argument(f"--user-agent={self._obtener_ua_consistente()}")
             
             if settings.headless:
@@ -118,7 +133,8 @@ class TwitterBot:
             return True
         
         except Exception as e:
-            logger.error(f"Error iniciando driver: {e}")
+            self.ultimo_error = f"{type(e).__name__}: {e}"
+            logger.exception(f"Error iniciando driver para {self.usuario}: {e}")
             return False
     
     def login_con_cookies(self) -> bool:
@@ -146,6 +162,7 @@ class TwitterBot:
             time.sleep(3)
             
             if "login" in self.driver.current_url.lower():
+                self.ultimo_error = "sesión expirada (cookies .pkl)"
                 logger.warning(f"Sesion expirada para {self.usuario}")
                 return False
             
@@ -153,7 +170,8 @@ class TwitterBot:
             return True
         
         except Exception as e:
-            logger.error(f"Error en login: {e}")
+            self.ultimo_error = f"{type(e).__name__}: {e}"
+            logger.exception(f"Error en login {self.usuario}: {e}")
             return False
     
     def login_con_cookies_json(self) -> bool:
@@ -172,6 +190,7 @@ class TwitterBot:
             logger.error(f"Error leyendo cookies_json de {self.usuario}: {e}")
 
         if not cookies_json:
+            self.ultimo_error = "la cuenta no tiene cookies guardadas"
             logger.warning(f"No hay cookies_json para {self.usuario}")
             return False
 
@@ -216,6 +235,7 @@ class TwitterBot:
             time.sleep(3)
 
             if "login" in self.driver.current_url.lower():
+                self.ultimo_error = "sesión expirada (cookies_json)"
                 logger.warning(f"Sesion expirada para {self.usuario} (cookies_json)")
                 return False
 
@@ -223,7 +243,8 @@ class TwitterBot:
             return True
 
         except Exception as e:
-            logger.error(f"Error en login con cookies_json: {e}")
+            self.ultimo_error = f"{type(e).__name__}: {e}"
+            logger.exception(f"Error en login con cookies_json {self.usuario}: {e}")
             return False
     
     def esperar_login_manual(self, usuario: str) -> bool:
@@ -522,6 +543,7 @@ class TwitterBot:
                 return None
         
         if self._detectar_limite_cuenta():
+            self.ultimo_error = "cuenta limitada por X"
             logger.error("Cuenta limitada, saltando publicacion")
             return None
         
@@ -547,6 +569,7 @@ class TwitterBot:
             
             # Verificar que el tweet REALMENTE se publico (no basta con hacer clic)
             if not self._verificar_publicacion():
+                self.ultimo_error = "X no confirmó la publicación"
                 logger.error(f"No se confirmo la publicacion del tweet por {self.usuario}")
                 try:
                     self.driver.save_screenshot(resolver_ruta("data/temp/twitter_no_publicado.png"))
@@ -566,7 +589,8 @@ class TwitterBot:
             return url or True   # True como fallback truthy si no se pudo obtener la URL
         
         except Exception as e:
-            logger.error(f"Error publicando tweet: {e}")
+            self.ultimo_error = f"{type(e).__name__}: {e}"
+            logger.exception(f"Error publicando tweet para {self.usuario}: {e}")
             try:
                 self.driver.save_screenshot(resolver_ruta("data/temp/twitter_error_publish.png"))
                 logger.error(f"Captura de pantalla guardada: data/temp/twitter_error_publish.png")
