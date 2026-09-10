@@ -61,9 +61,10 @@ def render(usuario):
     # ===================== 1. IMPORTAR LOTE =====================
     st.markdown("### 📥 Importar lote de cuentas")
     st.caption(
-        "Una cuenta por línea, en formato de 7 campos separados por `:`:\n"
-        "`username:password:totp_secret:email:email_password:auth_token:cookies_base64` "
-        "(el último campo es el JSON de cookies en base64)."
+        "Una cuenta por línea, campos separados por `:`:\n"
+        "`username:password:totp_secret:email:email_password:auth_token:cookies_base64`\n"
+        "El 7º campo (`cookies_base64`) es **opcional**: si no lo traes, la cuenta "
+        "igual se importa y el validador obtiene el `ct0` con el `auth_token`."
     )
 
     texto_lote = st.text_area("Pega aquí el lote (una cuenta por línea)", height=220)

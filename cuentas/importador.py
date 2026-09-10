@@ -1,12 +1,14 @@
 """Importador de cuentas de X (Twitter) desde un lote de texto.
 
-Formato de cada línea (7 campos separados por `:`):
+Formato de cada línea (campos separados por `:`):
 
-    username:password:totp_secret:email:email_password:auth_token:cookies_base64
+    username:password:totp_secret:email:email_password:auth_token[:cookies_base64]
 
-El último campo (`cookies_base64`) es una cadena en base64 que, al decodificarla,
-contiene un JSON con una LISTA de cookies nativas de X (objetos con claves
-`name`, `value`, `domain`, `path`, `secure`, `httpOnly`, etc.).
+* 6 campos: sin cookies (lo normal en lotes recién creados; el `auth_token`
+  basta para validar la sesión y derivar el `ct0` después).
+* 7 campos: el último (`cookies_base64`) es una cadena en base64 que, al
+  decodificarla, contiene un JSON con una LISTA de cookies nativas de X
+  (objetos con claves `name`, `value`, `domain`, `path`, `secure`, etc.).
 
 Este módulo reemplaza el flujo obsoleto de `cargar_cuenta.py` (login con
 contraseña para extraer la cookie): ahora las credenciales y las cookies se
@@ -77,20 +79,28 @@ def parsear_linea(linea: str) -> Optional[dict]:
     if not linea or linea.startswith("#"):
         return None
 
-    partes = linea.split(":", 6)
+    partes = linea.split(":")
+    # Acepta 6 campos (sin cookies) o 7 (con cookies_base64). El base64 no
+    # contiene ':' por lo que split simple es seguro.
+    if len(partes) == 6:
+        partes = partes + [""]
     if len(partes) != 7:
         logger.warning(
-            f"Línea malformada (se esperaban 7 campos, se obtuvieron {len(partes)}): "
-            f"{linea[:40]}"
+            f"Línea malformada (se esperaban 6 o 7 campos, se obtuvieron "
+            f"{len(partes)}): {linea[:40]}"
         )
         return None
 
     username, password, totp_secret, email, email_password, auth_token, cookies_b64 = partes
 
-    cookies = decodificar_cookies(cookies_b64)
-    if cookies is None:
-        logger.warning(f"Línea malformada (cookies inválidas): {linea[:40]}")
-        return None
+    # Las cookies son OPCIONALES: si no vienen, la cuenta se importa igual y el
+    # validador obtiene el ct0 a partir del auth_token.
+    cookies = None
+    if cookies_b64.strip():
+        cookies = decodificar_cookies(cookies_b64)
+        if cookies is None:
+            logger.warning(f"Línea malformada (cookies inválidas): {linea[:40]}")
+            return None
 
     return {
         "username": username,

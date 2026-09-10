@@ -49,6 +49,67 @@ def extraer_ct0(cookies: list) -> str:
     return ""
 
 
+def obtener_ct0(proxy: str = None, timeout: int = 15) -> str:
+    """Obtiene un `ct0` fresco visitando x.com.
+
+    X emite la cookie `ct0` a cualquier visitante, así que las cuentas
+    importadas solo con `auth_token` (sin cookies) pueden completar su sesión:
+    basta con capturar el `ct0` que devuelve X y combinarlo con el auth_token.
+    """
+    try:
+        resp = httpx.get(
+            "https://x.com/",
+            proxy=proxy,
+            timeout=timeout,
+            follow_redirects=True,
+            headers={
+                "user-agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                )
+            },
+        )
+        return resp.cookies.get("ct0", "") or ""
+    except Exception as e:
+        logger.warning(f"No se pudo obtener ct0 de x.com: {str(e)[:150]}")
+        return ""
+
+
+def cookies_minimas(auth_token: str, ct0: str) -> list:
+    """Construye la lista de cookies mínimas (auth_token + ct0) para x.com."""
+    return [
+        {"name": "auth_token", "value": auth_token, "domain": ".x.com",
+         "path": "/", "secure": True, "httpOnly": True},
+        {"name": "ct0", "value": ct0, "domain": ".x.com",
+         "path": "/", "secure": True, "httpOnly": False},
+    ]
+
+
+def _guardar_cookies(usuario: str, auth_token: str, ct0: str) -> None:
+    """Persiste auth_token + ct0 en `cookies_json` para poder publicar luego."""
+    try:
+        with get_db_session() as db:
+            reg = db.query(Cuenta).filter(Cuenta.usuario == usuario).first()
+            if reg is not None:
+                reg.cookies_json = cookies_minimas(auth_token, ct0)
+    except Exception as e:
+        logger.error(f"Error guardando cookies de {usuario}: {e}")
+
+
+def _proxy_operativo(usuario: str) -> str:
+    """Proxy sticky por cuenta que SÍ alcanza x.com (rota la sesión si X la
+    bloquea, igual que hace el bot al publicar)."""
+    from utils.proxies import ProxyManager
+
+    pm = ProxyManager()
+    proxy = settings.proxy_sticky_mx(session_id=_session_id_por_cuenta(usuario))
+    for _ in range(4):
+        if pm.x_accesible(proxy):
+            return proxy
+        proxy = pm.refrescar_sesion(proxy)
+    return proxy
+
+
 def cookie_a_dict(cookies: list) -> dict:
     """Convierte una lista de cookies a `{name: value}` (para el header Cookie)."""
     resultado = {}
@@ -145,13 +206,23 @@ def validar_cuenta(cuenta) -> str:
             logger.error(f"Error actualizando cuenta {cuenta.usuario}: {e}")
         return estado
 
-    if not auth_token or not ct0:
+    if not auth_token:
+        logger.warning(f"Cuenta {cuenta.usuario} sin auth_token -> expired")
+        return _actualizar("expired")
+
+    proxy = _proxy_operativo(cuenta.usuario)
+
+    # Sin ct0: derivarlo de x.com a partir del auth_token y persistirlo.
+    if not ct0:
+        ct0 = obtener_ct0(proxy=proxy)
+        if ct0:
+            _guardar_cookies(cuenta.usuario, auth_token, ct0)
+            logger.info(f"ct0 derivado y guardado para {cuenta.usuario}")
+
+    if not ct0:
         logger.warning(f"Cuenta {cuenta.usuario} sin auth_token/ct0 -> expired")
         return _actualizar("expired")
 
-    proxy = settings.proxy_sticky_mx(
-        session_id=_session_id_por_cuenta(cuenta.usuario)
-    )
     resultado = validar_token(auth_token, ct0, proxy=proxy)
     estado = resultado["estado"]
     logger.info(
