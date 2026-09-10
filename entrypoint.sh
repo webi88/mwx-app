@@ -24,10 +24,5 @@ if [ ! -f "$SEED_MARKER" ]; then
     echo "[entrypoint] Siembra completada."
 fi
 
-# Autotest de red en segundo plano (diagnostico temporal; ver `railway logs`).
-if [ -f /app/diagnostico_red.py ]; then
-    ( timeout 180 python /app/diagnostico_red.py 2>&1 || true ) &
-fi
-
 echo "[entrypoint] Arrancando supervisord ..."
 exec "$@"
