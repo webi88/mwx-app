@@ -740,6 +740,41 @@ class ProxyManager:
         resultado["error"] = f"sin acceso a x.com (timeout/red): {ultimo_error[:160]}"
         return resultado
 
+    def x_accesible(self, proxy: str, timeout: int = 12) -> bool:
+        """True SOLO si x.com responde por este proxy.
+
+        A diferencia de verificar_acceso_x (que tolera timeouts por ser un
+        chequeo previo general), aqui un timeout o cierre SÍ se considera
+        fallo: X bloquea IPs residenciales y deja la conexion colgada. Esto
+        permite rotar la sesion sticky hasta dar con una IP que si responda.
+        """
+        import requests
+
+        info = self.analizar(proxy)
+        if not info:
+            return False
+        user = info.get("user")
+        pwd = info.get("password") or ""
+        creds = f"{user}:{pwd}@" if user else ""
+        url_proxy = f"{info['scheme']}://{creds}{info['host']}:{info['port']}"
+        proxies = {"http": url_proxy, "https": url_proxy}
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            )
+        }
+        try:
+            r = requests.get(
+                "https://x.com/robots.txt", proxies=proxies, timeout=timeout,
+                allow_redirects=True, headers=headers,
+            )
+            if r.status_code in (403, 429):
+                return False
+            return True
+        except Exception:
+            return False
+
     def refrescar_sesion(self, proxy: str) -> str:
         """Devuelve el MISMO proxy con una sesion _session-XXX nueva.
 

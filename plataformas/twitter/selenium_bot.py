@@ -43,7 +43,51 @@ class TwitterBot:
         return settings.proxy_sticky_mx(
             session_id=hashlib.md5(self.usuario.encode()).hexdigest()[:8]
         )
-    
+
+    def _guardar_proxy(self, proxy: str) -> None:
+        """Persiste el proxy que resultó funcional para reutilizarlo luego."""
+        try:
+            from core.database import get_db_session
+            from core.models import Cuenta
+            with get_db_session() as db:
+                cuenta = db.query(Cuenta).filter(Cuenta.usuario == self.usuario).first()
+                if cuenta and (cuenta.proxy or "") != proxy:
+                    cuenta.proxy = proxy
+        except Exception as e:
+            logger.warning(f"No se pudo guardar el proxy de {self.usuario}: {e}")
+
+    def _proxy_para_x(self) -> str:
+        """Devuelve un proxy que SI alcanza x.com.
+
+        X bloquea algunas IPs residenciales del pool: el tunel CONNECT da 200
+        pero x.com nunca responde (net::ERR_CONNECTION_CLOSED / timeout). Como
+        cada sesion sticky sale por una IP distinta, se valida y, si falla, se
+        rota la sesion hasta encontrar una operativa. El proxy resultante se
+        guarda en la cuenta para dar estabilidad en las siguientes ejecuciones.
+        """
+        proxy = self._obtener_proxy()
+        if not proxy:
+            return ""
+        pm = ProxyManager()
+        if "_session-" not in proxy:
+            return proxy
+
+        intentos = int(os.environ.get("PROXY_X_INTENTOS", "5"))
+        for i in range(intentos):
+            if pm.x_accesible(proxy):
+                if i:
+                    logger.info(f"Proxy de {self.usuario} OK tras {i} rotacion(es)")
+                    self._guardar_proxy(proxy)
+                return proxy
+            logger.warning(
+                f"Proxy de {self.usuario} no alcanza x.com; rotando sesion "
+                f"({i + 1}/{intentos})"
+            )
+            proxy = pm.refrescar_sesion(proxy)
+
+        logger.error(f"Ningun proxy alcanzo x.com para {self.usuario}; se usara el ultimo")
+        return proxy
+
     def _obtener_ua_consistente(self) -> str:
         if self._ua_persistente:
             return self._ua_persistente
@@ -103,7 +147,7 @@ class TwitterBot:
             else:
                 options.add_argument("--window-size=1366,768")
             
-            proxy = self._obtener_proxy()
+            proxy = self._proxy_para_x()
             if proxy:
                 ProxyManager().aplicar_a_options(options, proxy, tag=self.usuario)
             

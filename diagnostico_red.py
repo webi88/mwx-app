@@ -47,10 +47,23 @@ def main():
     except Exception as e:
         _log(f"HTTPS directo FAIL: {type(e).__name__}: {e}")
 
-    # 3) HTTPS a x.com via el proxy local (igual que Chrome).
+    # 3) Logica real del bot: validar x.com y rotar la sesion si esta bloqueada.
+    _log("validando x.com con rotacion de sesion (igual que el bot)...")
+    for i in range(6):
+        if pm.x_accesible(proxy, timeout=12):
+            sesion = proxy.split("_session-")[1].split(":")[0] if "_session-" in proxy else "?"
+            _log(f"x.com ACCESIBLE con sesion {sesion} tras {i} rotacion(es)")
+            break
+        _log(f"  sesion bloqueada por X; rotando ({i + 1}/6)")
+        proxy = pm.refrescar_sesion(proxy)
+    else:
+        _log("x.com NO accesible tras 6 rotaciones")
+
+    # 4) Mismo camino que Chrome (proxy local) con la sesion ya validada.
     try:
         from utils.forward_proxy import LocalForwardProxy
         import requests
+        info = pm.analizar(proxy)
         fwd = LocalForwardProxy(info["host"], info["port"], info["user"], info["password"])
         port = fwd.start()
         url = f"http://127.0.0.1:{port}"
@@ -60,19 +73,10 @@ def main():
             timeout=30,
             headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) Chrome/120 Safari/537.36"},
         )
-        _log(f"x.com via proxy OK: {r.status_code} ({len(r.text)} bytes)")
+        _log(f"x.com via proxy local OK: {r.status_code} ({len(r.text)} bytes)")
         fwd.close()
     except Exception as e:
-        _log(f"x.com via proxy FAIL: {type(e).__name__}: {e}")
-
-    # 4) Peticion a x.com por el proxy via requests (sin forwarder) como control.
-    try:
-        import requests
-        proxies = {"http": proxy, "https": proxy}
-        r = requests.get("https://x.com/", proxies=proxies, timeout=30)
-        _log(f"x.com via proxy directo OK: {r.status_code} ({len(r.text)} bytes)")
-    except Exception as e:
-        _log(f"x.com via proxy directo FAIL: {type(e).__name__}: {e}")
+        _log(f"x.com via proxy local FAIL: {type(e).__name__}: {e}")
 
 
 if __name__ == "__main__":
