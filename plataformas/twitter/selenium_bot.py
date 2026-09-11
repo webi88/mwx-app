@@ -69,12 +69,12 @@ class TwitterBot:
         except Exception as e:
             logger.warning(f"No se pudieron guardar las cookies de {self.usuario}: {e}")
 
-    def _derivar_cookies(self) -> Optional[list]:
-        """Construye auth_token + ct0 para cuentas importadas sin cookies.
+    def _cookies_auth_token(self) -> Optional[list]:
+        """Cookie mínima (solo auth_token) para que el NAVEGADOR complete la sesión.
 
-        Visita x.com por un proxy operativo para capturar el `ct0` que emite X
-        y lo combina con el `auth_token` guardado en BD. Así el bot puede
-        iniciar sesión sin que el usuario tenga que pegar cookies."""
+        X NO emite `ct0` en una petición sin sesión; lo emite al cargar x.com
+        con una sesión válida. Por eso inyectamos solo el auth_token, cargamos
+        x.com y luego guardamos todas las cookies que X emita (incluido ct0)."""
         try:
             from core.database import get_db_session
             from core.models import Cuenta
@@ -86,21 +86,14 @@ class TwitterBot:
             return None
 
         if not auth_token:
-            self.ultimo_error = "la cuenta no tiene auth_token para derivar cookies"
+            self.ultimo_error = "la cuenta no tiene auth_token para iniciar sesión"
             return None
 
-        from plataformas.twitter.session_validator import obtener_ct0, cookies_minimas
-
-        proxy = self._proxy_para_x()
-        ct0 = obtener_ct0(proxy=proxy)
-        if not ct0:
-            self.ultimo_error = "no se pudo obtener ct0 de x.com (proxy/token invalido)"
-            return None
-
-        cookies = cookies_minimas(auth_token, ct0)
-        self._guardar_cookies_json(cookies)
-        logger.info(f"Cookies derivadas (auth_token + ct0) para {self.usuario}")
-        return cookies
+        logger.info(f"Inyectando auth_token de {self.usuario} para que X emita ct0")
+        return [{
+            "name": "auth_token", "value": auth_token, "domain": ".x.com",
+            "path": "/", "secure": True, "httpOnly": True,
+        }]
 
     def _proxy_para_x(self) -> str:
         """Devuelve un proxy que SI alcanza x.com.
@@ -287,8 +280,8 @@ class TwitterBot:
             logger.error(f"Error leyendo cookies_json de {self.usuario}: {e}")
 
         if not cookies_json:
-            logger.info(f"{self.usuario} sin cookies: derivando auth_token + ct0...")
-            cookies_json = self._derivar_cookies()
+            logger.info(f"{self.usuario} sin cookies: usando auth_token para que X emita ct0...")
+            cookies_json = self._cookies_auth_token()
 
         if not cookies_json:
             self.ultimo_error = self.ultimo_error or "la cuenta no tiene cookies ni auth_token usable"
@@ -335,10 +328,33 @@ class TwitterBot:
             self.driver.refresh()
             time.sleep(3)
 
+            # Entrar a /home para que X ejecute su JS autenticado y emita ct0.
+            try:
+                self.driver.get(f"{self.base_url}/home")
+                time.sleep(4)
+            except Exception:
+                pass
+
             if "login" in self.driver.current_url.lower():
-                self.ultimo_error = "sesión expirada (cookies_json)"
+                self.ultimo_error = "sesión expirada (auth_token/cookies inválidos)"
                 logger.warning(f"Sesion expirada para {self.usuario} (cookies_json)")
                 return False
+
+            # Guarda TODAS las cookies que X generó (incluye ct0) para reutilizar.
+            try:
+                cookies_navegador = self.driver.get_cookies()
+                if cookies_navegador and any(c.get("name") == "ct0" for c in cookies_navegador):
+                    self._guardar_cookies_json(cookies_navegador)
+                    logger.info(
+                        f"Cookies (incl. ct0) guardadas para {self.usuario} "
+                        f"({len(cookies_navegador)})"
+                    )
+                else:
+                    logger.warning(f"X no emitio ct0 para {self.usuario}; sesion no confirmada")
+                    self.ultimo_error = "X no emitió ct0 (auth_token inválido o sesión bloqueada)"
+                    return False
+            except Exception as e:
+                logger.warning(f"No se pudieron guardar las cookies del navegador: {e}")
 
             logger.info(f"Login exitoso para {self.usuario} via cookies_json")
             return True

@@ -210,19 +210,17 @@ def validar_cuenta(cuenta) -> str:
         logger.warning(f"Cuenta {cuenta.usuario} sin auth_token -> expired")
         return _actualizar("expired")
 
+    # Sin ct0 no se puede validar por API (X lo emite solo con el navegador).
+    # En vez de marcar "expired" en falso, se deja el estado actual y el bot
+    # obtendrá el ct0 al cargar x.com cuando se use la cuenta.
+    if not ct0:
+        logger.info(
+            f"Cuenta {cuenta.usuario} sin ct0 todavia; se derivara al publicar "
+            f"(no se marca expirada)"
+        )
+        return cuenta.status or "imported"
+
     proxy = _proxy_operativo(cuenta.usuario)
-
-    # Sin ct0: derivarlo de x.com a partir del auth_token y persistirlo.
-    if not ct0:
-        ct0 = obtener_ct0(proxy=proxy)
-        if ct0:
-            _guardar_cookies(cuenta.usuario, auth_token, ct0)
-            logger.info(f"ct0 derivado y guardado para {cuenta.usuario}")
-
-    if not ct0:
-        logger.warning(f"Cuenta {cuenta.usuario} sin auth_token/ct0 -> expired")
-        return _actualizar("expired")
-
     resultado = validar_token(auth_token, ct0, proxy=proxy)
     estado = resultado["estado"]
     logger.info(
