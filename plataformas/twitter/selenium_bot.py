@@ -533,6 +533,21 @@ class TwitterBot:
         delay = base_delay + random.uniform(0.5, 1.5)
         time.sleep(delay)
     
+    def _es_tweet_fijado(self, tweet) -> bool:
+        """True si el `article` es el tweet fijado (Pinned/Fijado) del perfil.
+
+        Evita que `_obtener_ultimo_enlace` / `_obtener_url_respuesta` devuelvan
+        el tweet fijado en lugar de la publicacion recien hecha.
+        """
+        try:
+            for ctx in tweet.find_elements(By.CSS_SELECTOR, "[data-testid='socialContext']"):
+                txt = (ctx.text or "").lower()
+                if "pinned" in txt or "fijado" in txt:
+                    return True
+        except Exception:
+            pass
+        return False
+
     def _obtener_ultimo_enlace(self, usuario: str) -> Optional[str]:
         try:
             self.driver.get(f"{self.base_url}/{usuario}")
@@ -540,9 +555,15 @@ class TwitterBot:
             
             tweets = self.driver.find_elements(By.CSS_SELECTOR, "article[data-testid='tweet']")
             
-            if tweets:
-                enlace = tweets[0].find_element(By.CSS_SELECTOR, "a[href*='/status/']")
-                return enlace.get_attribute("href")
+            # Salta el tweet fijado: no es la publicacion recien hecha.
+            for tweet in tweets[:5]:
+                try:
+                    if self._es_tweet_fijado(tweet):
+                        continue
+                    enlace = tweet.find_element(By.CSS_SELECTOR, "a[href*='/status/']")
+                    return enlace.get_attribute("href")
+                except Exception:
+                    continue
             
             return None
         
@@ -720,9 +741,11 @@ class TwitterBot:
         toast ('Your post was sent' / 'Tu post fue enviado') y saca de /compose/post."""
         senales = [
             "your post was sent",
+            "your reply was sent",
             "tu post fue enviado",
             "tu post se envió",
             "tu publicación fue enviada",
+            "tu respuesta fue enviada",
             "tweet publicado",
         ]
         inicio = time.time()
@@ -879,6 +902,251 @@ class TwitterBot:
                 pass
             return None
     
+    # ------------------------------------------------------------------
+    # Respuestas / comentarios a tweets existentes
+    # ------------------------------------------------------------------
+    # NOTA: los selectores de la UI de X cambian con frecuencia. Estos metodos
+    # usan varios selectores de respaldo (data-testid / rol textbox / texto
+    # visible) y verifican la publicacion real antes de reportar exito.
+
+    def _buscar_boton_responder(self, timeout: int = 12):
+        """Devuelve el boton Responder del tweet (o un fallback).
+
+        Selectores (con fallback): `[data-testid='reply']`, `button[...]`,
+        aria-label "Responder"/"Reply" y botones con ese texto visible.
+        Devuelve None si no aparece un boton visible/habilitado en `timeout`s.
+        """
+        selectores = [
+            "[data-testid='reply']",
+            "button[data-testid='reply']",
+        ]
+        xpaths = [
+            "//*[@data-testid='reply']",
+            "//*[contains(translate(@aria-label, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', "
+            "'abcdefghijklmnopqrstuvwxyz'), 'responder')]",
+            "//*[contains(translate(@aria-label, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', "
+            "'abcdefghijklmnopqrstuvwxyz'), 'reply')]",
+            "//div[@role='button'][.//span[text()='Responder']]",
+            "//div[@role='button'][.//span[text()='Reply']]",
+        ]
+        fin = time.time() + timeout
+        while time.time() < fin:
+            for sel in selectores:
+                try:
+                    for btn in self.driver.find_elements(By.CSS_SELECTOR, sel):
+                        if btn.is_displayed() and btn.is_enabled():
+                            logger.info(f"Boton Responder encontrado con selector: {sel}")
+                            return btn
+                except Exception:
+                    continue
+            for xp in xpaths:
+                try:
+                    for btn in self.driver.find_elements(By.XPATH, xp):
+                        if btn.is_displayed() and btn.is_enabled():
+                            logger.info(f"Boton Responder encontrado con XPath: {xp}")
+                            return btn
+                except Exception:
+                    continue
+            time.sleep(0.5)
+        return None
+
+    def _buscar_editor_respuesta(self, timeout: int = 12):
+        """Devuelve el textbox de composicion visible de la respuesta.
+
+        Prefiere el editor dentro del modal (`div[role='dialog']`) y luego
+        cualquier editor visible. Selectores (con fallback):
+        `[data-testid='tweetTextarea_0']`, `div[role='textbox']` y
+        `div[contenteditable='true']`. Devuelve None si no aparece.
+        """
+        selectores = [
+            "[data-testid='tweetTextarea_0']",
+            "div[role='textbox'][contenteditable='true']",
+            "div[contenteditable='true']",
+        ]
+        fin = time.time() + timeout
+        while time.time() < fin:
+            # 1) Preferir el editor dentro de un dialogo visible (modal reply).
+            try:
+                for dlg in self.driver.find_elements(By.CSS_SELECTOR, "div[role='dialog']"):
+                    try:
+                        if not dlg.is_displayed():
+                            continue
+                    except Exception:
+                        continue
+                    for sel in selectores:
+                        try:
+                            editor = dlg.find_element(By.CSS_SELECTOR, sel)
+                            if editor.is_displayed():
+                                return editor
+                        except Exception:
+                            continue
+            except Exception:
+                pass
+            # 2) Cualquier editor visible de la pagina.
+            for sel in selectores:
+                try:
+                    for editor in self.driver.find_elements(By.CSS_SELECTOR, sel):
+                        if editor.is_displayed():
+                            return editor
+                except Exception:
+                    continue
+            time.sleep(0.5)
+        return None
+
+    @staticmethod
+    def _status_id(url: str) -> str:
+        """Extrae el id numerico de un enlace `/status/<id>` ('' si no hay)."""
+        m = re.search(r"/status/(\d+)", url or "")
+        return m.group(1) if m else ""
+
+    def _obtener_url_respuesta(self, url_original: str = "") -> Optional[str]:
+        """Mejor esfuerzo para obtener la URL de la respuesta recien publicada.
+
+        La pestana principal del perfil NO muestra las respuestas, por eso se
+        consulta `/<usuario>/with_replies` y se salta el tweet fijado y la URL
+        original respondida (comparando por `status id`, no por dominio, para
+        que twitter.com/x.com no confundan). Devuelve None si no se pudo.
+        """
+        original = (url_original or "").split("?")[0].rstrip("/")
+        original_id = self._status_id(original)
+        try:
+            actual = (self.driver.current_url or "").split("?")[0].rstrip("/")
+            if (
+                "/status/" in actual
+                and "/compose" not in actual
+                and self._status_id(actual) != original_id
+            ):
+                return actual
+        except Exception:
+            pass
+
+        try:
+            self.driver.get(f"{self.base_url}/{self.usuario}/with_replies")
+            time.sleep(4)
+            tweets = self.driver.find_elements(By.CSS_SELECTOR, "article[data-testid='tweet']")
+            for tweet in tweets[:5]:
+                try:
+                    if self._es_tweet_fijado(tweet):
+                        continue
+                    enlace = tweet.find_element(By.CSS_SELECTOR, "a[href*='/status/']")
+                    href = (enlace.get_attribute("href") or "").split("?")[0].rstrip("/")
+                    if href and self._status_id(href) != original_id:
+                        return href
+                except Exception:
+                    continue
+        except Exception as e:
+            logger.warning(f"No se pudo obtener la URL de la respuesta: {e}")
+        return None
+
+    def responder_tweet(
+        self, url: str, texto: str, imagen_path: Optional[str] = None
+    ) -> Optional[str]:
+        """Responde (comentario) a un tweet existente y devuelve la URL.
+
+        Asume que el llamador ya inicio sesion; si no hay driver, intenta
+        `login_con_cookies()`. Navega a `url`, clica Responder
+        (`_buscar_boton_responder`), escribe `texto` (`_pegar_texto`) y publica
+        con `_buscar_boton_post()`. `imagen_path` es opcional y tolerante a
+        fallos (`_subir_imagen` solo loguea si falla).
+
+        Verifica la publicacion real con `_verificar_publicacion()` (toast
+        "Your reply was sent" / cierre del compositor): NO devuelve exito solo
+        por hacer clic. Si se publico, intenta obtener la URL de la respuesta
+        (`_obtener_url_respuesta`).
+
+        Devuelve la URL de la respuesta (str) si se obtuvo, `True` como fallback
+        truthy si se publico pero no hubo URL, o `None` si fallo (el motivo
+        queda en `self.ultimo_error`).
+        """
+        self.ultimo_error = ""
+
+        if not (url or "").strip():
+            self.ultimo_error = "falta la URL del tweet a responder"
+            return None
+        if not (texto or "").strip():
+            self.ultimo_error = "falta el texto de la respuesta"
+            return None
+
+        if not self.driver:
+            if not self.login_con_cookies():
+                self.ultimo_error = self.ultimo_error or "no se pudo iniciar sesion"
+                return None
+
+        try:
+            self.driver.get(url)
+            time.sleep(random.uniform(2.5, 4.0))
+
+            if self._detectar_limite_cuenta():
+                self.ultimo_error = "cuenta limitada por X"
+                logger.error("Cuenta limitada, saltando respuesta")
+                return None
+
+            reply_btn = self._buscar_boton_responder()
+            if reply_btn is None:
+                self.ultimo_error = "no se encontro el boton Responder del tweet"
+                logger.warning(self.ultimo_error)
+                return None
+            try:
+                self.driver.execute_script(
+                    "arguments[0].scrollIntoView({block: 'center'});", reply_btn
+                )
+                time.sleep(0.5)
+            except Exception:
+                pass
+            self.driver.execute_script("arguments[0].click();", reply_btn)
+            time.sleep(random.uniform(1.0, 2.0))
+
+            editor = self._buscar_editor_respuesta()
+            if editor is None:
+                self.ultimo_error = "no se encontro el cuadro de composicion de la respuesta"
+                logger.warning(self.ultimo_error)
+                return None
+
+            self._pegar_texto(editor, self._reorganizar_hashtags(texto))
+            time.sleep(random.uniform(0.8, 1.5))
+
+            if imagen_path and os.path.exists(imagen_path):
+                self._subir_imagen(imagen_path)
+                time.sleep(1)
+
+            publicar_btn = self._buscar_boton_post()
+            self.driver.execute_script("arguments[0].click();", publicar_btn)
+
+            # Verificacion real: no basta con hacer clic.
+            if not self._verificar_publicacion():
+                self.ultimo_error = "X no confirmo la publicación de la respuesta"
+                logger.error(f"No se confirmo la respuesta de {self.usuario}")
+                try:
+                    self.driver.save_screenshot(
+                        resolver_ruta("data/temp/twitter_no_respondido.png")
+                    )
+                    logger.error("Captura guardada: data/temp/twitter_no_respondido.png")
+                except Exception:
+                    pass
+                return None
+
+            logger.info(f"Respuesta publicada por {self.usuario}")
+
+            # 3s de vista a la pantalla para confirmacion visual (patron del bot).
+            logger.info("Dejando 3s la pantalla visible para confirmacion visual...")
+            time.sleep(3)
+
+            url_respuesta = self._obtener_url_respuesta(url)
+            if url_respuesta:
+                self.ultima_url_publicada = url_respuesta
+            return url_respuesta or True
+
+        except Exception as e:
+            self.ultimo_error = f"{type(e).__name__}: {e}"
+            logger.exception(f"Error respondiendo tweet para {self.usuario}: {e}")
+            try:
+                self.driver.save_screenshot(
+                    resolver_ruta("data/temp/twitter_error_reply.png")
+                )
+            except Exception:
+                pass
+            return None
+
     def _reorganizar_hashtags(self, texto: str) -> str:
         palabras = texto.split()
         hashtags = [p for p in palabras if p.startswith("#")]
@@ -914,6 +1182,28 @@ class TwitterBot:
         except Exception as e:
             logger.error(f"Error subiendo imagen: {e}")
     
+    def _esperar_rt_confirmado(self, timeout: int = 12) -> bool:
+        """True si el tweet objetivo quedo retwitteado.
+
+        Tras aplicar el RT, X cambia el boton `[data-testid='retweet']` por
+        `[data-testid='unretweet']`. Se revisa SOLO el primer `article` (en una
+        pagina de status es el tweet objetivo) para no confundirlo con
+        respuestas de la conversacion ya retwitteadas.
+        """
+        fin = time.time() + timeout
+        while time.time() < fin:
+            try:
+                articulos = self.driver.find_elements(
+                    By.CSS_SELECTOR, "article[data-testid='tweet']"
+                )
+                if articulos:
+                    if articulos[0].find_elements(By.CSS_SELECTOR, "[data-testid='unretweet']"):
+                        return True
+            except Exception:
+                pass
+            time.sleep(0.5)
+        return False
+
     def solo_retwittear(
         self,
         targets: list[str],
@@ -923,6 +1213,17 @@ class TwitterBot:
         dar_like: bool = False,
         imagen_path: Optional[str] = None
     ) -> dict:
+        """Hace RT (simple o con cita) de las URLs recibidas.
+
+        Para la distribucion horaria se usa con UNA sola URL: hace exactamente
+        un RT y devuelve `{"exitos": 1, "urls": [<url>]}` (el RT simple no crea
+        una URL nueva; se registra la del tweet retwitteado). Con varias URLs
+        mantiene el recorrido secuencial en el mismo navegador.
+
+        Verifica cada publicacion REALMENTE (estado `unretweet` en RT simple y
+        `_verificar_publicacion()` en citas) antes de contar el exito, por lo
+        que `exitos`/`fallidos`/`urls` reflejan el resultado real por URL.
+        """
         resultados = {"exitos": 0, "fallidos": 0, "urls": []}
         
         if not self.driver:
@@ -935,6 +1236,7 @@ class TwitterBot:
                 time.sleep(3)
                 
                 if self._detectar_limite_cuenta():
+                    self.ultimo_error = "cuenta limitada por X"
                     break
                 
                 rt_btn = self.driver.find_element(By.CSS_SELECTOR, "[data-testid='retweet']")
@@ -959,9 +1261,18 @@ class TwitterBot:
                     
                     publicar_btn = self._buscar_boton_post()
                     self.driver.execute_script("arguments[0].click();", publicar_btn)
+                    
+                    # Verificacion real: no contar exito solo por hacer clic.
+                    if not self._verificar_publicacion():
+                        raise Exception("X no confirmo la publicacion de la cita")
                 else:
                     rt_option = self.driver.find_element(By.CSS_SELECTOR, "[data-testid='retweetConfirm']")
                     self.driver.execute_script("arguments[0].click();", rt_option)
+                    
+                    # Verificacion real: el boton del tweet objetivo debe pasar
+                    # a estado "unretweet".
+                    if not self._esperar_rt_confirmado():
+                        raise Exception("X no confirmo el RT (sin estado 'unretweet')")
                 
                 time.sleep(2)
                 
@@ -981,11 +1292,16 @@ class TwitterBot:
                     if url_publicada:
                         resultados["urls"].append(url_publicada)
                         self.ultima_url_publicada = url_publicada
+                else:
+                    # El RT simple no genera URL nueva: la canonica es la del
+                    # tweet retwitteado.
+                    resultados["urls"].append(url)
                 
                 time.sleep(random.uniform(2.5, 6.0))
             
             except Exception as e:
                 resultados["fallidos"] += 1
+                self.ultimo_error = f"{type(e).__name__}: {e}"
                 logger.error(f"Error en RT: {e}")
         
         return resultados
@@ -1428,9 +1744,1269 @@ class TwitterBot:
             logger.error(f"Error reportando post: {e}")
             return False
     
+    # ------------------------------------------------------------------
+    # Perfil: cambio de nombre visible y de @handle (Selenium)
+    # ------------------------------------------------------------------
+    # NOTA: la UI de configuracion de X (/settings/profile y
+    # /settings/username) cambia con frecuencia. Estos metodos usan varios
+    # selectores de respaldo (data-testid / name / texto visible) y verifican
+    # el resultado recargando la pagina, pero pueden requerir ajustar los
+    # selectores si X rediseña esas pantallas.
+
+    def _esperar_input(self, selectores: list, timeout: int = 15):
+        """Devuelve el primer input visible y habilitado de `selectores` (o None)."""
+        fin = time.time() + timeout
+        while time.time() < fin:
+            for sel in selectores:
+                try:
+                    for elem in self.driver.find_elements(By.CSS_SELECTOR, sel):
+                        if elem.is_displayed() and elem.is_enabled():
+                            return elem
+                except Exception:
+                    continue
+            time.sleep(0.5)
+        return None
+
+    def _escribir_input(self, elemento, texto: str) -> bool:
+        """Limpia el input (CTRL+A + DELETE) y escribe `texto`."""
+        try:
+            elemento.click()
+            modifier = Keys.COMMAND if os.name == "posix" else Keys.CONTROL
+            ActionChains(self.driver).key_down(modifier).send_keys("a").key_up(modifier).perform()
+            ActionChains(self.driver).send_keys(Keys.DELETE).perform()
+            time.sleep(0.2)
+            self._pegar_texto(elemento, texto)
+            return True
+        except Exception as e:
+            logger.warning(f"Pegado fallido, usando send_keys: {e}")
+            try:
+                for char in texto:
+                    elemento.send_keys(char)
+                    time.sleep(0.01)
+                return True
+            except Exception as e2:
+                logger.error(f"Error escribiendo el input: {e2}")
+                return False
+
+    def _clic_guardar(
+        self, testids: Optional[list] = None, textos: Optional[tuple] = None
+    ) -> bool:
+        """Clica Guardar/Save/Confirmar.
+
+        Intenta por data-testid, por cualquier `*_Save_Button` visible, por
+        texto en botones/`role=button` y, como ultimo recurso, con el patron
+        `_clic_texto_visible` del bot.
+        """
+        textos = textos or ("guardar", "save", "confirmar", "confirm")
+
+        for testid in (testids or []):
+            for sel in (f"[data-testid='{testid}']", f"button[data-testid='{testid}']"):
+                try:
+                    btn = self.driver.find_element(By.CSS_SELECTOR, sel)
+                    if btn.is_displayed() and btn.is_enabled():
+                        self.driver.execute_script("arguments[0].click();", btn)
+                        return True
+                except Exception:
+                    continue
+
+        try:
+            for btn in self.driver.find_elements(By.CSS_SELECTOR, "[data-testid$='_Save_Button']"):
+                if btn.is_displayed() and btn.is_enabled():
+                    self.driver.execute_script("arguments[0].click();", btn)
+                    return True
+        except Exception:
+            pass
+
+        try:
+            candidatos = self.driver.find_elements(
+                By.XPATH, "//button | //div[@role='button'] | //a[@role='button']"
+            )
+        except Exception:
+            candidatos = []
+
+        for texto in textos:
+            for elem in candidatos:
+                try:
+                    if not (elem.is_displayed() and elem.is_enabled()):
+                        continue
+                    txt = (elem.text or "").strip().lower()
+                    if txt and len(txt) <= 40 and texto in txt:
+                        self.driver.execute_script("arguments[0].click();", elem)
+                        return True
+                except Exception:
+                    continue
+
+        return self._clic_texto_visible(*textos)
+
+    def _confirmar_guardado(
+        self,
+        senales: list,
+        url_recarga: str,
+        selectores_input: list,
+        valor_esperado: str,
+    ) -> bool:
+        """Confirma un guardado de perfil por toast o recargando la pagina.
+
+        - Toast: elementos `[data-testid='toast']` / `div[role='alert']`.
+        - Fuente: solo frases largas (>=13 chars) para no dar falsos positivos.
+        - Verificacion fuerte: recarga `url_recarga` y compara el value del
+          input con `valor_esperado` (ignora el '@' inicial).
+        """
+        fin = time.time() + 10
+        while time.time() < fin:
+            try:
+                toasts = self.driver.find_elements(
+                    By.CSS_SELECTOR, "[data-testid='toast'], div[role='alert']"
+                )
+                for toast in toasts:
+                    txt = (toast.text or "").lower()
+                    if any(s in txt for s in senales):
+                        return True
+                src = self.driver.page_source.lower()
+                for s in senales:
+                    if len(s) >= 13 and s in src:
+                        return True
+            except Exception:
+                pass
+            time.sleep(1)
+
+        try:
+            self.driver.get(url_recarga)
+            time.sleep(3)
+            elem = self._esperar_input(selectores_input, timeout=10)
+            if elem is not None:
+                actual = (elem.get_attribute("value") or "").strip().lstrip("@")
+                esperado = (valor_esperado or "").strip().lstrip("@")
+                if actual.lower() == esperado.lower():
+                    return True
+        except Exception as e:
+            logger.warning(f"No se pudo verificar recargando {url_recarga}: {e}")
+        return False
+
+    def cambiar_nombre(self, nuevo_nombre: str) -> bool:
+        """Cambia el nombre visible (display name) de la cuenta.
+
+        Valida no vacio y <=50 caracteres. Si no hay driver, llama a
+        `login_con_cookies()` (que intenta `.pkl` y cae a `cookies_json`).
+
+        Selectores: `input[name='displayName']`, `input[autocomplete='name']`,
+        primer `input[type='text']` visible. Guardar:
+        `[data-testid='Profile_Save_Button']`, `[data-testid$='_Save_Button']`,
+        texto "Guardar"/"Save" (`_clic_texto_visible` como fallback).
+
+        Verifica por toast ("Guardado"/"Saved"/"Your profile was updated"/
+        "Se actualizo tu perfil") o recargando /settings/profile y comparando
+        el valor. Deja 3s visible. Devuelve bool y rellena `self.ultimo_error`.
+
+        La UI de X cambia: si falla, revisar estos selectores con Chrome real.
+        """
+        self.ultimo_error = ""
+        nombre = (nuevo_nombre or "").strip()
+        if not nombre:
+            self.ultimo_error = "el nombre no puede estar vacio"
+            return False
+        if len(nombre) > 50:
+            self.ultimo_error = "el nombre supera los 50 caracteres permitidos por X"
+            return False
+
+        try:
+            if not self.driver:
+                if not self.login_con_cookies():
+                    self.ultimo_error = self.ultimo_error or "no se pudo iniciar sesion"
+                    return False
+
+            url_perfil = f"{self.base_url}/settings/profile"
+            self.driver.get(url_perfil)
+            time.sleep(3)
+
+            selectores = [
+                "input[name='displayName']",
+                "input[autocomplete='name']",
+                "input[type='text']",
+            ]
+            campo = self._esperar_input(selectores, timeout=15)
+            if campo is None:
+                self.ultimo_error = "no se encontro el campo de nombre en /settings/profile"
+                logger.warning(self.ultimo_error)
+                return False
+
+            if not self._escribir_input(campo, nombre):
+                self.ultimo_error = "no se pudo escribir el nuevo nombre"
+                return False
+            time.sleep(1)
+
+            if not self._clic_guardar(["Profile_Save_Button"]):
+                self.ultimo_error = "no se encontro el boton Guardar en /settings/profile"
+                logger.warning(self.ultimo_error)
+                return False
+
+            senales = [
+                "your profile was updated",
+                "profile was updated",
+                "se actualizo tu perfil",
+                "se actualizó tu perfil",
+                "guardado",
+                "saved",
+            ]
+            ok = self._confirmar_guardado(senales, url_perfil, selectores, nombre)
+            if not ok:
+                self.ultimo_error = "X no confirmo el cambio de nombre"
+                logger.warning(self.ultimo_error)
+
+            logger.info("Dejando 3s la pantalla visible para confirmacion visual...")
+            time.sleep(3)
+            return ok
+
+        except Exception as e:
+            self.ultimo_error = f"{type(e).__name__}: {e}"
+            logger.exception(f"Error cambiando el nombre de {self.usuario}: {e}")
+            return False
+
+    def cambiar_handle(self, nuevo_handle: str, password: str = "") -> bool:
+        """Cambia el @usuario (handle) de la cuenta.
+
+        Normaliza quitando el '@' y espacios; valida `^[A-Za-z0-9_]{4,15}$`.
+        X exige confirmar la contrasena: si `password` esta vacia devuelve
+        False con `self.ultimo_error`.
+
+        Selectores: `input[name='username']`,
+        `input[autocomplete='username']`, `input[type='text']`. Guardar:
+        `[data-testid='Profile_Save_Button']`,
+        `[data-testid='UserName_Save_Button']`,
+        `[data-testid$='_Save_Button']`, textos "Guardar"/"Save". Modal de
+        contrasena: `input[type='password']`/`input[name='password']` y
+        "Confirmar"/"Confirm"/"Next" (se prueba Enter tambien).
+
+        Verifica recargando /settings/username (input value == nuevo_handle)
+        o por toast. Deja 3s visible. Devuelve bool y rellena
+        `self.ultimo_error` con el error real.
+
+        La UI de X cambia: si falla, revisar estos selectores con Chrome real.
+        """
+        self.ultimo_error = ""
+        handle = (nuevo_handle or "").strip().lstrip("@").strip()
+        if not re.match(r"^[A-Za-z0-9_]{4,15}$", handle):
+            self.ultimo_error = (
+                "handle invalido: usa de 4 a 15 letras, numeros o _ (sin @)"
+            )
+            return False
+        if not (password or "").strip():
+            self.ultimo_error = "se requiere contrasena para cambiar el @"
+            return False
+
+        try:
+            if not self.driver:
+                if not self.login_con_cookies():
+                    self.ultimo_error = self.ultimo_error or "no se pudo iniciar sesion"
+                    return False
+
+            url_usuario = f"{self.base_url}/settings/username"
+            self.driver.get(url_usuario)
+            time.sleep(3)
+
+            selectores = [
+                "input[name='username']",
+                "input[autocomplete='username']",
+                "input[type='text']",
+            ]
+            campo = self._esperar_input(selectores, timeout=15)
+            if campo is None:
+                self.ultimo_error = "no se encontro el campo de @usuario en /settings/username"
+                logger.warning(self.ultimo_error)
+                return False
+
+            if not self._escribir_input(campo, handle):
+                self.ultimo_error = "no se pudo escribir el nuevo @"
+                return False
+            time.sleep(1)
+
+            if not self._clic_guardar(["Profile_Save_Button", "UserName_Save_Button"]):
+                self.ultimo_error = "no se encontro el boton Guardar en /settings/username"
+                logger.warning(self.ultimo_error)
+                return False
+
+            # X suele pedir la contrasena en un modal para confirmar el cambio.
+            time.sleep(1)
+            modal = self._esperar_input(
+                ["input[type='password']", "input[name='password']"], timeout=5
+            )
+            if modal is not None:
+                try:
+                    modal.click()
+                    modal.send_keys(password)
+                    time.sleep(0.5)
+                    try:
+                        modal.send_keys(Keys.ENTER)
+                    except Exception:
+                        pass
+                    time.sleep(1)
+                    if self._esperar_input(
+                        ["input[type='password']", "input[name='password']"], timeout=2
+                    ) is not None:
+                        self._clic_guardar(
+                            ["confirmationSheetConfirm"],
+                            textos=(
+                                "confirmar",
+                                "confirm",
+                                "guardar",
+                                "save",
+                                "next",
+                                "siguiente",
+                            ),
+                        )
+                except Exception as e:
+                    logger.warning(f"No se pudo confirmar la contrasena: {e}")
+
+            senales = [
+                "your username was updated",
+                "username was updated",
+                "se actualizo tu nombre de usuario",
+                "se actualizó tu nombre de usuario",
+                "tu nombre de usuario se actualizo",
+                "guardado",
+                "saved",
+            ]
+            ok = self._confirmar_guardado(senales, url_usuario, selectores, handle)
+            if not ok:
+                self.ultimo_error = "X no confirmo el cambio de @"
+                logger.warning(self.ultimo_error)
+
+            logger.info("Dejando 3s la pantalla visible para confirmacion visual...")
+            time.sleep(3)
+            return ok
+
+        except Exception as e:
+            self.ultimo_error = f"{type(e).__name__}: {e}"
+            logger.exception(f"Error cambiando el handle de {self.usuario}: {e}")
+            return False
+
+    def cambiar_perfil(
+        self,
+        nombre: str = None,
+        handle: str = None,
+        password: str = None,
+        foto_perfil_path: Optional[str] = None,
+        foto_portada_path: Optional[str] = None,
+        verificar_fotos_manuales: bool = False,
+    ) -> dict:
+        """Cambia el nombre y/o el @ de la cuenta y lo persiste en BD.
+
+        Apartado de fotos (brandeo) para hacerlo facil en el mismo flujo:
+          - `foto_perfil_path` / `foto_portada_path`: ruta local -> subida
+            automatica via `cambiar_foto_perfil/portada(path)`.
+          - `verificar_fotos_manuales=True`: el operador ya subio foto+portada
+            a mano (p. ej. con `abrir_para_brandeo_manual`); solo verifica
+            (`cambiar_foto_perfil(None)` / `cambiar_foto_portada(None)`) y
+            guarda cookies. Si ademas se paso `*_path`, la subida automatica
+            tiene prioridad y no se verifica esa foto en modo manual.
+
+        Si no hay driver, llama a `login_con_cookies()`. Si `password` es None
+        la lee de la BD (`Cuenta.password`). Actualiza en BD
+        `nombre_mostrado`/`handle_actual` de los cambios que tuvieron exito.
+
+        Devuelve {"ok", "nombre", "handle", "foto_perfil", "foto_portada",
+        "error"}. "ok" es True si al menos un cambio solicitado tuvo exito
+        (o si no habia nada que cambiar). Nunca lanza excepcion. Requiere
+        Chrome real; los selectores de X pueden cambiar.
+        """
+        resultado = {
+            "ok": False,
+            "nombre": False,
+            "handle": False,
+            "foto_perfil": False,
+            "foto_portada": False,
+            "error": "",
+        }
+
+        def _agregar_error(msg: str) -> None:
+            msg = (msg or "").strip()
+            if not msg:
+                return
+            if resultado["error"]:
+                resultado["error"] = f"{resultado['error']} | {msg}"
+            else:
+                resultado["error"] = msg
+
+        try:
+            quiere_nombre = bool((nombre or "").strip())
+            quiere_handle = bool((handle or "").strip())
+            quiere_foto_perfil = bool((foto_perfil_path or "").strip())
+            quiere_foto_portada = bool((foto_portada_path or "").strip())
+            quiere_verificar_manual = bool(verificar_fotos_manuales)
+
+            if (
+                not quiere_nombre
+                and not quiere_handle
+                and not quiere_foto_perfil
+                and not quiere_foto_portada
+                and not quiere_verificar_manual
+            ):
+                resultado["ok"] = True
+                return resultado
+
+            if not self.driver:
+                if not self.login_con_cookies():
+                    resultado["error"] = self.ultimo_error or "no se pudo iniciar sesion"
+                    return resultado
+
+            if quiere_handle and password is None:
+                try:
+                    from core.database import get_db_session
+                    from core.models import Cuenta
+
+                    with get_db_session() as db:
+                        reg = db.query(Cuenta).filter(Cuenta.usuario == self.usuario).first()
+                        password = (reg.password or "") if reg else ""
+                except Exception as e:
+                    logger.warning(f"No se pudo leer la contrasena de {self.usuario}: {e}")
+                    password = ""
+
+            if quiere_nombre:
+                resultado["nombre"] = self.cambiar_nombre(nombre)
+                if not resultado["nombre"]:
+                    _agregar_error(self.ultimo_error or "no se pudo cambiar el nombre")
+
+            if quiere_handle:
+                resultado["handle"] = self.cambiar_handle(handle, password or "")
+                if not resultado["handle"]:
+                    _agregar_error(self.ultimo_error or "no se pudo cambiar el @")
+
+            if quiere_foto_perfil:
+                try:
+                    resultado["foto_perfil"] = bool(self.cambiar_foto_perfil(foto_perfil_path))
+                    if not resultado["foto_perfil"]:
+                        _agregar_error(self.ultimo_error or "no se pudo cambiar la foto de perfil")
+                except Exception as e:
+                    _agregar_error(f"foto perfil: {type(e).__name__}: {e}")
+
+            if quiere_foto_portada:
+                try:
+                    resultado["foto_portada"] = bool(self.cambiar_foto_portada(foto_portada_path))
+                    if not resultado["foto_portada"]:
+                        _agregar_error(self.ultimo_error or "no se pudo cambiar la foto de portada")
+                except Exception as e:
+                    _agregar_error(f"foto portada: {type(e).__name__}: {e}")
+
+            if quiere_verificar_manual:
+                if not quiere_foto_perfil:
+                    try:
+                        resultado["foto_perfil"] = bool(self.cambiar_foto_perfil(None))
+                        if not resultado["foto_perfil"]:
+                            _agregar_error(
+                                self.ultimo_error or "no se verifico la foto de perfil manual"
+                            )
+                    except Exception as e:
+                        _agregar_error(f"foto perfil manual: {type(e).__name__}: {e}")
+                if not quiere_foto_portada:
+                    try:
+                        resultado["foto_portada"] = bool(self.cambiar_foto_portada(None))
+                        if not resultado["foto_portada"]:
+                            _agregar_error(
+                                self.ultimo_error or "no se verifico la foto de portada manual"
+                            )
+                    except Exception as e:
+                        _agregar_error(f"foto portada manual: {type(e).__name__}: {e}")
+
+            resultado["ok"] = bool(
+                resultado["nombre"]
+                or resultado["handle"]
+                or resultado["foto_perfil"]
+                or resultado["foto_portada"]
+            )
+
+            campos = {}
+            if resultado["nombre"]:
+                campos["nombre_mostrado"] = (nombre or "").strip()
+            if resultado["handle"]:
+                campos["handle_actual"] = (handle or "").strip().lstrip("@")
+
+            if campos:
+                try:
+                    from core.database import get_db_session
+                    from core.models import Cuenta
+
+                    with get_db_session() as db:
+                        reg = db.query(Cuenta).filter(Cuenta.usuario == self.usuario).first()
+                        if reg is not None:
+                            for campo, valor in campos.items():
+                                if hasattr(Cuenta, campo):
+                                    setattr(reg, campo, valor)
+                except Exception as e:
+                    logger.error(f"Error actualizando perfil en BD de {self.usuario}: {e}")
+                    if not resultado["error"]:
+                        resultado["error"] = f"bd: {str(e)[:150]}"
+
+            return resultado
+
+        except Exception as e:
+            resultado["error"] = f"{type(e).__name__}: {e}"
+            logger.exception(f"Error en cambiar_perfil de {self.usuario}: {e}")
+            return resultado
+
+    # ------------------------------------------------------------------
+    # Perfil: foto de perfil (avatar) y foto de portada (banner)
+    # ------------------------------------------------------------------
+    # NOTA: la UI de /settings/profile de X cambia con frecuencia. Estos
+    # metodos usan varios selectores de respaldo (data-testid / aria-label /
+    # texto visible en espanol e ingles) y verifican el resultado por toast o
+    # recargando la pagina. Si X rediseña esa pantalla, revisar los selectores
+    # con Chrome real.
+
+    def cambiar_foto_perfil(self, imagen_path: Optional[str] = None) -> bool:
+        """Sube la foto de perfil (avatar) de la cuenta desde un archivo local.
+
+        Dos modos:
+          - Automatico: pasa `imagen_path` (.png/.jpg/.jpeg/.webp/.gif) y se
+            sube via `input[type='file']` + modal de recorte + Guardar.
+          - Manual (brandeo): pasa `imagen_path=None` cuando el operador ya
+            subio la foto a mano (p. ej. con `abrir_para_brandeo_manual`); en
+            ese caso NO se abre file-chooser, solo se verifica que haya avatar
+            (`_src_foto`) y se guardan cookies (.pkl + BD).
+
+        Requiere Chrome real con sesion valida (cookies); sin Chrome o sin
+        sesion devuelve False con `self.ultimo_error` claro. Nunca lanza
+        excepcion. Selectores sujetos a cambios de X: probar con Chrome real.
+        """
+        return self._cambiar_foto(imagen_path, "avatar")
+
+    def cambiar_foto_portada(self, imagen_path: Optional[str] = None) -> bool:
+        """Sube la foto de portada (banner/encabezado) desde un archivo local.
+
+        Dos modos (igual que `cambiar_foto_perfil`):
+          - Automatico: `imagen_path` con el archivo a subir.
+          - Manual (brandeo): `imagen_path=None`; asume que el operador ya la
+            subio a mano y solo verifica (`profile_banners`) + guarda cookies.
+
+        Requiere Chrome real con sesion valida; sin Chrome devuelve False con
+        `self.ultimo_error` claro. Nunca lanza excepcion. Selectores sujetos
+        a cambios de X: probar con Chrome real.
+        """
+        return self._cambiar_foto(imagen_path, "portada")
+
+    def _verificar_foto_manual(self, tipo: str) -> bool:
+        """Verifica una foto que el operador ya subio a mano y guarda cookies.
+
+        Asume que NO se pasa archivo: solo confirma que en
+        https://x.com/settings/profile ya hay avatar (`profile_images`) o
+        portada (`profile_banners`), guarda cookies (.pkl + BD) y devuelve
+        True si la imagen esta presente. Requiere Chrome real con sesion
+        valida; si no hay driver intenta `login_con_cookies()`. Nunca lanza
+        excepcion: cualquier fallo queda en `self.ultimo_error`.
+        """
+        self.ultimo_error = ""
+        etiqueta = "perfil" if tipo == "avatar" else "portada"
+        try:
+            if not self.driver:
+                try:
+                    if not self.login_con_cookies():
+                        self.ultimo_error = self.ultimo_error or "no se pudo iniciar sesion"
+                        logger.warning(
+                            f"[foto-manual] Sin sesion para {self.usuario}: "
+                            "requiere Chrome real con cookies validas"
+                        )
+                        return False
+                except Exception as e:
+                    self.ultimo_error = f"{type(e).__name__}: {e}"
+                    logger.warning(
+                        f"[foto-manual] Requiere Chrome real; no se pudo abrir: {e}"
+                    )
+                    return False
+
+            try:
+                self.driver.get(f"{self.base_url}/settings/profile")
+                time.sleep(3)
+            except Exception as e:
+                logger.warning(f"[foto-manual] No se pudo cargar /settings/profile: {e}")
+
+            try:
+                if "login" in (self.driver.current_url or "").lower():
+                    self.ultimo_error = "sesion expirada: X pidio login en /settings/profile"
+                    return False
+            except Exception:
+                pass
+
+            src = ""
+            try:
+                src = self._src_foto(tipo)
+            except Exception as e:
+                logger.warning(f"[foto-manual] No se pudo leer el preview de {etiqueta}: {e}")
+
+            guardado = False
+            try:
+                guardado = self.guardar_cookies()
+            except Exception as e:
+                logger.warning(f"[foto-manual] No se pudo guardar .pkl: {e}")
+            try:
+                cookies_nav = self.driver.get_cookies()
+                if cookies_nav:
+                    self._guardar_cookies_json(cookies_nav)
+            except Exception as e:
+                logger.warning(f"[foto-manual] No se pudo guardar cookies en BD: {e}")
+
+            if src:
+                logger.info(
+                    f"[foto-manual] Foto de {etiqueta} de {self.usuario} verificada "
+                    f"(manual) y cookies guardadas (pkl={guardado})"
+                )
+                return True
+
+            self.ultimo_error = (
+                f"no se detecto foto de {etiqueta} subida manualmente "
+                "(requiere Chrome real; sube la imagen en /settings/profile y reintenta)"
+            )
+            logger.warning(self.ultimo_error)
+            return False
+        except Exception as e:
+            self.ultimo_error = f"{type(e).__name__}: {e}"
+            logger.exception(f"[foto-manual] Error verificando foto de {etiqueta}: {e}")
+            return False
+
+    def _cambiar_foto(self, imagen_path: Optional[str], tipo: str) -> bool:
+        """Implementacion compartida de avatar/portada (ver metodos publicos).
+
+        Si `imagen_path` es None/vacio asume brandeo manual previo (el
+        operador ya subio la foto a mano) y delega a `_verificar_foto_manual`
+        (solo verifica + guarda cookies). Si trae ruta, hace la subida
+        automatica con los selectores actuales (requieren Chrome real).
+        """
+        self.ultimo_error = ""
+
+        # 0) Modo manual: sin archivo -> solo verificar + guardar cookies.
+        #     (brandeo con `abrir_para_brandeo_manual`).
+        if not (imagen_path or "").strip():
+            logger.info(
+                f"Sin imagen_path para {tipo}: asumiendo subida manual previa, "
+                "solo se verifica y se guardan cookies"
+            )
+            return self._verificar_foto_manual(tipo)
+
+        # 1) Validacion local ANTES de login/Chrome.
+        ruta = os.path.abspath(imagen_path)
+        if not os.path.isfile(ruta):
+            self.ultimo_error = f"no existe el archivo de imagen: {imagen_path}"
+            logger.warning(self.ultimo_error)
+            return False
+        if not ruta.lower().endswith((".png", ".jpg", ".jpeg", ".webp", ".gif")):
+            self.ultimo_error = f"formato de imagen no soportado: {imagen_path}"
+            return False
+
+        etiquetas_avatar = (
+            "añadir foto de perfil", "agregar foto de perfil",
+            "cambiar foto de perfil", "editar foto de perfil",
+            "add profile photo", "change profile photo", "update profile photo",
+            "add avatar", "change avatar", "update avatar", "edit avatar",
+            "añadir foto", "agregar foto", "cambiar foto", "editar foto",
+            "add photo", "change photo", "edit photo",
+        )
+        etiquetas_portada = (
+            "añadir foto de portada", "agregar foto de portada",
+            "cambiar foto de portada", "editar foto de portada",
+            "añadir foto de encabezado", "agregar foto de encabezado",
+            "añadir encabezado", "agregar encabezado", "cambiar encabezado",
+            "editar encabezado",
+            "add header photo", "change header photo", "add header",
+            "add a header", "add banner", "change banner", "edit banner",
+            "change header", "edit header", "update header",
+        )
+
+        if tipo == "portada":
+            etiquetas, excluir = etiquetas_portada, etiquetas_avatar
+        else:
+            etiquetas, excluir = etiquetas_avatar, etiquetas_portada
+
+        try:
+            # 2) Login si no hay driver.
+            if not self.driver:
+                if not self.login_con_cookies():
+                    self.ultimo_error = self.ultimo_error or "no se pudo iniciar sesion"
+                    return False
+
+            # 3) Abrir /settings/profile.
+            url_perfil = f"{self.base_url}/settings/profile"
+            try:
+                self.driver.get(url_perfil)
+                time.sleep(3)
+            except Exception as e:
+                logger.warning(f"No se pudo cargar {url_perfil}: {e}")
+
+            if "login" in (self.driver.current_url or "").lower():
+                self.ultimo_error = "sesion expirada: X pidio login en /settings/profile"
+                return False
+
+            src_antes = self._src_foto(tipo)
+
+            # 4) Control de portada (para el avatar es opcional).
+            timeout_control = 8 if tipo == "portada" else 3
+            control = self._buscar_control_etiqueta(
+                etiquetas, excluir=excluir, timeout=timeout_control
+            )
+            if tipo == "portada" and control is None:
+                self.ultimo_error = (
+                    "no se encontro el control de portada "
+                    "(Añadir encabezado/Add header) en /settings/profile"
+                )
+                logger.warning(self.ultimo_error)
+                return False
+
+            # 5) Inputs de archivo candidatos.
+            inputs = self._inputs_archivo(timeout=10)
+            candidato = None
+            if tipo == "portada":
+                candidato = self._input_cercano_a_preview("profile_banners")
+            else:
+                candidato = self._input_cercano_a_preview("profile_images")
+            if candidato is None:
+                candidato = self._input_archivo_por_etiqueta(etiquetas, excluir=excluir)
+
+            candidatos = []
+            if candidato is not None:
+                candidatos.append(candidato)
+            for inp in inputs:
+                if inp not in candidatos:
+                    candidatos.append(inp)
+
+            # Si no hay inputs, clicar el control (con el dialogo nativo de
+            # archivos interceptado para no bloquear Chrome) y esperarlos.
+            if not candidatos and control is not None:
+                self._clic_evitando_dialogo(control)
+                candidatos = list(self._inputs_archivo(timeout=8))
+
+            if not candidatos:
+                self.ultimo_error = (
+                    "no se encontro el input de archivo para la foto de "
+                    + ("perfil" if tipo == "avatar" else "portada")
+                )
+                logger.warning(self.ultimo_error)
+                return False
+
+            # 6) Enviar la imagen: preferido y, si no sale el modal, el siguiente.
+            subido = False
+            for indice, inp in enumerate(candidatos[:2]):
+                if not self._enviar_archivo_input(inp, ruta):
+                    continue
+                subido = True
+                if self._hay_modal_recorte(timeout=7):
+                    break
+                logger.info(
+                    f"No aparecio el modal de recorte con el input #{indice + 1}; "
+                    "probando otro"
+                )
+
+            if not subido:
+                self.ultimo_error = "X no acepto el archivo (send_keys fallo en los inputs)"
+                return False
+
+            # 7) Aceptar el recorte (si no hay modal, continuar) y guardar.
+            if not self._aceptar_modal_recorte(timeout=10):
+                logger.info("Sin modal de recorte; continuando con el guardado del perfil")
+            time.sleep(1)
+            for _ in range(3):
+                if self._clic_guardar(["Profile_Save_Button"]):
+                    time.sleep(2)
+                    break
+                time.sleep(2)
+
+            # 8) Verificar y dejar la pantalla visible.
+            ok = self._verificar_foto_subida(tipo, src_antes, timeout=15)
+            if not ok:
+                self.ultimo_error = (
+                    "X no confirmo el cambio de foto de "
+                    + ("perfil" if tipo == "avatar" else "portada")
+                )
+                logger.warning(self.ultimo_error)
+
+            logger.info("Dejando 3s la pantalla visible para confirmacion visual...")
+            time.sleep(3)
+            return ok
+
+        except Exception as e:
+            self.ultimo_error = f"{type(e).__name__}: {e}"
+            logger.exception(f"Error cambiando la foto ({tipo}) de {self.usuario}: {e}")
+            return False
+
+    def _inputs_archivo(self, timeout: int = 10) -> list:
+        """Espera a que existan `input[type='file']` (aunque esten ocultos)."""
+        fin = time.time() + timeout
+        while time.time() < fin:
+            try:
+                inputs = self.driver.find_elements(By.CSS_SELECTOR, "input[type='file']")
+                if inputs:
+                    return inputs
+            except Exception:
+                pass
+            time.sleep(0.5)
+        return []
+
+    def _etiqueta_cercana(self, elemento, etiquetas: tuple) -> bool:
+        """True si el propio elemento o sus ancestros (<=6) tienen un
+        aria-label o un texto corto que contiene alguna de `etiquetas`."""
+        nodos = [elemento]
+        try:
+            nodos += elemento.find_elements(By.XPATH, "./ancestor::*[position()<=6]")
+        except Exception:
+            pass
+        for nodo in nodos:
+            try:
+                al = (nodo.get_attribute("aria-label") or "").lower()
+            except Exception:
+                al = ""
+            try:
+                txt = (nodo.text or "").strip().lower()
+            except Exception:
+                txt = ""
+            for etq in etiquetas:
+                if etq and (etq in al or (txt and len(txt) <= 60 and etq in txt)):
+                    return True
+        return False
+
+    def _input_archivo_por_etiqueta(self, etiquetas: tuple, excluir: tuple = ()):
+        """Input de archivo dentro del contenedor de un control con esas
+        etiquetas; descarta los que esten junto a etiquetas de `excluir`."""
+        try:
+            inputs = self.driver.find_elements(By.CSS_SELECTOR, "input[type='file']")
+        except Exception:
+            return None
+        for inp in inputs:
+            if excluir and self._etiqueta_cercana(inp, excluir):
+                continue
+            if self._etiqueta_cercana(inp, etiquetas):
+                return inp
+        return None
+
+    def _input_cercano_a_preview(self, patron_src: str):
+        """Devuelve el input[type=file] mas cercano en el DOM a un img cuyo src
+        contiene `patron_src` ('profile_images' avatar, 'profile_banners' portada)."""
+        script = """
+        var patron = arguments[0];
+        var inputs = document.querySelectorAll("input[type='file']");
+        var mejor = null, mejorNivel = 99;
+        for (var i = 0; i < inputs.length; i++) {
+            var node = inputs[i].parentElement;
+            var nivel = 0;
+            while (node && node !== document.body && nivel < 10) {
+                var imgs = node.querySelectorAll("img");
+                var encontrado = false;
+                for (var j = 0; j < imgs.length; j++) {
+                    var src = imgs[j].getAttribute("src") || "";
+                    if (src.indexOf(patron) !== -1) { encontrado = true; break; }
+                }
+                if (encontrado) {
+                    if (nivel < mejorNivel) { mejorNivel = nivel; mejor = inputs[i]; }
+                    break;
+                }
+                node = node.parentElement;
+                nivel++;
+            }
+        }
+        return mejor;
+        """
+        try:
+            return self.driver.execute_script(script, patron_src)
+        except Exception as e:
+            logger.debug(f"No se pudo buscar input cercano a {patron_src}: {e}")
+            return None
+
+    def _buscar_control_etiqueta(self, etiquetas: tuple, excluir: tuple = (), timeout: int = 6):
+        """Busca un control visible por aria-label o texto (botones y
+        `role=button`) que contenga alguna de `etiquetas` (minusculas)."""
+        fin = time.time() + timeout
+        while time.time() < fin:
+            candidatos = []
+            for etiqueta in etiquetas:
+                try:
+                    candidatos += self.driver.find_elements(
+                        By.XPATH,
+                        "//*[contains(translate(@aria-label, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', "
+                        f"'abcdefghijklmnopqrstuvwxyz'), '{etiqueta}')]",
+                    )
+                except Exception:
+                    pass
+                try:
+                    candidatos += self.driver.find_elements(
+                        By.XPATH,
+                        "//*[self::button or @role='button'][contains(translate("
+                        "normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', "
+                        "'abcdefghijklmnopqrstuvwxyz'), "
+                        f"'{etiqueta}') and string-length(normalize-space(.)) <= 60]",
+                    )
+                except Exception:
+                    pass
+            for elem in candidatos:
+                try:
+                    if not (elem.is_displayed() and elem.is_enabled()):
+                        continue
+                    if excluir and self._etiqueta_cercana(elem, excluir):
+                        continue
+                    return elem
+                except Exception:
+                    continue
+            time.sleep(0.5)
+        return None
+
+    def _clic_evitando_dialogo(self, elemento) -> bool:
+        """Clica sin abrir el dialogo nativo de archivos (bloquearia Selenium):
+        intercepta el file chooser por CDP antes del clic."""
+        try:
+            self.driver.execute_cdp_cmd(
+                "Page.setInterceptFileChooserDialog", {"enabled": True}
+            )
+        except Exception as e:
+            logger.debug(f"No se pudo interceptar el file chooser: {e}")
+        try:
+            self.driver.execute_script(
+                "arguments[0].scrollIntoView({block: 'center'});", elemento
+            )
+            time.sleep(0.3)
+            self.driver.execute_script("arguments[0].click();", elemento)
+            time.sleep(1)
+            return True
+        except Exception as e:
+            logger.warning(f"No se pudo clicar el control de imagen: {e}")
+            return False
+        finally:
+            try:
+                self.driver.execute_cdp_cmd(
+                    "Page.setInterceptFileChooserDialog", {"enabled": False}
+                )
+            except Exception:
+                pass
+
+    def _enviar_archivo_input(self, input_elem, ruta: str) -> bool:
+        """Hace send_keys de la ruta al input (funciona aunque este oculto)."""
+        try:
+            input_elem.send_keys(ruta)
+            return True
+        except Exception as e:
+            logger.debug(f"send_keys al input de archivo fallo: {e}")
+            return False
+
+    def _hay_modal_recorte(self, timeout: int = 6) -> bool:
+        """Detecta si aparecio el modal de recorte tras subir una imagen."""
+        fin = time.time() + timeout
+        while time.time() < fin:
+            try:
+                if self.driver.find_elements(
+                    By.CSS_SELECTOR,
+                    "[data-testid='applyButton'], [data-testid='cropApplyButton']",
+                ):
+                    return True
+            except Exception:
+                pass
+            try:
+                dialogos = self.driver.find_elements(
+                    By.CSS_SELECTOR, "div[role='dialog'], div[aria-modal='true']"
+                )
+                for dlg in dialogos:
+                    txt = (dlg.text or "").lower()
+                    if any(p in txt for p in ("recortar", "crop", "aplicar", "apply", "ajustar")):
+                        return True
+            except Exception:
+                pass
+            time.sleep(0.5)
+        return False
+
+    def _aceptar_modal_recorte(self, timeout: int = 10) -> bool:
+        """Espera y clica "Aplicar"/"Apply"/"Guardar"/"Save"/"Listo"/"Done"
+        del modal de recorte. Devuelve False si no habia modal (no es fatal)."""
+        textos = ("aplicar", "apply", "guardar", "save", "listo", "done")
+        testids = ("applyButton", "cropApplyButton", "mediaApplyButton", "confirmationSheetConfirm")
+        fin = time.time() + timeout
+        while time.time() < fin:
+            for testid in testids:
+                try:
+                    btn = self.driver.find_element(By.CSS_SELECTOR, f"[data-testid='{testid}']")
+                    if btn.is_displayed() and btn.is_enabled():
+                        self.driver.execute_script("arguments[0].click();", btn)
+                        time.sleep(1.5)
+                        return True
+                except Exception:
+                    continue
+
+            try:
+                dialogos = self.driver.find_elements(
+                    By.CSS_SELECTOR, "div[role='dialog'], div[aria-modal='true']"
+                )
+            except Exception:
+                dialogos = []
+            for dlg in dialogos:
+                try:
+                    botones = dlg.find_elements(By.XPATH, ".//button | .//*[@role='button']")
+                except Exception:
+                    botones = []
+                for btn in botones:
+                    try:
+                        if not (btn.is_displayed() and btn.is_enabled()):
+                            continue
+                        txt = (btn.text or "").strip().lower()
+                        if txt and len(txt) <= 30 and any(t in txt for t in textos):
+                            self.driver.execute_script("arguments[0].click();", btn)
+                            time.sleep(1.5)
+                            return True
+                    except Exception:
+                        continue
+            time.sleep(0.5)
+        return False
+
+    def _src_foto(self, tipo: str) -> str:
+        """Devuelve el src de la imagen actual de avatar/portada en la pagina."""
+        if tipo == "portada":
+            selectores = [
+                "img[src*='profile_banners']",
+                "img[alt*='encabezado']",
+                "img[alt*='portada']",
+                "img[alt*='header']",
+                "img[alt*='banner']",
+            ]
+        else:
+            selectores = [
+                "img[src*='profile_images']",
+                "img[alt*='foto de perfil']",
+                "img[alt*='profile photo']",
+                "img[alt*='avatar']",
+            ]
+        for sel in selectores:
+            try:
+                for img in self.driver.find_elements(By.CSS_SELECTOR, sel):
+                    src = img.get_attribute("src") or ""
+                    if src:
+                        return src
+            except Exception:
+                continue
+        return ""
+
+    def _verificar_foto_subida(self, tipo: str, src_antes: str = "", timeout: int = 15) -> bool:
+        """Confirma la subida de avatar/portada por toast o recargando y
+        comparando el src de la imagen (`profile_images`/`profile_banners`)."""
+        senales = (
+            "profile was updated", "your profile was updated",
+            "se actualizo tu perfil", "se actualizó tu perfil",
+            "tu perfil se actualizo", "tu perfil se actualizó",
+            "actualizado", "actualizada", "guardado", "saved", "updated",
+        )
+        inicio = time.time()
+        while time.time() - inicio < timeout:
+            try:
+                toasts = self.driver.find_elements(
+                    By.CSS_SELECTOR, "[data-testid='toast'], div[role='alert']"
+                )
+                for toast in toasts:
+                    txt = (toast.text or "").lower()
+                    if txt and any(s in txt for s in senales):
+                        return True
+            except Exception:
+                pass
+            time.sleep(1)
+
+        # Sin toast: recarga y compara el src (verificacion fuerte).
+        try:
+            self.driver.get(f"{self.base_url}/settings/profile")
+            time.sleep(3)
+            src_despues = self._src_foto(tipo)
+            if src_despues and src_despues != src_antes:
+                logger.info(f"Foto de {tipo} verificada por cambio de src")
+                return True
+        except Exception as e:
+            logger.warning(f"No se pudo verificar la foto de {tipo} recargando: {e}")
+        return False
+
+    def abrir_para_brandeo_manual(self, minutos: int = 5) -> bool:
+        """Abre Chrome con la sesion de la cuenta para brandeo manual.
+
+        Flujo para la seccion de "brandear" cuentas: abre el navegador con las
+        cookies de `self.usuario`, navega a
+        https://x.com/settings/profile y deja la ventana abierta `minutos`
+        (default 5) para que el operador suba manualmente la foto de perfil +
+        la portada (retrato). Al terminar guarda las cookies actualizadas
+        (.pkl con `guardar_cookies()` + BD con `_guardar_cookies_json()`) y
+        cierra el navegador.
+
+        Requiere Chrome real con sesion valida (cookies .pkl o cookies_json /
+        auth_token). Fuerza modo visible temporalmente (el brandeo manual no
+        funciona en headless) y restaura `settings.headless` al salir.
+
+        No rompe si el operador cierra la ventana antes: detecta el cierre
+        (`current_url` lanza), lo loguea e intenta guardar lo que haya sin
+        lanzar excepcion. Devuelve True si se guardaron cookies, False si no
+        (motivo en `self.ultimo_error`). Nunca lanza excepcion.
+
+        Uso:
+            from plataformas.twitter.selenium_bot import TwitterBot
+            bot = TwitterBot("mi_cuenta")
+            bot.abrir_para_brandeo_manual(minutos=5)
+            bot.cerrar()  # por seguridad (el metodo ya cierra solo)
+        """
+        self.ultimo_error = ""
+        try:
+            minutos_int = int(minutos or 5)
+        except Exception:
+            minutos_int = 5
+        if minutos_int <= 0:
+            minutos_int = 5
+        segundos_totales = minutos_int * 60
+
+        headless_previo = bool(getattr(settings, "headless", False))
+        if headless_previo:
+            try:
+                settings.headless = False
+                logger.info(
+                    "[brandeo] HEADLESS desactivado temporalmente: "
+                    "el brandeo manual requiere ventana visible"
+                )
+            except Exception:
+                pass
+
+        try:
+            if not self.driver:
+                try:
+                    ok_login = self.login_con_cookies()
+                except Exception as e:
+                    self.ultimo_error = f"{type(e).__name__}: {e}"
+                    logger.warning(
+                        f"[brandeo] Requiere Chrome real; no se pudo abrir: {e}"
+                    )
+                    return False
+                if not ok_login:
+                    self.ultimo_error = self.ultimo_error or "no se pudo iniciar sesion"
+                    logger.warning(
+                        f"[brandeo] Sin sesion para {self.usuario}: "
+                        "requiere Chrome real con cookies validas"
+                    )
+                    return False
+
+            url_brandeo = f"{self.base_url}/settings/profile"
+            try:
+                self.driver.get(url_brandeo)
+                time.sleep(3)
+            except Exception as e:
+                logger.warning(f"[brandeo] No se pudo cargar {url_brandeo}: {e}")
+
+            try:
+                if "login" in (self.driver.current_url or "").lower():
+                    self.ultimo_error = "sesion expirada: X pidio login en /settings/profile"
+                    logger.warning(f"[brandeo] {self.ultimo_error}")
+                    return False
+            except Exception:
+                pass
+
+            try:
+                self.driver.set_window_size(1920, 1080)
+            except Exception:
+                try:
+                    self.driver.maximize_window()
+                except Exception:
+                    pass
+
+            logger.info(
+                f"[brandeo] @{self.usuario}: tienes {minutos_int} minutos — "
+                "sube la foto de perfil + la portada (retrato) manualmente en "
+                "esta ventana. NO cierres la ventana; se guardara sola al terminar."
+            )
+            logger.info(
+                f"[brandeo] Ve a {url_brandeo} si no estas ahi; "
+                f"te quedan {minutos_int} minutos para el brandeo manual."
+            )
+
+            fin = time.time() + segundos_totales
+            ultimo_aviso = -1
+            while time.time() < fin:
+                try:
+                    _ = self.driver.current_url
+                except Exception:
+                    logger.warning(
+                        f"[brandeo] El navegador de {self.usuario} se cerro antes "
+                        "de tiempo; se intentara guardar lo que haya sin romper."
+                    )
+                    break
+                restante = int(fin - time.time())
+                minuto_restante = restante // 60
+                if minuto_restante != ultimo_aviso and restante > 0:
+                    ultimo_aviso = minuto_restante
+                    if minuto_restante > 0:
+                        logger.info(f"[brandeo] @{self.usuario}: quedan ~{minuto_restante} min...")
+                time.sleep(5)
+
+            guardado = False
+            try:
+                guardado = bool(self.guardar_cookies())
+            except Exception as e:
+                logger.warning(f"[brandeo] No se pudo guardar .pkl: {e}")
+                guardado = False
+            try:
+                cookies_nav = self.driver.get_cookies()
+                if cookies_nav:
+                    self._guardar_cookies_json(cookies_nav)
+                    logger.info(
+                        f"[brandeo] Cookies actualizadas de {self.usuario} "
+                        f"(.pkl={guardado}, BD={len(cookies_nav)} cookies)"
+                    )
+                elif not guardado:
+                    self.ultimo_error = "no se pudieron guardar las cookies tras el brandeo"
+            except Exception as e:
+                # El operador pudo cerrar la ventana: no romper.
+                logger.warning(f"[brandeo] No se pudo leer/guardar cookies en BD: {e}")
+                if not guardado:
+                    self.ultimo_error = (
+                        "el navegador se cerro antes de guardar las cookies"
+                    )
+
+            if guardado:
+                logger.info(
+                    f"[brandeo] Brandeo manual de @{self.usuario} terminado; "
+                    "cookies guardadas. Puedes verificar con "
+                    "cambiar_foto_perfil(None) / cambiar_foto_portada(None)."
+                )
+                return True
+            logger.warning(
+                f"[brandeo] Brandeo de @{self.usuario} sin guardar cookies: "
+                f"{self.ultimo_error or 'requiere Chrome real'}"
+            )
+            return False
+        except Exception as e:
+            self.ultimo_error = f"{type(e).__name__}: {e}"
+            logger.exception(f"[brandeo] Error en brandeo manual de {self.usuario}: {e}")
+            return False
+        finally:
+            try:
+                if bool(getattr(settings, "headless", False)) != bool(headless_previo):
+                    settings.headless = headless_previo
+            except Exception:
+                pass
+            try:
+                self.cerrar()
+            except Exception:
+                pass
+            finally:
+                try:
+                    self.driver = None
+                except Exception:
+                    pass
+
     def cerrar(self):
         if self.driver:
             try:
                 self.driver.quit()
             except Exception as e:
                 logger.error(f"Error cerrando driver: {e}")
+
+
+def abrir_para_brandeo_manual(usuario: str, minutos: int = 5) -> bool:
+    """Atajo de modulo para el brandeo manual de una cuenta.
+
+    Abre Chrome con la sesion de `usuario`, navega a
+    https://x.com/settings/profile y deja la ventana abierta `minutos`
+    (default 5) para que el operador suba foto de perfil + portada
+    manualmente; luego guarda cookies (.pkl + BD) y cierra. No rompe si el
+    operador cierra antes. Requiere Chrome real.
+
+    Uso:
+        from plataformas.twitter.selenium_bot import abrir_para_brandeo_manual
+        abrir_para_brandeo_manual("mi_cuenta", minutos=5)
+    """
+    bot = TwitterBot((usuario or "").strip())
+    try:
+        return bool(bot.abrir_para_brandeo_manual(minutos=minutos))
+    finally:
+        try:
+            bot.cerrar()
+        except Exception:
+            pass

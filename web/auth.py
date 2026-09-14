@@ -1,7 +1,12 @@
+import base64
 import hashlib
+import hmac
 import json
 import os
+import time
 from pathlib import Path
+
+from core.config import settings
 
 WEB_USERS_FILE = Path(__file__).parent.parent / "data" / "web_users.json"
 
@@ -54,6 +59,62 @@ def verificar_login_web(username: str, password: str):
         "username": username,
         "nombre": usuario.get("nombre", username),
         "rol": usuario.get("role", "operador")
+    }
+
+
+def crear_token_sesion(usuario: dict, horas: int = 12) -> str:
+    """Crea un token de sesion firmado (HMAC-SHA256) para persistir el login.
+
+    Formato: base64.urlsafe (sin '=' finales) de "username|exp_ts|firma".
+    No incluye la contrasena ni datos sensibles: al verificar se recargan
+    nombre y rol desde data/web_users.json."""
+    username = str((usuario or {}).get("username") or "").strip()
+    if not username:
+        return ""
+    exp_ts = int(time.time()) + int(horas * 3600)
+    payload = f"{username}|{exp_ts}"
+    firma = hmac.new(
+        settings.secret_key.encode(), payload.encode(), hashlib.sha256
+    ).hexdigest()
+    token = f"{payload}|{firma}"
+    return base64.urlsafe_b64encode(token.encode()).decode().rstrip("=")
+
+
+def verificar_token_sesion(token: str):
+    """Valida un token de sesion y devuelve el dict de usuario o None.
+
+    Devuelve None si el token esta vacio, mal formado, expiro, la firma no
+    coincide, o el usuario ya no existe/esta inactivo. El dict devuelto tiene
+    la misma forma que `verificar_login_web`: {username, nombre, rol}."""
+    if not token:
+        return None
+    if isinstance(token, (list, tuple)):
+        token = token[0] if token else ""
+    try:
+        crudo = base64.urlsafe_b64decode(str(token) + "=" * (-len(str(token)) % 4))
+        username, exp_ts_txt, firma = crudo.decode("utf-8").split("|")
+        exp_ts = int(exp_ts_txt)
+    except Exception:
+        return None
+
+    payload = f"{username}|{exp_ts}"
+    firma_esperada = hmac.new(
+        settings.secret_key.encode(), payload.encode(), hashlib.sha256
+    ).hexdigest()
+    if not hmac.compare_digest(str(firma), firma_esperada):
+        return None
+    if exp_ts < int(time.time()):
+        return None
+
+    usuario = _cargar_usuarios().get(username)
+    if not usuario:
+        return None
+    if not usuario.get("activo", True):
+        return None
+    return {
+        "username": username,
+        "nombre": usuario.get("nombre", username),
+        "rol": usuario.get("role", "operador"),
     }
 
 

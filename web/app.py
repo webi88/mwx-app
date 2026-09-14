@@ -6,7 +6,12 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from core.database import init_db
-from web.auth import verificar_login_web, asegurar_admin_por_defecto
+from web.auth import (
+    asegurar_admin_por_defecto,
+    crear_token_sesion,
+    verificar_login_web,
+    verificar_token_sesion,
+)
 from web.ui import inyectar_css, cabecera
 from web.sidebar import render_sidebar
 
@@ -18,13 +23,23 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-init_db()
-asegurar_admin_por_defecto()
+
+@st.cache_resource(show_spinner=False)
+def _init_app():
+    """Inicializa la base de datos y el admin por defecto UNA sola vez por
+    proceso (cache_resource). Antes corria en cada rerun/interaccion y con
+    PostgreSQL/Supabase agregaba latencia a todas las paginas."""
+    init_db()
+    asegurar_admin_por_defecto()
+
+
+_init_app()
 inyectar_css()
 
 
 OPCIONES = [
     "📰 Posts / Mantenimientos",
+    "⏰ Reparto por Hora",
     "⚡ RTS / Activaciones",
     "🎯 Activación Masiva",
     "🚨 Alertas",
@@ -44,7 +59,91 @@ OPCIONES = [
 ]
 
 OPCIONES_ADMIN = ["👑 Admin: Usuarios"]
-OPCIONES_CREAR = ["🗂️ Cuentas: Importar & Validar"]
+OPCIONES_CREAR = ["🗂️ Cuentas: Perfiles, Secciones & Nombres"]
+
+
+def _leer_query_param(nombre: str):
+    """Devuelve el valor del query param `nombre` (o None)."""
+    try:
+        valor = st.query_params.get(nombre)
+    except Exception:
+        return None
+    if isinstance(valor, (list, tuple)):
+        valor = valor[0] if valor else None
+    return valor or None
+
+
+def _leer_token_query_params():
+    """Devuelve el token de sesion del query param `s` (o None)."""
+    return _leer_query_param("s")
+
+
+def _op_desde_query_param(opciones: list) -> str | None:
+    """Restaura la operación seleccionada desde `?op=`.
+
+    Acepta coincidencia exacta o por prefijo (tolerante a URLs viejas).
+    Devuelve None si no hay `?op=` o no es válido para este rol (ej. un
+    operador abriendo un link de una operación de admin)."""
+    crudo = _leer_query_param("op")
+    if not crudo:
+        return None
+    crudo = str(crudo)
+    if crudo in opciones:
+        return crudo
+    for op in opciones:
+        if op.startswith(crudo) or crudo.startswith(op):
+            return op
+    return None
+
+
+def _sincronizar_op_en_url(seleccion: str):
+    """Escribe `?op=` en la URL sin disparar rerun (actualizar query params
+    no re-ejecuta el script). Así una recarga del navegador vuelve a la
+    misma operación en vez de caer a Alertas por defecto."""
+    try:
+        if _leer_query_param("op") != seleccion:
+            st.query_params["op"] = seleccion
+    except Exception:
+        pass
+
+
+def _on_cambio_operacion():
+    """Callback del selectbox: persiste la operación en URL + session_state
+    y limpia `?tab=` al salir de Cuentas (la pestaña solo aplica ahí)."""
+    try:
+        seleccion = st.session_state.get("web_nav_selector")
+        if not seleccion:
+            return
+        st.session_state["operacion_actual"] = seleccion
+        st.query_params["op"] = seleccion
+        if not str(seleccion).startswith("🗂️") and "tab" in st.query_params:
+            del st.query_params["tab"]
+    except Exception:
+        pass
+
+
+def _guardar_token_sesion(usuario: dict):
+    """Escribe el token firmado en el query param `s` para que una recarga
+    del navegador o una reconexion del WebSocket no boten al login."""
+    try:
+        token = crear_token_sesion(usuario)
+        if token:
+            st.query_params["s"] = token
+    except Exception:
+        pass
+
+
+def _recuperar_sesion() -> bool:
+    """Reautentica desde el token del query param. True si lo logro."""
+    token = _leer_token_query_params()
+    if not token:
+        return False
+    usuario = verificar_token_sesion(token)
+    if not usuario:
+        return False
+    st.session_state["web_autenticado"] = True
+    st.session_state["web_usuario"] = usuario
+    return True
 
 
 def _login():
@@ -64,6 +163,7 @@ def _login():
         if usuario:
             st.session_state["web_autenticado"] = True
             st.session_state["web_usuario"] = usuario
+            _guardar_token_sesion(usuario)
             st.rerun()
         else:
             st.error("Credenciales inválidas")
@@ -71,10 +171,17 @@ def _login():
 
 def main():
     if not st.session_state.get("web_autenticado"):
+        if _recuperar_sesion():
+            st.rerun()
         _login()
         return
     
     usuario = st.session_state["web_usuario"]
+
+    # Si ya esta autenticado y no hay token en la URL, generarlo para que
+    # una recarga del navegador no bote la sesion.
+    if not _leer_token_query_params():
+        _guardar_token_sesion(usuario)
     
     with st.sidebar:
         render_sidebar(usuario)
@@ -82,19 +189,43 @@ def main():
     opciones = OPCIONES.copy()
     if usuario["rol"] == "admin":
         opciones += OPCIONES_ADMIN + OPCIONES_CREAR
-    
+
+    # --- Navegación persistente (?op= + session_state) ---
+    # Recarga del navegador -> session_state vacío -> se restaura desde ?op=.
+    # st.rerun() normal -> el selectbox conserva su valor y ?op= solo se
+    # re-sincroniza. Nunca se vuelve a Alertas salvo que no haya ni estado
+    # ni query param válido.
     index_default = opciones.index("🚨 Alertas")
+    if "web_nav_selector" not in st.session_state:
+        op_guardada = _op_desde_query_param(opciones)
+        if op_guardada is not None:
+            st.session_state["web_nav_selector"] = op_guardada
+            st.session_state["operacion_actual"] = op_guardada
     seleccion = st.selectbox(
         "📍 SELECCIONA LA OPERACIÓN:",
         opciones,
         index=index_default,
         key="web_nav_selector",
+        on_change=_on_cambio_operacion,
     )
+    st.session_state["operacion_actual"] = seleccion
+    _sincronizar_op_en_url(seleccion)
+
+    if not seleccion.startswith("🗂️"):
+        # La pestaña ?tab= solo aplica a Cuentas: limpiar restos viejos.
+        try:
+            if "tab" in st.query_params:
+                del st.query_params["tab"]
+        except Exception:
+            pass
     
     st.markdown("---")
     
     if seleccion.startswith("📰"):
         from web.operaciones.posts import render
+        render(usuario)
+    elif seleccion.startswith("⏰"):
+        from web.operaciones.reparto_hora import render
         render(usuario)
     elif seleccion.startswith("⚡"):
         from web.operaciones.rts import render
@@ -148,6 +279,19 @@ def main():
         from web.operaciones.admin import render
         render(usuario)
     elif seleccion.startswith("🗂️"):
+        # Pre-carga la pestaña interna desde ?tab= ANTES del render para
+        # que una recarga no caiga a "Importar" (ver cuentas.py).
+        try:
+            from web.operaciones.cuentas import TABS as CUENTAS_TABS
+            tab_qp = _leer_query_param("tab")
+            if (
+                tab_qp
+                and "cuentas_pestana_selector" not in st.session_state
+                and str(tab_qp) in CUENTAS_TABS
+            ):
+                st.session_state["cuentas_pestana_selector"] = str(tab_qp)
+        except Exception:
+            pass
         from web.operaciones.cuentas import render
         render(usuario)
 

@@ -1,6 +1,9 @@
 # Web Dashboard
 streamlit==1.41.1
 
+# Bot Telegram (PTB v21, async - usado en bot/main.py, bot/handlers/*)
+python-telegram-bot==21.5
+
 # Database (SQLite local / PostgreSQL en Supabase)
 sqlalchemy==2.0.35
 psycopg2-binary>=2.9.9
@@ -27,6 +30,9 @@ Pillow==10.4.0
 
 # Excel export
 openpyxl==3.1.5
+
+# Data (usado directo en web/operaciones/cuentas.py, reparto_hora.py, posts.py)
+pandas==2.2.3
 
 # Utilities
 python-dotenv==1.0.1

@@ -8,7 +8,10 @@ from loguru import logger
 
 class SchedulerManager:
     def __init__(self):
-        self.scheduler = BackgroundScheduler()
+        # max_instances=1: evita que _verificar_tareas se encime consigo mismo
+        # (una corrida lenta con ejecuciones Selenium no debe solaparse con la
+        # siguiente pasada del IntervalTrigger de 30s).
+        self.scheduler = BackgroundScheduler(max_instances=1)
         self.ejecutor = EjecutorTareas()
         self._iniciar()
     

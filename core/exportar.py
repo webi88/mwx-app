@@ -12,12 +12,22 @@ from core.models import Cuenta
 # Todos los campos necesarios para un login manual de la cuenta.
 COLUMNAS_CUENTAS = (
     ("usuario", "Usuario_X"),
+    ("handle_actual", "Handle_Actual"),
+    ("nombre_mostrado", "Nombre_Mostrado"),
+    ("seccion", "Seccion_CI_CD_IP"),
+    ("tipo_cuenta", "Tipo_Cuenta"),
+    ("nombre_propuesto", "Nombre_Propuesto"),
+    ("handle_propuesto", "Handle_Propuesto"),
     ("password", "Password_X"),
     ("totp_secret", "Semilla_2FA_TOTP"),
     ("email", "Email_Respaldo"),
     ("email_password", "Password_Email"),
     ("auth_token", "Auth_Token"),
     ("status", "Estado"),
+    ("personalidad", "Personalidad"),
+    ("perfil_personalidad", "Perfil_Personalidad"),
+    ("rol_activacion", "Rol_Activacion"),
+    ("banner_path", "Banner_Portada"),
 )
 
 INSTRUCCIONES_LOGIN = [

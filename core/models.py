@@ -46,7 +46,10 @@ class Cuenta(Base):
     password = Column(String(200), default="")
     plataforma = Column(String(20), nullable=False)
     tags = Column(String(500), default="")
-    grupo = Column(String(10), default="A")
+    # Grupo operativo libre (sin valor por defecto): ""/NULL = sin grupo.
+    # Ya NO se usa "A" como default; la migracion en core/database.py
+    # convierte los grupo="A" historicos a "" sin tocar otros grupos reales.
+    grupo = Column(String(10), default="")
     activa = Column(Boolean, default=True)
     celery_id = Column(Integer, ForeignKey("celulas.id"), nullable=True)
     cliente_id = Column(Integer, ForeignKey("clientes.id"), nullable=True)
@@ -57,6 +60,36 @@ class Cuenta(Base):
     pais = Column(String(50), default="")
     sector = Column(String(30), default="")
     avatar_path = Column(String(200), default="")
+    # Ruta local de la foto de portada (banner) de la cuenta.
+    banner_path = Column(String(200), default="")
+    # Clasificacion operativa: CI=Centro-Izquierda, CD=Centro-Derecha,
+    # IP=Institucion Privada (ver core/secciones.py). 'nombre_mostrado' y
+    # 'handle_actual' guardan como se llama la cuenta REALMENTE en X, porque
+    # otros clientes pueden renombrarla. 'usuario' sigue siendo la clave
+    # interna de login y no se modifica.
+    seccion = Column(String(20), default="")
+    nombre_mostrado = Column(String(120), default="")
+    handle_actual = Column(String(100), default="")
+    # Tipo de voz de la cuenta: "politica" (lenguaje cuidado/institucional),
+    # "activista" (tecnico-coloquial, ciudadania politica) o "ciudadana"
+    # (lenguaje coloquial, persona real); "" = sin definir.
+    # 'nombre_propuesto'/'handle_propuesto' guardan la propuesta generada con
+    # IA ANTES de aplicarla en X (ver core/registros.py).
+    tipo_cuenta = Column(String(20), default="")
+    nombre_propuesto = Column(String(120), default="")
+    handle_propuesto = Column(String(100), default="")
+    # Personalidad: descripcion breve de tono/intereses/gustos de la cuenta,
+    # usada por el mantenimiento programado para generar tuits acordes.
+    personalidad = Column(Text, default="")
+    # Rol de activacion en campana: "cita" (retweet con cita), "hashtags"
+    # (publicar hashtags y menciones), "rt" (retweet simple) o "" (sin rol).
+    # Ver core/roles.py para normalizacion y etiquetas.
+    rol_activacion = Column(String(20), default="")
+    # Perfil de redaccion para el contenido: "formal" (estructurado en 3
+    # partes), "ciudadano" (par de renglones, analisis intermedio) o "popular"
+    # (casual de un renglon con faltas intencionales). Se reparte equitativo
+    # entre las cuentas; ver core/perfiles.py.
+    perfil_personalidad = Column(String(20), default="")
     fecha_creacion = Column(DateTime, default=datetime.utcnow)
     totp_secret = Column(String(100), default="")
     email_password = Column(String(200), default="")

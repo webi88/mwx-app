@@ -126,35 +126,140 @@ def _resincronizar_secuencias():
         logger.warning(f"No se pudieron resincronizar las secuencias: {e}")
 
 
+# Columnas que se agregan a tablas 'cuentas' ya existentes.
+# Formato: nombre -> tipo SQL (compatible con SQLite; en PostgreSQL se omiten
+# los tipos DATETIME, que no existen en ese motor).
+NUEVAS_COLUMNAS_CUENTAS = {
+    "proxy": "VARCHAR(300) DEFAULT ''",
+    "pais": "VARCHAR(50) DEFAULT ''",
+    "sector": "VARCHAR(30) DEFAULT ''",
+    "avatar_path": "VARCHAR(200) DEFAULT ''",
+    "banner_path": "VARCHAR(200) DEFAULT ''",
+    "seccion": "VARCHAR(20) DEFAULT ''",
+    "nombre_mostrado": "VARCHAR(120) DEFAULT ''",
+    "handle_actual": "VARCHAR(100) DEFAULT ''",
+    "tipo_cuenta": "VARCHAR(20) DEFAULT ''",
+    "nombre_propuesto": "VARCHAR(120) DEFAULT ''",
+    "handle_propuesto": "VARCHAR(100) DEFAULT ''",
+    "personalidad": "TEXT",
+    "rol_activacion": "VARCHAR(20) DEFAULT ''",
+    "perfil_personalidad": "VARCHAR(20) DEFAULT ''",
+    "totp_secret": "VARCHAR(100) DEFAULT ''",
+    "email_password": "VARCHAR(200) DEFAULT ''",
+    "auth_token": "VARCHAR(200) DEFAULT ''",
+    "cookies_json": "TEXT",
+    "status": "VARCHAR(20) DEFAULT 'imported'",
+    "last_checked": "DATETIME",
+}
+
+
+def _backfill_seccion(conn) -> None:
+    """Preclasifica en CI/CD/IP las cuentas ya existentes segun su 'sector'.
+
+    Se ejecuta una sola vez, justo despues de crear la columna 'seccion':
+    valores con 'derech' -> CD, 'izquierd' -> CI, 'privad' -> IP ('' el resto).
+    Solo toca filas con seccion vacia/NULL, asi que es idempotente."""
+    from sqlalchemy import text
+
+    conn.execute(
+        text(
+            "UPDATE cuentas SET seccion = CASE "
+            "WHEN lower(sector) LIKE '%derech%' THEN 'CD' "
+            "WHEN lower(sector) LIKE '%izquierd%' THEN 'CI' "
+            "WHEN lower(sector) LIKE '%privad%' THEN 'IP' "
+            "ELSE '' END "
+            "WHERE (seccion IS NULL OR seccion = '')"
+        )
+    )
+
+
+def _limpiar_grupo_por_defecto(conn) -> None:
+    """Limpia el antiguo default grupo='A': lo pasa a '' (sin grupo).
+
+    Solo toca filas con grupo exactamente igual a 'A'; respeta NULL, '' y
+    cualquier otro grupo real (B, C, ...). Es idempotente: una segunda
+    ejecucion no cambia nada."""
+    from sqlalchemy import text
+
+    conn.execute(text("UPDATE cuentas SET grupo = '' WHERE grupo = 'A'"))
+
+
 def _migrar_columnas():
     """Migraciones ligeras: agrega columnas nuevas a tablas existentes.
 
-    Solo aplica a SQLite (PRAGMA table_info + ALTER TABLE). En PostgreSQL las
-    columnas se crean directamente con Base.metadata.create_all()."""
-    if not _ES_SQLITE:
-        return
+    - SQLite: PRAGMA table_info + ALTER TABLE ... ADD COLUMN. Se registra en el
+      set 'agregadas' que columnas se crearon de verdad; si 'seccion' es nueva
+      se hace backfill desde 'sector' para preclasificar cuentas ya creadas.
+      Ademas convierte grupo='A' historico a '' (sin grupo) sin tocar otros
+      grupos reales (ver _limpiar_grupo_por_defecto).
+    - PostgreSQL/Supabase: ALTER TABLE ... ADD COLUMN IF NOT EXISTS (idempotente
+      y tolerante a fallos: solo advierte si algo no se puede aplicar). No se
+      migran tipos DATETIME ('last_checked' ya existe en produccion). Tambien
+      limpia grupo='A' -> '' de la misma forma idempotente."""
     from sqlalchemy import text
 
-    nuevas_columnas = {
-        "proxy": "VARCHAR(300) DEFAULT ''",
-        "pais": "VARCHAR(50) DEFAULT ''",
-        "sector": "VARCHAR(30) DEFAULT ''",
-        "avatar_path": "VARCHAR(200) DEFAULT ''",
-        "totp_secret": "VARCHAR(100) DEFAULT ''",
-        "email_password": "VARCHAR(200) DEFAULT ''",
-        "auth_token": "VARCHAR(200) DEFAULT ''",
-        "cookies_json": "TEXT",
-        "status": "VARCHAR(20) DEFAULT 'imported'",
-        "last_checked": "DATETIME",
-    }
+    nuevas_columnas = NUEVAS_COLUMNAS_CUENTAS
+
+    if not _ES_SQLITE:
+        # PostgreSQL (Supabase): ADD COLUMN IF NOT EXISTS es idempotente.
+        try:
+            with engine.begin() as conn:
+                existentes = {
+                    row[0]
+                    for row in conn.execute(
+                        text(
+                            "SELECT column_name FROM information_schema.columns "
+                            "WHERE table_name = 'cuentas'"
+                        )
+                    )
+                }
+                for nombre, tipo in nuevas_columnas.items():
+                    if "DATETIME" in tipo.upper():
+                        # En PostgreSQL DATETIME no existe; 'last_checked' ya
+                        # esta en produccion y no se toca.
+                        continue
+                    conn.execute(
+                        text(
+                            f"ALTER TABLE cuentas ADD COLUMN IF NOT EXISTS "
+                            f"{nombre} {tipo}"
+                        )
+                    )
+                if existentes and "seccion" not in existentes:
+                    _backfill_seccion(conn)
+                    logger.info(
+                        "Migracion (Postgres): backfill de 'cuentas.seccion' desde 'sector'"
+                    )
+                try:
+                    _limpiar_grupo_por_defecto(conn)
+                    logger.info(
+                        "Migracion (Postgres): grupo='A' historico convertido a '' (sin grupo)"
+                    )
+                except Exception as e_grupo:
+                    logger.warning(f"Migracion de grupo (Postgres) no aplicada: {e_grupo}")
+        except Exception as e:
+            logger.warning(f"Migracion de columnas (Postgres) no aplicada: {e}")
+        return
 
     try:
+        agregadas = set()
         with engine.connect() as conn:
             cols = [row[1] for row in conn.execute(text("PRAGMA table_info(cuentas)"))]
             for nombre, tipo in nuevas_columnas.items():
                 if cols and nombre not in cols:
                     conn.execute(text(f"ALTER TABLE cuentas ADD COLUMN {nombre} {tipo}"))
+                    agregadas.add(nombre)
                     logger.info(f"Migracion: columna 'cuentas.{nombre}' agregada")
+            if "seccion" in agregadas:
+                _backfill_seccion(conn)
+                logger.info("Migracion: backfill de 'cuentas.seccion' desde 'sector'")
+            if cols:
+                try:
+                    _limpiar_grupo_por_defecto(conn)
+                    logger.info(
+                        "Migracion: grupo='A' historico convertido a '' (sin grupo)"
+                    )
+                except Exception as e_grupo:
+                    logger.warning(f"Migracion de grupo no aplicada: {e_grupo}")
             conn.commit()
     except Exception as e:
         logger.warning(f"Migracion de columnas no aplicada: {e}")

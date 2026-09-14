@@ -25,6 +25,18 @@ from loguru import logger
 from core.database import get_db_session
 from core.models import Cuenta
 
+try:
+    from core.secciones import normalizar_seccion
+except Exception:  # pragma: no cover - defensivo si falta core/secciones.py
+    def normalizar_seccion(valor):
+        return ""
+
+try:
+    from core.registros import normalizar_tipo_cuenta
+except Exception:  # pragma: no cover - defensivo si falta core/registros.py
+    def normalizar_tipo_cuenta(valor):
+        return ""
+
 
 def decodificar_cookies(cookies_base64: str) -> Optional[list]:
     """Decodifica una cadena base64 a una lista de cookies (JSON).
@@ -113,11 +125,34 @@ def parsear_linea(linea: str) -> Optional[dict]:
     }
 
 
-def importar_una(fields: dict) -> str:
+def _valor_informado(valor) -> bool:
+    """True si el lote trae un valor no vacío (tras `strip`).
+
+    Se usa para NO pisar la BD con vacíos al re-importar: una línea de
+    6 campos llega con `cookies=None` y puede traer `auth_token=""` u
+    otras credenciales vacías; en esos casos se conserva lo guardado.
+    """
+    return isinstance(valor, str) and bool(valor.strip())
+
+
+def importar_una(fields: dict, seccion: str = "", tipo_cuenta: str = "") -> str:
     """Inserta o actualiza una cuenta en la base de datos (upsert por usuario).
 
     Devuelve `"nueva"` si la cuenta no existía y `"actualizada"` si ya existía.
+
+    `seccion` (CI/CD/IP) y `tipo_cuenta` (politica/ciudadana) son OPCIONALES:
+    - Al crear una cuenta nueva se guardan normalizados (vacíos si no vienen).
+    - Al actualizar una existente solo se pisan si llegan con valor; si vienen
+      vacíos se respeta lo que ya tiene la cuenta.
+
+    Sesión existente: al re-importar una línea de 6 campos (sin cookies) con
+    `auth_token`/credenciales vacías NO se pisan `auth_token` ni
+    `cookies_json` (ni el resto de credenciales); solo se actualizan cuando
+    el lote trae valores no vacíos (`cookies` solo cuando no es `None`).
     """
+    seccion_norm = normalizar_seccion(seccion)
+    tipo_norm = normalizar_tipo_cuenta(tipo_cuenta)
+
     with get_db_session() as db:
         cuenta = db.query(Cuenta).filter(Cuenta.usuario == fields["username"]).first()
 
@@ -129,33 +164,52 @@ def importar_una(fields: dict) -> str:
                 email=fields.get("email", ""),
                 email_password=fields.get("email_password", ""),
                 auth_token=fields.get("auth_token", ""),
-                cookies_json=fields["cookies"],
+                cookies_json=fields.get("cookies"),
                 plataforma="twitter",
                 status="imported",
                 activa=True,
                 grupo="A",
                 sector="",
+                seccion=seccion_norm,
+                tipo_cuenta=tipo_norm,
                 fecha_creacion=datetime.utcnow(),
                 last_checked=None,
             )
             db.add(cuenta)
             resultado = "nueva"
         else:
-            cuenta.password = fields.get("password", "")
-            cuenta.totp_secret = fields.get("totp_secret", "")
-            cuenta.email = fields.get("email", "")
-            cuenta.email_password = fields.get("email_password", "")
-            cuenta.auth_token = fields.get("auth_token", "")
-            cuenta.cookies_json = fields["cookies"]
+            # NO pisar la sesión existente: si la línea viene sin
+            # auth_token/cookies (6 campos -> cookies=None) u otras
+            # credenciales vacías, se conserva lo ya guardado en BD.
+            # Solo se actualiza cuando el lote trae valores no vacíos.
+            for _campo in (
+                "password",
+                "totp_secret",
+                "email",
+                "email_password",
+                "auth_token",
+            ):
+                _nuevo = fields.get(_campo, "")
+                if _valor_informado(_nuevo):
+                    setattr(cuenta, _campo, _nuevo)
+            if fields.get("cookies") is not None:
+                cuenta.cookies_json = fields["cookies"]
             cuenta.status = "imported"
             cuenta.last_checked = None
+            if seccion_norm:
+                cuenta.seccion = seccion_norm
+            if tipo_norm:
+                cuenta.tipo_cuenta = tipo_norm
             resultado = "actualizada"
 
     return resultado
 
 
-def importar_lote(texto: str) -> dict:
+def importar_lote(texto: str, seccion: str = "", tipo_cuenta: str = "") -> dict:
     """Importa un lote completo de cuentas (una por línea).
+
+    `seccion` y `tipo_cuenta` son opcionales y se aplican a TODAS las líneas
+    (ver `importar_una` para la semántica de actualización).
 
     Devuelve un dict con el resumen:
         {"total", "importadas", "actualizadas", "errores", "detalle_errores"}
@@ -180,7 +234,7 @@ def importar_lote(texto: str) -> dict:
                 detalle_errores.append(f"Línea malformada: {linea[:40]}")
                 continue
 
-            resultado = importar_una(fields)
+            resultado = importar_una(fields, seccion=seccion, tipo_cuenta=tipo_cuenta)
             if resultado == "nueva":
                 importadas += 1
             else:

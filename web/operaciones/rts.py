@@ -24,7 +24,13 @@ def render(usuario: dict):
 
 
 def _seleccionar_cuentas(key: str):
-    col1, col2 = st.columns(2)
+    from core.roles import (
+        ROLES_ACTIVACION,
+        etiqueta_rol_activacion,
+        normalizar_rol_activacion,
+    )
+
+    col1, col2, col3 = st.columns(3)
     with col1:
         tags = st.multiselect(
             "Filtrar por tags",
@@ -32,10 +38,29 @@ def _seleccionar_cuentas(key: str):
             key=f"{key}_tags",
         )
     with col2:
+        roles = st.multiselect(
+            "Filtrar por rol de activación",
+            list(ROLES_ACTIVACION.values()) + ["Sin rol"],
+            key=f"{key}_roles",
+            help="Filtra por el rol de activación (Cuenta.rol_activacion).",
+        )
+    with col3:
         cuentas = cuentas_por_tags(tags if tags else None)
+        if roles:
+            deseados = {normalizar_rol_activacion(r) for r in roles}
+            cuentas = [
+                c for c in cuentas
+                if normalizar_rol_activacion(
+                    getattr(c, "rol_activacion", "")
+                ) in deseados
+            ]
         st.caption(f"Cuentas disponibles: **{len(cuentas)}**")
     
-    opciones = {f"@{c.usuario} (Grupo {c.grupo})": c for c in cuentas}
+    opciones = {
+        f"@{c.usuario} (Grupo {c.grupo} · "
+        f"{etiqueta_rol_activacion(getattr(c, 'rol_activacion', ''))})": c
+        for c in cuentas
+    }
     seleccionadas = st.multiselect(
         "Selecciona cuentas",
         list(opciones),

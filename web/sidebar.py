@@ -1,6 +1,6 @@
 import streamlit as st
 from core.database import get_db_session
-from core.models import Cuenta, Cliente
+from core.models import Cuenta, Cliente, Celula
 from ia.celulas import CelulasManager
 from web.ui import emoji_plataforma, divider
 
@@ -13,9 +13,22 @@ def render_sidebar(usuario: dict):
         st.markdown(f"{rol_emoji} **{usuario['nombre']}** `({usuario['rol']})`")
     with col_logout:
         if st.button("🚪 Salir", key="btn_logout_web"):
-            for key in ["web_autenticado", "web_usuario"]:
+            # Cierra la sesión: limpia auth + navegación persistente (?op=,
+            # ?tab=) para que el siguiente login empiece limpio en Alertas.
+            for key in [
+                "web_autenticado",
+                "web_usuario",
+                "web_nav_selector",
+                "operacion_actual",
+                "cuentas_pestana_selector",
+            ]:
                 if key in st.session_state:
                     del st.session_state[key]
+            for param in ("s", "op", "tab"):
+                try:
+                    del st.query_params[param]
+                except Exception:
+                    pass
             st.rerun()
     
     divider()
@@ -130,14 +143,58 @@ def _seccion_asistente_ia(usuario: dict):
         cantidad = st.number_input("Cantidad", 1, 20, 5, key="sb_ia_cant")
         
         if st.button("✨ Generar Contenido", key="sb_btn_ia"):
-            st.session_state["web_generar_contenido"] = {
-                "tipo": tipo_map[st.session_state["sb_ia_formato"]],
-                "celula_id": sel_cel_id,
-                "cliente_id": sel_cli_id,
-                "contexto": contexto,
-                "cantidad": int(cantidad),
-            }
-            st.success("Generación programada. Ve a la operación 'Posts / Mantenimientos'.")
+            _generar_contenido_sidebar(
+                tipo=tipo_map[st.session_state["sb_ia_formato"]],
+                celula_id=sel_cel_id,
+                cliente_id=sel_cli_id,
+                contexto=contexto,
+                cantidad=int(cantidad),
+            )
+
+
+def _generar_contenido_sidebar(tipo: str, celula_id, cliente_id, contexto: str, cantidad: int):
+    """Genera contenido con IA sin salir del sidebar y lo deja listo para
+    revisarlo/publicarlo en la operación 'Posts / Mantenimientos'."""
+    from ia.generador_contenido import GeneradorContenido
+    
+    narrativa = ""
+    entrenamiento = ""
+    
+    if celula_id:
+        with get_db_session() as db:
+            celula = db.query(Celula).filter(Celula.id == celula_id).first()
+            if celula:
+                narrativa = celula.narrativa or ""
+    
+    if cliente_id:
+        with get_db_session() as db:
+            cliente = db.query(Cliente).filter(Cliente.id == cliente_id).first()
+            if cliente:
+                entrenamiento = cliente.entrenamiento or ""
+    
+    with st.spinner("✨ Generando con OpenAI..."):
+        try:
+            generador = GeneradorContenido()
+            textos = generador.generar_contenido(
+                tipo=tipo,
+                narrativa=narrativa,
+                entrenamiento=entrenamiento,
+                contexto=contexto,
+                cantidad=cantidad,
+            )
+            error = getattr(generador, "ultimo_error", "")
+        except Exception as e:
+            textos, error = [], str(e)
+    
+    if textos:
+        st.session_state["web_ia_posts"] = textos
+        st.session_state.pop("web_generar_contenido", None)
+        st.success(
+            f"Se generaron {len(textos)} textos. Ve a 'Posts / Mantenimientos' → "
+            "pestaña 'Generado con IA' para revisarlos y publicarlos."
+        )
+    else:
+        st.error(f"Error de generación: {error or 'sin respuesta'}")
 
 
 def _seccion_multimedia(usuario: dict):

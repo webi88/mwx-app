@@ -49,6 +49,18 @@ def _programar():
         placeholder="1,2,3",
     )
     
+    variar_por_cuenta = False
+    if tipo == "post":
+        variar_por_cuenta = st.checkbox(
+            "🔀 Variar texto por cuenta (una versión distinta por cada cuenta)",
+            key="cal_variar_por_cuenta",
+        )
+        if variar_por_cuenta:
+            st.caption(
+                "Se programará una tarea por cuenta, cada una con su propia "
+                "versión del texto (IA con fallback local)."
+            )
+    
     if st.button("📅 Programar", type="primary", key="btn_cal_programar"):
         if not cuenta_ids_text:
             st.warning("Indica al menos un ID de cuenta.")
@@ -62,6 +74,83 @@ def _programar():
         
         fecha_hora = datetime.combine(fecha, hora)
         
+        from scheduler.manager import SchedulerManager
+        manager = SchedulerManager()
+        
+        if tipo == "post" and variar_por_cuenta and len(cuenta_ids) > 1:
+            if not contenido.strip():
+                st.warning("Escribe el contenido base para generar las variaciones.")
+                return
+
+            # Registro de lenguaje y perfil de redaccion por ID (el texto de
+            # cada cuenta respeta ambos).
+            from core.models import Cuenta
+            from core.perfiles import normalizar_perfil
+            from core.registros import normalizar_tipo_cuenta
+
+            with get_db_session() as db:
+                cuentas_pool = (
+                    db.query(Cuenta).filter(Cuenta.id.in_(cuenta_ids)).all()
+                )
+                registro_por_id = {
+                    c.id: normalizar_tipo_cuenta(getattr(c, "tipo_cuenta", ""))
+                    for c in cuentas_pool
+                }
+                perfil_por_id = {
+                    c.id: normalizar_perfil(getattr(c, "perfil_personalidad", ""))
+                    for c in cuentas_pool
+                }
+            registros = [registro_por_id.get(cid, "") for cid in cuenta_ids]
+            perfiles = [perfil_por_id.get(cid, "") for cid in cuenta_ids]
+
+            from web.operaciones._helpers import generar_pool_por_cuenta_seguro
+            with st.spinner("🔀 Generando una versión distinta por cuenta..."):
+                try:
+                    pool, uso_fallback = generar_pool_por_cuenta_seguro(
+                        contenido,
+                        len(cuenta_ids),
+                        registros=registros,
+                        perfiles=perfiles,
+                    )
+                except TypeError:
+                    # Version vieja del helper sin el kwarg 'perfiles'.
+                    pool, uso_fallback = generar_pool_por_cuenta_seguro(
+                        contenido, len(cuenta_ids), registros=registros
+                    )
+            if uso_fallback:
+                st.info(
+                    "La IA no estaba disponible: se usaron variaciones locales del texto."
+                )
+            
+            programadas = 0
+            for i, cuenta_id in enumerate(cuenta_ids):
+                texto = pool[i] if i < len(pool) else contenido
+                tarea = Tarea(
+                    tipo=tipo,
+                    plataforma=plataforma,
+                    contenido=texto,
+                    cuentas_ids=str([cuenta_id]),
+                    fecha_hora=fecha_hora,
+                    estado="pendiente",
+                    creada_por=usuario.get("username"),
+                )
+                if manager.programar_tarea(tarea):
+                    programadas += 1
+            
+            if programadas == len(cuenta_ids):
+                st.success(
+                    f"✅ {programadas} tareas programadas (una por cuenta, con texto "
+                    f"distinto) para {fecha_hora.strftime('%d/%m/%Y %H:%M')}"
+                )
+            elif programadas:
+                st.warning(
+                    f"⚠️ Solo se programaron {programadas}/{len(cuenta_ids)} tareas. "
+                    "Revisa la pestaña 'Pendientes'."
+                )
+            else:
+                st.error("Error al programar las tareas.")
+            return
+        
         tarea = Tarea(
             tipo=tipo,
             plataforma=plataforma,
@@ -72,8 +161,6 @@ def _programar():
             creada_por=usuario.get("username"),
         )
         
-        from scheduler.manager import SchedulerManager
-        manager = SchedulerManager()
         if manager.programar_tarea(tarea):
             st.success(f"✅ Tarea programada para {fecha_hora.strftime('%d/%m/%Y %H:%M')}")
         else:

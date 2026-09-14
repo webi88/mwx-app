@@ -46,6 +46,10 @@ class EjecutorTareas:
         
         return resultados
     
+    #: Tipos sociales que llevan pausa de cierre. El scheduler puede juntar
+    #: varias tareas de la misma cuenta a la misma hora y no queremos rafagas.
+    TIPOS_CON_PAUSA_CIERRE = ("post", "comentario", "retweet")
+
     def _ejecutar_accion(self, tarea: Tarea, cuenta: Cuenta) -> bool:
         try:
             from plataformas.base import PlataformaFactory
@@ -63,12 +67,32 @@ class EjecutorTareas:
                 else:
                     resultado = bot.publicar(tarea.contenido, tarea.imagen_path)
             
-            elif tarea.tipo == "retweet":
+            elif tarea.tipo == "comentario":
+                # contenido = {"url": ..., "texto": ...} (tolerante a texto plano).
                 if cuenta.plataforma == "twitter":
-                    urls = json.loads(tarea.contenido) if tarea.contenido else []
-                    for url in urls:
-                        resultado = bot.retweet(url)
-                        time.sleep(random.uniform(2.5, 6.0))
+                    url, texto = self._parsear_comentario(tarea.contenido)
+                    if not url or not texto:
+                        logger.warning(
+                            f"Tarea {tarea.id} de comentario sin url/texto validos: "
+                            f"{tarea.contenido!r}"
+                        )
+                    else:
+                        resultado = bool(bot.responder_tweet(url, texto))
+                # Pausa despues de responder (patron humano del bot).
+                time.sleep(random.uniform(3.0, 8.0))
+            
+            elif tarea.tipo == "retweet":
+                # Cada tarea ejecuta UN retweet: la PRIMERA URL de la lista.
+                # El planner reparte una URL por tarea; si el contenido trae
+                # varias (formato viejo) se mantiene la compatibilidad haciendo
+                # solo la primera.
+                url = self._primera_url(tarea.contenido)
+                if not url:
+                    logger.warning(f"Tarea {tarea.id} de retweet sin URL valida")
+                elif cuenta.plataforma == "twitter":
+                    resultado = self._retwittear_una(bot, url, cuenta.usuario)
+                elif hasattr(bot, "retweet"):
+                    resultado = bool(bot.retweet(url))
             
             elif tarea.tipo == "like":
                 if cuenta.plataforma == "twitter":
@@ -85,8 +109,99 @@ class EjecutorTareas:
             
             bot.cerrar()
             
+            # Cierre suave SOLO para acciones sociales: evita rafagas cuando el
+            # scheduler junta varias tareas de la misma cuenta a la misma hora.
+            if tarea.tipo in self.TIPOS_CON_PAUSA_CIERRE:
+                time.sleep(random.uniform(2.0, 15.0))
+            
             return resultado
         
         except Exception as e:
             logger.error(f"Error ejecutando accion: {e}")
             return False
+
+    @staticmethod
+    def _parsear_comentario(contenido) -> tuple[str, str]:
+        """Devuelve ``(url, texto)`` de ``tarea.contenido``.
+
+        Acepta JSON ``{"url","texto"}``, el dict ya deserializado, una lista
+        JSON (primera URL) o texto plano: si la primera linea empieza por
+        http(s) se toma como URL y el resto como comentario; si no, todo es
+        texto. Nunca lanza.
+        """
+        url = ""
+        texto = ""
+        try:
+            if not contenido:
+                return url, texto
+            if isinstance(contenido, dict):
+                return (
+                    str(contenido.get("url") or "").strip(),
+                    str(contenido.get("texto") or "").strip(),
+                )
+            crudo = str(contenido).strip()
+            try:
+                datos = json.loads(crudo)
+            except (ValueError, TypeError):
+                datos = None
+            if isinstance(datos, dict):
+                url = str(datos.get("url") or "").strip()
+                texto = str(datos.get("texto") or "").strip()
+                if url or texto:
+                    return url, texto
+            if isinstance(datos, list) and datos:
+                return str(datos[0] or "").strip(), ""
+            lineas = crudo.splitlines()
+            primera = lineas[0].strip() if lineas else ""
+            if primera.lower().startswith(("http://", "https://")):
+                partes = primera.split(None, 1)
+                url = partes[0]
+                resto = partes[1] if len(partes) > 1 else ""
+                texto = "\n".join(([resto] if resto else []) + lineas[1:]).strip()
+            else:
+                texto = crudo
+        except Exception:
+            pass
+        return url, texto
+
+    @staticmethod
+    def _primera_url(contenido) -> str:
+        """Extrae la primera URL de un contenido JSON/lista/plano. Nunca lanza."""
+        try:
+            if not contenido:
+                return ""
+            if isinstance(contenido, (list, tuple)):
+                for valor in contenido:
+                    valor = str(valor or "").strip()
+                    if valor:
+                        return valor
+                return ""
+            crudo = str(contenido).strip()
+            try:
+                datos = json.loads(crudo)
+            except (ValueError, TypeError):
+                datos = None
+            if isinstance(datos, (list, tuple)):
+                for valor in datos:
+                    valor = str(valor or "").strip()
+                    if valor:
+                        return valor
+                return ""
+            if isinstance(datos, dict):
+                return str(datos.get("url") or "").strip()
+            if isinstance(datos, str):
+                return datos.strip()
+            return crudo.split(",")[0].strip()
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _retwittear_una(bot, url: str, usuario: str) -> bool:
+        """Hace UN retweet verificado con ``solo_retwittear``; fallback a
+        ``retweet`` si el bot no expone el primero. Nunca lanza."""
+        if hasattr(bot, "solo_retwittear"):
+            resultado = bot.solo_retwittear([url], usuario)
+            if isinstance(resultado, dict):
+                return resultado.get("exitos", 0) > 0
+            return bool(resultado)
+        return bool(bot.retweet(url))
