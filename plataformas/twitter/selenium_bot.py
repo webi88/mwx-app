@@ -270,12 +270,16 @@ class TwitterBot:
         import json
 
         cookies_json = None
+        password = ""
+        totp_secret = ""
         try:
             from core.database import get_db_session
             from core.models import Cuenta
             with get_db_session() as db:
                 cuenta = db.query(Cuenta).filter(Cuenta.usuario == self.usuario).first()
                 cookies_json = cuenta.cookies_json if cuenta else None
+                password = (cuenta.password or "").strip() if cuenta else ""
+                totp_secret = (cuenta.totp_secret or "").strip() if cuenta else ""
         except Exception as e:
             logger.error(f"Error leyendo cookies_json de {self.usuario}: {e}")
 
@@ -304,7 +308,9 @@ class TwitterBot:
                 return False
 
         try:
-            self.driver.get(self.base_url)
+            # /404 en vez de home: evita las redirecciones agresivas que X hace
+            # desde "/" cuando aun no hay sesion (te manda a /i/flow/login).
+            self.driver.get(f"{self.base_url}/404")
             time.sleep(2)
 
             for cookie in cookies_json:
@@ -335,19 +341,41 @@ class TwitterBot:
             except Exception:
                 pass
 
+            # X suele lanzar un desafio de seguridad (login inusual) al inyectar
+            # un auth_token "en frio". Si hay password/totp_secret en la BD, se
+            # intenta resolver antes de declarar la sesion como expirada.
+            if self._hay_challenge_seguridad():
+                if not self._resolver_challenge_seguridad(password, totp_secret):
+                    self.ultimo_error = self.ultimo_error or (
+                        "X pidio verificar identidad y no se pudo resolver "
+                        "con password/totp_secret"
+                    )
+                    logger.warning(
+                        f"Challenge de seguridad sin resolver para {self.usuario}"
+                    )
+                    return False
+
             if "login" in self.driver.current_url.lower():
                 self.ultimo_error = "sesión expirada (auth_token/cookies inválidos)"
                 logger.warning(f"Sesion expirada para {self.usuario} (cookies_json)")
                 return False
 
-            # Guarda TODAS las cookies que X generó (incluye ct0) para reutilizar.
+            # Guarda TODAS las cookies que X generó (incluye ct0) para reutilizar
+            # tanto en `cookies_json` (BD) como en el .pkl local: "brandear" la
+            # cuenta para no repetir este proceso en la siguiente ejecucion.
             try:
                 cookies_navegador = self.driver.get_cookies()
                 if cookies_navegador and any(c.get("name") == "ct0" for c in cookies_navegador):
                     self._guardar_cookies_json(cookies_navegador)
+                    try:
+                        os.makedirs(os.path.dirname(self.cookies_path), exist_ok=True)
+                        with open(self.cookies_path, "wb") as f:
+                            pickle.dump(cookies_navegador, f)
+                    except Exception as e:
+                        logger.warning(f"No se pudo escribir el .pkl de {self.usuario}: {e}")
                     logger.info(
                         f"Cookies (incl. ct0) guardadas para {self.usuario} "
-                        f"({len(cookies_navegador)})"
+                        f"({len(cookies_navegador)}), cuenta brandeada"
                     )
                 else:
                     logger.warning(f"X no emitio ct0 para {self.usuario}; sesion no confirmada")
@@ -363,7 +391,99 @@ class TwitterBot:
             self.ultimo_error = f"{type(e).__name__}: {e}"
             logger.exception(f"Error en login con cookies_json {self.usuario}: {e}")
             return False
-    
+
+    def _hay_challenge_seguridad(self) -> bool:
+        """True si X esta mostrando un desafio de verificacion de identidad
+        (login inusual) en vez de haber cargado la sesion directamente."""
+        try:
+            url = (self.driver.current_url or "").lower()
+        except Exception:
+            url = ""
+        if "challenge" in url or "flow/login" in url or "account/access" in url:
+            return True
+        try:
+            src = self.driver.page_source.lower()
+        except Exception:
+            return False
+        senales = (
+            "verify your identity", "verifica tu identidad", "confirm your identity",
+            "confirma tu identidad", "unusual login activity", "actividad de inicio de "
+            "sesion inusual",
+        )
+        return any(s in src for s in senales)
+
+    def _resolver_challenge_seguridad(self, password: str, totp_secret: str, timeout: int = 20) -> bool:
+        """Intenta pasar el desafio de seguridad de X usando `password` y el
+        codigo TOTP derivado de `totp_secret` (ambos guardados en la BD junto
+        al auth_token). Devuelve True si el desafio quedo resuelto."""
+        logger.info(f"Resolviendo challenge de seguridad para {self.usuario}...")
+
+        if password:
+            password_input = None
+            for sel in ("input[name='password']", "input[type='password']"):
+                try:
+                    password_input = WebDriverWait(self.driver, 8).until(
+                        EC.element_to_be_clickable((By.CSS_SELECTOR, sel))
+                    )
+                    break
+                except Exception:
+                    continue
+            if password_input is not None:
+                try:
+                    password_input.click()
+                    password_input.send_keys(password)
+                    time.sleep(1)
+                    self._clic_texto_visible(
+                        "iniciar sesion", "log in", "entrar", "sign in",
+                        "iniciar sesión", "siguiente", "next", "confirmar", "confirm",
+                    )
+                    time.sleep(3)
+                except Exception as e:
+                    logger.warning(f"No se pudo enviar password en challenge de {self.usuario}: {e}")
+
+        if totp_secret:
+            codigo_input = None
+            for sel in (
+                "input[data-testid='ocfEnterTextTextInput']",
+                "input[name='text']",
+                "input[name='challenge_response']",
+                "input[type='text']",
+            ):
+                try:
+                    codigo_input = WebDriverWait(self.driver, 8).until(
+                        EC.element_to_be_clickable((By.CSS_SELECTOR, sel))
+                    )
+                    break
+                except Exception:
+                    continue
+            if codigo_input is not None:
+                try:
+                    import pyotp
+                    codigo = pyotp.TOTP(totp_secret.replace(" ", "")).now()
+                    codigo_input.click()
+                    codigo_input.send_keys(codigo)
+                    time.sleep(1)
+                    self._clic_texto_visible(
+                        "siguiente", "next", "confirmar", "confirm",
+                        "verificar", "verify", "continuar", "continue",
+                    )
+                    time.sleep(3)
+                except Exception as e:
+                    logger.warning(f"No se pudo enviar TOTP en challenge de {self.usuario}: {e}")
+
+        fin = time.time() + timeout
+        while time.time() < fin:
+            if not self._hay_challenge_seguridad():
+                try:
+                    url = (self.driver.current_url or "").lower()
+                except Exception:
+                    url = ""
+                return "login" not in url
+            time.sleep(1)
+
+        logger.warning(f"El challenge de seguridad de {self.usuario} no se resolvio a tiempo")
+        return False
+
     def esperar_login_manual(self, usuario: str) -> bool:
         try:
             if not self.iniciar_driver():
