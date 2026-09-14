@@ -228,4 +228,4 @@ def _seccion_inventario(usuario: dict):
             st.markdown(f"{emoji_plataforma(plat)} **{plat.upper()}** ({activas}/{len(lista)} activas)")
             for c in lista:
                 estado = "🟢" if c.activa else "🔴"
-                st.caption(f"{estado} @{c.usuario} · Grupo {c.grupo}")
+                st.caption(f"{estado} @{c.usuario} · Grupo {c.grupo or 'sin grupo'}")

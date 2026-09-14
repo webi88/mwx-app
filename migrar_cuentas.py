@@ -56,7 +56,7 @@ def migrar_cuentas(config_path: str):
                 continue
             
             tags = ", ".join(c.get("tags", []))
-            grupo = c.get("grupo", "") or "A"
+            grupo = c.get("grupo", "") or ""
             plataforma = "twitter"
             
             existe = db.query(Cuenta).filter(Cuenta.usuario == usuario).first()
@@ -119,7 +119,7 @@ def migrar_cuentas(config_path: str):
                     usuario=usuario,
                     plataforma="twitter",
                     tags="",
-                    grupo="A",
+                    grupo="",
                     activa=True,
                     cookies_path=f"data/cookies/twitter/{usuario}.pkl"
                 )

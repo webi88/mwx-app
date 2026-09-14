@@ -168,7 +168,7 @@ def importar_una(fields: dict, seccion: str = "", tipo_cuenta: str = "") -> str:
                 plataforma="twitter",
                 status="imported",
                 activa=True,
-                grupo="A",
+                grupo="",
                 sector="",
                 seccion=seccion_norm,
                 tipo_cuenta=tipo_norm,

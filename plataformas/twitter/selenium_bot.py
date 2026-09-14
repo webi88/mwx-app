@@ -58,7 +58,9 @@ class TwitterBot:
             logger.warning(f"No se pudo guardar el proxy de {self.usuario}: {e}")
 
     def _guardar_cookies_json(self, cookies: list) -> None:
-        """Persiste las cookies derivadas en `cookies_json` de la cuenta."""
+        """Persiste las cookies derivadas en `cookies_json` de la cuenta (y el
+        `auth_token` que traigan, para que futuras corridas no dependan del
+        password/TOTP si el .pkl/cookies_json se pierden)."""
         try:
             from core.database import get_db_session
             from core.models import Cuenta
@@ -66,8 +68,26 @@ class TwitterBot:
                 cuenta = db.query(Cuenta).filter(Cuenta.usuario == self.usuario).first()
                 if cuenta is not None:
                     cuenta.cookies_json = cookies
+                    auth_token = next(
+                        (c.get("value") for c in cookies
+                         if isinstance(c, dict) and c.get("name") == "auth_token" and c.get("value")),
+                        None,
+                    )
+                    if auth_token:
+                        cuenta.auth_token = auth_token
         except Exception as e:
             logger.warning(f"No se pudieron guardar las cookies de {self.usuario}: {e}")
+
+    def _brandear_cuenta(self, cookies: list) -> None:
+        """Guarda la sesion resultante en .pkl y en la BD (`cookies_json` +
+        `auth_token`) para que la cuenta quede lista sin repetir el login."""
+        self._guardar_cookies_json(cookies)
+        try:
+            os.makedirs(os.path.dirname(self.cookies_path), exist_ok=True)
+            with open(self.cookies_path, "wb") as f:
+                pickle.dump(cookies, f)
+        except Exception as e:
+            logger.warning(f"No se pudo escribir el .pkl de {self.usuario}: {e}")
 
     def _cookies_auth_token(self) -> Optional[list]:
         """Cookie mínima (solo auth_token) para que el NAVEGADOR complete la sesión.
@@ -288,6 +308,12 @@ class TwitterBot:
             cookies_json = self._cookies_auth_token()
 
         if not cookies_json:
+            if password:
+                logger.info(
+                    f"{self.usuario} sin cookies ni auth_token: intentando login con "
+                    "password/TOTP..."
+                )
+                return self.login_con_password(password, totp_secret=totp_secret)
             self.ultimo_error = self.ultimo_error or "la cuenta no tiene cookies ni auth_token usable"
             logger.warning(f"No hay cookies_json para {self.usuario}")
             return False
@@ -366,13 +392,7 @@ class TwitterBot:
             try:
                 cookies_navegador = self.driver.get_cookies()
                 if cookies_navegador and any(c.get("name") == "ct0" for c in cookies_navegador):
-                    self._guardar_cookies_json(cookies_navegador)
-                    try:
-                        os.makedirs(os.path.dirname(self.cookies_path), exist_ok=True)
-                        with open(self.cookies_path, "wb") as f:
-                            pickle.dump(cookies_navegador, f)
-                    except Exception as e:
-                        logger.warning(f"No se pudo escribir el .pkl de {self.usuario}: {e}")
+                    self._brandear_cuenta(cookies_navegador)
                     logger.info(
                         f"Cookies (incl. ct0) guardadas para {self.usuario} "
                         f"({len(cookies_navegador)}), cuenta brandeada"
@@ -392,15 +412,22 @@ class TwitterBot:
             logger.exception(f"Error en login con cookies_json {self.usuario}: {e}")
             return False
 
-    def _hay_challenge_seguridad(self) -> bool:
+    def _hay_challenge_seguridad(self, revisar_url: bool = True) -> bool:
         """True si X esta mostrando un desafio de verificacion de identidad
-        (login inusual) en vez de haber cargado la sesion directamente."""
-        try:
-            url = (self.driver.current_url or "").lower()
-        except Exception:
-            url = ""
-        if "challenge" in url or "flow/login" in url or "account/access" in url:
-            return True
+        (login inusual) en vez de haber cargado la sesion directamente.
+
+        `revisar_url=False` omite la heuristica por URL: dentro del propio
+        flujo de `login_con_password` la URL es `/i/flow/login` durante TODO
+        el proceso (tambien en los pasos normales de usuario/password), asi
+        que ahi solo el texto de la pagina es una senal confiable.
+        """
+        if revisar_url:
+            try:
+                url = (self.driver.current_url or "").lower()
+            except Exception:
+                url = ""
+            if "challenge" in url or "flow/login" in url or "account/access" in url:
+                return True
         try:
             src = self.driver.page_source.lower()
         except Exception:
@@ -517,16 +544,30 @@ class TwitterBot:
             logger.error(f"Error en login manual: {e}")
             return False
     
-    def login_con_password(self, password: str, timeout: int = 60) -> bool:
+    def login_con_password(self, password: str, timeout: int = 60, totp_secret: str = "") -> bool:
         """Login automatizado con usuario + contraseña y guarda las cookies.
 
         Abre x.com/i/flow/login, escribe el usuario, avanza, escribe la
         contraseña y confirma. Si termina en home (o sin 'login' en la URL),
         guarda las cookies y devuelve True. Devuelve False si algo falla o si
         tarda más de 'timeout' segundos.
+
+        Si X responde con un desafio de verificacion de identidad (comun en
+        logins automatizados) y hay `totp_secret`, intenta resolverlo antes
+        de declarar el intento como fallido.
         """
         if not self.iniciar_driver():
             return False
+
+        if not totp_secret:
+            try:
+                from core.database import get_db_session
+                from core.models import Cuenta
+                with get_db_session() as db:
+                    cuenta = db.query(Cuenta).filter(Cuenta.usuario == self.usuario).first()
+                    totp_secret = (cuenta.totp_secret or "").strip() if cuenta else ""
+            except Exception as e:
+                logger.warning(f"No se pudo leer el totp_secret de {self.usuario}: {e}")
 
         try:
             self.driver.get(f"{self.base_url}/i/flow/login")
@@ -579,18 +620,28 @@ class TwitterBot:
                 "iniciar sesion", "log in", "entrar", "sign in", "iniciar sesión"
             )
 
-            # 3) Esperar a entrar (home o fuera de login).
+            # 3) Esperar a entrar (home o fuera de login), resolviendo un
+            # posible desafio de verificacion de identidad en el camino.
+            challenge_intentado = False
             fin = time.time() + timeout
             while time.time() < fin:
                 try:
                     url = self.driver.current_url.lower()
                 except Exception:
                     url = ""
+
+                if not challenge_intentado and self._hay_challenge_seguridad(revisar_url=False):
+                    challenge_intentado = True
+                    self._resolver_challenge_seguridad(password, totp_secret)
+                    time.sleep(1)
+                    continue
+
                 if "login" not in url or "home" in url or f"/{self.usuario.lower()}" in url:
                     time.sleep(2)
                     if "login" not in url:
-                        self.guardar_cookies()
-                        logger.info(f"Login con password exitoso para {self.usuario}")
+                        cookies = self.driver.get_cookies()
+                        self._brandear_cuenta(cookies)
+                        logger.info(f"Login con password exitoso para {self.usuario}, cuenta brandeada")
                         return True
                 time.sleep(2)
 

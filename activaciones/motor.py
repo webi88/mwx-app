@@ -65,8 +65,8 @@ def _normalizar_menciones(valor: str) -> list[str]:
 
 
 MENSAJE_SIN_SESION = (
-    "sin sesión: sin .pkl ni cookies_json/auth_token; "
-    "brandea o carga cookies antes de activar"
+    "sin sesión: sin .pkl, cookies_json/auth_token ni password; "
+    "brandea o carga credenciales antes de activar"
 )
 
 
@@ -74,9 +74,9 @@ def _sugerencia_sesion(n: int) -> str:
     """Accion sugerida para las cuentas filtradas por falta de sesion."""
     return (
         f"{n} cuenta(s) sin sesión: no tienen .pkl en "
-        "data/cookies/twitter/ ni cookies_json/auth_token en la BD. "
-        "Brandéalas (login manual) o importa el lote con auth_token/cookies "
-        "antes de activar; se saltaron sin abrir navegador."
+        "data/cookies/twitter/ ni cookies_json/auth_token/password en la BD. "
+        "Brandéalas (login manual) o importa el lote con auth_token/cookies/"
+        "password antes de activar; se saltaron sin abrir navegador."
     )
 
 
@@ -103,9 +103,14 @@ def _tiene_credencial_sesion(cuenta) -> bool:
     elif cookies:
         return True
     auth = getattr(cuenta, "auth_token", "")
-    if isinstance(auth, str):
-        return bool(auth.strip())
-    return bool(auth)
+    if isinstance(auth, str) and auth.strip():
+        return True
+    elif auth:
+        return True
+    password = getattr(cuenta, "password", "")
+    if isinstance(password, str):
+        return bool(password.strip())
+    return bool(password)
 
 
 def _partir_por_sesion(cuentas: list) -> tuple:
