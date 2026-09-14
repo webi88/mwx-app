@@ -23,7 +23,7 @@ from core.models import Cuenta
 from core.config import settings, resolver_ruta
 from core.roles import normalizar_rol_activacion
 from activaciones.variaciones import generar_pool_variaciones_openai, variar_texto
-from core.registro import registrar_accion
+from core.registro import registrar_accion, marcar_cuenta_suspendida
 
 
 def _parsear_tokens(valor: str) -> list[str]:
@@ -271,6 +271,8 @@ class MotorActivacion:
             if not bot.login_con_cookies():
                 motivo = getattr(bot, "ultimo_error", "") or "login fallido"
                 logger.warning(f"Login fallido para @{cuenta.usuario}: {motivo}")
+                if getattr(bot, "cuenta_suspendida", False):
+                    marcar_cuenta_suspendida(cuenta.usuario)
                 return (cuenta.usuario, False, motivo[:120], "")
 
             res = bot.solo_retwittear(
@@ -279,6 +281,8 @@ class MotorActivacion:
                 mensaje_cita=texto,
                 dar_like=dar_like,
             )
+            if getattr(bot, "cuenta_suspendida", False):
+                marcar_cuenta_suspendida(cuenta.usuario)
             bot.cerrar()
 
             ok = res.get("exitos", 0) > 0
@@ -348,10 +352,14 @@ class MotorActivacion:
                     dar_like=dar_like,
                 )
                 ok = res.get("exitos", 0) > 0
+                urls_pub = res.get("urls") or []
+                # El RT simple no genera un post propio: `solo_retwittear`
+                # ya devuelve el perfil de quien retwittea, no el tweet original.
+                url_publicada = urls_pub[0] if urls_pub else f"https://twitter.com/{cuenta.usuario}"
                 detalle = "ok" if ok else (
                     getattr(bot, "ultimo_error", "") or "sin exito"
                 )
-                return (cuenta.usuario, rol, ok, detalle[:120], url_objetivo)
+                return (cuenta.usuario, rol, ok, detalle[:120], url_publicada)
 
             if rol == "comentario":
                 if not (texto or "").strip():
@@ -391,6 +399,11 @@ class MotorActivacion:
             )
         finally:
             if bot is not None:
+                if getattr(bot, "cuenta_suspendida", False):
+                    marcar_cuenta_suspendida(cuenta.usuario)
+                    logger.warning(
+                        f"@{cuenta.usuario} marcada como suspendida (desactivada)"
+                    )
                 try:
                     bot.cerrar()
                 except Exception as e:

@@ -682,6 +682,23 @@ def _cambiar_estado(usuarios, activa: bool) -> int:
     return cambiadas
 
 
+def _eliminar_cuentas(usuarios) -> int:
+    """DELETE definitivo de cuentas (cookies, historial y configuración se
+    pierden). A diferencia de `_cambiar_estado`, esto NO es reversible;
+    pensado para cuentas ya confirmadas como baneadas/suspendidas por X."""
+    usuarios = [u for u in (usuarios or []) if u]
+    if not usuarios:
+        return 0
+    with get_db_session() as db:
+        eliminadas = (
+            db.query(Cuenta)
+            .filter(Cuenta.plataforma == "twitter", Cuenta.usuario.in_(usuarios))
+            .delete(synchronize_session=False)
+        )
+    _listar_cuentas.clear()
+    return eliminadas
+
+
 def _guardar_propuestas_editadas(df) -> None:
     """Valida y persiste las propuestas editadas en el data_editor.
 
@@ -1753,6 +1770,51 @@ def _tab_estado():
         for f in todas
     ]
     st.dataframe(tabla, use_container_width=True)
+
+    st.markdown("---")
+    st.markdown("#### 🚫 Cuentas suspendidas por X")
+    st.caption(
+        "Se marcan automáticamente como `suspended` cuando el bot confirma "
+        "(al iniciar sesión o al intentar publicar/retwittear) que X bloqueó "
+        "la cuenta — no por errores sueltos de carga o selectores. Borrar "
+        "aquí es DEFINITIVO: se pierden cookies, historial y configuración; "
+        "no se puede deshacer."
+    )
+    suspendidas = [f for f in todas if f.get("status") == "suspended"]
+    if not suspendidas:
+        st.caption("No hay cuentas marcadas como suspendidas.")
+    else:
+        st.dataframe(
+            [
+                {"usuario": f["usuario"], "última revisión": f.get("last_checked", "")}
+                for f in suspendidas
+            ],
+            use_container_width=True,
+        )
+        opciones_sus = {f"@{f['usuario']}": f["usuario"] for f in suspendidas}
+        elegidas = st.multiselect(
+            "Selecciona cuáles borrar definitivamente",
+            list(opciones_sus),
+            default=list(opciones_sus),
+            key="est_sus_borrar",
+        )
+        confirmar = st.checkbox(
+            "Confirmo que quiero borrar estas cuentas de forma permanente",
+            key="est_sus_confirmar",
+        )
+        if st.button(
+            "🗑️ Eliminar definitivamente",
+            type="primary",
+            disabled=not elegidas or not confirmar,
+            key="btn_est_eliminar",
+        ):
+            usuarios_borrar = [opciones_sus[e] for e in elegidas]
+            try:
+                eliminadas = _eliminar_cuentas(usuarios_borrar)
+                _flash(f"Cuentas eliminadas definitivamente: {eliminadas}.")
+                st.rerun()
+            except Exception as e:
+                st.error(f"No se pudieron eliminar las cuentas: {e}")
 
 
 def _tab_fotos():

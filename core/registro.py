@@ -4,10 +4,12 @@ Permite persistir el resultado de cada accion ejecutada por el sistema para
 que la seccion de reportes pueda mostrar, por ejemplo, la URL de cada
 publicacion exitosa.
 """
+from datetime import datetime
+
 from loguru import logger
 
 from core.database import get_db_session
-from core.models import RegistroAccion
+from core.models import Cuenta, RegistroAccion
 
 
 def registrar_accion(
@@ -34,6 +36,25 @@ def registrar_accion(
             )
     except Exception as e:
         logger.warning(f"Error registrando accion ({tipo}/{estado} de {usuario}): {e}")
+
+
+def marcar_cuenta_suspendida(usuario: str) -> None:
+    """Marca una cuenta como `status='suspended'` y la desactiva (`activa =
+    False`) cuando el bot confirma (via `TwitterBot.cuenta_suspendida`) que X
+    bloqueo la sesion. No borra nada: el borrado definitivo se hace a mano
+    desde el dashboard (Cuentas > Estado > Cuentas suspendidas por X).
+
+    En caso de error, lo registra con logger.warning y no propaga la excepcion.
+    """
+    try:
+        with get_db_session() as db:
+            reg = db.query(Cuenta).filter(Cuenta.usuario == usuario).first()
+            if reg is not None:
+                reg.status = "suspended"
+                reg.activa = False
+                reg.last_checked = datetime.utcnow()
+    except Exception as e:
+        logger.warning(f"Error marcando cuenta suspendida ({usuario}): {e}")
 
 
 def obtener_acciones(limit: int = 100) -> list:

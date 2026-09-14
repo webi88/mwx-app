@@ -199,15 +199,22 @@ def ejecutar_en_cuentas(cuentas: list[Cuenta], accion, plataforma: str = "twitte
             bot = PlataformaFactory.crear_bot(plataforma, cuenta.usuario)
             accion_cuenta = acciones[i] if i < len(acciones) else acciones[-1]
             res = accion_cuenta(bot)
+            if getattr(bot, "cuenta_suspendida", False):
+                from core.registro import marcar_cuenta_suspendida
+                marcar_cuenta_suspendida(cuenta.usuario)
+                logger.warning(f"@{cuenta.usuario} marcada como suspendida (desactivada)")
             bot.cerrar()
-            
+
             ok = res
             url = res if isinstance(res, str) else (getattr(bot, "ultima_url_publicada", "") or "")
             
             if ok:
                 resultados["exitos"] += 1
                 if url:
-                    resultados["detalles"].append(f"✅ @{cuenta.usuario} — [ver post]({url})")
+                    # RT simple (y calentamiento, que tambien retwittea sin
+                    # cita) enlazan el perfil de quien retwittea, no un post.
+                    etiqueta = "ver perfil" if tipo in ("rt", "calentamiento") else "ver post"
+                    resultados["detalles"].append(f"✅ @{cuenta.usuario} — [{etiqueta}]({url})")
                 else:
                     resultados["detalles"].append(f"✅ @{cuenta.usuario}")
                 registrar_accion(cuenta.usuario, tipo, "exito", url, "")

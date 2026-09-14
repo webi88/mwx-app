@@ -1,5 +1,6 @@
 from core.models import Tarea, Cuenta
 from core.database import get_db_session
+from core.registro import marcar_cuenta_suspendida
 import json
 import time
 import random
@@ -57,6 +58,9 @@ class EjecutorTareas:
             
             if not bot.login_con_cookies():
                 logger.warning(f"Login fallido para {cuenta.usuario}")
+                if getattr(bot, "cuenta_suspendida", False):
+                    marcar_cuenta_suspendida(cuenta.usuario)
+                    logger.warning(f"@{cuenta.usuario} marcada como suspendida (desactivada)")
                 return False
             
             resultado = False
@@ -107,8 +111,11 @@ class EjecutorTareas:
                 comportamiento_humano_visualizacion(bot.driver)
                 resultado = True
             
+            if getattr(bot, "cuenta_suspendida", False):
+                marcar_cuenta_suspendida(cuenta.usuario)
+                logger.warning(f"@{cuenta.usuario} marcada como suspendida (desactivada)")
             bot.cerrar()
-            
+
             # Cierre suave SOLO para acciones sociales: evita rafagas cuando el
             # scheduler junta varias tareas de la misma cuenta a la misma hora.
             if tarea.tipo in self.TIPOS_CON_PAUSA_CIERRE:

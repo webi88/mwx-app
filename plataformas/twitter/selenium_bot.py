@@ -4,6 +4,7 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.common.action_chains import ActionChains
+from selenium.common.exceptions import TimeoutException
 import pickle
 import time
 import random
@@ -28,6 +29,7 @@ class TwitterBot:
         self._ua_persistente = None
         self.ultima_url_publicada = ""
         self.ultimo_error = ""
+        self.cuenta_suspendida = False
         self._proxy_cache = None
     
     def _obtener_proxy(self) -> str:
@@ -270,12 +272,18 @@ class TwitterBot:
             
             self.driver.refresh()
             time.sleep(3)
-            
+
+            if self._detectar_cuenta_propia_suspendida():
+                self.cuenta_suspendida = True
+                self.ultimo_error = "cuenta suspendida/bloqueada por X"
+                logger.warning(f"Cuenta suspendida detectada para {self.usuario}")
+                return False
+
             if "login" in self.driver.current_url.lower():
                 self.ultimo_error = "sesión expirada (cookies .pkl)"
                 logger.warning(f"Sesion expirada para {self.usuario}")
                 return False
-            
+
             logger.info(f"Login exitoso para {self.usuario}")
             return True
         
@@ -366,6 +374,12 @@ class TwitterBot:
                 time.sleep(4)
             except Exception:
                 pass
+
+            if self._detectar_cuenta_propia_suspendida():
+                self.cuenta_suspendida = True
+                self.ultimo_error = "cuenta suspendida/bloqueada por X"
+                logger.warning(f"Cuenta suspendida detectada para {self.usuario} (cookies_json)")
+                return False
 
             # X suele lanzar un desafio de seguridad (login inusual) al inyectar
             # un auth_token "en frio". Si hay password/totp_secret en la BD, se
@@ -836,10 +850,58 @@ class TwitterBot:
                     return True
             
             return False
-        
+
         except:
             return False
-    
+
+    def _detectar_cuenta_propia_suspendida(self) -> bool:
+        """Detecta si la CUENTA CON LA QUE SE INICIO SESION (no el tweet/
+        cuenta objetivo) fue suspendida/bloqueada por X. A diferencia de
+        `_detectar_limite_cuenta()` (limites blandos y temporales), esto solo
+        reconoce frases de bloqueo permanente para no marcar como baneada una
+        cuenta con un limite recuperable."""
+        try:
+            url_actual = (self.driver.current_url or "").lower()
+            if "/account/access" in url_actual or "/suspended" in url_actual:
+                return True
+
+            page_source = self.driver.page_source.lower()
+            frases = [
+                "your account is suspended",
+                "we suspended your account",
+                "we've suspended your account",
+                "your account has been locked",
+                "tu cuenta ha sido suspendida",
+                "tu cuenta fue suspendida",
+                "hemos suspendido tu cuenta",
+            ]
+            return any(frase in page_source for frase in frases)
+        except Exception:
+            return False
+
+    def _detectar_tweet_no_disponible(self) -> str:
+        """Revisa si la pagina del tweet objetivo cargo pero no es
+        retwitteable (borrado, protegido/privado o cuenta suspendida).
+        Devuelve el motivo detectado o "" si no hay indicios."""
+        try:
+            page_source = self.driver.page_source.lower()
+
+            motivos = {
+                "this post is unavailable": "tweet no disponible/borrado",
+                "this tweet is unavailable": "tweet no disponible/borrado",
+                "hmm...this page doesn't exist": "tweet no disponible/borrado",
+                "these posts are protected": "cuenta protegida/privada",
+                "this account is protected": "cuenta protegida/privada",
+                "this account doesn't exist": "cuenta no existe",
+                "account suspended": "cuenta objetivo suspendida",
+            }
+            for frase, motivo in motivos.items():
+                if frase in page_source:
+                    return motivo
+            return ""
+        except Exception:
+            return ""
+
     def publicar_tweet(self, contenido: str, imagen_path: Optional[str] = None) -> Optional[str]:
         """Publica un tweet y devuelve la URL del post recien publicado.
 
@@ -1319,16 +1381,36 @@ class TwitterBot:
             return None
 
     def _reorganizar_hashtags(self, texto: str) -> str:
-        palabras = texto.split()
-        hashtags = [p for p in palabras if p.startswith("#")]
-        no_hashtags = [p for p in palabras if not p.startswith("#")]
-        
+        """Reubica los hashtags sueltos del texto en un unico punto natural
+        cercano a la mitad (mismo criterio que
+        ``core.perfiles.colocar_hashtag_en_medio``: nunca al final, nunca
+        partidos a la mitad de una palabra, sin espacios/saltos sueltos)."""
+        hashtags = re.findall(r"#[A-Za-z0-9ÁÉÍÓÚÜÑáéíóúüñ_]+", texto)
         if not hashtags:
             return texto
-        
-        mid = len(no_hashtags) // 2
-        resultado = no_hashtags[:mid] + ["\n"] + hashtags + ["\n"] + no_hashtags[mid:]
-        return " ".join(resultado)
+
+        base = re.sub(r"#[A-Za-z0-9ÁÉÍÓÚÜÑáéíóúüñ_]+", " ", texto)
+        base = re.sub(r"[ \t]+", " ", base)
+        base = re.sub(r"\n{3,}", "\n\n", base).strip()
+        tags = " ".join(hashtags)
+        if not base:
+            return tags
+
+        mitad = len(base) // 2
+        puntos = [m.start() for m in re.finditer(r"(?:\s|\n)", base)]
+        if puntos:
+            punto = min(puntos, key=lambda p: abs(p - mitad))
+            izquierda = base[:punto].rstrip()
+            derecha = base[punto:].lstrip()
+        else:
+            corte = max(1, len(base) // 2)
+            izquierda, derecha = base[:corte].rstrip(), base[corte:].lstrip()
+
+        if not izquierda:
+            return f"{tags} {derecha}".strip()
+        if not derecha:
+            return f"{izquierda} {tags}".strip()
+        return f"{izquierda} {tags} {derecha}".strip()
     
     def _pegar_texto(self, elemento, texto: str):
         import pyperclip
@@ -1388,8 +1470,8 @@ class TwitterBot:
 
         Para la distribucion horaria se usa con UNA sola URL: hace exactamente
         un RT y devuelve `{"exitos": 1, "urls": [<url>]}` (el RT simple no crea
-        una URL nueva; se registra la del tweet retwitteado). Con varias URLs
-        mantiene el recorrido secuencial en el mismo navegador.
+        una URL nueva; se registra la del perfil de la cuenta que retwittea).
+        Con varias URLs mantiene el recorrido secuencial en el mismo navegador.
 
         Verifica cada publicacion REALMENTE (estado `unretweet` en RT simple y
         `_verificar_publicacion()` en citas) antes de contar el exito, por lo
@@ -1409,8 +1491,19 @@ class TwitterBot:
                 if self._detectar_limite_cuenta():
                     self.ultimo_error = "cuenta limitada por X"
                     break
-                
-                rt_btn = self.driver.find_element(By.CSS_SELECTOR, "[data-testid='retweet']")
+
+                try:
+                    rt_btn = WebDriverWait(self.driver, 12).until(
+                        EC.element_to_be_clickable((By.CSS_SELECTOR, "[data-testid='retweet']"))
+                    )
+                except TimeoutException:
+                    if self._detectar_cuenta_propia_suspendida():
+                        self.cuenta_suspendida = True
+                        raise Exception("cuenta suspendida/bloqueada por X")
+                    motivo = self._detectar_tweet_no_disponible()
+                    raise Exception(
+                        motivo or "boton de retweet no encontrado (carga lenta o cambio de interfaz)"
+                    )
                 rt_btn.click()
                 time.sleep(1)
                 
@@ -1437,7 +1530,9 @@ class TwitterBot:
                     if not self._verificar_publicacion():
                         raise Exception("X no confirmo la publicacion de la cita")
                 else:
-                    rt_option = self.driver.find_element(By.CSS_SELECTOR, "[data-testid='retweetConfirm']")
+                    rt_option = WebDriverWait(self.driver, 5).until(
+                        EC.element_to_be_clickable((By.CSS_SELECTOR, "[data-testid='retweetConfirm']"))
+                    )
                     self.driver.execute_script("arguments[0].click();", rt_option)
                     
                     # Verificacion real: el boton del tweet objetivo debe pasar
@@ -1464,9 +1559,11 @@ class TwitterBot:
                         resultados["urls"].append(url_publicada)
                         self.ultima_url_publicada = url_publicada
                 else:
-                    # El RT simple no genera URL nueva: la canonica es la del
-                    # tweet retwitteado.
-                    resultados["urls"].append(url)
+                    # El RT simple no genera un post propio: se enlaza el
+                    # perfil de la cuenta que retwittea, no el tweet original.
+                    url_perfil = f"https://twitter.com/{usuario}"
+                    resultados["urls"].append(url_perfil)
+                    self.ultima_url_publicada = url_perfil
                 
                 time.sleep(random.uniform(2.5, 6.0))
             
