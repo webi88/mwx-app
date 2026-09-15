@@ -7,6 +7,7 @@ from typing import Optional
 from loguru import logger
 
 from core.config import resolver_ruta
+from utils.anti_detection import normalizar_cookies, resolver_ua_cuenta
 
 
 class TwitterAPI:
@@ -15,45 +16,71 @@ class TwitterAPI:
         self.cookies_path = resolver_ruta(f"data/cookies/twitter/{usuario}.pkl")
         self.session = None
         self.bearer_token = "AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs=1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA"
-        
-        self.user_agents = [
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        ]
-    
+
+    def _leer_cuenta(self):
+        """Devuelve la fila `Cuenta` de la BD (o None) para leer su UA/cookies."""
+        try:
+            from core.database import get_db_session
+            from core.models import Cuenta
+            with get_db_session() as db:
+                return db.query(Cuenta).filter(Cuenta.usuario == self.usuario).first()
+        except Exception as e:
+            logger.warning(f"No se pudo leer la cuenta {self.usuario}: {e}")
+            return None
+
     def _cargar_cookies(self) -> bool:
-        if not os.path.exists(self.cookies_path):
+        cuenta = self._leer_cuenta()
+
+        cookies_list = None
+        if os.path.exists(self.cookies_path):
+            try:
+                with open(self.cookies_path, "rb") as f:
+                    cookies_list = pickle.load(f)
+            except Exception as e:
+                logger.error(f"Error leyendo {self.cookies_path}: {e}")
+
+        # Sin .pkl (o ilegible): usa TODAS las cookies guardadas en la BD.
+        if not cookies_list and cuenta is not None:
+            cookies_json = getattr(cuenta, "cookies_json", None)
+            if cookies_json:
+                logger.info(f"Sin .pkl para {self.usuario}; usando cookies_json de la BD")
+                cookies_list = cookies_json
+
+        cookies_norm = normalizar_cookies(cookies_list)
+        if not cookies_norm:
             logger.warning(f"No hay cookies para {self.usuario}")
             return False
-        
+
         try:
-            with open(self.cookies_path, "rb") as f:
-                cookies_list = pickle.load(f)
-            
             self.session = requests.Session(impersonate="chrome120")
-            
-            cookie_dict = {}
-            for cookie in cookies_list:
-                cookie_dict[cookie["name"]] = cookie["value"]
-            
+
+            cookie_dict = {c["name"]: c["value"] for c in cookies_norm}
             self.session.cookies.update(cookie_dict)
-            
+
             ct0 = cookie_dict.get("ct0", "")
             auth_token = cookie_dict.get("auth_token", "")
-            
-            self.session.headers.update({
+
+            headers = {
                 "authorization": f"Bearer {self.bearer_token}",
                 "x-csrf-token": ct0,
                 "x-twitter-auth-type": "OAuth2Session",
                 "x-twitter-active-user": "yes",
-                "user-agent": random.choice(self.user_agents),
                 "referer": "https://x.com/",
                 "origin": "https://x.com",
-            })
-            
+            }
+
+            # UA EXACTO de la cuenta (del lote). Si la cuenta no lo tiene, se
+            # omite el header y curl_cffi usa el UA natural de su impersonacion.
+            ua_cuenta = resolver_ua_cuenta(cuenta)
+            if ua_cuenta:
+                headers["user-agent"] = ua_cuenta
+            else:
+                logger.info(f"{self.usuario} sin user_agent; curl_cffi usara su UA natural")
+
+            self.session.headers.update(headers)
+
             return True
-        
+
         except Exception as e:
             logger.error(f"Error cargando cookies: {e}")
             return False

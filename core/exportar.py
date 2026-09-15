@@ -23,6 +23,7 @@ COLUMNAS_CUENTAS = (
     ("email", "Email_Respaldo"),
     ("email_password", "Password_Email"),
     ("auth_token", "Auth_Token"),
+    ("user_agent", "User_Agent"),
     ("status", "Estado"),
     ("personalidad", "Personalidad"),
     ("perfil_personalidad", "Perfil_Personalidad"),

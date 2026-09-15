@@ -8,6 +8,7 @@ from typing import Optional
 from loguru import logger
 
 from core.config import settings, resolver_ruta, detectar_chrome_version
+from utils.anti_detection import aplicar_stealth
 
 
 class InstagramBot:
@@ -56,6 +57,7 @@ class InstagramBot:
         try:
             self.driver = uc.Chrome(options=options, version_main=detectar_chrome_version(), use_subprocess=False)
             self.driver.set_page_load_timeout(30)
+            aplicar_stealth(self.driver)
             return True
         except Exception as e:
             logger.error(f"Error iniciando Chrome: {e}")

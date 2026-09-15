@@ -17,6 +17,12 @@ from loguru import logger
 
 from core.config import settings, resolver_ruta, detectar_chrome_version
 from utils.proxies import ProxyManager
+from utils.anti_detection import (
+    aplicar_stealth,
+    aplicar_user_agent,
+    normalizar_cookies,
+    resolver_ua_cuenta,
+)
 
 
 class TwitterBot:
@@ -156,31 +162,34 @@ class TwitterBot:
         return proxy
 
     def _obtener_ua_consistente(self) -> str:
-        if self._ua_persistente:
+        """Devuelve el User-Agent EXACTO que debe usar esta cuenta.
+
+        Orden: `Cuenta.user_agent` (viene en el lote y se guarda en la BD) ->
+        archivo global `data/perfiles_chrome/ua_config.txt` (override manual) ->
+        "" (se deja el UA natural de Chrome). Nunca genera ni persiste un UA
+        aleatorio, porque un UA distinto al de la cuenta delata la automatizacion.
+        """
+        if self._ua_persistente is not None:
             return self._ua_persistente
-        
-        uas = [
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        ]
-        
-        if os.path.exists(self.ua_config_path):
-            try:
-                with open(self.ua_config_path, "r") as f:
-                    ua = f.read().strip()
-                    if ua:
-                        self._ua_persistente = ua
-                        return ua
-            except:
-                pass
-        
-        ua = random.choice(uas)
-        os.makedirs(os.path.dirname(self.ua_config_path), exist_ok=True)
-        with open(self.ua_config_path, "w") as f:
-            f.write(ua)
-        
+
+        ua = ""
+        try:
+            from core.database import get_db_session
+            from core.models import Cuenta
+            with get_db_session() as db:
+                cuenta = db.query(Cuenta).filter(Cuenta.usuario == self.usuario).first()
+                ua = resolver_ua_cuenta(cuenta)
+        except Exception as e:
+            logger.warning(f"No se pudo leer el user_agent de {self.usuario}: {e}")
+            ua = resolver_ua_cuenta(None)
+
         self._ua_persistente = ua
+        if ua:
+            logger.info(f"UA de {self.usuario}: {ua}")
+        else:
+            logger.info(
+                f"{self.usuario} sin user_agent configurado; se usara el UA natural de Chrome"
+            )
         return ua
     
     def iniciar_driver(self, pantalla_externa: bool = False) -> bool:
@@ -204,7 +213,12 @@ class TwitterBot:
             options.add_argument("--disable-software-rasterizer")
             options.add_argument("--disable-quic")
             options.add_argument(f"--user-data-dir={perfil}")
-            options.add_argument(f"--user-agent={self._obtener_ua_consistente()}")
+
+            # UA EXACTO de la cuenta (del lote). Si no hay, se deja el natural
+            # de Chrome (no se inventa/persiste uno aleatorio).
+            ua = self._obtener_ua_consistente()
+            if ua:
+                options.add_argument(f"--user-agent={ua}")
             
             if settings.headless:
                 options.add_argument("--headless=new")
@@ -218,28 +232,14 @@ class TwitterBot:
             if proxy:
                 ProxyManager().aplicar_a_options(options, proxy, tag=self.usuario)
             
-            stealth_script = """
-            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-            Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
-            Object.defineProperty(navigator, 'languages', {get: () => ['es-MX', 'es', 'en-US', 'en']});
-            window.chrome = {runtime: {}, loadTimes: function(){}, csi: function(){}, app: {}};
-            Object.defineProperty(navigator, 'hardwareConcurrency', {get: () => 8});
-            Object.defineProperty(navigator, 'deviceMemory', {get: () => 8});
-            Object.defineProperty(navigator, 'maxTouchPoints', {get: () => 0});
-            const _getParameter = WebGLRenderingContext.prototype.getParameter;
-            WebGLRenderingContext.prototype.getParameter = function(parameter) {
-                if (parameter === 37445) return 'Intel Inc.';
-                if (parameter === 37446) return 'Intel Iris OpenGL Engine';
-                return _getParameter.call(this, parameter);
-            };
-            """
-            
             self.driver = uc.Chrome(options=options, version_main=detectar_chrome_version(), use_subprocess=False)
             self.driver.set_page_load_timeout(30)
-            
-            self.driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
-                "source": stealth_script
-            })
+
+            # Stealth en cada documento nuevo + UA por CDP (incluye
+            # userAgentMetadata y Accept-Language coherentes con el UA).
+            aplicar_stealth(self.driver)
+            if ua:
+                aplicar_user_agent(self.driver, ua)
             
             logger.info(f"Driver iniciado para {self.usuario}")
             return True
@@ -280,9 +280,14 @@ class TwitterBot:
                 return False
 
             if "login" in self.driver.current_url.lower():
-                self.ultimo_error = "sesión expirada (cookies .pkl)"
-                logger.warning(f"Sesion expirada para {self.usuario}")
-                return False
+                logger.warning(
+                    f"Sesion .pkl expirada para {self.usuario}; "
+                    "probando cookies completas de la BD (cookies_json)"
+                )
+                # El .pkl puede estar vencido o tener solo auth_token: antes de
+                # rendirse usa TODAS las cookies de la BD (auth_token, ct0,
+                # twid, ...) reutilizando el driver ya abierto.
+                return self.login_con_cookies_json()
 
             logger.info(f"Login exitoso para {self.usuario}")
             return True
@@ -290,7 +295,8 @@ class TwitterBot:
         except Exception as e:
             self.ultimo_error = f"{type(e).__name__}: {e}"
             logger.exception(f"Error en login {self.usuario}: {e}")
-            return False
+            # Falla dura del .pkl: intenta con las cookies completas de la BD.
+            return self.login_con_cookies_json()
     
     def login_con_cookies_json(self) -> bool:
         """Inicia sesión inyectando las cookies nativas de X guardadas en BD
@@ -347,22 +353,19 @@ class TwitterBot:
             self.driver.get(f"{self.base_url}/404")
             time.sleep(2)
 
-            for cookie in cookies_json:
-                if not isinstance(cookie, dict):
-                    continue
+            # Normaliza TODAS las cookies (auth_token, ct0, twid, etc.) desde
+            # formatos de vendedor/EditThisCookie/Selenium al que acepta Chrome.
+            cookies_selenium = normalizar_cookies(cookies_json)
+            if not cookies_selenium:
+                logger.warning(f"cookies_json de {self.usuario} sin cookies utilizables")
+                self.ultimo_error = "cookies_json sin cookies utilizables"
+                return False
 
-                cookie_selenium = {}
-                for key in ("name", "value", "domain", "path", "secure", "httpOnly", "expiry"):
-                    if key in cookie:
-                        cookie_selenium[key] = cookie[key]
-
-                if "name" not in cookie_selenium or "value" not in cookie_selenium:
-                    continue
-
+            for cookie in cookies_selenium:
                 try:
-                    self.driver.add_cookie(cookie_selenium)
+                    self.driver.add_cookie(cookie)
                 except Exception as e:
-                    logger.debug(f"Cookie {cookie_selenium.get('name')} no inyectada: {e}")
+                    logger.debug(f"Cookie {cookie.get('name')} no inyectada: {e}")
                     continue
 
             self.driver.refresh()
@@ -419,6 +422,9 @@ class TwitterBot:
                 logger.warning(f"No se pudieron guardar las cookies del navegador: {e}")
 
             logger.info(f"Login exitoso para {self.usuario} via cookies_json")
+            # Limpia un error previo (p.ej. del .pkl vencido) ya que la sesion
+            # quedo confirmada.
+            self.ultimo_error = ""
             return True
 
         except Exception as e:

@@ -22,6 +22,7 @@ Subcomandos:
     aplicar-fotos    Aplica en X las fotos ya generadas (Selenium + Chrome).
     sincronizar      Lee el nombre/@ reales desde X por httpx (sin Chrome).
     cambiar-perfil   Cambia el nombre/@ reales de UNA cuenta (Selenium + Chrome).
+    renombrar        Renombra la clave interna (Cuenta.usuario) y migra todo.
 
 Ejemplos:
     python cli_cuentas.py listar
@@ -49,6 +50,8 @@ Ejemplos:
     python cli_cuentas.py sincronizar --seccion sin-asignar
     python cli_cuentas.py cambiar-perfil --usuario u1 --nombre "Nuevo Nombre"
     python cli_cuentas.py cambiar-perfil --usuario u1 --handle nuevo_handle --password clave
+    python cli_cuentas.py renombrar --usuario u1 --nuevo u1_nueva --dry-run
+    python cli_cuentas.py renombrar --usuario u1 --actual
 
 Seleccion por rango (seccion, tipo, desactivar, activar, generar-fotos,
 aplicar-fotos, generar-nombres y sincronizar):
@@ -67,8 +70,8 @@ Codigos de salida:
        generar-nombres, aplicar-nombres, generar-fotos, sincronizar), las
        cuentas fallidas individuales no cambian el codigo de salida.
     1  Error de uso, error de base de datos, error de escritura del --json,
-       cambio de perfil fallido (cambiar-perfil) o ninguna foto aplicada con
-       fallas (aplicar-fotos).
+       cambio de perfil fallido (cambiar-perfil), renombrado fallido
+       (renombrar) o ninguna foto aplicada con fallas (aplicar-fotos).
 """
 import argparse
 import bisect
@@ -87,7 +90,7 @@ except Exception:
 
 from sqlalchemy import or_
 
-from core.config import resolver_ruta
+from core.config import PROJECT_ROOT, resolver_ruta
 from core.database import get_db_session, init_db
 from core.models import Cuenta
 from core.registros import (
@@ -1354,19 +1357,113 @@ def cmd_cambiar_perfil(args):
 
 
 # ---------------------------------------------------------------------------
+# Subcomando: renombrar
+# ---------------------------------------------------------------------------
+
+
+def _ruta_corta(ruta):
+    """Ruta relativa al proyecto para que la tabla sea legible ('' -> '-')."""
+    texto = str(ruta or "").strip()
+    if not texto:
+        return "-"
+    try:
+        raiz = os.path.abspath(str(PROJECT_ROOT))
+        absoluta = os.path.abspath(texto)
+        if os.path.normcase(absoluta).startswith(os.path.normcase(raiz + os.sep)):
+            return os.path.relpath(absoluta, raiz).replace("\\", "/")
+    except Exception:
+        pass
+    return texto
+
+
+def cmd_renombrar(args):
+    """Renombra la clave interna (Cuenta.usuario) migrando archivos/rutas."""
+    try:
+        from core.renombrar import renombrar_al_handle_actual, renombrar_usuario
+    except Exception as e:
+        _error(f"no se pudo importar core.renombrar: {e}")
+
+    usuario = (args.usuario or "").strip().lstrip("@")
+    if not usuario:
+        _error("--usuario es obligatorio")
+
+    if args.actual:
+        resultado = renombrar_al_handle_actual(usuario, dry_run=bool(args.dry_run))
+    else:
+        resultado = renombrar_usuario(
+            usuario, args.nuevo, dry_run=bool(args.dry_run)
+        )
+
+    for advertencia in resultado.get("advertencias") or []:
+        print(f"AVISO: {advertencia}", file=sys.stderr)
+
+    anterior = resultado.get("usuario_anterior") or usuario
+    nuevo = resultado.get("usuario_nuevo") or ""
+    modo = "DRY-RUN" if resultado.get("dry_run") else "REAL"
+    print(f"Renombrado de clave interna ({modo}): {anterior} -> {nuevo or '-'}")
+
+    archivos = resultado.get("archivos") or []
+    if archivos:
+        filas = []
+        for entrada in archivos:
+            filas.append(
+                [
+                    entrada.get("tipo", "?"),
+                    _ruta_corta(entrada.get("de")),
+                    _ruta_corta(entrada.get("a")),
+                    "OK" if entrada.get("ok") else "ERROR",
+                    entrada.get("error", ""),
+                ]
+            )
+        _imprimir_tabla(["tipo", "de", "a", "estado", "error"], filas)
+    else:
+        print("Archivos a migrar: ninguno (no existen cookies/perfil/avatar/portada).")
+
+    referencias = resultado.get("referencias") or {}
+    print("")
+    print(
+        "Referencias: "
+        f"registros={referencias.get('registros', 0)} "
+        f"cookies_path={'si' if referencias.get('cookies_path') else 'no'} "
+        f"rutas_imagenes={'si' if referencias.get('rutas_imagenes') else 'no'}"
+    )
+
+    if not resultado.get("ok"):
+        error = (resultado.get("error") or "").strip() or "(sin detalle)"
+        print(f"ERROR: {error}", file=sys.stderr)
+        return 1
+
+    if resultado.get("dry_run"):
+        print("DRY-RUN: no se modifico la base de datos ni el disco.")
+        return 0
+
+    if resultado.get("renombrado"):
+        print(f"OK: la cuenta se renombro a '{nuevo}' en la base de datos.")
+    fallos = [entrada for entrada in archivos if not entrada.get("ok")]
+    if fallos:
+        print(
+            f"AVISO: {len(fallos)} archivo(s) no se pudieron migrar; "
+            "revisa los errores de la tabla.",
+            file=sys.stderr,
+        )
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # Parser
 # ---------------------------------------------------------------------------
 
 
 def construir_parser():
-    """Construye el parser argparse con los 8 subcomandos del CLI."""
+    """Construye el parser argparse con todos los subcomandos del CLI."""
     parser = _Parser(
         prog="cli_cuentas.py",
         description=(
             "Gestion masiva de cuentas Twitter/X: secciones CI/CD/IP, tipo de "
             "voz, estado activa/inactiva, propuestas de nombre/@, fotos de "
             "perfil/portada, preclasificacion por sector, sincronizacion de "
-            "perfil (httpx) y cambio real de nombre/@ (Selenium + Chrome)."
+            "perfil (httpx), cambio real de nombre/@ (Selenium + Chrome) y "
+            "renombrado de la clave interna (Cuenta.usuario)."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
@@ -1396,6 +1493,8 @@ def construir_parser():
             "  python cli_cuentas.py sincronizar --todas --timeout 20\n"
             "  python cli_cuentas.py sincronizar --desde a --hasta m --status active\n"
             "  python cli_cuentas.py cambiar-perfil --usuario u1 --nombre \"Nuevo Nombre\"\n"
+            "  python cli_cuentas.py renombrar --usuario u1 --nuevo u1_nueva --dry-run\n"
+            "  python cli_cuentas.py renombrar --usuario u1 --actual\n"
             "\n"
             "Seleccion por rango (seccion, tipo, desactivar, activar,\n"
             "generar-fotos, aplicar-fotos, generar-nombres, sincronizar):\n"
@@ -1411,7 +1510,7 @@ def construir_parser():
         metavar=(
             "{listar,seccion,preclasificar,tipo,desactivar,activar,"
             "generar-nombres,aplicar-nombres,generar-fotos,aplicar-fotos,"
-            "sincronizar,cambiar-perfil}"
+            "sincronizar,cambiar-perfil,renombrar}"
         ),
     )
 
@@ -1666,6 +1765,31 @@ def construir_parser():
     p.add_argument("--password", default=None, metavar="PASS",
                    help="Contrasena de X (opcional; si falta se lee de la BD)")
     p.set_defaults(func=cmd_cambiar_perfil)
+
+    # --- renombrar ---------------------------------------------------------
+    p = sub.add_parser(
+        "renombrar",
+        help="Renombra la clave interna (Cuenta.usuario) y migra archivos",
+        description=(
+            "Renombra la clave interna de UNA cuenta (Cuenta.usuario) migrando "
+            "cookies, carpeta de perfil Chrome, avatar/portada, los campos "
+            "cookies_path/avatar_path/banner_path y el historial de "
+            "RegistroAccion. NO cambia nada en X: solo la base de datos y los "
+            "archivos locales. Con --actual usa handle_actual (de la BD) como "
+            "destino; si la cuenta cambio de @ en X, sincroniza primero."
+        ),
+    )
+    p.add_argument("--usuario", required=True, metavar="USER",
+                   help="Clave interna actual (Cuenta.usuario)")
+    grupo = p.add_mutually_exclusive_group(required=True)
+    grupo.add_argument("--nuevo", metavar="NUEVO",
+                       help="Nuevo nombre de la clave interna (sin @; si no "
+                            "parece un handle de X se advierte, no se bloquea)")
+    grupo.add_argument("--actual", action="store_true",
+                       help="Usa Cuenta.handle_actual de la BD como nuevo nombre")
+    p.add_argument("--dry-run", action="store_true",
+                   help="Muestra que haria sin tocar la base de datos ni el disco")
+    p.set_defaults(func=cmd_renombrar)
 
     return parser
 

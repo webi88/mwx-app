@@ -4,9 +4,12 @@ desde X (httpx, sin Chrome), cambio de nombre/@ (Selenium + Chrome) e
 inventario/exportación.
 
 Reemplaza el flujo obsoleto de auto-registro con Grizzly SMS por la nueva
-arquitectura: importación en lote (7 campos) + validador de sesión + inventario.
+arquitectura: importación en lote (8 campos, con `user_agent` opcional) +
+validador de sesión + inventario, incluyendo anti-detección (User-Agent por
+cuenta y cookies completas).
 """
 import bisect
+import json
 import os
 import re
 
@@ -53,7 +56,9 @@ TABS = [
     "🏷️ Nombres",
     "⏸️ Estado",
     "📷 Fotos",
+    "🛡️ Anti-detección",
     "🔄 Sincronizar desde X",
+    "🏷️ Renombrar usuario",
     "✏️ Cambiar nombre/@",
     "📋 Inventario",
     "📤 Exportar",
@@ -80,6 +85,14 @@ def _fmt_fecha(dt) -> str:
     if hasattr(dt, "strftime"):
         return dt.strftime("%Y-%m-%d %H:%M")
     return str(dt)
+
+
+def _abreviar(texto, maximo: int = 40) -> str:
+    """Trunca visualmente un texto largo; el dato completo se conserva aparte."""
+    texto = str(texto or "").strip()
+    if len(texto) <= maximo:
+        return texto
+    return texto[: maximo - 1] + "…"
 
 
 def _opciones_filtro_seccion(incluir_todas: bool = True) -> list:
@@ -305,6 +318,7 @@ def _listar_cuentas(status_filtro: str = OPCION_TODAS, seccion_filtro=None) -> l
                             getattr(c, "handle_propuesto", "") or ""
                         ).strip(),
                         "password": getattr(c, "password", "") or "",
+                        "user_agent": getattr(c, "user_agent", "") or "",
                         "sector": getattr(c, "sector", "") or "",
                         "grupo": (getattr(c, "grupo", "") or "").strip(),
                         "grupo_etiqueta": _etiqueta_grupo(
@@ -856,10 +870,17 @@ def _mostrar_resumen_sincronizacion(res: dict):
 def _tab_importar():
     st.markdown("### 📥 Importar lote de cuentas")
     st.caption(
-        "Una cuenta por línea, campos separados por `:`:\n"
-        "`username:password:totp_secret:email:email_password:auth_token:cookies_base64`\n"
-        "El 7º campo (`cookies_base64`) es **opcional**: si no lo traes, la cuenta "
-        "igual se importa y el validador obtiene el `ct0` con el `auth_token`."
+        "Una cuenta por línea, campos separados por `:`; los dos últimos son "
+        "**opcionales**:\n"
+        "`username:password:totp_secret:email:email_password:auth_token:cookies:user_agent`\n"
+        "El 7º campo (`cookies`) acepta **JSON crudo** (`[...]` o "
+        "`{\"cookies\":[...]}`) o **base64**, y el 8º (`user_agent`) es el UA "
+        "original del lote. También se acepta el campo `ua=`/`user_agent=` en "
+        "cualquier posición de la línea.\n"
+        "Las cookies se guardan **COMPLETAS** (`auth_token`, `ct0`, `twid`…), "
+        "no solo el `auth_token`: son las que se inyectan al abrir Chrome. Sin "
+        "cookies la cuenta igual se importa y el validador obtiene el `ct0` con "
+        "el `auth_token`."
     )
 
     texto_lote = st.text_area(
@@ -2258,9 +2279,350 @@ def _tab_sincronizar():
                         f"Resumen de: Modo: Manual — {len(seleccion_labels)} cuentas"
                     )
                 _mostrar_resumen_sincronizacion(res)
+                cambios_handle = int(res.get("cambios_handle", 0) or 0)
+                if cambios_handle > 0:
+                    st.info(
+                        f"{cambios_handle} cuenta(s) cambiaron de @ real: su "
+                        "usuario interno quedó desalineado. Puedes renombrarlas "
+                        "para dejar el inventario bien."
+                    )
+                    # on_click: cambiar cuentas_pestana_selector dentro del
+                    # handler lanzaría StreamlitAPIException (el radio ya existe).
+                    st.button(
+                        "🏷️ Ir a Renombrar usuario",
+                        use_container_width=True,
+                        key="btn_sync_ir_renombrar",
+                        on_click=_ir_a_tab_renombrar,
+                    )
             except Exception as e:
                 estado.write("")
                 st.error(f"Falló la sincronización: {e}")
+
+
+def _render_resultado_sync_cuenta(res: dict):
+    """Muestra el resultado de `sincronizar_cuenta` para UNA cuenta."""
+    usuario = res.get("usuario") or ""
+    error = res.get("error") or ""
+    handle = (res.get("handle") or "").strip()
+    nombre = (res.get("nombre") or "").strip()
+    if error == "":
+        detalle = f"@{handle}" if handle else "(sin @)"
+        if nombre:
+            detalle += f" — {nombre}"
+        st.success(f"Perfil de @{usuario} sincronizado desde X: {detalle}")
+    elif error == "sin_datos":
+        st.warning(
+            f"@{usuario}: X no devolvió datos del perfil (cookies vencidas, "
+            "proxy bloqueado o página sin parsear)."
+        )
+    else:
+        st.error(f"No se pudo sincronizar @{usuario}: {error}")
+
+
+def _render_resultado_renombrado(res: dict, titulo: str = ""):
+    """Muestra el dict de `core.renombrar` (archivos, referencias y avisos).
+
+    Sirve para el dry-run y para el renombrado real. Nunca lanza: tolera un
+    dict incompleto con `.get`.
+    """
+    if titulo:
+        st.markdown(f"#### {titulo}")
+    anterior = res.get("usuario_anterior") or ""
+    nuevo = res.get("usuario_nuevo") or ""
+    if res.get("ok"):
+        if res.get("dry_run"):
+            st.success(
+                f"Simulación correcta: @{anterior} → @{nuevo}. No se tocó nada."
+            )
+        else:
+            st.success(f"Usuario interno renombrado: @{anterior} → @{nuevo}.")
+    else:
+        st.error(
+            f"No se pudo renombrar @{anterior}: {res.get('error') or 'sin detalle'}"
+        )
+
+    archivos = res.get("archivos") or []
+    if archivos:
+        st.dataframe(
+            [
+                {
+                    "tipo": a.get("tipo", ""),
+                    "de": a.get("de", ""),
+                    "a": a.get("a", ""),
+                    "ok": "✅" if a.get("ok") else "❌",
+                    "error": a.get("error", ""),
+                }
+                for a in archivos
+            ],
+            use_container_width=True,
+        )
+    else:
+        st.caption(
+            "No se encontraron archivos asociados para migrar (cookies `.pkl`, "
+            "perfil Chrome, avatar o portada)."
+        )
+
+    refs = res.get("referencias") or {}
+    st.caption(
+        f"Historial migrado: {refs.get('registros', 0)} registro(s) · "
+        f"`cookies_path`: {'sí' if refs.get('cookies_path') else 'no'} · "
+        f"rutas de imágenes: {'sí' if refs.get('rutas_imagenes') else 'no'}"
+    )
+    if res.get("advertencias"):
+        with st.expander(f"⚠️ Advertencias ({len(res['advertencias'])})"):
+            for aviso in res["advertencias"]:
+                st.markdown(f"- {aviso}")
+
+
+def _ir_a_tab_renombrar():
+    """Callback: cambia el radio interno a '🏷️ Renombrar usuario'.
+
+    Se usa `on_click` porque `cuentas_pestana_selector` pertenece al radio de
+    `render()`, que ya está instanciado cuando corre esta pestaña: asignarlo
+    dentro del handler lanzaría `StreamlitAPIException`. Los callbacks corren
+    antes del rerun, cuando todavía no hay widget instanciado.
+    """
+    st.session_state["cuentas_pestana_selector"] = "🏷️ Renombrar usuario"
+
+
+def _tab_renombrar():
+    """Renombra la clave interna `usuario` para alinearla con el @ real."""
+    st.markdown("### 🏷️ Renombrar usuario interno")
+    st.caption(
+        "Renombra la clave interna `usuario` para que el inventario coincida con "
+        "el @ real. La migración mueve las cookies `.pkl`, el perfil de Chrome, "
+        "el avatar/portada y el historial (`RegistroAccion`); las **tareas "
+        "programadas no se ven afectadas** porque referencian cuentas por `id`. "
+        "Recomendado: sincroniza primero el perfil desde X y luego renombra aquí."
+    )
+
+    # Resultados pendientes de una acción anterior que hizo st.rerun() (el
+    # rerun descarta lo dibujado: se guardan y se muestran en esta pasada).
+    resultado_previo = st.session_state.pop("cuentas_renombrar_resultado", None)
+    if resultado_previo:
+        _render_resultado_renombrado(
+            resultado_previo, "📄 Resultado del último renombrado"
+        )
+
+    sync_previo = st.session_state.pop("cuentas_renombrar_sync", None)
+    if sync_previo:
+        _render_resultado_sync_cuenta(sync_previo)
+
+    cuentas = _listar_cuentas(OPCION_TODAS)
+    if not cuentas:
+        st.info("No hay cuentas de Twitter en la base de datos.")
+        return
+
+    opciones = {_etiqueta_cuenta_perfil(f): f for f in cuentas}
+    etiqueta = st.selectbox(
+        "Cuenta a renombrar", list(opciones.keys()), key="ren_cuenta"
+    )
+    fila = opciones[etiqueta]
+    usuario = fila["usuario"]
+    handle_real = (fila.get("handle_actual") or "").strip().lstrip("@")
+    nombre_real = (fila.get("nombre_mostrado") or "").strip()
+    difiere = bool(handle_real) and handle_real.lower() != usuario.lower()
+
+    # ---------------- Estado actual ----------------
+    st.markdown("#### 📋 Estado actual")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Usuario interno", f"@{usuario}")
+    c2.metric("@ real en X", f"@{handle_real}" if handle_real else "—")
+    c3.metric("Nombre en X", nombre_real or "—")
+
+    if difiere:
+        st.info(
+            f"El @ real guardado (@{handle_real}) difiere del usuario interno "
+            f"(@{usuario}). Sincroniza para confirmar que sigue vigente."
+        )
+    elif not handle_real:
+        st.warning(
+            "Esta cuenta no tiene `handle_actual` guardado; sincronízala para "
+            "leer su @ real desde X."
+        )
+    else:
+        st.caption("El usuario interno ya coincide con el @ real guardado.")
+
+    if st.button(
+        "🔄 Sincronizar este perfil desde X",
+        use_container_width=True,
+        key=f"ren_sync_{usuario}",
+        help="Relee nombre/@ reales con las cookies guardadas (httpx, sin Chrome).",
+    ):
+        resultado = None
+        try:
+            with get_db_session() as db:
+                cuenta = db.query(Cuenta).filter(Cuenta.usuario == usuario).first()
+            if cuenta is None:
+                st.error(f"No se encontró @{usuario} en la base de datos.")
+            else:
+                from plataformas.twitter.perfil import sincronizar_cuenta
+
+                resultado = sincronizar_cuenta(cuenta)
+        except Exception as e:
+            st.error(f"Falló la sincronización de @{usuario}: {e}")
+        if resultado is not None:
+            _listar_cuentas.clear()
+            st.session_state["cuentas_renombrar_sync"] = resultado
+            _flash(f"Perfil de @{usuario} sincronizado desde X.")
+            st.rerun()
+
+    # ---------------- Nuevo usuario ----------------
+    st.markdown("---")
+    st.markdown("#### ✍️ Nuevo usuario interno")
+    default_nuevo = handle_real if difiere else usuario
+    nuevo = (
+        st.text_input(
+            "Nuevo usuario interno",
+            value=default_nuevo,
+            key=f"ren_nuevo_{usuario}",
+            help=(
+                "Clave interna usada por cookies, perfil Chrome y rutas de "
+                "imágenes. Por defecto se propone el @ real."
+            ),
+        )
+        .strip()
+        .lstrip("@")
+        .strip()
+    )
+
+    if nuevo and not HANDLE_RE.match(nuevo):
+        st.warning(
+            f"'{nuevo}' no cumple el formato de handle de X "
+            "(4-15 caracteres: letras, números y _). Puedes continuar, pero "
+            "verifica que sea un nombre válido."
+        )
+
+    if st.button(
+        "🔍 Previsualizar (dry-run)",
+        use_container_width=True,
+        key="btn_ren_dry",
+        help="Calcula la migración sin tocar la BD ni mover archivos.",
+    ):
+        from core.renombrar import renombrar_usuario
+
+        res = renombrar_usuario(usuario, nuevo, dry_run=True)
+        _render_resultado_renombrado(res, "👁️ Simulación (no se tocó nada)")
+
+    # ---------------- Renombrado real ----------------
+    st.markdown("---")
+    st.markdown("#### 🏷️ Aplicar renombrado")
+    confirmado = st.checkbox(
+        "Confirmo renombrar la clave interna (migra los archivos y el historial)",
+        key=f"ren_confirm_{usuario}",
+    )
+    if st.button(
+        "🏷️ Renombrar usuario interno",
+        type="primary",
+        use_container_width=True,
+        key=f"ren_btn_{usuario}",
+    ):
+        if not confirmado:
+            st.warning("Marca la casilla de confirmación para continuar.")
+        elif not nuevo:
+            st.warning("Escribe el nuevo usuario interno.")
+        elif nuevo.lower() == usuario.lower():
+            st.warning("El nuevo usuario es igual al actual: no hay nada que renombrar.")
+        else:
+            from core.renombrar import renombrar_usuario
+
+            with st.spinner(f"Renombrando @{usuario} → @{nuevo}..."):
+                res = renombrar_usuario(usuario, nuevo)
+            _listar_cuentas.clear()
+            st.session_state["cuentas_renombrar_resultado"] = res
+            if res.get("ok"):
+                _flash(f"Usuario interno renombrado: @{usuario} → @{nuevo}.")
+            st.rerun()
+
+    # ---------------- Lote al @ real ----------------
+    st.markdown("---")
+    st.markdown("#### 🧹 Renombrar al @ real (lote)")
+    st.caption(
+        "Detecta las cuentas cuyo `handle_actual` difiere del usuario interno y "
+        "las renombra a ese @. Es la forma práctica de dejar el inventario "
+        "alineado tras una sincronización masiva."
+    )
+
+    pendientes = []
+    for f in cuentas:
+        handle_f = (f.get("handle_actual") or "").strip().lstrip("@")
+        if handle_f and handle_f.lower() != (f.get("usuario") or "").lower():
+            pendientes.append(f)
+
+    if not pendientes:
+        st.info(
+            "No hay cuentas pendientes: el usuario interno ya coincide con el "
+            "@ real guardado."
+        )
+        return
+
+    st.caption(f"Cuentas pendientes: **{len(pendientes)}**.")
+    opciones_lote = {_etiqueta_cuenta_perfil(f): f for f in pendientes}
+    seleccion_lote = st.multiselect(
+        "Cuentas a renombrar al @ real",
+        list(opciones_lote.keys()),
+        key="ren_lote_cuentas",
+    )
+    confirmado_lote = st.checkbox(
+        "Confirmo renombrar las cuentas seleccionadas al @ real guardado",
+        key="ren_lote_confirm",
+    )
+    if st.button(
+        "🏷️ Renombrar seleccionadas al @ real",
+        type="primary",
+        use_container_width=True,
+        key="btn_ren_lote",
+    ):
+        if not confirmado_lote:
+            st.warning("Marca la casilla de confirmación para continuar.")
+        elif not seleccion_lote:
+            st.warning("Selecciona al menos una cuenta.")
+        else:
+            from core.renombrar import renombrar_al_handle_actual
+
+            usuarios_lote = [
+                opciones_lote[label]["usuario"]
+                for label in seleccion_lote
+                if label in opciones_lote
+            ]
+            total = len(usuarios_lote)
+            barra = st.progress(0.0)
+            estado = st.empty()
+            filas_resumen = []
+            ok = 0
+            for i, usuario_lote in enumerate(usuarios_lote, start=1):
+                estado.write(f"⏳ Renombrando @{usuario_lote} ({i}/{total})...")
+                try:
+                    res_lote = renombrar_al_handle_actual(usuario_lote)
+                except Exception as e:  # blindaje extra: nunca debería lanzar
+                    res_lote = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+                movidos = sum(
+                    1 for a in (res_lote.get("archivos") or []) if a.get("ok")
+                )
+                if res_lote.get("ok"):
+                    ok += 1
+                filas_resumen.append(
+                    {
+                        "usuario anterior": res_lote.get("usuario_anterior")
+                        or usuario_lote,
+                        "usuario nuevo": res_lote.get("usuario_nuevo") or "",
+                        "ok": "✅" if res_lote.get("ok") else "❌",
+                        "archivos movidos": movidos,
+                        "error": res_lote.get("error") or "",
+                        "advertencias": " · ".join(
+                            res_lote.get("advertencias") or []
+                        ),
+                    }
+                )
+                barra.progress(i / total)
+
+            _listar_cuentas.clear()
+            estado.write("✅ Lote terminado")
+            if ok:
+                st.success(f"Renombradas: {ok}/{total} cuenta(s).")
+            if ok < total:
+                st.error(f"Fallidas: {total - ok}/{total} cuenta(s).")
+            st.dataframe(filas_resumen, use_container_width=True)
 
 
 def _tab_cambiar_perfil():
@@ -2320,6 +2682,16 @@ def _tab_cambiar_perfil():
         "Confirmo que quiero modificar el perfil REAL de esta cuenta",
         key=f"perfil_confirm_{usuario}",
     )
+    renombrar_interno = st.checkbox(
+        "Renombrar también el usuario interno al nuevo @ "
+        "(migra cookies/perfiles/historial)",
+        key=f"perfil_renombrar_{usuario}",
+        help=(
+            "Si el cambio de @ en X tiene éxito, la clave interna `usuario` pasa "
+            "a ser el nuevo @. Las tareas programadas no se ven afectadas "
+            "(referencian cuentas por id)."
+        ),
+    )
 
     if st.button(
         "✏️ Aplicar cambios en X",
@@ -2378,10 +2750,40 @@ def _tab_cambiar_perfil():
         if handle_env:
             if res.get("handle"):
                 st.markdown("- ✅ **@** actualizado en X.")
-                st.info(
-                    f"El @ interno (`usuario`) NO cambió por diseño: la clave "
-                    f"interna de login sigue siendo `{usuario}`."
-                )
+                if renombrar_interno and handle_env.lower() != usuario.lower():
+                    # El bot ya persistió `handle_actual`; aquí solo se migra la
+                    # clave interna y sus archivos al nuevo @.
+                    from core.renombrar import renombrar_usuario
+
+                    with st.spinner(
+                        f"Migrando la clave interna @{usuario} → @{handle_env}..."
+                    ):
+                        res_ren = renombrar_usuario(usuario, handle_env)
+                    _listar_cuentas.clear()
+                    if res_ren.get("ok"):
+                        st.success(
+                            "Usuario interno renombrado: "
+                            f"@{res_ren.get('usuario_anterior') or usuario} → "
+                            f"@{res_ren.get('usuario_nuevo') or handle_env}."
+                        )
+                    else:
+                        st.error(
+                            "No se pudo renombrar el usuario interno: "
+                            f"{res_ren.get('error') or 'sin detalle'}"
+                        )
+                    for aviso in res_ren.get("advertencias") or []:
+                        st.warning(aviso)
+                elif renombrar_interno:
+                    st.caption(
+                        "El usuario interno ya coincide con el nuevo @: no hace "
+                        "falta renombrar la clave interna."
+                    )
+                else:
+                    st.info(
+                        "El @ interno (`usuario`) NO cambió por diseño: la clave "
+                        f"interna de login sigue siendo `{usuario}`. Marca la "
+                        "casilla de renombrado si también quieres migrarla."
+                    )
             else:
                 st.markdown("- ❌ No se pudo cambiar el **@**.")
 
@@ -2393,6 +2795,345 @@ def _tab_cambiar_perfil():
             ultimo_error = getattr(bot, "ultimo_error", "") if bot is not None else ""
             if ultimo_error:
                 st.markdown(f"`bot.ultimo_error`: {ultimo_error}")
+
+
+# ------------------- Anti-detección (User-Agent + cookies) -------------------
+
+def _datos_anti_deteccion(usuario: str) -> dict:
+    """Lee `cookies_json`, `auth_token` y `user_agent` de una cuenta, ya planos.
+
+    Se consulta en vivo (no desde `_listar_cuentas`) para mostrar las cookies
+    completas sin engordar la cache del inventario. Nunca lanza: ante error
+    devuelve `error` con el detalle."""
+    datos = {"cookies": [], "auth_token": "", "user_agent": "", "error": ""}
+    try:
+        with get_db_session() as db:
+            cuenta = db.query(Cuenta).filter(Cuenta.usuario == usuario).first()
+            if cuenta is None:
+                datos["error"] = f"No se encontró @{usuario} en la base de datos."
+                return datos
+            cookies = getattr(cuenta, "cookies_json", None)
+            if isinstance(cookies, str):
+                try:
+                    cookies = json.loads(cookies)
+                except Exception:
+                    cookies = []
+            if isinstance(cookies, dict):
+                cookies = cookies.get("cookies") or []
+            datos["cookies"] = (
+                list(cookies) if isinstance(cookies, (list, tuple)) else []
+            )
+            datos["auth_token"] = getattr(cuenta, "auth_token", "") or ""
+            datos["user_agent"] = getattr(cuenta, "user_agent", "") or ""
+    except Exception as e:
+        datos["error"] = f"No se pudo consultar la cuenta: {e}"
+    return datos
+
+
+def _nombres_cookies(cookies) -> list:
+    """Nombres de las cookies guardadas (acepta `name`/`Name`), sin duplicar."""
+    nombres = []
+    for cookie in cookies or []:
+        if not isinstance(cookie, dict):
+            continue
+        nombre = cookie.get("name", cookie.get("Name"))
+        if nombre and str(nombre) not in nombres:
+            nombres.append(str(nombre))
+    return nombres
+
+
+def _valor_cookie(cookies, objetivo: str) -> str:
+    """Valor de la primera cookie con ese nombre (comparacion sin mayusculas)."""
+    for cookie in cookies or []:
+        if not isinstance(cookie, dict):
+            continue
+        nombre = cookie.get("name", cookie.get("Name"))
+        if nombre and str(nombre).strip().lower() == objetivo.lower():
+            valor = cookie.get("value", cookie.get("Value"))
+            if valor not in (None, ""):
+                return str(valor)
+    return ""
+
+
+def _guardar_user_agent(usuario: str, user_agent: str) -> int:
+    """Guarda `Cuenta.user_agent` ('' = UA natural). Devuelve filas cambiadas."""
+    with get_db_session() as db:
+        cambiadas = (
+            db.query(Cuenta)
+            .filter(Cuenta.plataforma == "twitter", Cuenta.usuario == usuario)
+            .update({Cuenta.user_agent: user_agent}, synchronize_session=False)
+        )
+    _listar_cuentas.clear()
+    return cambiadas
+
+
+def _guardar_cookies_completas(usuario: str, cookies: list) -> dict:
+    """Reemplaza `Cuenta.cookies_json` con la lista decodificada COMPLETA.
+
+    Si el lote trae una cookie `auth_token` con valor, tambien actualiza
+    `Cuenta.auth_token` (lo usa el validador de sesiones). Devuelve
+    `{"ok": bool, "auth_token": bool, "error": str}`; nunca lanza."""
+    try:
+        auth = _valor_cookie(cookies, "auth_token")
+        with get_db_session() as db:
+            cuenta = (
+                db.query(Cuenta)
+                .filter(Cuenta.plataforma == "twitter", Cuenta.usuario == usuario)
+                .first()
+            )
+            if cuenta is None:
+                return {
+                    "ok": False,
+                    "auth_token": False,
+                    "error": f"No se encontró @{usuario} en la base de datos.",
+                }
+            cuenta.cookies_json = cookies
+            if auth:
+                cuenta.auth_token = auth.strip()[:200]
+        _listar_cuentas.clear()
+        return {"ok": True, "auth_token": bool(auth), "error": ""}
+    except Exception as e:
+        return {"ok": False, "auth_token": False, "error": str(e)}
+
+
+def _tab_anti_deteccion():
+    """User-Agent por cuenta y cookies completas (anti-deteccion)."""
+    st.markdown("### 🛡️ Anti-detección (User-Agent y cookies)")
+    st.caption(
+        "`undetected-chromedriver` ya oculta `navigator.webdriver` al abrir "
+        "Chrome. Esta pestaña controla lo que depende del lote: el "
+        "**User-Agent de cada cuenta** (debe coincidir con el navegador que "
+        "emitió las cookies) y las **cookies completas** (`auth_token`, `ct0`, "
+        "`twid`…) que se inyectan al abrir el navegador."
+    )
+
+    cuentas = _listar_cuentas(OPCION_TODAS)
+    if not cuentas:
+        st.info("No hay cuentas de Twitter en la base de datos.")
+        return
+
+    preview = st.session_state.pop("cuentas_ad_cookies_preview", None)
+    if preview:
+        st.success(
+            f"Cookies guardadas para @{preview['usuario']}: "
+            f"{preview['total']} cookie(s), {preview['inyectables']} inyectable(s)."
+        )
+        if preview.get("nombres"):
+            st.caption("Nombres: " + ", ".join(preview["nombres"]))
+
+    opciones = {_etiqueta_cuenta_perfil(f): f for f in cuentas}
+    etiqueta = st.selectbox("Cuenta", list(opciones.keys()), key="ad_cuenta")
+    fila = opciones[etiqueta]
+    usuario = fila["usuario"]
+
+    datos = _datos_anti_deteccion(usuario)
+    if datos.get("error"):
+        st.error(datos["error"])
+        return
+
+    from utils.anti_detection import normalizar_cookies, resolver_ua_cuenta
+
+    cookies = datos["cookies"]
+    nombres = _nombres_cookies(cookies)
+    ua_bd = (datos["user_agent"] or "").strip()
+    ua_efectivo = resolver_ua_cuenta({"user_agent": ua_bd})
+    ua_global = resolver_ua_cuenta({"user_agent": ""})
+
+    st.markdown("#### 📋 Estado actual")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.metric("Cookies guardadas", len(cookies))
+        if nombres:
+            resumen_nombres = ", ".join(nombres[:10])
+            if len(nombres) > 10:
+                resumen_nombres += f" … (+{len(nombres) - 10})"
+            st.caption(resumen_nombres)
+        else:
+            st.caption("Sin cookies guardadas.")
+    with c2:
+        st.metric("User-Agent en BD", "Sí" if ua_bd else "No")
+        st.caption(ua_bd or "—")
+    with c3:
+        if ua_bd:
+            origen_ua = "Cuenta"
+        elif ua_global:
+            origen_ua = "Global"
+        else:
+            origen_ua = "Natural"
+        st.metric("UA efectivo", origen_ua)
+        st.caption(ua_efectivo or "UA natural de Chrome")
+
+    if ua_bd and "Mozilla/" not in ua_bd:
+        st.warning(
+            "El User-Agent guardado no contiene `Mozilla/`; los navegadores "
+            "reales sí lo incluyen, así que probablemente sea inválido."
+        )
+
+    # ---------------- Editor de User-Agent ----------------
+    st.markdown("---")
+    st.markdown("#### ✍️ User-Agent de esta cuenta")
+    version_ua = int(st.session_state.get("ad_ua_version", 0) or 0)
+    ua_editado = st.text_area(
+        "User-Agent",
+        value=ua_bd,
+        height=100,
+        key=f"ad_ua_texto_{usuario}_{version_ua}",
+        placeholder="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ...",
+        help="Se usa al abrir Chrome para esta cuenta. Vacío = UA natural del navegador.",
+    )
+    ua_limpio = (ua_editado or "").strip()
+    no_mozilla = bool(ua_limpio) and "Mozilla/" not in ua_limpio
+
+    confirmar_ua = False
+    if no_mozilla:
+        st.warning(
+            "Este User-Agent no contiene `Mozilla/`: los navegadores reales sí. "
+            "Guardarlo así puede delatar la automatización."
+        )
+        confirmar_ua = st.checkbox(
+            "Confirmo guardar un User-Agent sin `Mozilla/`",
+            key=f"ad_ua_confirmar_{usuario}_{version_ua}",
+        )
+
+    col_guardar, col_limpiar = st.columns(2)
+    with col_guardar:
+        if st.button(
+            "💾 Guardar User-Agent",
+            type="primary",
+            use_container_width=True,
+            key=f"ad_ua_guardar_{usuario}_{version_ua}",
+        ):
+            if not ua_limpio:
+                st.warning(
+                    "El campo está vacío: usa 'Limpiar (usar UA natural)' para "
+                    "dejar la cuenta con el UA del navegador."
+                )
+            elif no_mozilla and not confirmar_ua:
+                st.warning(
+                    "Marca la casilla de confirmación para guardar un "
+                    "User-Agent sin `Mozilla/`."
+                )
+            else:
+                try:
+                    if _guardar_user_agent(usuario, ua_limpio):
+                        st.session_state["ad_ua_version"] = version_ua + 1
+                        _flash(
+                            f"User-Agent de @{usuario} guardado"
+                            + (" (sin `Mozilla/`)." if no_mozilla else ".")
+                        )
+                        st.rerun()
+                    else:
+                        st.error(f"No se encontró @{usuario} en la base de datos.")
+                except Exception as e:
+                    st.error(f"No se pudo guardar el User-Agent: {e}")
+    with col_limpiar:
+        if st.button(
+            "🧹 Limpiar (usar UA natural)",
+            use_container_width=True,
+            key=f"ad_ua_limpiar_{usuario}_{version_ua}",
+        ):
+            try:
+                if _guardar_user_agent(usuario, ""):
+                    st.session_state["ad_ua_version"] = version_ua + 1
+                    _flash(
+                        f"User-Agent de @{usuario} limpiado: usará el UA "
+                        "natural de Chrome."
+                    )
+                    st.rerun()
+                else:
+                    st.error(f"No se encontró @{usuario} en la base de datos.")
+            except Exception as e:
+                st.error(f"No se pudo limpiar el User-Agent: {e}")
+
+    # ---------------- Inyector de cookies ----------------
+    st.markdown("---")
+    st.markdown("#### 🍪 Cookies completas (pegar del vendedor)")
+    st.caption(
+        "Acepta JSON crudo (`[...]` o `{\"cookies\":[...]}`) o base64. Se "
+        "guardan COMPLETAS (`auth_token`, `ct0`, `twid`…), no solo el "
+        "`auth_token`; si el lote trae esa cookie, también se actualiza "
+        "`Cuenta.auth_token`."
+    )
+    version_ck = int(st.session_state.get("ad_cookies_version", 0) or 0)
+    texto_cookies = st.text_area(
+        "Cookies (JSON crudo o base64)",
+        height=160,
+        key=f"ad_cookies_texto_{usuario}_{version_ck}",
+        placeholder='[{"name":"auth_token","value":"..."}, ...]',
+    )
+    confirmar_cookies = st.checkbox(
+        "Confirmo reemplazar las cookies guardadas de esta cuenta",
+        key=f"ad_cookies_confirmar_{usuario}_{version_ck}",
+    )
+    if st.button(
+        "🍪 Guardar cookies completas",
+        type="primary",
+        use_container_width=True,
+        key=f"ad_cookies_guardar_{usuario}_{version_ck}",
+    ):
+        if not (texto_cookies or "").strip():
+            st.warning("Pega las cookies primero (JSON crudo o base64).")
+        elif not confirmar_cookies:
+            st.warning("Marca la casilla de confirmación para reemplazar las cookies.")
+        else:
+            from cuentas.importador import decodificar_cookies
+
+            lista = decodificar_cookies(texto_cookies)
+            if not lista:
+                st.error(
+                    "No se pudieron decodificar: revisa que sea JSON válido "
+                    "(`[...]` o `{\"cookies\":[...]}`) o base64 correcto."
+                )
+            else:
+                normalizadas = normalizar_cookies(lista)
+                if not normalizadas:
+                    st.error(
+                        "Las cookies decodificaron, pero ninguna es inyectable "
+                        "en Selenium (revisa `name`/`value`): no se guardó nada."
+                    )
+                else:
+                    if len(normalizadas) < len(lista):
+                        st.warning(
+                            f"{len(lista) - len(normalizadas)} cookie(s) no son "
+                            "inyectables y Selenium las ignorará."
+                        )
+                    res = _guardar_cookies_completas(usuario, lista)
+                    if res.get("ok"):
+                        st.session_state["cuentas_ad_cookies_preview"] = {
+                            "usuario": usuario,
+                            "total": len(lista),
+                            "inyectables": len(normalizadas),
+                            "nombres": _nombres_cookies(lista)[:10],
+                        }
+                        st.session_state["ad_cookies_version"] = version_ck + 1
+                        extra = (
+                            " y `auth_token` actualizado"
+                            if res.get("auth_token")
+                            else " (sin cookie `auth_token`: no se tocó la columna)"
+                        )
+                        _flash(
+                            f"Cookies de @{usuario} guardadas: {len(lista)} en "
+                            f"total, {len(normalizadas)} inyectables{extra}."
+                        )
+                        st.rerun()
+                    else:
+                        st.error(
+                            res.get("error")
+                            or "No se pudieron guardar las cookies."
+                        )
+
+    # ---------------- Verificación manual ----------------
+    st.markdown("---")
+    with st.expander("✅ Verificación manual"):
+        st.markdown(
+            "1. Abre el navegador controlado y pulsa `F12` para abrir DevTools.\n"
+            "2. En la consola ejecuta `navigator.webdriver`: debe devolver "
+            "`undefined` (o `false`).\n"
+            "3. En la pestaña Network revisa el header `User-Agent` de cualquier "
+            "petición: debe ser idéntico al del lote.\n"
+            "4. Entra a `https://x.com/home`: debe abrir el feed directo, sin "
+            "pasar por `https://x.com/account/access`."
+        )
 
 
 def _tab_inventario():
@@ -2487,6 +3228,7 @@ def _tab_inventario():
                 "email": f["email"],
                 "last_checked": f["last_checked"],
                 "cookies": f["cookies"],
+                "user_agent": _abreviar(f.get("user_agent"), 40),
             }
             for f in grupo_filas
         ]
@@ -2593,7 +3335,9 @@ def render(usuario):
         "🏷️ Nombres": _tab_nombres,
         "⏸️ Estado": _tab_estado,
         "📷 Fotos": _tab_fotos,
+        "🛡️ Anti-detección": _tab_anti_deteccion,
         "🔄 Sincronizar desde X": _tab_sincronizar,
+        "🏷️ Renombrar usuario": _tab_renombrar,
         "✏️ Cambiar nombre/@": _tab_cambiar_perfil,
         "📋 Inventario": _tab_inventario,
         "📤 Exportar": _tab_exportar,

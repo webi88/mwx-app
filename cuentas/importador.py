@@ -2,17 +2,25 @@
 
 Formato de cada línea (campos separados por `:`):
 
-    username:password:totp_secret:email:email_password:auth_token[:cookies_base64]
+    username:password:totp_secret:email:email_password:auth_token[:cookies][:user_agent]
 
-* 6 campos: sin cookies (lo normal en lotes recién creados; el `auth_token`
-  basta para validar la sesión y derivar el `ct0` después).
-* 7 campos: el último (`cookies_base64`) es una cadena en base64 que, al
-  decodificarla, contiene un JSON con una LISTA de cookies nativas de X
-  (objetos con claves `name`, `value`, `domain`, `path`, `secure`, etc.).
+* 6 campos: sin cookies ni User-Agent (lo normal en lotes recién creados; el
+  `auth_token` basta para validar la sesión y derivar el `ct0` después).
+* 7 campos: el último (`cookies`) es la sesión de la cuenta, ya sea en base64
+  (que al decodificar da un JSON) o JSON CRUDO (`[...]` / `{"cookies": [...]}`),
+  con la LISTA de cookies nativas de X (objetos con claves `name`, `value`,
+  `domain`, `path`, `secure`, etc.). Si el 7º campo empieza con `Mozilla/` es
+  en realidad el User-Agent con las cookies vacías.
+* 8 campos: el 7º son las `cookies` y el 8º (último) el `user_agent`, que se
+  guarda tal cual para que Chrome use el mismo agente que cuando se creó.
+* El User-Agent también puede venir con clave `user_agent=`, `useragent=` o
+  `ua=` en CUALQUIER posición: se extrae su valor (solo el texto posterior al
+  `=`) y el campo se elimina del listado.
 
 Este módulo reemplaza el flujo obsoleto de `cargar_cuenta.py` (login con
-contraseña para extraer la cookie): ahora las credenciales y las cookies se
-importan directamente a la base de datos.
+contraseña para extraer la cookie): ahora las credenciales, las cookies
+COMPLETAS (auth_token, ct0, twid, etc.) y el User-Agent se importan
+directamente a la base de datos.
 """
 import base64
 import binascii
@@ -38,19 +46,59 @@ except Exception:  # pragma: no cover - defensivo si falta core/registros.py
         return ""
 
 
-def decodificar_cookies(cookies_base64: str) -> Optional[list]:
-    """Decodifica una cadena base64 a una lista de cookies (JSON).
+def _extraer_lista_cookies(datos) -> Optional[list]:
+    """Extrae la lista de cookies de un JSON ya parseado.
 
-    Devuelve la lista de cookies o `None` si el base64/JSON es inválido.
-    Tolerante con padding de base64 incompleto, `binascii.Error`,
-    `json.JSONDecodeError` y `UnicodeDecodeError`.
+    Acepta directamente una lista o un objeto `{"cookies": [...]}` (algunos
+    exportadores envuelven la lista). Devuelve `None` con warning si la forma
+    no es reconocida. NO normaliza las cookies: se guardan tal cual vienen.
     """
-    if not cookies_base64:
-        logger.warning("Cookies base64 vacías")
+    if isinstance(datos, list):
+        return datos
+    if isinstance(datos, dict) and isinstance(datos.get("cookies"), list):
+        return datos["cookies"]
+    logger.warning(
+        f"El JSON de cookies no es una lista ni {{'cookies': [...]}} "
+        f"(es {type(datos).__name__})"
+    )
+    return None
+
+
+def decodificar_cookies(valor: str) -> Optional[list]:
+    """Convierte el campo de cookies a una lista de cookies (JSON).
+
+    Acepta:
+    * JSON CRUDO: el texto (tras `strip`) empieza con `[` o `{`; los lotes de
+      vendedores suelen pegar el JSON directamente. Si es un objeto con la
+      forma `{"cookies": [...]}` se extrae esa lista.
+    * Base64 (comportamiento original): se decodifica y el JSON resultante
+      debe ser una lista (o un objeto `{"cookies": [...]}`).
+
+    Devuelve la lista de cookies tal como viene (SIN normalizar; la
+    normalización para Selenium vive en `utils/anti_detection.py`) o `None`
+    si el JSON/base64 es inválido. Nunca lanza excepciones: es tolerante con
+    padding de base64 incompleto, `binascii.Error`, `json.JSONDecodeError` y
+    `UnicodeDecodeError`.
+    """
+    if not valor:
+        logger.warning("Cookies vacías")
         return None
 
-    raw = cookies_base64.strip()
-    # Agregar padding `=` si hace falta (múltiplo de 4).
+    raw = valor.strip()
+    if not raw:
+        logger.warning("Cookies vacías")
+        return None
+
+    # JSON crudo (lotes de vendedores que pegan el JSON directamente).
+    if raw[0] in "[{":
+        try:
+            datos = json.loads(raw)
+        except json.JSONDecodeError as e:
+            logger.warning(f"JSON inválido en cookies: {e}")
+            return None
+        return _extraer_lista_cookies(datos)
+
+    # Base64: agregar padding `=` si hace falta (múltiplo de 4).
     rem = len(raw) % 4
     if rem:
         raw += "=" * (4 - rem)
@@ -73,15 +121,33 @@ def decodificar_cookies(cookies_base64: str) -> Optional[list]:
         logger.warning(f"JSON inválido en cookies: {e}")
         return None
 
-    if not isinstance(cookies, list):
-        logger.warning(f"El JSON de cookies no es una lista (es {type(cookies).__name__})")
-        return None
+    return _extraer_lista_cookies(cookies)
 
-    return cookies
+
+# Claves aceptadas para el User-Agent cuando viene etiquetado (`clave=valor`)
+# en cualquier posición de la línea.
+_CLAVES_USER_AGENT = ("user_agent", "useragent", "ua")
 
 
 def parsear_linea(linea: str) -> Optional[dict]:
-    """Convierte una línea del lote en un dict con las credenciales y cookies.
+    """Convierte una línea del lote en un dict con credenciales, cookies y UA.
+
+    Formatos aceptados (campos separados por `:`):
+
+        user:pass:totp:email:email_pass:auth_token[:cookies][:user_agent]
+
+    * 6 campos: sin cookies ni User-Agent.
+    * 7 campos: el último son las cookies (base64 o JSON crudo). Si el último
+      campo empieza con `Mozilla/` es el User-Agent y las cookies vienen
+      vacías.
+    * 8 campos: 7º cookies, 8º User-Agent.
+    * El User-Agent también se acepta con clave `user_agent=`, `useragent=` o
+      `ua=` en cualquier posición; ese campo se extrae (solo el texto posterior
+      al primer `=`) y se elimina del listado.
+    * Las cookies pueden ser JSON crudo; como el JSON contiene `:`, si el 7º
+      campo empieza con `[` o `{` se re-une el resto de la línea como un solo
+      campo de cookies (si al final viene un User-Agent posicional que empieza
+      con `Mozilla/`, se separa antes de re-unir).
 
     Devuelve `None` si la línea está vacía, es un comentario (`#`) o está
     malformada. Registra con `logger.warning` el motivo del fallo (incluyendo
@@ -92,18 +158,57 @@ def parsear_linea(linea: str) -> Optional[dict]:
         return None
 
     partes = linea.split(":")
-    # Acepta 6 campos (sin cookies) o 7 (con cookies_base64). El base64 no
-    # contiene ':' por lo que split simple es seguro.
+
+    # 1) Extraer el User-Agent etiquetado (`ua=Mozilla/...`) de cualquier
+    #    posición. El UA no contiene `:`, así que basta con el fragmento.
+    user_agent = ""
+    restantes = []
+    for parte in partes:
+        clave, sep, valor = parte.partition("=")
+        if sep and clave.strip().lower() in _CLAVES_USER_AGENT:
+            if not user_agent:
+                user_agent = valor.strip()
+        else:
+            restantes.append(parte)
+    partes = restantes
+
+    # 2) Cookies en JSON crudo: el JSON trae `:` propios, por lo que el split
+    #    simple lo fragmenta. Si el 7º campo empieza con `[` o `{`, se re-une
+    #    todo el resto de la línea como el campo de cookies. Un User-Agent
+    #    posicional (sin clave, empieza con `Mozilla/`) al final se separa
+    #    antes de re-unir, porque si no quedaría dentro del JSON.
+    if len(partes) > 7 and partes[6].strip().startswith(("[", "{")):
+        if not user_agent and partes[-1].strip().startswith("Mozilla/"):
+            user_agent = partes[-1].strip()
+            partes = partes[:6] + [":".join(partes[6:-1])]
+        else:
+            partes = partes[:6] + [":".join(partes[6:])]
+
+    # Acepta 6 campos (sin cookies), 7 (con cookies o con UA) u 8 (cookies+UA).
     if len(partes) == 6:
-        partes = partes + [""]
-    if len(partes) != 7:
+        cookies_b64 = ""
+    elif len(partes) == 7:
+        ultimo = partes[6].strip()
+        if ultimo.startswith("Mozilla/"):
+            # 7º campo = User-Agent (las cookies vienen vacías).
+            cookies_b64 = ""
+            if not user_agent:
+                user_agent = ultimo
+        else:
+            cookies_b64 = partes[6]
+    elif len(partes) == 8:
+        cookies_b64 = partes[6]
+        ua_posicional = partes[7].strip()
+        if ua_posicional and not user_agent:
+            user_agent = ua_posicional
+    else:
         logger.warning(
-            f"Línea malformada (se esperaban 6 o 7 campos, se obtuvieron "
+            f"Línea malformada (se esperaban 6, 7 u 8 campos, se obtuvieron "
             f"{len(partes)}): {linea[:40]}"
         )
         return None
 
-    username, password, totp_secret, email, email_password, auth_token, cookies_b64 = partes
+    username, password, totp_secret, email, email_password, auth_token = partes[:6]
 
     # Las cookies son OPCIONALES: si no vienen, la cuenta se importa igual y el
     # validador obtiene el ct0 a partir del auth_token.
@@ -122,6 +227,7 @@ def parsear_linea(linea: str) -> Optional[dict]:
         "email_password": email_password,
         "auth_token": auth_token,
         "cookies": cookies,
+        "user_agent": user_agent,
     }
 
 
@@ -149,6 +255,8 @@ def importar_una(fields: dict, seccion: str = "", tipo_cuenta: str = "") -> str:
     `auth_token`/credenciales vacías NO se pisan `auth_token` ni
     `cookies_json` (ni el resto de credenciales); solo se actualizan cuando
     el lote trae valores no vacíos (`cookies` solo cuando no es `None`).
+    El `user_agent` se pisa igual que el resto: solo si el lote trae uno no
+    vacío, así una re-importación sin UA conserva el guardado.
     """
     seccion_norm = normalizar_seccion(seccion)
     tipo_norm = normalizar_tipo_cuenta(tipo_cuenta)
@@ -165,6 +273,7 @@ def importar_una(fields: dict, seccion: str = "", tipo_cuenta: str = "") -> str:
                 email_password=fields.get("email_password", ""),
                 auth_token=fields.get("auth_token", ""),
                 cookies_json=fields.get("cookies"),
+                user_agent=fields.get("user_agent", ""),
                 plataforma="twitter",
                 status="imported",
                 activa=True,
@@ -188,6 +297,7 @@ def importar_una(fields: dict, seccion: str = "", tipo_cuenta: str = "") -> str:
                 "email",
                 "email_password",
                 "auth_token",
+                "user_agent",
             ):
                 _nuevo = fields.get(_campo, "")
                 if _valor_informado(_nuevo):

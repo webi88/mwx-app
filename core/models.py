@@ -95,6 +95,9 @@ class Cuenta(Base):
     email_password = Column(String(200), default="")
     auth_token = Column(String(200), default="")
     cookies_json = Column(JSON, nullable=True)
+    # User-Agent original de la cuenta (viene en el lote) para que Chrome use
+    # el mismo agente que cuando se creo.
+    user_agent = Column(String(300), default="")
     status = Column(String(20), default="imported")
     last_checked = Column(DateTime, nullable=True)
     

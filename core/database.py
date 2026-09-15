@@ -147,6 +147,7 @@ NUEVAS_COLUMNAS_CUENTAS = {
     "totp_secret": "VARCHAR(100) DEFAULT ''",
     "email_password": "VARCHAR(200) DEFAULT ''",
     "auth_token": "VARCHAR(200) DEFAULT ''",
+    "user_agent": "VARCHAR(300) DEFAULT ''",
     "cookies_json": "TEXT",
     "status": "VARCHAR(20) DEFAULT 'imported'",
     "last_checked": "DATETIME",
