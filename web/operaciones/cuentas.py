@@ -12,6 +12,7 @@ import bisect
 import json
 import os
 import re
+import threading
 
 import streamlit as st
 
@@ -60,6 +61,7 @@ TABS = [
     "🔄 Sincronizar desde X",
     "🏷️ Renombrar usuario",
     "✏️ Cambiar nombre/@",
+    "🧾 Perfil completo",
     "📋 Inventario",
     "📤 Exportar",
 ]
@@ -2797,6 +2799,430 @@ def _tab_cambiar_perfil():
                 st.markdown(f"`bot.ultimo_error`: {ultimo_error}")
 
 
+# ------------------- Perfil completo (flujo guiado en X) -------------------
+
+# Campos booleanos que devuelve `actualizar_perfil_completo`, en el orden del
+# flujo del backend (login → foto de perfil → portada → nombre → bio →
+# ubicación → @). Se usan para el resumen persistente.
+PERFIL_PASOS_RESUMEN = [
+    ("login", "Inicio de sesión"),
+    ("foto_perfil", "Foto de perfil"),
+    ("foto_portada", "Foto de portada"),
+    ("nombre", "Nombre mostrado"),
+    ("bio", "Biografía"),
+    ("ubicacion", "Ubicación"),
+    ("handle", "Usuario (@)"),
+]
+
+
+def _progreso_perfil_callback(barra, estado, pasos: list, hilo_ui: int, lock):
+    """Callback de progreso para `TwitterBot.actualizar_perfil_completo`.
+
+    El backend Selenium es síncrono, así que en la práctica el callback corre en
+    el mismo hilo que el script de Streamlit y puede pintar la barra/el estado en
+    vivo. Si el backend lo invocara desde un hilo auxiliar, solo se registra el
+    paso en `pasos` (protegido por `lock`) y NO se tocan widgets de Streamlit
+    fuera de su hilo: eso es lo que provocaría excepciones y condiciones de
+    carrera con la sesión.
+    """
+
+    def _callback(actual, total, paso, ok, detalle):
+        registro = {
+            "paso": str(paso or ""),
+            "ok": bool(ok),
+            "detalle": str(detalle or ""),
+        }
+        with lock:
+            pasos.append(registro)
+
+        if threading.get_ident() != hilo_ui:
+            return
+        try:
+            if total:
+                valor = max(0.0, min(float(actual) / float(total), 1.0))
+                barra.progress(
+                    valor, text=f"Paso {actual}/{total}: {registro['paso']}"
+                )
+            icono = "✅" if registro["ok"] else "❌"
+            mensaje = f"{icono} [{actual}/{total}] {registro['paso']}"
+            if registro["detalle"]:
+                mensaje += f" — {registro['detalle']}"
+            estado.write(mensaje)
+        except Exception:
+            pass
+
+    return _callback
+
+
+def _render_resultado_perfil_completo(resultado: dict):
+    """Resumen (persistente en session_state) del flujo completo, real o dry-run."""
+    usuario = resultado.get("usuario") or ""
+    res = resultado.get("res") or {}
+    dry = bool(resultado.get("dry_run"))
+    pasos = res.get("pasos") or resultado.get("pasos_callback") or []
+
+    if dry:
+        st.info(
+            f"Simulación (dry-run) para @{usuario}: se recorrieron los pasos "
+            "sin guardar cambios en X."
+        )
+    elif res.get("ok"):
+        st.success(f"Flujo completo terminado en @{usuario}.")
+    else:
+        st.error(f"El flujo en @{usuario} terminó con pasos fallidos.")
+
+    filas = [
+        {"paso": etiqueta, "resultado": "✅" if res.get(clave) else "—"}
+        for clave, etiqueta in PERFIL_PASOS_RESUMEN
+        if clave in res
+    ]
+    if filas:
+        st.dataframe(filas, use_container_width=True)
+
+    if pasos:
+        st.markdown("#### 🧭 Pasos ejecutados")
+        st.dataframe(
+            [
+                {
+                    "paso": p.get("paso", ""),
+                    "ok": "✅" if p.get("ok") else "❌",
+                    "detalle": p.get("detalle", ""),
+                }
+                for p in pasos
+            ],
+            use_container_width=True,
+        )
+    else:
+        st.caption("El backend no reportó pasos individuales.")
+
+    if res.get("error"):
+        st.warning(f"Detalle del error: {res['error']}")
+
+    res_ren = resultado.get("renombrado")
+    if res_ren:
+        _render_resultado_renombrado(res_ren, "🏷️ Renombrado de la clave interna")
+
+
+def _tab_perfil_completo():
+    """Flujo guiado completo del perfil en X, en el orden que pidió el usuario.
+
+    El backend (`TwitterBot.actualizar_perfil_completo`) es el único que toca X;
+    esta pestaña solo arma el formulario, muestra el progreso paso a paso y
+    persiste el resumen para que el `st.rerun()` no lo borre."""
+    st.markdown("### 🧾 Perfil completo (flujo en orden)")
+    st.caption(
+        "Ejecuta el flujo completo en el orden del backend: **login con cookie → "
+        "foto de perfil → foto de portada → nombre → biografía → ubicación → @ "
+        "(con contraseña)**. El dry-run verifica selectores sin guardar cambios; "
+        "la ejecución real **requiere Chrome instalado**."
+    )
+    st.warning(
+        "Los cambios son **REALES e irreversibles** en X. Revisa la cuenta y "
+        "cada dato antes de ejecutar."
+    )
+
+    # El rerun posterior a una ejecución exitosa descarta lo dibujado: el
+    # resumen se guarda en session_state y se muestra en esta pasada.
+    resultado_previo = st.session_state.pop(
+        "cuentas_perfil_completo_resultado", None
+    )
+    if resultado_previo:
+        _render_resultado_perfil_completo(resultado_previo)
+
+    cuentas = _listar_cuentas(OPCION_TODAS)
+    if not cuentas:
+        st.info("No hay cuentas de Twitter en la base de datos.")
+        return
+
+    opciones = {_etiqueta_cuenta_perfil(f): f for f in cuentas}
+    etiqueta = st.selectbox(
+        "Cuenta a configurar", list(opciones.keys()), key="pc_cuenta"
+    )
+    fila = opciones[etiqueta]
+    usuario = fila["usuario"]
+    nombre_default = (fila.get("nombre_mostrado") or "").strip()
+    handle_default = (
+        (fila.get("handle_actual") or "").strip() or usuario
+    ).lstrip("@")
+    password_default = fila.get("password") or ""
+
+    st.caption(
+        "Deja un campo vacío para omitir ese paso. Las fotos son opcionales: si "
+        "no subes ninguna, esos pasos se saltan."
+    )
+
+    # 1) Foto de perfil
+    st.markdown("**1. 📷 Foto de perfil**")
+    archivo_perfil = st.file_uploader(
+        "Sube o pega la foto de perfil (png/jpg/jpeg/webp)",
+        type=["png", "jpg", "jpeg", "webp"],
+        key=f"pc_foto_perfil_{usuario}",
+    )
+    if archivo_perfil is not None:
+        st.image(
+            archivo_perfil,
+            caption="Vista previa de la foto de perfil",
+            width=220,
+        )
+
+    # 2) Foto de portada
+    st.markdown("**2. 🖼️ Foto de portada**")
+    archivo_portada = st.file_uploader(
+        "Sube o pega la foto de portada (png/jpg/jpeg/webp)",
+        type=["png", "jpg", "jpeg", "webp"],
+        key=f"pc_foto_portada_{usuario}",
+    )
+    if archivo_portada is not None:
+        st.image(
+            archivo_portada,
+            caption="Vista previa de la foto de portada",
+            width=220,
+        )
+
+    # 3) Nombre mostrado
+    st.markdown("**3. 👤 Nombre mostrado**")
+    nombre_txt = st.text_input(
+        "Nombre mostrado (vacío = no cambiar)",
+        value=nombre_default,
+        key=f"pc_nombre_{usuario}",
+    )
+    nombre_env = (nombre_txt or "").strip()
+    if nombre_env and nombre_env == nombre_default:
+        st.caption(
+            "ℹ️ Es el mismo nombre guardado; si no quieres cambiarlo, deja el "
+            "campo vacío."
+        )
+
+    # 4) Biografía (máx. 160)
+    st.markdown("**4. 📝 Biografía**")
+    bio_txt = st.text_area(
+        "Biografía (máx. 160 caracteres; vacío = no cambiar)",
+        value="",
+        max_chars=160,
+        key=f"pc_bio_{usuario}",
+    )
+    bio_env = (bio_txt or "").strip()
+    if len(bio_env) > 160:
+        bio_env = bio_env[:160]
+        st.warning(
+            "La biografía supera los 160 caracteres: se enviarán solo los "
+            "primeros 160."
+        )
+    if bio_env:
+        st.caption(f"Caracteres: {len(bio_env)}/160")
+
+    # 5) Ubicación
+    st.markdown("**5. 📍 Ubicación**")
+    ubicacion_txt = st.text_input(
+        "Ubicación (vacío = no cambiar)",
+        value="",
+        key=f"pc_ubicacion_{usuario}",
+    )
+    ubicacion_env = (ubicacion_txt or "").strip()
+
+    # 6) Nuevo @
+    st.markdown("**6. 🏷️ Nuevo @**")
+    handle_txt = st.text_input(
+        "Nuevo @ (sin @; vacío = no cambiar)",
+        value=handle_default,
+        key=f"pc_handle_{usuario}",
+    )
+    handle_env = (handle_txt or "").strip().lstrip("@").strip()
+    if handle_env and not HANDLE_RE.match(handle_env):
+        st.warning(
+            f"'{handle_env}' no cumple el formato de handle de X "
+            "(4-15 caracteres: letras, números y _)."
+        )
+    if handle_env and handle_env.lower() == handle_default.lower():
+        st.caption(
+            "ℹ️ Es el @ actual guardado; si no quieres cambiarlo, deja el campo "
+            "vacío."
+        )
+
+    # 7) Contraseña (Account information)
+    st.markdown("**7. 🔑 Contraseña**")
+    password_txt = st.text_input(
+        "Contraseña de la cuenta (para Account information)",
+        value=password_default,
+        type="password",
+        key=f"pc_pass_{usuario}",
+    )
+    password_env = password_txt or ""
+
+    st.markdown("---")
+    confirmado = st.checkbox(
+        "Confirmo que quiero modificar el perfil REAL de esta cuenta en X",
+        key=f"pc_confirm_{usuario}",
+    )
+    renombrar_interno = st.checkbox(
+        "Renombrar también la clave interna al nuevo @ "
+        "(migra cookies/perfiles/historial)",
+        key=f"pc_renombrar_{usuario}",
+        help=(
+            "Si el paso del @ tiene éxito, la clave interna `usuario` pasa a ser "
+            "el nuevo @. Las tareas programadas no se ven afectadas "
+            "(referencian cuentas por id)."
+        ),
+    )
+
+    col_dry, col_ejecutar = st.columns(2)
+    with col_dry:
+        btn_dry = st.button(
+            "🔍 Verificar selectores (dry-run)",
+            use_container_width=True,
+            key=f"pc_dry_{usuario}",
+            help="Recorre los pasos sin guardar cambios en X (no toca el perfil).",
+        )
+    with col_ejecutar:
+        btn_ejecutar = st.button(
+            "▶️ Ejecutar flujo completo en X",
+            type="primary",
+            use_container_width=True,
+            key=f"pc_btn_{usuario}",
+        )
+
+    if not (btn_dry or btn_ejecutar):
+        return
+
+    if btn_ejecutar and not confirmado:
+        st.warning("Marca la casilla de confirmación para ejecutar el flujo real.")
+        return
+
+    if handle_env and not HANDLE_RE.match(handle_env):
+        st.error(
+            "Corrige el nuevo @ antes de ejecutar "
+            "(4-15 caracteres: letras, números y _)."
+        )
+        return
+
+    # Las imágenes subidas se guardan en data/temp solo al ejecutar; se
+    # reutiliza el mismo helper que Publicar Texto / RT con cita.
+    foto_perfil_path = None
+    foto_portada_path = None
+    if archivo_perfil is not None or archivo_portada is not None:
+        from web.operaciones._helpers import guardar_imagen_subida
+
+        if archivo_perfil is not None:
+            foto_perfil_path = guardar_imagen_subida(
+                archivo_perfil, prefijo=f"perfil_{usuario}"
+            )
+        if archivo_portada is not None:
+            foto_portada_path = guardar_imagen_subida(
+                archivo_portada, prefijo=f"portada_{usuario}"
+            )
+
+    hay_algo = bool(
+        foto_perfil_path
+        or foto_portada_path
+        or nombre_env
+        or bio_env
+        or ubicacion_env
+        or handle_env
+    )
+    if not hay_algo:
+        st.warning(
+            "No hay nada que hacer: sube una foto o llena al menos un campo "
+            "(nombre, biografía, ubicación o @)."
+        )
+        return
+
+    dry_run = bool(btn_dry and not btn_ejecutar)
+
+    hilo_ui = threading.get_ident()
+    pasos_callbacks = []
+    lock = threading.Lock()
+    barra = st.progress(0.0, text="Iniciando flujo de perfil…")
+    estado = st.empty()
+    callback = _progreso_perfil_callback(
+        barra, estado, pasos_callbacks, hilo_ui, lock
+    )
+
+    bot = None
+    res = None
+    try:
+        from plataformas.twitter.selenium_bot import TwitterBot
+
+        accion = (
+            "Verificando selectores" if dry_run else "Ejecutando flujo completo"
+        )
+        with st.spinner(f"{accion} en @{usuario} (Chrome)..."):
+            bot = TwitterBot(usuario)
+            res = bot.actualizar_perfil_completo(
+                foto_perfil_path=foto_perfil_path,
+                foto_portada_path=foto_portada_path,
+                nombre=nombre_env or None,
+                bio=bio_env or None,
+                ubicacion=ubicacion_env or None,
+                handle=handle_env or None,
+                password=password_env,
+                dry_run=dry_run,
+                callback=callback,
+            )
+    except Exception as e:
+        st.error(f"Falló la ejecución de Selenium: {e}")
+    finally:
+        if bot is not None:
+            try:
+                bot.cerrar()
+            except Exception:
+                pass
+
+    if res is None:
+        return
+    if not isinstance(res, dict):
+        res = {"ok": bool(res)}
+
+    pasos_finales = list(res.get("pasos") or pasos_callbacks or [])
+
+    # Renombrado opcional de la clave interna SOLO si el paso del @ tuvo éxito.
+    res_ren = None
+    if (
+        not dry_run
+        and res.get("handle")
+        and renombrar_interno
+        and handle_env
+        and handle_env.lower() != usuario.lower()
+    ):
+        from core.renombrar import renombrar_usuario
+
+        with st.spinner(
+            f"Migrando la clave interna @{usuario} → @{handle_env}..."
+        ):
+            try:
+                res_ren = renombrar_usuario(usuario, handle_env)
+            except Exception as e:
+                res_ren = {
+                    "ok": False,
+                    "usuario_anterior": usuario,
+                    "usuario_nuevo": handle_env,
+                    "error": f"{type(e).__name__}: {e}",
+                }
+
+    exitos = [
+        clave
+        for clave, _ in PERFIL_PASOS_RESUMEN
+        if res.get(clave)
+    ]
+    resultado = {
+        "usuario": usuario,
+        "res": {**res, "pasos": pasos_finales},
+        "dry_run": dry_run,
+        "renombrado": res_ren,
+        "pasos_callback": pasos_callbacks,
+    }
+
+    if not dry_run and exitos:
+        _listar_cuentas.clear()
+        st.session_state["cuentas_perfil_completo_resultado"] = resultado
+        _flash(
+            f"Flujo de perfil en @{usuario}: "
+            f"{len(exitos)} de {len(PERFIL_PASOS_RESUMEN)} paso(s) aplicado(s)."
+        )
+        st.rerun()
+
+    _render_resultado_perfil_completo(resultado)
+
+
 # ------------------- Anti-detección (User-Agent + cookies) -------------------
 
 def _datos_anti_deteccion(usuario: str) -> dict:
@@ -3339,6 +3765,7 @@ def render(usuario):
         "🔄 Sincronizar desde X": _tab_sincronizar,
         "🏷️ Renombrar usuario": _tab_renombrar,
         "✏️ Cambiar nombre/@": _tab_cambiar_perfil,
+        "🧾 Perfil completo": _tab_perfil_completo,
         "📋 Inventario": _tab_inventario,
         "📤 Exportar": _tab_exportar,
     }

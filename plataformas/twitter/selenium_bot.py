@@ -3083,6 +3083,1291 @@ class TwitterBot:
             logger.warning(f"No se pudo verificar la foto de {tipo} recargando: {e}")
         return False
 
+    # ------------------------------------------------------------------
+    # Flujo guiado completo de perfil
+    # (foto perfil -> portada -> bio -> ubicacion -> nombre -> @handle)
+    # ------------------------------------------------------------------
+    # Orden pedido: 1) login con cookies, 2) foto de perfil, 3) foto de
+    # portada, 4) biografia, 5) ubicacion, 6) nombre mostrado, 7) @handle
+    # (More -> Settings and privacy -> Your account -> Account information ->
+    # contrasena -> Username -> guardar).
+    #
+    # Camino principal: perfil propio + modal "Edit profile". Si el modal o
+    # algun campo no aparece, cada paso cae a los metodos existentes de
+    # /settings/profile (`_cambiar_foto`, `_escribir_bio`,
+    # `_escribir_ubicacion`, `cambiar_nombre`, `cambiar_handle`).
+
+    _SEL_NOMBRE_PERFIL = (
+        "input[name='displayName']",
+        "input[autocomplete='name']",
+        "input[data-testid='displayName']",
+    )
+    _SEL_BIO_PERFIL = (
+        "textarea[name='description']",
+        "textarea[aria-label*='Bio' i]",
+        "textarea[aria-label*='Biografía' i]",
+        "textarea[aria-label*='biografia' i]",
+        "textarea[placeholder*='Bio' i]",
+        "textarea[placeholder*='descripción' i]",
+        "textarea[placeholder*='Descripción' i]",
+        "textarea[data-testid='bio']",
+        "textarea[data-testid='ProfileBio']",
+    )
+    _SEL_UBICACION_PERFIL = (
+        "input[name='location']",
+        "input[aria-label*='Location' i]",
+        "input[aria-label*='Ubicación' i]",
+        "input[aria-label*='ubicacion' i]",
+        "input[placeholder*='Location' i]",
+        "input[placeholder*='Ubicación' i]",
+        "input[data-testid='location']",
+    )
+
+    def _datos_cuenta_perfil(self) -> dict:
+        """Lee de la BD el @ actual y la contrasena de la cuenta.
+
+        La contrasena se devuelve para usarla internamente; NUNCA se loguea
+        ni se incluye en resultados."""
+        datos = {"handle_actual": "", "password": ""}
+        try:
+            from core.database import get_db_session
+            from core.models import Cuenta
+
+            with get_db_session() as db:
+                reg = db.query(Cuenta).filter(Cuenta.usuario == self.usuario).first()
+                if reg is not None:
+                    datos["handle_actual"] = (
+                        getattr(reg, "handle_actual", "") or ""
+                    ).strip().lstrip("@")
+                    datos["password"] = (getattr(reg, "password", "") or "").strip()
+        except Exception as e:
+            logger.warning(f"No se pudieron leer los datos de perfil de {self.usuario}: {e}")
+        return datos
+
+    def _clic_elemento(self, elemento) -> bool:
+        """Clica de forma robusta (scroll + JS click con fallback nativo)."""
+        if elemento is None:
+            return False
+        try:
+            self.driver.execute_script(
+                "arguments[0].scrollIntoView({block: 'center'});", elemento
+            )
+            time.sleep(0.3)
+        except Exception:
+            pass
+        try:
+            self.driver.execute_script("arguments[0].click();", elemento)
+            return True
+        except Exception:
+            pass
+        try:
+            elemento.click()
+            return True
+        except Exception as e:
+            logger.debug(f"No se pudo clicar el elemento: {e}")
+            return False
+
+    def _elemento_por_testid_o_texto(
+        self, testids: tuple = (), textos: tuple = (), timeout: int = 10,
+        exacto_texto: bool = False,
+    ):
+        """Primer elemento visible por data-testid o por texto (ES/EN).
+
+        Con `exacto_texto=True` el texto debe coincidir completo (util para
+        "More"/"Your account", que aparecen como subcadenas en otras frases).
+        """
+        fin = time.time() + timeout
+        while time.time() < fin:
+            for testid in testids:
+                try:
+                    for elem in self.driver.find_elements(
+                        By.CSS_SELECTOR, f"[data-testid='{testid}']"
+                    ):
+                        if elem.is_displayed() and elem.is_enabled():
+                            return elem
+                except Exception:
+                    continue
+            for texto in textos:
+                try:
+                    xpath = (
+                        "//*[self::button or @role='button' or self::a or self::span]["
+                        "contains(translate(normalize-space(.), "
+                        "'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), "
+                        f"'{texto.lower()}') and string-length(normalize-space(.)) <= 80]"
+                    )
+                    for elem in self.driver.find_elements(By.XPATH, xpath):
+                        try:
+                            if not (elem.is_displayed() and elem.is_enabled()):
+                                continue
+                            txt = re.sub(r"\s+", " ", (elem.text or "").strip().lower())
+                            if exacto_texto and txt != texto.lower():
+                                continue
+                            return elem
+                        except Exception:
+                            continue
+                except Exception:
+                    continue
+            time.sleep(0.5)
+        return None
+
+    def _clic_por_testid_o_texto(
+        self, testids: tuple = (), textos: tuple = (), timeout: int = 10,
+        exacto_texto: bool = False,
+    ) -> bool:
+        elem = self._elemento_por_testid_o_texto(
+            testids, textos, timeout=timeout, exacto_texto=exacto_texto
+        )
+        if elem is None:
+            return False
+        return self._clic_elemento(elem)
+
+    def _dialogo_editar_perfil(self, timeout: int = 10):
+        """Devuelve el `div[role='dialog']` del modal "Edit profile" (o None)."""
+        fin = time.time() + timeout
+        while time.time() < fin:
+            try:
+                dialogos = self.driver.find_elements(
+                    By.CSS_SELECTOR, "div[role='dialog'], div[aria-modal='true']"
+                )
+            except Exception:
+                dialogos = []
+            for dlg in dialogos:
+                try:
+                    if not dlg.is_displayed():
+                        continue
+                except Exception:
+                    continue
+                for sel in (
+                    "textarea[name='description']",
+                    "input[name='displayName']",
+                    "input[name='location']",
+                    "input[type='file']",
+                ):
+                    try:
+                        if dlg.find_elements(By.CSS_SELECTOR, sel):
+                            return dlg
+                    except Exception:
+                        continue
+                try:
+                    txt = (dlg.text or "").lower()
+                    if "edit profile" in txt or "editar perfil" in txt:
+                        return dlg
+                except Exception:
+                    pass
+            time.sleep(0.5)
+        return None
+
+    def _cerrar_modal_perfil(self) -> bool:
+        """Cierra el modal de edicion de perfil (close button o Escape)."""
+        if self._dialogo_editar_perfil(timeout=1) is None:
+            return True
+        for sel in (
+            "[data-testid='app-bar-close']",
+            "div[role='dialog'] [aria-label='Close']",
+            "div[role='dialog'] [aria-label='Cerrar']",
+        ):
+            try:
+                btn = self.driver.find_element(By.CSS_SELECTOR, sel)
+                if btn.is_displayed():
+                    self._clic_elemento(btn)
+                    time.sleep(1)
+                    if self._dialogo_editar_perfil(timeout=2) is None:
+                        return True
+            except Exception:
+                continue
+        try:
+            ActionChains(self.driver).send_keys(Keys.ESCAPE).perform()
+            time.sleep(1)
+        except Exception:
+            pass
+        return self._dialogo_editar_perfil(timeout=2) is None
+
+    def _abrir_modal_editar_perfil(self, handle_url: str = "", timeout: int = 15) -> bool:
+        """Navega al perfil propio y abre el modal "Edit profile".
+
+        Devuelve True si el modal quedo abierto. Rellena `self.ultimo_error`
+        si algo falla (sesion expirada, suspension, sin boton, sin modal).
+        """
+        self.ultimo_error = ""
+        try:
+            if self._dialogo_editar_perfil(timeout=1) is not None:
+                return True
+
+            perfil = (handle_url or "").strip().lstrip("@") or self.usuario
+            self.driver.get(f"{self.base_url}/{perfil}")
+            time.sleep(3)
+
+            try:
+                url = (self.driver.current_url or "").lower()
+            except Exception:
+                url = ""
+            if "login" in url:
+                self.ultimo_error = "sesion expirada: X pidio login al abrir el perfil"
+                return False
+            if self._detectar_cuenta_propia_suspendida():
+                self.cuenta_suspendida = True
+                self.ultimo_error = "cuenta suspendida/bloqueada por X"
+                return False
+
+            boton = None
+            for testid in ("editProfileButton", "EditProfileButton"):
+                try:
+                    for elem in self.driver.find_elements(
+                        By.CSS_SELECTOR, f"[data-testid='{testid}']"
+                    ):
+                        if elem.is_displayed() and elem.is_enabled():
+                            boton = elem
+                            break
+                except Exception:
+                    continue
+                if boton is not None:
+                    break
+            if boton is None:
+                boton = self._buscar_control_etiqueta(
+                    ("edit profile", "editar perfil"), timeout=8
+                )
+            if boton is None:
+                self.ultimo_error = (
+                    "no se encontro el boton Edit profile/Editar perfil en el perfil propio"
+                )
+                logger.warning(self.ultimo_error)
+                return False
+
+            self._clic_elemento(boton)
+            if self._dialogo_editar_perfil(timeout=timeout) is None:
+                self.ultimo_error = "no se abrio el modal Edit profile"
+                logger.warning(self.ultimo_error)
+                return False
+            return True
+        except Exception as e:
+            self.ultimo_error = f"{type(e).__name__}: {e}"
+            logger.exception(f"Error abriendo el modal Edit profile de {self.usuario}: {e}")
+            return False
+
+    def _buscar_en_contenedor(self, contenedor, selectores):
+        """Primer elemento visible/habilitado de `selectores` dentro de `contenedor`."""
+        for sel in selectores:
+            try:
+                for elem in contenedor.find_elements(By.CSS_SELECTOR, sel):
+                    try:
+                        if elem.is_displayed() and elem.is_enabled():
+                            return elem
+                    except Exception:
+                        continue
+            except Exception:
+                continue
+        return None
+
+    def _inputs_archivo_en_dialogo(self, dialogo) -> list:
+        """Todos los `input[type='file']` dentro del modal (hasta los ocultos)."""
+        try:
+            return list(dialogo.find_elements(By.CSS_SELECTOR, "input[type='file']"))
+        except Exception:
+            return []
+
+    def _input_archivo_cercano_en_dialogo(self, dialogo, patron_src: str):
+        """`input[type=file]` mas cercano en el DOM (dentro del modal) a un img
+        cuyo src contiene `patron_src` ('profile_images'/'profile_banners')."""
+        script = """
+        var dlg = arguments[0], patron = arguments[1];
+        var inputs = dlg.querySelectorAll("input[type='file']");
+        var mejor = null, mejorNivel = 99;
+        for (var i = 0; i < inputs.length; i++) {
+            var node = inputs[i].parentElement;
+            var nivel = 0;
+            while (node && node !== dlg && nivel < 10) {
+                var imgs = node.querySelectorAll("img");
+                var encontrado = false;
+                for (var j = 0; j < imgs.length; j++) {
+                    var src = imgs[j].getAttribute("src") || "";
+                    if (src.indexOf(patron) !== -1) { encontrado = true; break; }
+                }
+                if (encontrado) {
+                    if (nivel < mejorNivel) { mejorNivel = nivel; mejor = inputs[i]; }
+                    break;
+                }
+                node = node.parentElement;
+                nivel++;
+            }
+        }
+        return mejor;
+        """
+        try:
+            return self.driver.execute_script(script, dialogo, patron_src)
+        except Exception as e:
+            logger.debug(f"No se pudo buscar input cercano a {patron_src} en el modal: {e}")
+            return None
+
+    def _candidatos_input_foto(self, dialogo, tipo: str) -> list:
+        """Candidatos de `input[type=file]` para avatar/portada en el modal.
+
+        Orden: cercano al preview en el modal -> cercano al preview global ->
+        por etiqueta -> cualquier input del modal (para portada se descarta el
+        del avatar) -> cualquier input de la pagina."""
+        etiquetas_avatar = (
+            "añadir foto de perfil", "agregar foto de perfil",
+            "cambiar foto de perfil", "editar foto de perfil",
+            "add profile photo", "change profile photo", "update profile photo",
+            "add avatar", "change avatar", "update avatar", "edit avatar",
+            "añadir foto", "agregar foto", "cambiar foto", "editar foto",
+            "add photo", "change photo", "edit photo",
+        )
+        etiquetas_portada = (
+            "añadir foto de portada", "agregar foto de portada",
+            "cambiar foto de portada", "editar foto de portada",
+            "añadir foto de encabezado", "agregar foto de encabezado",
+            "añadir encabezado", "agregar encabezado", "cambiar encabezado",
+            "editar encabezado",
+            "add header photo", "change header photo", "add header",
+            "add a header", "add banner", "change banner", "edit banner",
+            "change header", "edit header", "update header",
+        )
+        if tipo == "portada":
+            etiquetas, excluir, patron = etiquetas_portada, etiquetas_avatar, "profile_banners"
+        else:
+            etiquetas, excluir, patron = etiquetas_avatar, etiquetas_portada, "profile_images"
+
+        candidatos = []
+
+        def _agregar(elem):
+            if elem is None:
+                return
+            try:
+                if elem not in candidatos:
+                    candidatos.append(elem)
+            except Exception:
+                pass
+
+        try:
+            if dialogo is not None:
+                _agregar(self._input_archivo_cercano_en_dialogo(dialogo, patron))
+            _agregar(self._input_cercano_a_preview(patron))
+            _agregar(self._input_archivo_por_etiqueta(etiquetas, excluir=excluir))
+        except Exception as e:
+            logger.debug(f"No se pudieron calcular candidatos de foto ({tipo}): {e}")
+
+        inputs = []
+        try:
+            if dialogo is not None:
+                inputs = self._inputs_archivo_en_dialogo(dialogo)
+        except Exception:
+            inputs = []
+        if not inputs:
+            inputs = self._inputs_archivo(timeout=3)
+
+        avatar_input = None
+        if dialogo is not None:
+            avatar_input = self._input_archivo_cercano_en_dialogo(dialogo, "profile_images")
+        for inp in inputs:
+            if tipo == "portada" and avatar_input is not None and inp == avatar_input:
+                continue
+            _agregar(inp)
+        return candidatos
+
+    def _escribir_campo_perfil(self, selectores: tuple, texto: str, dialogo=None) -> tuple:
+        """Rellena un campo del perfil: modal "Edit profile" primero y, si el
+        campo no aparece, `/settings/profile` con los MISMOS selectores.
+
+        Devuelve `(ok, via)` con `via` = "modal" | "settings" | "".
+        """
+        self.ultimo_error = ""
+        try:
+            if dialogo is None:
+                dialogo = self._dialogo_editar_perfil(timeout=1)
+
+            campo = None
+            via = "settings"
+            if dialogo is not None:
+                via = "modal"
+                campo = self._buscar_en_contenedor(dialogo, selectores)
+                if campo is None:
+                    campo = self._esperar_input(list(selectores), timeout=4)
+            else:
+                campo = self._esperar_input(list(selectores), timeout=4)
+
+            if campo is None:
+                logger.info(
+                    "Campo de perfil no visible; usando /settings/profile "
+                    f"({', '.join(selectores[:2])}...)"
+                )
+                self.driver.get(f"{self.base_url}/settings/profile")
+                time.sleep(3)
+                campo = self._esperar_input(list(selectores), timeout=12)
+                via = "settings"
+
+            if campo is None:
+                self.ultimo_error = (
+                    "no se encontro el campo de perfil (modal ni /settings/profile)"
+                )
+                logger.warning(self.ultimo_error)
+                return False, ""
+
+            if not self._escribir_input(campo, texto):
+                self.ultimo_error = "no se pudo escribir en el campo de perfil"
+                return False, via
+            return True, via
+        except Exception as e:
+            self.ultimo_error = f"{type(e).__name__}: {e}"
+            logger.warning(f"Error escribiendo campo de perfil: {e}")
+            return False, ""
+
+    def _escribir_bio(self, texto: str, dialogo=None) -> tuple:
+        """Escribe la biografia (modal primero, fallback /settings/profile)."""
+        return self._escribir_campo_perfil(
+            self._SEL_BIO_PERFIL, (texto or "").strip(), dialogo=dialogo
+        )
+
+    def _escribir_ubicacion(self, texto: str, dialogo=None) -> tuple:
+        """Escribe la ubicacion (modal primero, fallback /settings/profile)."""
+        return self._escribir_campo_perfil(
+            self._SEL_UBICACION_PERFIL, (texto or "").strip(), dialogo=dialogo
+        )
+
+    def _verificar_campo_perfil(self, valor: str, selectores: tuple, timeout: int = 12) -> bool:
+        """Verifica un campo recargando /settings/profile y comparando el value."""
+        esperado = (valor or "").strip()
+        try:
+            self.driver.get(f"{self.base_url}/settings/profile")
+            time.sleep(3)
+        except Exception as e:
+            logger.warning(f"No se pudo recargar /settings/profile: {e}")
+        fin = time.time() + timeout
+        while time.time() < fin:
+            campo = self._esperar_input(list(selectores), timeout=2)
+            if campo is not None:
+                try:
+                    actual = campo.get_attribute("value")
+                except Exception:
+                    actual = None
+                if actual is None or actual == "":
+                    try:
+                        actual = campo.get_attribute("textContent") or campo.text or ""
+                    except Exception:
+                        actual = ""
+                actual = (actual or "").strip()
+                if actual == esperado:
+                    return True
+                if re.sub(r"\s+", " ", actual) == re.sub(r"\s+", " ", esperado):
+                    return True
+                self.ultimo_error = (
+                    f"el campo no quedo con el valor esperado (actual={actual[:60]!r})"
+                )
+                return False
+            time.sleep(0.5)
+        self.ultimo_error = self.ultimo_error or "no se pudo leer el campo para verificar"
+        return False
+
+    def _guardar_modal_perfil(self, senales: tuple = (), timeout: int = 12) -> bool:
+        """Clica Guardar del modal Edit profile y espera toast o cierre del modal."""
+        senales = senales or (
+            "profile was updated", "your profile was updated",
+            "se actualizo tu perfil", "se actualizó tu perfil",
+            "tu perfil se actualizo", "tu perfil se actualizó",
+            "guardado", "saved",
+        )
+        if not self._clic_guardar(["Profile_Save_Button"]):
+            self.ultimo_error = "no se encontro el boton Guardar del modal de perfil"
+            logger.warning(self.ultimo_error)
+            return False
+        fin = time.time() + timeout
+        while time.time() < fin:
+            try:
+                toasts = self.driver.find_elements(
+                    By.CSS_SELECTOR, "[data-testid='toast'], div[role='alert']"
+                )
+                for toast in toasts:
+                    txt = (toast.text or "").lower()
+                    if txt and any(s in txt for s in senales):
+                        return True
+            except Exception:
+                pass
+            if self._dialogo_editar_perfil(timeout=1) is None:
+                return True
+            time.sleep(0.5)
+        self.ultimo_error = "X no confirmo el guardado del perfil (modal sigue abierto)"
+        logger.warning(self.ultimo_error)
+        return False
+
+    def _paso_foto(self, tipo: str, ruta: str, handle_url: str) -> tuple:
+        """Sube avatar/portada via modal Edit profile; fallback /settings/profile."""
+        etiqueta = "perfil" if tipo == "avatar" else "portada"
+        try:
+            ruta_txt = (ruta or "").strip()
+            if not ruta_txt:
+                return True, "no solicitado"
+            ruta_abs = os.path.abspath(ruta_txt)
+            if not os.path.isfile(ruta_abs):
+                return False, f"no existe el archivo de imagen: {ruta_txt}"
+            if not ruta_abs.lower().endswith((".png", ".jpg", ".jpeg", ".webp", ".gif")):
+                return False, f"formato de imagen no soportado: {ruta_txt}"
+            self.ultimo_error = ""
+
+            # Camino principal: perfil propio + modal "Edit profile".
+            if self._abrir_modal_editar_perfil(handle_url):
+                dialogo = self._dialogo_editar_perfil(timeout=6)
+                if dialogo is not None:
+                    src_antes = ""
+                    try:
+                        src_antes = self._src_foto(tipo)
+                    except Exception:
+                        pass
+                    candidatos = self._candidatos_input_foto(dialogo, tipo)
+                    subido = False
+                    for indice, inp in enumerate(candidatos[:3]):
+                        if not self._enviar_archivo_input(inp, ruta_abs):
+                            continue
+                        subido = True
+                        if self._hay_modal_recorte(timeout=7):
+                            break
+                        logger.info(
+                            f"No aparecio el modal de recorte con el input "
+                            f"#{indice + 1} para {etiqueta}; probando otro"
+                        )
+                    if subido:
+                        if not self._aceptar_modal_recorte(timeout=12):
+                            logger.info(
+                                f"Sin modal de recorte para {etiqueta}; continuando"
+                            )
+                        time.sleep(1)
+                        if self._guardar_modal_perfil():
+                            if self._verificar_foto_subida(tipo, src_antes, timeout=15):
+                                return True, f"modal Edit profile ({etiqueta})"
+                    logger.info(
+                        f"El modal no completo la foto de {etiqueta}; "
+                        "usando fallback /settings/profile"
+                    )
+
+            # Fallback: mismos metodos existentes sobre /settings/profile.
+            ok = (
+                self.cambiar_foto_perfil(ruta_txt)
+                if tipo == "avatar"
+                else self.cambiar_foto_portada(ruta_txt)
+            )
+            if ok:
+                return True, "fallback URL directa /settings/profile"
+            return False, self.ultimo_error or f"no se pudo cambiar la foto de {etiqueta}"
+        except Exception as e:
+            return False, f"{type(e).__name__}: {e}"
+
+    def _paso_campo_texto(self, tipo: str, texto: str, handle_url: str) -> tuple:
+        """Aplica bio/ubicacion con modal primero y fallback /settings/profile."""
+        etiqueta = "biografia" if tipo == "bio" else "ubicacion"
+        selectores = self._SEL_BIO_PERFIL if tipo == "bio" else self._SEL_UBICACION_PERFIL
+        escribidor = self._escribir_bio if tipo == "bio" else self._escribir_ubicacion
+        try:
+            valor = (texto or "").strip()
+            if not valor:
+                return True, "no solicitado"
+            if tipo == "bio" and len(valor) > 160:
+                return False, "la biografia supera los 160 caracteres permitidos por X"
+            if tipo == "ubicacion" and len(valor) > 30:
+                return False, "la ubicacion supera los 30 caracteres permitidos por X"
+            self.ultimo_error = ""
+
+            # Camino principal: modal "Edit profile".
+            if self._abrir_modal_editar_perfil(handle_url):
+                dialogo = self._dialogo_editar_perfil(timeout=6)
+                ok, via = escribidor(valor, dialogo=dialogo)
+                if ok and via == "modal":
+                    if self._guardar_modal_perfil():
+                        if self._verificar_campo_perfil(valor, selectores):
+                            return True, f"modal Edit profile ({etiqueta})"
+                logger.info(
+                    f"El modal no completo la {etiqueta}; usando fallback /settings/profile"
+                )
+
+            # Fallback: /settings/profile con los mismos selectores.
+            self._cerrar_modal_perfil()
+            ok, via = escribidor(valor, dialogo=None)
+            if ok:
+                if self._clic_guardar(["Profile_Save_Button"], textos=("guardar", "save")):
+                    senales = [
+                        "your profile was updated", "profile was updated",
+                        "se actualizo tu perfil", "se actualizó tu perfil",
+                        "tu perfil se actualizo", "tu perfil se actualizó",
+                        "guardado", "saved",
+                    ]
+                    url_settings = f"{self.base_url}/settings/profile"
+                    if self._confirmar_guardado(senales, url_settings, list(selectores), valor):
+                        return True, "fallback URL directa /settings/profile"
+                self.ultimo_error = (
+                    self.ultimo_error or f"X no confirmo el cambio de {etiqueta}"
+                )
+            return False, self.ultimo_error or f"no se pudo cambiar la {etiqueta}"
+        except Exception as e:
+            return False, f"{type(e).__name__}: {e}"
+
+    def _paso_nombre(self, nombre: str, handle_url: str) -> tuple:
+        """Cambia el nombre mostrado: modal primero, fallback `cambiar_nombre`."""
+        try:
+            valor = (nombre or "").strip()
+            if not valor:
+                return True, "no solicitado"
+            if len(valor) > 50:
+                return False, "el nombre supera los 50 caracteres permitidos por X"
+            self.ultimo_error = ""
+
+            if self._abrir_modal_editar_perfil(handle_url):
+                dialogo = self._dialogo_editar_perfil(timeout=6)
+                ok, via = self._escribir_campo_perfil(
+                    self._SEL_NOMBRE_PERFIL, valor, dialogo=dialogo
+                )
+                if ok and via == "modal":
+                    if self._guardar_modal_perfil():
+                        if self._verificar_campo_perfil(valor, self._SEL_NOMBRE_PERFIL):
+                            return True, "modal Edit profile (nombre mostrado)"
+                logger.info(
+                    "El modal no completo el nombre; usando fallback cambiar_nombre"
+                )
+
+            if self.cambiar_nombre(valor):
+                return True, "fallback URL directa /settings/profile"
+            return False, self.ultimo_error or "no se pudo cambiar el nombre"
+        except Exception as e:
+            return False, f"{type(e).__name__}: {e}"
+
+    def _hay_prompt_password(self) -> bool:
+        return (
+            self._esperar_input(
+                ["input[type='password']", "input[name='password']"], timeout=1
+            )
+            is not None
+        )
+
+    def _enviar_prompt_password(self, password: str, timeout: int = 15) -> bool:
+        """Escribe y envia la contrasena en el prompt de seguridad de X.
+
+        La contrasena NUNCA se loguea ni se devuelve."""
+        self.ultimo_error = ""
+        campo = self._esperar_input(
+            ["input[type='password']", "input[name='password']"], timeout=8
+        )
+        if campo is None:
+            return True
+        try:
+            campo.click()
+            modifier = Keys.COMMAND if os.name == "posix" else Keys.CONTROL
+            ActionChains(self.driver).key_down(modifier).send_keys("a").key_up(modifier).perform()
+            ActionChains(self.driver).send_keys(Keys.DELETE).perform()
+            time.sleep(0.2)
+            campo.send_keys(password)
+            time.sleep(0.5)
+        except Exception as e:
+            self.ultimo_error = f"no se pudo escribir la contrasena ({type(e).__name__})"
+            logger.warning(self.ultimo_error)
+            return False
+
+        enviado = False
+        for testid in ("confirmationSheetConfirm",):
+            try:
+                for btn in self.driver.find_elements(
+                    By.CSS_SELECTOR, f"[data-testid='{testid}']"
+                ):
+                    if btn.is_displayed() and btn.is_enabled():
+                        self._clic_elemento(btn)
+                        enviado = True
+                        break
+            except Exception:
+                pass
+            if enviado:
+                break
+
+        if not enviado:
+            try:
+                dialogos = self.driver.find_elements(
+                    By.CSS_SELECTOR, "div[role='dialog'], div[aria-modal='true']"
+                )
+            except Exception:
+                dialogos = []
+            for dlg in dialogos:
+                try:
+                    botones = dlg.find_elements(By.XPATH, ".//button | .//*[@role='button']")
+                except Exception:
+                    botones = []
+                for btn in botones:
+                    try:
+                        if not (btn.is_displayed() and btn.is_enabled()):
+                            continue
+                        txt = (btn.text or "").strip().lower()
+                        if txt and len(txt) <= 30 and any(
+                            t in txt
+                            for t in (
+                                "confirmar", "confirm", "next", "siguiente",
+                                "continuar", "continue",
+                            )
+                        ):
+                            self._clic_elemento(btn)
+                            enviado = True
+                            break
+                    except Exception:
+                        continue
+                if enviado:
+                    break
+
+        if not enviado:
+            try:
+                campo.send_keys(Keys.ENTER)
+                enviado = True
+            except Exception:
+                pass
+        if not enviado:
+            self.ultimo_error = "no se encontro el boton para confirmar la contrasena"
+            return False
+
+        fin = time.time() + timeout
+        while time.time() < fin:
+            if (
+                self._esperar_input(
+                    ["input[type='password']", "input[name='password']"], timeout=1
+                )
+                is None
+            ):
+                return True
+            time.sleep(0.5)
+        self.ultimo_error = "X no acepto la contrasena (el prompt sigue visible)"
+        logger.warning(self.ultimo_error)
+        return False
+
+    def _navegar_account_information(self, timeout: int = 15) -> bool:
+        """Navega More -> Settings and privacy -> Your account -> Account information.
+
+        Devuelve True si llego (haya o no prompt de contrasena)."""
+        self.ultimo_error = ""
+        try:
+            if not self.driver:
+                self.ultimo_error = "no hay driver (requiere login previo)"
+                return False
+            try:
+                url_actual = (self.driver.current_url or "").lower()
+            except Exception:
+                url_actual = ""
+            if "x.com" not in url_actual:
+                self.driver.get(f"{self.base_url}/home")
+                time.sleep(3)
+
+            # 1) More / Mas
+            if not self._clic_por_testid_o_texto(
+                ("AppTabBar_More_Menu",),
+                ("more", "más", "mas"),
+                timeout=10,
+                exacto_texto=True,
+            ):
+                self.ultimo_error = "no se encontro el menu More/Mas (AppTabBar_More_Menu)"
+                logger.warning(self.ultimo_error)
+                return False
+            time.sleep(1.5)
+
+            # 2) Settings and privacy / Configuracion y privacidad
+            if not self._clic_por_testid_o_texto(
+                ("settingsAndPrivacy",),
+                ("settings and privacy", "configuración y privacidad",
+                 "configuracion y privacidad"),
+                timeout=10,
+                exacto_texto=True,
+            ):
+                self.ultimo_error = (
+                    "no se encontro Settings and privacy/Configuracion y privacidad"
+                )
+                logger.warning(self.ultimo_error)
+                return False
+            time.sleep(2.5)
+
+            # 3) Your account / Tu cuenta
+            if not self._clic_por_testid_o_texto(
+                ("yourAccount",), ("your account", "tu cuenta"),
+                timeout=10, exacto_texto=True,
+            ):
+                if self._hay_prompt_password():
+                    return True
+                self.ultimo_error = "no se encontro Your account/Tu cuenta"
+                logger.warning(self.ultimo_error)
+                return False
+            time.sleep(2)
+            if self._hay_prompt_password():
+                return True
+
+            # 4) Account information / Informacion de la cuenta
+            if not self._clic_por_testid_o_texto(
+                ("accountInfo",),
+                ("account information", "información de la cuenta",
+                 "informacion de la cuenta"),
+                timeout=10,
+                exacto_texto=True,
+            ):
+                if self._hay_prompt_password():
+                    return True
+                self.ultimo_error = (
+                    "no se encontro Account information/Informacion de la cuenta"
+                )
+                logger.warning(self.ultimo_error)
+                return False
+            time.sleep(2)
+
+            # 5) Esperar prompt de contrasena o la fila Username.
+            fin = time.time() + timeout
+            while time.time() < fin:
+                if self._hay_prompt_password():
+                    return True
+                if self._elemento_por_testid_o_texto(
+                    ("Username",), ("username", "nombre de usuario"), timeout=1
+                ) is not None:
+                    return True
+                time.sleep(0.5)
+            self.ultimo_error = "no aparecio el prompt de contrasena ni la opcion Username"
+            logger.warning(self.ultimo_error)
+            return False
+        except Exception as e:
+            self.ultimo_error = f"{type(e).__name__}: {e}"
+            logger.warning(f"No se pudo navegar a Account information: {e}")
+            return False
+
+    def _cambiar_handle_en_account_info(self, handle: str, password: str) -> bool:
+        """Click en Username, escribe el nuevo @ y guarda (con contrasena si
+        X la pide). Verifica con `_confirmar_guardado` (toast o
+        /settings/username)."""
+        self.ultimo_error = ""
+        try:
+            # La ruta pudo haberse detenido en el prompt de contrasena.
+            if self._hay_prompt_password():
+                if not self._enviar_prompt_password(password):
+                    return False
+                time.sleep(2)
+
+            fila = self._elemento_por_testid_o_texto(
+                ("Username",), ("username", "nombre de usuario"), timeout=8
+            )
+            if fila is None:
+                # Puede faltar el click en Account information (el prompt de
+                # contrasena corto la ruta antes de ese paso).
+                if self._clic_por_testid_o_texto(
+                    ("accountInfo",),
+                    ("account information", "información de la cuenta",
+                     "informacion de la cuenta"),
+                    timeout=5,
+                    exacto_texto=True,
+                ):
+                    time.sleep(2)
+                    if self._hay_prompt_password():
+                        if not self._enviar_prompt_password(password):
+                            return False
+                    fila = self._elemento_por_testid_o_texto(
+                        ("Username",), ("username", "nombre de usuario"), timeout=8
+                    )
+            if fila is None:
+                self.ultimo_error = "no se encontro la opcion Username en Account information"
+                logger.warning(self.ultimo_error)
+                return False
+            self._clic_elemento(fila)
+            time.sleep(2)
+
+            # Esperar el campo del @ (X puede pedir contrasena otra vez).
+            selectores = [
+                "input[name='username']",
+                "input[autocomplete='username']",
+            ]
+            campo = None
+            fin = time.time() + 20
+            while time.time() < fin:
+                if self._hay_prompt_password():
+                    if not self._enviar_prompt_password(password):
+                        return False
+                    time.sleep(1)
+                    continue
+                campo = self._esperar_input(selectores, timeout=2)
+                if campo is not None:
+                    break
+                time.sleep(0.5)
+            if campo is None:
+                self.ultimo_error = "no se encontro el campo de @usuario tras Account information"
+                logger.warning(self.ultimo_error)
+                return False
+
+            if not self._escribir_input(campo, handle):
+                self.ultimo_error = "no se pudo escribir el nuevo @"
+                return False
+            time.sleep(1)
+
+            if not self._clic_guardar(
+                ["UserName_Save_Button", "Profile_Save_Button"],
+                textos=("guardar", "save"),
+            ):
+                self.ultimo_error = "no se encontro el boton Guardar del @"
+                logger.warning(self.ultimo_error)
+                return False
+
+            # X puede volver a pedir la contrasena al guardar.
+            time.sleep(1)
+            if self._hay_prompt_password():
+                if not self._enviar_prompt_password(password):
+                    return False
+
+            senales = [
+                "your username was updated",
+                "username was updated",
+                "se actualizo tu nombre de usuario",
+                "se actualizó tu nombre de usuario",
+                "tu nombre de usuario se actualizo",
+                "guardado",
+                "saved",
+            ]
+            url_usuario = f"{self.base_url}/settings/username"
+            ok = self._confirmar_guardado(senales, url_usuario, selectores, handle)
+            if not ok:
+                self.ultimo_error = "X no confirmo el cambio de @"
+                logger.warning(self.ultimo_error)
+            return ok
+        except Exception as e:
+            self.ultimo_error = f"{type(e).__name__}: {e}"
+            logger.exception(f"Error cambiando el @ por Account information: {e}")
+            return False
+
+    def _paso_handle(self, handle: str, password_bd: str) -> tuple:
+        """Paso 7: More -> Settings -> Account information -> Username -> @.
+
+        Si toda la ruta falla, cae a `cambiar_handle(handle, password)` (URL
+        directa) y lo indica en el detalle."""
+        nuevo = (handle or "").strip().lstrip("@").strip()
+        if not re.match(r"^[A-Za-z0-9_]{4,15}$", nuevo):
+            return False, "handle invalido: usa de 4 a 15 letras, numeros o _ (sin @)"
+        password = (password_bd or "").strip()
+        try:
+            self.ultimo_error = ""
+            alcanzado = self._navegar_account_information()
+            detalle_ruta = ""
+            if alcanzado:
+                if self._cambiar_handle_en_account_info(nuevo, password):
+                    return True, (
+                        "ruta More > Settings and privacy > Your account > "
+                        "Account information > Username"
+                    )
+                detalle_ruta = self.ultimo_error or "la ruta de Ajustes no completo el cambio"
+            else:
+                detalle_ruta = self.ultimo_error or "no se alcanzo Account information"
+
+            logger.info(
+                "El cambio de @ por la ruta de Ajustes fallo; probando URL "
+                f"directa /settings/username ({detalle_ruta})"
+            )
+            if self.cambiar_handle(nuevo, password):
+                return True, f"fallback URL directa /settings/username ({detalle_ruta})"
+            return False, self.ultimo_error or detalle_ruta or "no se pudo cambiar el @"
+        except Exception as e:
+            return False, f"{type(e).__name__}: {e}"
+
+    def _chequear_controles_perfil(self, quiere: dict, handle_url: str) -> dict:
+        """Dry-run: comprueba los controles SIN subir/escribir/enviar nada.
+
+        Devuelve `{paso: (ok, detalle)}` solo de los pasos solicitados, en el
+        orden pedido (foto_perfil, foto_portada, bio, ubicacion, nombre, handle).
+        """
+        resultados = {}
+        modal = None
+        avatar_input = None
+        banner_input = None
+        bio_campo = None
+        ubicacion_campo = None
+        nombre_campo = None
+        modal_ok = False
+        detalle_modal = ""
+
+        try:
+            modal_ok = self._abrir_modal_editar_perfil(handle_url)
+            if modal_ok:
+                modal = self._dialogo_editar_perfil(timeout=8)
+            if modal is not None:
+                file_inputs = self._inputs_archivo_en_dialogo(modal)
+                avatar_input = self._input_archivo_cercano_en_dialogo(
+                    modal, "profile_images"
+                )
+                if avatar_input is None and file_inputs:
+                    avatar_input = file_inputs[0]
+                banner_input = self._input_archivo_cercano_en_dialogo(
+                    modal, "profile_banners"
+                )
+                if banner_input is None and len(file_inputs) > 1:
+                    banner_input = file_inputs[1]
+                bio_campo = self._buscar_en_contenedor(modal, self._SEL_BIO_PERFIL)
+                ubicacion_campo = self._buscar_en_contenedor(
+                    modal, self._SEL_UBICACION_PERFIL
+                )
+                nombre_campo = self._buscar_en_contenedor(modal, self._SEL_NOMBRE_PERFIL)
+                detalle_modal = "modal Edit profile alcanzado"
+            else:
+                detalle_modal = self.ultimo_error or "no se pudo abrir el modal Edit profile"
+        except Exception as e:
+            detalle_modal = f"{type(e).__name__}: {e}"
+
+        try:
+            self._cerrar_modal_perfil()
+        except Exception:
+            pass
+
+        if quiere.get("foto_perfil"):
+            ok = bool(modal_ok and avatar_input is not None)
+            resultados["foto_perfil"] = (
+                ok,
+                "input de archivo de avatar encontrado en el modal"
+                if ok
+                else f"no se encontro el input de avatar ({detalle_modal})",
+            )
+        if quiere.get("foto_portada"):
+            ok = bool(modal_ok and banner_input is not None)
+            resultados["foto_portada"] = (
+                ok,
+                "input de archivo de portada encontrado en el modal"
+                if ok
+                else f"no se encontro el input de portada ({detalle_modal})",
+            )
+        if quiere.get("bio"):
+            ok = bool(modal_ok and bio_campo is not None)
+            resultados["bio"] = (
+                ok,
+                "textarea de biografia encontrado en el modal"
+                if ok
+                else f"no se encontro el textarea de biografia ({detalle_modal})",
+            )
+        if quiere.get("ubicacion"):
+            ok = bool(modal_ok and ubicacion_campo is not None)
+            resultados["ubicacion"] = (
+                ok,
+                "input de ubicacion encontrado en el modal"
+                if ok
+                else f"no se encontro el input de ubicacion ({detalle_modal})",
+            )
+        if quiere.get("nombre"):
+            ok = bool(modal_ok and nombre_campo is not None)
+            resultados["nombre"] = (
+                ok,
+                "input de nombre (displayName) encontrado en el modal"
+                if ok
+                else f"no se encontro el input de nombre ({detalle_modal})",
+            )
+        if quiere.get("handle"):
+            try:
+                ruta_ok = self._navegar_account_information()
+                prompt = self._hay_prompt_password() if ruta_ok else False
+                fila_username = False
+                if ruta_ok and not prompt:
+                    fila_username = (
+                        self._elemento_por_testid_o_texto(
+                            ("Username",), ("username", "nombre de usuario"), timeout=3
+                        )
+                        is not None
+                    )
+                if prompt or fila_username:
+                    if prompt:
+                        detalle = (
+                            "ruta More > Settings > Your account > Account information "
+                            "alcanzada; prompt de contrasena visible (NO se envio)"
+                        )
+                    else:
+                        detalle = (
+                            "ruta More > Settings > Your account > Account information "
+                            "alcanzada; opcion Username visible"
+                        )
+                    resultados["handle"] = (True, detalle)
+                else:
+                    resultados["handle"] = (
+                        False,
+                        self.ultimo_error
+                        or "no aparecio el prompt de contrasena ni la opcion Username",
+                    )
+            except Exception as e:
+                resultados["handle"] = (False, f"{type(e).__name__}: {e}")
+        return resultados
+
+    def actualizar_perfil_completo(
+        self,
+        foto_perfil_path: Optional[str] = None,
+        foto_portada_path: Optional[str] = None,
+        nombre: Optional[str] = None,
+        bio: Optional[str] = None,
+        ubicacion: Optional[str] = None,
+        handle: Optional[str] = None,
+        password: str = "",
+        dry_run: bool = False,
+        callback=None,
+    ) -> dict:
+        """Flujo guiado completo de perfil, en el orden pedido por el usuario.
+
+        1) Login con cookies (`login_con_cookies`, que cae a cookies_json).
+        2) Foto de perfil en el perfil propio + modal "Edit profile".
+        3) Foto de portada (banner).
+        4) Biografia (max 160).
+        5) Ubicacion (max 30).
+        6) Nombre mostrado (modal; fallback `cambiar_nombre`).
+        7) @handle por la ruta More -> Settings and privacy -> Your account ->
+           Account information (contrasena si X la pide) -> Username ->
+           guardar; si toda la ruta falla, fallback `cambiar_handle`.
+
+        `dry_run=True`: hace login + navegaciones y comprueba los controles
+        (boton Edit profile, inputs de archivo, textarea bio, input ubicacion,
+        ruta de Ajustes y prompt de contrasena) SIN subir archivos, SIN
+        escribir campos, SIN enviar la contrasena y SIN guardar nada.
+
+        Devuelve el dict con "ok", "login", un bool por paso, "pasos"
+        ({"paso","ok","detalle"} en orden) y "error" (primer error legible).
+        `callback(actual, total, paso, ok, detalle)` es opcional. Nunca lanza
+        excepcion ni expone la contrasena.
+        """
+        resultado = {
+            "ok": False,
+            "login": False,
+            "foto_perfil": False,
+            "foto_portada": False,
+            "nombre": False,
+            "bio": False,
+            "ubicacion": False,
+            "handle": False,
+            "pasos": [],
+            "error": "",
+        }
+        pasos = resultado["pasos"]
+
+        quiere = {
+            "foto_perfil": bool((foto_perfil_path or "").strip()),
+            "foto_portada": bool((foto_portada_path or "").strip()),
+            "bio": bool((bio or "").strip()),
+            "ubicacion": bool((ubicacion or "").strip()),
+            "nombre": bool((nombre or "").strip()),
+            "handle": bool((handle or "").strip()),
+        }
+        total_previsto = 1 + sum(1 for v in quiere.values() if v)
+
+        def _reportar(paso: str, ok: bool, detalle: str) -> None:
+            detalle = (detalle or "").strip()[:400]
+            pasos.append({"paso": paso, "ok": bool(ok), "detalle": detalle})
+            if not ok and not resultado["error"]:
+                resultado["error"] = f"{paso}: {detalle}" if detalle else paso
+            if callback is not None:
+                try:
+                    callback(len(pasos), total_previsto, paso, bool(ok), detalle)
+                except Exception as e:
+                    logger.debug(f"callback de progreso fallo: {e}")
+
+        try:
+            # 1) Login con cookies (.pkl y, si falla, cookies_json).
+            if not self.driver:
+                login_ok = bool(self.login_con_cookies())
+            else:
+                login_ok = True
+            resultado["login"] = login_ok
+            _reportar(
+                "login",
+                login_ok,
+                "sesion iniciada con cookies"
+                if login_ok
+                else (self.ultimo_error or "no se pudo iniciar sesion"),
+            )
+            if not login_ok:
+                return resultado
+
+            datos = self._datos_cuenta_perfil()
+            handle_url = datos.get("handle_actual") or self.usuario
+            password_efectiva = (password or "").strip() or datos.get("password", "")
+
+            if dry_run:
+                chequeos = self._chequear_controles_perfil(quiere, handle_url)
+                for paso, (ok, detalle) in chequeos.items():
+                    _reportar(paso, ok, detalle)
+                    if paso in resultado:
+                        resultado[paso] = bool(ok)
+            else:
+                # 2) Foto de perfil (avatar).
+                if quiere["foto_perfil"]:
+                    ok, detalle = self._paso_foto("avatar", foto_perfil_path, handle_url)
+                    resultado["foto_perfil"] = bool(ok)
+                    _reportar("foto_perfil", ok, detalle)
+
+                # 3) Foto de portada (banner).
+                if quiere["foto_portada"]:
+                    ok, detalle = self._paso_foto("portada", foto_portada_path, handle_url)
+                    resultado["foto_portada"] = bool(ok)
+                    _reportar("foto_portada", ok, detalle)
+
+                # 4) Biografia.
+                if quiere["bio"]:
+                    ok, detalle = self._paso_campo_texto("bio", bio, handle_url)
+                    resultado["bio"] = bool(ok)
+                    _reportar("bio", ok, detalle)
+
+                # 5) Ubicacion.
+                if quiere["ubicacion"]:
+                    ok, detalle = self._paso_campo_texto("ubicacion", ubicacion, handle_url)
+                    resultado["ubicacion"] = bool(ok)
+                    _reportar("ubicacion", ok, detalle)
+
+                # 6) Nombre mostrado.
+                if quiere["nombre"]:
+                    ok, detalle = self._paso_nombre(nombre, handle_url)
+                    resultado["nombre"] = bool(ok)
+                    _reportar("nombre", ok, detalle)
+
+                # 7) @handle.
+                if quiere["handle"]:
+                    ok, detalle = self._paso_handle(handle, password_efectiva)
+                    resultado["handle"] = bool(ok)
+                    _reportar("handle", ok, detalle)
+
+            solicitados = [resultado[k] for k, v in quiere.items() if v]
+            resultado["ok"] = bool(resultado["login"]) and all(solicitados)
+            if resultado["ok"]:
+                resultado["error"] = ""
+
+            # Persistencia (solo cambios reales): nombre_mostrado/handle_actual
+            # y cookies frescas (.pkl + BD).
+            if not dry_run:
+                hubo_cambios = any(
+                    resultado[k]
+                    for k in (
+                        "foto_perfil", "foto_portada", "bio",
+                        "ubicacion", "nombre", "handle",
+                    )
+                )
+                if hubo_cambios:
+                    campos = {}
+                    if resultado["nombre"] and (nombre or "").strip():
+                        campos["nombre_mostrado"] = nombre.strip()
+                    if resultado["handle"] and (handle or "").strip():
+                        campos["handle_actual"] = handle.strip().lstrip("@")
+                    if campos:
+                        try:
+                            from core.database import get_db_session
+                            from core.models import Cuenta
+
+                            with get_db_session() as db:
+                                reg = db.query(Cuenta).filter(
+                                    Cuenta.usuario == self.usuario
+                                ).first()
+                                if reg is not None:
+                                    for campo, valor in campos.items():
+                                        if hasattr(Cuenta, campo):
+                                            setattr(reg, campo, valor)
+                        except Exception as e:
+                            logger.error(
+                                f"Error actualizando perfil en BD de {self.usuario}: {e}"
+                            )
+                    try:
+                        self.guardar_cookies()
+                    except Exception as e:
+                        logger.warning(f"No se pudo guardar el .pkl tras el perfil: {e}")
+                    try:
+                        cookies_nav = self.driver.get_cookies()
+                        if cookies_nav:
+                            self._guardar_cookies_json(cookies_nav)
+                    except Exception as e:
+                        logger.warning(
+                            f"No se pudieron guardar las cookies en BD: {e}"
+                        )
+
+            return resultado
+        except Exception as e:
+            resultado["error"] = f"{type(e).__name__}: {e}"
+            logger.exception(
+                f"Error en actualizar_perfil_completo de {self.usuario}: {e}"
+            )
+            return resultado
+
     def abrir_para_brandeo_manual(self, minutos: int = 5) -> bool:
         """Abre Chrome con la sesion de la cuenta para brandeo manual.
 
