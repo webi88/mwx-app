@@ -30,6 +30,19 @@ OPCION_SIN_ROL = "Sin rol"
 ORDEN_ROLES = ("cita", "hashtags", "rt")
 
 
+def _navegadores_default() -> int:
+    """Valor por defecto (1-30) de "Navegadores simultáneos" (`MAX_BROWSERS`).
+
+    `settings.max_browsers` viene de la variable de entorno y podría quedar
+    fuera del rango del `number_input`; se acota para no romper el widget.
+    """
+    try:
+        valor = int(settings.max_browsers)
+    except (TypeError, ValueError):
+        valor = 1
+    return min(30, max(1, valor))
+
+
 # ============================ LOGICA PURA ============================
 
 def _repartir_tercios(usuarios: list) -> dict:
@@ -240,11 +253,20 @@ def _mostrar_resultados_roles(resultados: dict):
     from core.roles import etiqueta_rol_activacion
 
     st.markdown("---")
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("🎯 Total", resultados.get("total", 0))
-    col2.metric("✅ Exitosas", resultados.get("exitosas", 0))
-    col3.metric("❌ Fallidas", resultados.get("fallidas", 0))
-    col4.metric("➖ Sin rol (saltadas)", resultados.get("sin_rol", 0))
+    metricas = [
+        ("🎯 Total", resultados.get("total", 0)),
+        ("✅ Exitosas", resultados.get("exitosas", 0)),
+        ("❌ Fallidas", resultados.get("fallidas", 0)),
+        ("➖ Sin rol (saltadas)", resultados.get("sin_rol", 0)),
+    ]
+    if "rondas" in resultados:
+        metricas.append(("🔄 Rondas", resultados.get("rondas", 0)))
+    if "sin_registro" in resultados:
+        metricas.append(
+            ("🪪 Sin registro (saltadas)", resultados.get("sin_registro", 0))
+        )
+    for col, (etiqueta, valor) in zip(st.columns(len(metricas)), metricas):
+        col.metric(etiqueta, valor)
 
     st.markdown("#### 🗂️ Subcuentas por rol")
     por_rol = resultados.get("por_rol") or {}
@@ -259,22 +281,36 @@ def _mostrar_resultados_roles(resultados: dict):
     detalles = resultados.get("detalles") or []
     if detalles:
         with st.expander(f"🔍 Detalle por cuenta ({len(detalles)})", expanded=False):
-            filas = [
-                {
+            filas = []
+            for d in detalles:
+                fila = {
                     "Usuario": f"@{d.get('usuario', '')}",
                     "Rol": etiqueta_rol_activacion(d.get("rol", "")),
                     "OK": "✅" if d.get("ok") else "❌",
                     "Detalle": d.get("detalle", ""),
                     "URL": d.get("url", ""),
                 }
-                for d in detalles
-            ]
+                if "ronda" in d:
+                    fila["Ronda"] = d.get("ronda", "")
+                filas.append(fila)
             st.dataframe(filas, use_container_width=True, hide_index=True)
 
     sin_rol_usuarios = resultados.get("sin_rol_usuarios") or []
     if sin_rol_usuarios:
         with st.expander(f"➖ Cuentas sin rol saltadas ({len(sin_rol_usuarios)})"):
             st.caption(", ".join(f"@{u}" for u in sin_rol_usuarios))
+
+    sin_registro_usuarios = resultados.get("sin_registro_usuarios") or []
+    sugerencia_registro = (resultados.get("sugerencia_registro") or "").strip()
+    if sin_registro_usuarios or sugerencia_registro:
+        with st.expander(
+            f"🪪 Cuentas sin registro saltadas ({len(sin_registro_usuarios)})",
+            expanded=False,
+        ):
+            if sugerencia_registro:
+                st.info(sugerencia_registro)
+            if sin_registro_usuarios:
+                st.caption(", ".join(f"@{u}" for u in sin_registro_usuarios))
 
 
 # ============================ PESTANAS ============================
@@ -290,7 +326,13 @@ def _cita_masiva():
         key="act_texto",
     )
 
-    col1, col2, col3 = st.columns(3)
+    hashtags = st.text_input(
+        "Hashtags para las citas (opcional, ej. #Mexico #4T)",
+        key="act_hashtags",
+        help="Se agregan a los retweets con cita (con '#' garantizado).",
+    )
+
+    col1, col2, col3, col4 = st.columns(4)
     with col1:
         cantidad = st.number_input(
             "Cantidad de cuentas (vacío = todas)",
@@ -304,12 +346,51 @@ def _cita_masiva():
         cohortes = st.number_input(
             "Cohortes", min_value=1, max_value=24, value=4, step=1, key="act_coh",
         )
+    with col4:
+        navegadores = st.number_input(
+            "Navegadores simultáneos",
+            min_value=1, max_value=30, value=_navegadores_default(), step=1,
+            key="act_nav",
+            help=(
+                "Cada navegador ejecuta una cuenta a la vez. En Railway "
+                "conviene 3 (configurable con la variable MAX_BROWSERS)."
+            ),
+        )
 
     col4, col5 = st.columns(2)
     with col4:
         dar_like = st.checkbox("Dar like también", value=False, key="act_like")
     with col5:
         grupo = st.text_input("Filtrar por grupo (A/B/C, opcional)", key="act_grupo")
+
+    col6, col7 = st.columns(2)
+    with col6:
+        repetir = st.checkbox(
+            "🔁 Repetir hasta agotar el tiempo (textos nuevos en cada ronda)",
+            value=True,
+            key="act_repetir",
+            help=(
+                "Cada cuenta sigue trabajando en rondas hasta agotar la "
+                "duración, con textos nuevos regenerados en cada ronda."
+            ),
+        )
+    with col7:
+        todas_cuentas = st.checkbox(
+            "📢 Todas las cuentas publican (solo con registro definido)",
+            value=False,
+            key="act_todas",
+            help=(
+                "Ignora la cantidad y usa todas las cuentas activas; las "
+                "cuentas sin registro (político/activista/ciudadanía) no hacen nada."
+            ),
+        )
+    if todas_cuentas:
+        st.caption(
+            "📢 **Todas las cuentas publican**: se ignora la cantidad de "
+            "cuentas y se usan todas las activas. Solo publican las que tengan "
+            "registro definido (político/activista/ciudadanía); las cuentas sin "
+            "registro no hacen nada."
+        )
 
     if st.button("🎯 Lanzar activación", type="primary", key="btn_act"):
         urls = [u.strip() for u in urls_text.splitlines() if u.strip()]
@@ -322,7 +403,7 @@ def _cita_masiva():
 
         from activaciones.motor import MotorActivacion
 
-        motor = MotorActivacion()
+        motor = MotorActivacion(max_concurrente=int(navegadores))
         progreso = st.progress(0.0)
         estado = st.empty()
 
@@ -334,28 +415,57 @@ def _cita_masiva():
         resultados = motor.ejecutar(
             urls=urls,
             texto_base=texto_base,
-            cantidad_cuentas=int(cantidad) if cantidad > 0 else None,
+            cantidad_cuentas=(
+                None if todas_cuentas else (int(cantidad) if cantidad > 0 else None)
+            ),
             grupo=grupo.strip() or None,
             dar_like=dar_like,
             duracion_min=int(duracion_min),
             cohortes=int(cohortes),
             callback=callback,
+            hashtags=hashtags,
+            repetir=bool(repetir),
+            solo_con_registro=bool(todas_cuentas),
         )
 
         st.markdown("---")
-        col1, col2, col3 = st.columns(3)
-        col1.metric("🎯 Total", resultados["total"])
-        col2.metric("✅ Exitosas", resultados["exitosas"])
-        col3.metric("❌ Fallidas", resultados["fallidas"])
+        metricas = [
+            ("🎯 Total", resultados.get("total", 0)),
+            ("✅ Exitosas", resultados.get("exitosas", 0)),
+            ("❌ Fallidas", resultados.get("fallidas", 0)),
+        ]
+        if "rondas" in resultados:
+            metricas.append(("🔄 Rondas", resultados.get("rondas", 0)))
+        if "sin_registro" in resultados:
+            metricas.append(
+                ("🪪 Sin registro (saltadas)", resultados.get("sin_registro", 0))
+            )
+        for col, (etiqueta, valor) in zip(st.columns(len(metricas)), metricas):
+            col.metric(etiqueta, valor)
 
-        if resultados["detalles"]:
+        detalles = resultados.get("detalles") or []
+        if detalles:
             with st.expander("🔍 Detalle por cuenta", expanded=False):
-                for d in resultados["detalles"]:
-                    icono = "✅" if d["ok"] else "❌"
-                    linea = f"{icono} @{d['usuario']} — {d['detalle']}"
+                for d in detalles:
+                    icono = "✅" if d.get("ok") else "❌"
+                    linea = f"{icono} @{d.get('usuario', '')} — {d.get('detalle', '')}"
                     if d.get("url"):
                         linea += f" — [ver post]({d['url']})"
+                    if d.get("ronda"):
+                        linea += f" — ronda {d['ronda']}"
                     st.markdown(linea)
+
+        sin_registro_usuarios = resultados.get("sin_registro_usuarios") or []
+        sugerencia_registro = (resultados.get("sugerencia_registro") or "").strip()
+        if sin_registro_usuarios or sugerencia_registro:
+            with st.expander(
+                f"🪪 Cuentas sin registro (saltadas) ({len(sin_registro_usuarios)})",
+                expanded=False,
+            ):
+                if sugerencia_registro:
+                    st.info(sugerencia_registro)
+                if sin_registro_usuarios:
+                    st.caption(", ".join(f"@{u}" for u in sin_registro_usuarios))
 
 
 def _por_roles():
@@ -463,9 +573,19 @@ def _por_roles():
         key="act_roles_urls",
     )
     texto_base = st.text_area(
-        "Texto base de la cita (se generan variaciones automáticas)",
+        "Texto base de la cita / contexto por defecto de los posts con hashtag",
         height=80,
         key="act_roles_texto",
+    )
+    contexto = st.text_area(
+        "Contexto de los posts con hashtag (tema sobre el que debe opinar la IA, "
+        "ej. 'gran deporte que tenemos como el futbol')",
+        height=80,
+        key="act_roles_contexto",
+        help=(
+            "Si lo dejas vacío, el motor usa el texto base de la cita como "
+            "contexto por defecto."
+        ),
     )
 
     col_hashtags, col_menciones = st.columns(2)
@@ -473,6 +593,10 @@ def _por_roles():
         hashtags = st.text_input(
             "Hashtags (ej. #Mexico #4T)",
             key="act_roles_hashtags",
+            help=(
+                "Se agregan también a los retweets con cita y la IA los usa en "
+                "los posts con hashtag."
+            ),
         )
     with col_menciones:
         menciones = st.text_input(
@@ -480,7 +604,7 @@ def _por_roles():
             key="act_roles_menciones",
         )
 
-    col_dur, col_coh = st.columns(2)
+    col_dur, col_coh, col_nav = st.columns(3)
     with col_dur:
         duracion_min = st.number_input(
             "Duración (min)", min_value=1, max_value=360, value=60, step=5,
@@ -491,8 +615,18 @@ def _por_roles():
             "Cohortes", min_value=1, max_value=24, value=4, step=1,
             key="act_roles_coh",
         )
+    with col_nav:
+        navegadores = st.number_input(
+            "Navegadores simultáneos",
+            min_value=1, max_value=30, value=_navegadores_default(), step=1,
+            key="act_roles_nav",
+            help=(
+                "Cada navegador ejecuta una cuenta a la vez. En Railway "
+                "conviene 3 (configurable con la variable MAX_BROWSERS)."
+            ),
+        )
 
-    col_like, col_solo = st.columns(2)
+    col_like, col_solo, col_rep = st.columns(3)
     with col_like:
         dar_like = st.checkbox(
             "Dar like también", value=False, key="act_roles_like"
@@ -500,6 +634,33 @@ def _por_roles():
     with col_solo:
         solo_con_rol = st.checkbox(
             "Solo cuentas con rol", value=True, key="act_roles_solo_rol"
+        )
+    with col_rep:
+        repetir = st.checkbox(
+            "🔁 Repetir hasta agotar el tiempo (textos nuevos en cada ronda)",
+            value=True,
+            key="act_roles_repetir",
+            help=(
+                "Cada cuenta sigue trabajando en rondas hasta agotar la "
+                "duración, con textos nuevos regenerados en cada ronda."
+            ),
+        )
+
+    todas_cuentas = st.checkbox(
+        "📢 Todas las cuentas publican (solo con registro definido)",
+        value=False,
+        key="act_roles_todas",
+        help=(
+            "Ignora el selector y usa todas las cuentas activas; las cuentas "
+            "sin registro (político/activista/ciudadanía) no hacen nada."
+        ),
+    )
+    if todas_cuentas:
+        st.caption(
+            "📢 **Todas las cuentas publican**: se ignora el selector de "
+            "cuentas y se usan todas las activas que cumplan el filtro de rol. "
+            "Solo publican las que tengan registro definido "
+            "(político/activista/ciudadanía); las cuentas sin registro no hacen nada."
         )
 
     if st.button(
@@ -509,8 +670,14 @@ def _por_roles():
     ):
         urls = [u.strip() for u in urls_text.splitlines() if u.strip()]
         solo_roles_param = list(ORDEN_ROLES) if solo_con_rol else None
+        usuarios_param = None if todas_cuentas else (usuarios_sel or None)
+        base_objetivo = (
+            [f for f in cuentas if f.get("tipo_cuenta")]
+            if todas_cuentas
+            else cuentas
+        )
         roles_objetivo = _roles_objetivo(
-            cuentas, usuarios_sel or None, solo_roles_param
+            base_objetivo, usuarios_param, solo_roles_param
         )
 
         if not roles_objetivo:
@@ -528,7 +695,7 @@ def _por_roles():
 
         from activaciones.motor import MotorActivacion
 
-        motor = MotorActivacion()
+        motor = MotorActivacion(max_concurrente=int(navegadores))
         progreso = st.progress(0.0)
         estado = st.empty()
 
@@ -545,9 +712,12 @@ def _por_roles():
             dar_like=dar_like,
             duracion_min=int(duracion_min),
             cohortes=int(cohortes),
-            usuarios=usuarios_sel or None,
+            usuarios=usuarios_param,
             solo_roles=solo_roles_param,
             callback=callback,
+            contexto=contexto,
+            repetir=bool(repetir),
+            solo_con_registro=bool(todas_cuentas),
         )
         _mostrar_resultados_roles(resultados)
 

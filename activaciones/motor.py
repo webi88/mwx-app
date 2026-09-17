@@ -22,6 +22,8 @@ from core.database import get_db_session
 from core.models import Cuenta
 from core.config import settings, resolver_ruta
 from core.roles import normalizar_rol_activacion
+from core.registros import normalizar_tipo_cuenta
+from core.perfiles import normalizar_perfil
 from activaciones.variaciones import generar_pool_variaciones_openai, variar_texto
 from core.registro import registrar_accion, marcar_cuenta_suspendida
 
@@ -119,6 +121,68 @@ def _partir_por_sesion(cuentas: list) -> tuple:
     for cuenta in (cuentas or []):
         (con if _tiene_credencial_sesion(cuenta) else sin).append(cuenta)
     return con, sin
+
+
+def _partir_por_registro(cuentas: list) -> tuple:
+    """Separa cuentas con registro definido de las que no lo tienen.
+
+    El registro se normaliza con `core.registros.normalizar_tipo_cuenta`
+    ("politica"/"activista"/"ciudadana"); "" = sin definir.
+    """
+    con, sin = [], []
+    for cuenta in (cuentas or []):
+        try:
+            registro = normalizar_tipo_cuenta(getattr(cuenta, "tipo_cuenta", ""))
+        except Exception:
+            registro = ""
+        (con if registro else sin).append(cuenta)
+    return con, sin
+
+
+def _sugerencia_registro(n: int) -> str:
+    """Accion sugerida para las cuentas filtradas por falta de registro."""
+    return (
+        f"{n} cuenta(s) sin registro definido (política/activista/ciudadanía): "
+        "asígnales registro en 🗂️ Cuentas antes de activar; se omitieron."
+    )
+
+
+def _garantizar_hashtags_texto(texto: str, tags: list[str]) -> str:
+    """Garantiza que el texto traiga al menos un hashtag de `tags`.
+
+    Si no trae ninguno, agrega al final 1-2 tags elegidos al azar (los que
+    quepan de la lista). Con `tags` vacio devuelve el texto intacto.
+    Nunca lanza.
+    """
+    t = str(texto or "").strip()
+    if not t or not tags:
+        return t
+    try:
+        presentes = {
+            h.lower()
+            for h in re.findall(r"#[A-Za-z0-9ÁÉÍÓÚÜÑáéíóúüñ_]+", t)
+        }
+        if any(str(tag).lower() in presentes for tag in tags):
+            return t
+        cantidad = min(len(tags), random.randint(1, 2))
+        elegidos = random.sample(list(tags), cantidad)
+        return (t + " " + " ".join(elegidos)).strip()
+    except Exception:
+        return t
+
+
+def _agregar_menciones(texto: str, menciones_norm: list[str]) -> str:
+    """Agrega al final un subconjunto aleatorio de menciones (si hay)."""
+    t = str(texto or "").strip()
+    if not t or not menciones_norm:
+        return t
+    try:
+        k = random.randint(1, len(menciones_norm))
+        seleccion = random.sample(list(menciones_norm), k)
+        random.shuffle(seleccion)
+        return f"{t}\n\n{' '.join(seleccion)}".strip()
+    except Exception:
+        return t
 
 
 class MotorActivacion:
@@ -250,6 +314,192 @@ class MotorActivacion:
             pool.append(f"{base_txt} ({sufijo})")
             sufijo += 1
         return pool[:cantidad]
+
+    def _generar_textos_por_rol(self, grupos_ejec: dict, texto_base: str,
+                                hashtags: str = "", menciones: str = "",
+                                narrativa: str = "",
+                                entrenamiento: str = "",
+                                contexto: str = "") -> dict:
+        """Arma {usuario: texto} para una ronda de la campana por roles.
+
+        - "cita": variaciones OpenAI/fallback del texto base con los hashtags
+          pedidos garantizados.
+        - "hashtags": posts ORIGINALES por cuenta con IA (registro/perfil);
+          si la IA falla o no devuelve texto, rellena con `_pool_hashtags`
+          (comportamiento anterior) y agrega las menciones al final.
+        - "rt": sin texto ("").
+        Nunca lanza por la IA: ante cualquier fallo usa el pool de respaldo.
+        """
+        asignaciones: dict = {}
+        tags = _normalizar_hashtags(hashtags)
+
+        citas = list(grupos_ejec.get("cita") or [])
+        if citas:
+            pool_cita = generar_pool_variaciones_openai(
+                texto_base,
+                cantidad=len(citas),
+                narrativa=narrativa,
+                entrenamiento=entrenamiento,
+            )
+            if tags:
+                pool_cita = [
+                    _garantizar_hashtags_texto(t, tags) for t in pool_cita
+                ]
+            random.shuffle(pool_cita)
+            for i, cuenta in enumerate(citas):
+                if i < len(pool_cita):
+                    asignaciones[cuenta.usuario] = pool_cita[i]
+                else:
+                    asignaciones[cuenta.usuario] = _garantizar_hashtags_texto(
+                        texto_base, tags
+                    )
+
+        cuentas_hashtags = list(grupos_ejec.get("hashtags") or [])
+        if cuentas_hashtags:
+            textos_ia: dict = {}
+            try:
+                from ia.generador_contenido import (
+                    generar_textos_hashtags_por_cuenta,
+                )
+
+                cuentas_info = []
+                for cuenta in cuentas_hashtags:
+                    cuentas_info.append({
+                        "usuario": cuenta.usuario,
+                        "registro": normalizar_tipo_cuenta(
+                            getattr(cuenta, "tipo_cuenta", "")
+                        ),
+                        "personalidad": (
+                            getattr(cuenta, "personalidad", "") or ""
+                        ),
+                        "seccion": getattr(cuenta, "seccion", "") or "",
+                        "nombre": (
+                            getattr(cuenta, "nombre_mostrado", "")
+                            or cuenta.usuario
+                        ),
+                        "perfil": normalizar_perfil(
+                            getattr(cuenta, "perfil_personalidad", "")
+                        ),
+                    })
+                resultado_ia = generar_textos_hashtags_por_cuenta(
+                    cuentas_info,
+                    hashtags=hashtags,
+                    contexto=(str(contexto or "").strip() or texto_base),
+                    n_por_cuenta=1,
+                    narrativa=narrativa,
+                    entrenamiento=entrenamiento,
+                )
+                if not isinstance(resultado_ia, dict):
+                    resultado_ia = {}
+                for cuenta in cuentas_hashtags:
+                    lista = resultado_ia.get(cuenta.usuario) or []
+                    if lista:
+                        texto_ia = str(lista[0] or "").strip()
+                        if texto_ia:
+                            textos_ia[cuenta.usuario] = texto_ia
+            except Exception as e:
+                logger.error(
+                    f"Activacion por roles: IA de hashtags fallo "
+                    f"({type(e).__name__}: {e}); se usa el pool de respaldo"
+                )
+
+            menciones_norm = _normalizar_menciones(menciones)
+            faltantes = [
+                c for c in cuentas_hashtags if c.usuario not in textos_ia
+            ]
+            respaldo = []
+            if faltantes:
+                respaldo = self._pool_hashtags(
+                    texto_base, hashtags, menciones, len(faltantes)
+                )
+                random.shuffle(respaldo)
+            for i, cuenta in enumerate(faltantes):
+                asignaciones[cuenta.usuario] = (
+                    respaldo[i] if i < len(respaldo) else texto_base
+                )
+            for cuenta in cuentas_hashtags:
+                if cuenta.usuario in textos_ia:
+                    asignaciones[cuenta.usuario] = _agregar_menciones(
+                        textos_ia[cuenta.usuario], menciones_norm
+                    )
+
+        for cuenta in (grupos_ejec.get("rt") or []):
+            asignaciones[cuenta.usuario] = ""
+
+        return asignaciones
+
+    def _bucle_rondas(self, procesables: list, duracion_min: int,
+                      generar_textos, ejecutar_uno, reportar) -> int:
+        """Ejecuta acciones en rondas hasta agotar `duracion_min`.
+
+        Worker-pool con cola compartida: `self.max_concurrente` workers toman
+        cuentas de un orden barajado; al agotarlo, regeneran los textos de la
+        siguiente ronda, vuelven a barajar y reinician el cursor. Las cuentas
+        que no alcanzan a ejecutar antes del deadline se omiten sin abrir
+        navegador. Devuelve el numero de rondas iniciadas. Nunca lanza.
+        """
+        try:
+            minutos = max(0, int(duracion_min or 0))
+        except (TypeError, ValueError):
+            minutos = 0
+        fin = time.monotonic() + minutos * 60
+        n_workers = max(1, int(self.max_concurrente or 1))
+        estado = {"cursor": 0, "ronda": 0, "orden": [], "textos": {}}
+        lock = threading.Lock()
+
+        def _iniciar_ronda_locked() -> None:
+            estado["ronda"] += 1
+            estado["orden"] = list(procesables)
+            random.shuffle(estado["orden"])
+            estado["cursor"] = 0
+            try:
+                textos = generar_textos(estado["ronda"]) or {}
+            except Exception as e:
+                logger.error(
+                    f"Activacion (rondas): no se pudieron generar los textos "
+                    f"de la ronda {estado['ronda']}: {e}"
+                )
+                textos = {}
+            estado["textos"] = textos if isinstance(textos, dict) else {}
+
+        def _worker() -> None:
+            while time.monotonic() < fin:
+                with lock:
+                    if estado["cursor"] >= len(estado["orden"]):
+                        _iniciar_ronda_locked()
+                    cuenta = estado["orden"][estado["cursor"]]
+                    estado["cursor"] += 1
+                    texto = estado["textos"].get(cuenta.usuario, "")
+                    ronda = estado["ronda"]
+                if time.monotonic() >= fin:
+                    return
+                try:
+                    resultado = ejecutar_uno(cuenta, texto)
+                except Exception as e:
+                    logger.error(
+                        f"Error en la ronda {ronda} para @{cuenta.usuario}: {e}"
+                    )
+                    continue
+                with lock:
+                    try:
+                        reportar(resultado, ronda)
+                    except Exception as e:
+                        logger.error(
+                            f"Error reportando el resultado de activacion: {e}"
+                        )
+
+        if not procesables:
+            return 0
+
+        with ThreadPoolExecutor(max_workers=n_workers) as pool_exec:
+            futuros = [pool_exec.submit(_worker) for _ in range(n_workers)]
+            for futuro in futuros:
+                try:
+                    futuro.result()
+                except Exception as e:
+                    logger.error(f"Worker de activacion termino con error: {e}")
+
+        return estado["ronda"]
 
     def _quote_rt_una_cuenta(self, cuenta: Cuenta, urls: list[str],
                              texto: str, dar_like: bool, retardo: float = 0) -> tuple:
@@ -425,6 +675,9 @@ class MotorActivacion:
         narrativa: str = "",
         entrenamiento: str = "",
         callback=None,
+        hashtags: str = "",
+        solo_con_registro: bool = False,
+        repetir: bool = False,
     ) -> dict:
         """Lanza la campaña completa.
 
@@ -432,14 +685,37 @@ class MotorActivacion:
         - cohortes: en cuantos grupos temporales se reparten las cuentas.
         - narrativa: narrativa general de la celula (contexto para OpenAI).
         - entrenamiento: entrenamiento propio del cliente (contexto para OpenAI).
+        - hashtags: se garantizan en CADA cita (si faltan, se agregan al final).
+        - solo_con_registro: salta las cuentas sin registro (politica/
+          activista/ciudadana) sin abrir navegador y las cuenta aparte.
+        - repetir: con True las cuentas trabajan en rondas hasta agotar
+          `duracion_min`, regenerando textos nuevos en cada ronda.
         """
         cuentas = self._obtener_cuentas(cantidad_cuentas, tags, grupo)
+
+        sin_registro = []
+        if solo_con_registro:
+            cuentas, sin_registro = _partir_por_registro(cuentas)
+        sin_registro_usuarios = [c.usuario for c in sin_registro]
+        sugerencia_registro = (
+            _sugerencia_registro(len(sin_registro)) if sin_registro else ""
+        )
+        if sin_registro:
+            logger.warning(
+                f"Activacion: {len(sin_registro)} cuenta(s) sin registro "
+                f"definido, se omiten. {sugerencia_registro}"
+            )
+
         if not cuentas:
             logger.warning("No hay cuentas activas de twitter para la activacion")
             return {
                 "exitosas": 0, "fallidas": 0, "detalles": [], "total": 0,
                 "sin_sesion": 0, "sin_sesion_usuarios": [],
                 "sugerencia_sesion": "",
+                "sin_registro": len(sin_registro),
+                "sin_registro_usuarios": sin_registro_usuarios,
+                "sugerencia_registro": sugerencia_registro,
+                "rondas": 0 if repetir else 1,
             }
 
         con_sesion, sin_sesion = _partir_por_sesion(cuentas)
@@ -480,6 +756,10 @@ class MotorActivacion:
                 "sin_sesion": len(sin_sesion),
                 "sin_sesion_usuarios": sin_sesion_usuarios,
                 "sugerencia_sesion": sugerencia_sesion,
+                "sin_registro": len(sin_registro),
+                "sin_registro_usuarios": sin_registro_usuarios,
+                "sugerencia_registro": sugerencia_registro,
+                "rondas": 0 if repetir else 1,
             }
             logger.info(
                 f"Activacion finalizada: {resumen_vacio['exitosas']} exitosas, "
@@ -488,13 +768,117 @@ class MotorActivacion:
             )
             return resumen_vacio
 
+        tags_pedidos = _normalizar_hashtags(hashtags)
+
+        if repetir:
+            resumen = {
+                "exitosas": self.progreso["exitosas"],
+                "fallidas": self.progreso["fallidas"],
+                "detalles": list(resultados),
+                "total": len(cuentas),
+                "sin_sesion": len(sin_sesion),
+                "sin_sesion_usuarios": sin_sesion_usuarios,
+                "sugerencia_sesion": sugerencia_sesion,
+                "sin_registro": len(sin_registro),
+                "sin_registro_usuarios": sin_registro_usuarios,
+                "sugerencia_registro": sugerencia_registro,
+                "rondas": 0,
+            }
+
+            def _generar_textos_ronda(_ronda):
+                nuevo = generar_pool_variaciones_openai(
+                    texto_base,
+                    cantidad=len(con_sesion),
+                    narrativa=narrativa,
+                    entrenamiento=entrenamiento,
+                )
+                if tags_pedidos:
+                    nuevo = [
+                        _garantizar_hashtags_texto(t, tags_pedidos)
+                        for t in nuevo
+                    ]
+                random.shuffle(nuevo)
+                return {
+                    cuenta.usuario: (
+                        nuevo[i] if i < len(nuevo)
+                        else _garantizar_hashtags_texto(
+                            texto_base, tags_pedidos
+                        )
+                    )
+                    for i, cuenta in enumerate(con_sesion)
+                }
+
+            def _ejecutar_una_cuenta(cuenta, texto):
+                try:
+                    return self._quote_rt_una_cuenta(
+                        cuenta, urls, texto, dar_like, 0
+                    )
+                except Exception as e:
+                    return (
+                        cuenta.usuario, False,
+                        f"{type(e).__name__}: {e}"[:120], "",
+                    )
+
+            def _reportar_ronda(resultado, ronda):
+                usuario_res, ok, detalle, url = resultado
+                with self._lock:
+                    self.progreso["hechas"] += 1
+                    self.progreso["exitosas" if ok else "fallidas"] += 1
+                    resumen["exitosas" if ok else "fallidas"] += 1
+                    registrar_accion(
+                        usuario_res,
+                        "activacion",
+                        "exito" if ok else "fallido",
+                        url,
+                        detalle,
+                    )
+                    resumen["detalles"].append({
+                        "usuario": usuario_res,
+                        "ok": ok,
+                        "detalle": detalle,
+                        "url": url,
+                        "ronda": ronda,
+                    })
+                    if callback:
+                        callback(
+                            self.progreso["hechas"],
+                            max(len(con_sesion), self.progreso["hechas"]),
+                            usuario_res,
+                            ok,
+                        )
+
+            logger.info(
+                f"Activacion masiva (rondas): {len(con_sesion)} cuentas con "
+                f"sesión, {len(urls)} urls, {duracion_min} min, concurrencia "
+                f"{self.max_concurrente}"
+            )
+            resumen["rondas"] = self._bucle_rondas(
+                con_sesion,
+                duracion_min,
+                _generar_textos_ronda,
+                _ejecutar_una_cuenta,
+                _reportar_ronda,
+            )
+            logger.info(
+                f"Activacion finalizada (rondas): {resumen['exitosas']} exitosas, "
+                f"{resumen['fallidas']} fallidas en {resumen['rondas']} ronda(s) "
+                f"({resumen['sin_sesion']} sin sesión, "
+                f"{resumen['sin_registro']} sin registro)"
+            )
+            return resumen
+
         pool = generar_pool_variaciones_openai(
             texto_base, cantidad=len(con_sesion), narrativa=narrativa, entrenamiento=entrenamiento
         )
+        if tags_pedidos:
+            pool = [_garantizar_hashtags_texto(t, tags_pedidos) for t in pool]
         # Garantizar un texto unico por cuenta (ninguna cuenta comparte el mismo).
         random.shuffle(pool)
         asignaciones = {
-            cuenta.usuario: (pool[i] if i < len(pool) else texto_base)
+            cuenta.usuario: (
+                pool[i] if i < len(pool)
+                else _garantizar_hashtags_texto(texto_base, tags_pedidos)
+            )
             for i, cuenta in enumerate(con_sesion)
         }
         bloques = self._distribuir_cohortes(con_sesion, duracion_min, cohortes)
@@ -553,11 +937,16 @@ class MotorActivacion:
             "sin_sesion": len(sin_sesion),
             "sin_sesion_usuarios": sin_sesion_usuarios,
             "sugerencia_sesion": sugerencia_sesion,
+            "sin_registro": len(sin_registro),
+            "sin_registro_usuarios": sin_registro_usuarios,
+            "sugerencia_registro": sugerencia_registro,
+            "rondas": 1,
         }
         logger.info(
             f"Activacion finalizada: {resumen['exitosas']} exitosas, "
             f"{resumen['fallidas']} fallidas de {resumen['total']} "
-            f"({resumen['sin_sesion']} sin sesión)"
+            f"({resumen['sin_sesion']} sin sesión, "
+            f"{resumen['sin_registro']} sin registro)"
         )
         return resumen
 
@@ -575,25 +964,48 @@ class MotorActivacion:
         narrativa: str = "",
         entrenamiento: str = "",
         callback=None,
+        contexto: str = "",
+        solo_con_registro: bool = False,
+        repetir: bool = False,
     ) -> dict:
         """Campaña masiva dividida en subcuentas por rol.
 
         - Carga cuentas twitter activas; si `usuarios` se pasa, limita a esos
           usuarios; si `solo_roles`, filtra a esos roles.
         - Agrupa por Cuenta.rol_activacion (normalizado con core/roles.py):
-            * "cita": quote-RT con texto del pool (OpenAI + fallback local).
-            * "hashtags": publica texto combinando base + hashtags + menciones.
+            * "cita": quote-RT con texto del pool (OpenAI + fallback local)
+              con los hashtags pedidos garantizados.
+            * "hashtags": posts ORIGINALES por cuenta con IA (registro/perfil)
+              sobre `contexto`; si la IA falla, cae al pool de respaldo
+              base + hashtags + menciones.
             * "rt": retweet simple (con like opcional).
         - Cuentas SIN rol se saltan y se cuentan en `sin_rol`.
         - Cuentas SIN ninguna credencial de sesion (.pkl, cookies_json ni
           auth_token) se filtran antes de abrir navegadores y se cuentan en
           `sin_sesion` con la accion sugerida en `sugerencia_sesion`.
+        - `solo_con_registro`: salta las cuentas sin registro (politica/
+          activista/ciudadana) sin abrir navegador y las cuenta aparte.
+        - `repetir`: con True las cuentas trabajan en rondas hasta agotar
+          `duracion_min`, regenerando textos nuevos en cada ronda.
         - Cohortes temporales + delay aleatorio y concurrencia limitada,
           igual que `ejecutar()`.
         - Nunca lanza: cada cuenta fallida se reporta en `detalles`.
         """
         urls = [str(u).strip() for u in (urls or []) if str(u).strip()]
         cuentas = self._obtener_cuentas_por_rol(usuarios, solo_roles)
+
+        sin_registro = []
+        if solo_con_registro:
+            cuentas, sin_registro = _partir_por_registro(cuentas)
+        sin_registro_usuarios = [c.usuario for c in sin_registro]
+        sugerencia_registro = (
+            _sugerencia_registro(len(sin_registro)) if sin_registro else ""
+        )
+        if sin_registro:
+            logger.warning(
+                f"Activacion por roles: {len(sin_registro)} cuenta(s) sin "
+                f"registro definido, se omiten. {sugerencia_registro}"
+            )
 
         grupos = {"cita": [], "hashtags": [], "rt": []}
         sin_rol_usuarios = []
@@ -639,6 +1051,10 @@ class MotorActivacion:
             "sin_rol_usuarios": sin_rol_usuarios,
             "sin_sesion_usuarios": sin_sesion_usuarios,
             "sugerencia_sesion": sugerencia_sesion,
+            "sin_registro": len(sin_registro),
+            "sin_registro_usuarios": sin_registro_usuarios,
+            "sugerencia_registro": sugerencia_registro,
+            "rondas": 0 if repetir else 1,
         }
         for cuenta in sin_sesion:
             rol = rol_de.get(cuenta.usuario, "")
@@ -675,42 +1091,10 @@ class MotorActivacion:
             )
             return resumen
 
-        # --- Pool de textos por rol ---
-        pool_cita = []
-        if grupos_ejec["cita"]:
-            pool_cita = generar_pool_variaciones_openai(
-                texto_base,
-                cantidad=len(grupos_ejec["cita"]),
-                narrativa=narrativa,
-                entrenamiento=entrenamiento,
-            )
-            random.shuffle(pool_cita)
-
-        pool_hashtags = []
-        if grupos_ejec["hashtags"]:
-            pool_hashtags = self._pool_hashtags(
-                texto_base, hashtags, menciones, len(grupos_ejec["hashtags"])
-            )
-            random.shuffle(pool_hashtags)
-
-        asignaciones = {}
-        for i, cuenta in enumerate(grupos_ejec["cita"]):
-            asignaciones[cuenta.usuario] = (
-                pool_cita[i] if i < len(pool_cita) else texto_base
-            )
-        for i, cuenta in enumerate(grupos_ejec["hashtags"]):
-            asignaciones[cuenta.usuario] = (
-                pool_hashtags[i] if i < len(pool_hashtags) else texto_base
-            )
-        for cuenta in grupos_ejec["rt"]:
-            asignaciones[cuenta.usuario] = ""
-
         rol_por_usuario = {
             cuenta.usuario: rol_de.get(cuenta.usuario, "")
             for cuenta in ejecutables
         }
-
-        bloques = self._distribuir_cohortes(ejecutables, duracion_min, cohortes)
 
         logger.info(
             f"Activacion por roles: {len(ejecutables)} cuentas con sesión "
@@ -737,6 +1121,92 @@ class MotorActivacion:
                     cuenta.usuario, False,
                 )
         intervalo_cohorte = max(1, (duracion_min * 60) // max(cohortes, 1))
+
+        if repetir:
+            def _generar_textos_ronda(_ronda):
+                return self._generar_textos_por_rol(
+                    grupos_ejec,
+                    texto_base,
+                    hashtags=hashtags,
+                    menciones=menciones,
+                    narrativa=narrativa,
+                    entrenamiento=entrenamiento,
+                    contexto=contexto,
+                )
+
+            def _ejecutar_una_rol(cuenta, texto):
+                rol = rol_por_usuario.get(cuenta.usuario, "")
+                try:
+                    return self._ejecutar_accion_rol(
+                        cuenta, rol, urls, texto, dar_like, 0
+                    )
+                except Exception as e:
+                    return (
+                        cuenta.usuario, rol, False,
+                        f"{type(e).__name__}: {e}"[:120], "",
+                    )
+
+            def _reportar_rol(resultado, ronda):
+                usuario_res, rol_res, ok, detalle, url = resultado
+                with self._lock:
+                    self.progreso["hechas"] += 1
+                    self.progreso["exitosas" if ok else "fallidas"] += 1
+                    resumen["exitosas" if ok else "fallidas"] += 1
+                    if rol_res in resumen["por_rol"]:
+                        resumen["por_rol"][rol_res][
+                            "exitosas" if ok else "fallidas"
+                        ] += 1
+                    registrar_accion(
+                        usuario_res,
+                        "activacion",
+                        "exito" if ok else "fallido",
+                        url,
+                        detalle,
+                    )
+                    resumen["detalles"].append({
+                        "usuario": usuario_res,
+                        "rol": rol_res,
+                        "ok": ok,
+                        "detalle": detalle,
+                        "url": url,
+                        "ronda": ronda,
+                    })
+                    if callback:
+                        callback(
+                            self.progreso["hechas"],
+                            max(len(ejecutables), self.progreso["hechas"]),
+                            usuario_res,
+                            ok,
+                        )
+
+            resumen["rondas"] = self._bucle_rondas(
+                ejecutables,
+                duracion_min,
+                _generar_textos_ronda,
+                _ejecutar_una_rol,
+                _reportar_rol,
+            )
+            logger.info(
+                f"Activacion por roles finalizada (rondas): "
+                f"{resumen['exitosas']} exitosas, {resumen['fallidas']} fallidas "
+                f"en {resumen['rondas']} ronda(s) "
+                f"({resumen['sin_rol']} sin rol, {resumen['sin_sesion']} sin sesión, "
+                f"{resumen['sin_registro']} sin registro)"
+            )
+            return resumen
+
+        # --- Pool de textos por rol (una sola ronda) ---
+        asignaciones = self._generar_textos_por_rol(
+            grupos_ejec,
+            texto_base,
+            hashtags=hashtags,
+            menciones=menciones,
+            narrativa=narrativa,
+            entrenamiento=entrenamiento,
+            contexto=contexto,
+        )
+
+        bloques = self._distribuir_cohortes(ejecutables, duracion_min, cohortes)
 
         with ThreadPoolExecutor(max_workers=self.max_concurrente) as pool_exec:
             futuros = []

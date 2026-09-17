@@ -574,6 +574,60 @@ def get_prompt_comentario(
     )
 
 
+def get_prompt_hashtags(
+    hashtags: str = "",
+    contexto: str = "",
+    narrativa: str = "",
+    entrenamiento: str = "",
+    cantidad: int = 0,
+    registro: str = "",
+    personalidad: str = "",
+    perfil: str = "",
+) -> str:
+    """Prompt de POST ORIGINAL con hashtag(s) obligatorios.
+
+    A diferencia de los tipos clasicos, aqui el texto SIEMPRE debe ser una
+    publicacion ORIGINAL sobre ``contexto``: se opina, comenta y aporta algo
+    propio (prohibido copiar el contexto tal cual o parafrasearlo plano). Los
+    ``hashtags`` pedidos se integran EN MEDIO del texto (nunca al final) y
+    ``registro``/``perfil``/``personalidad`` modulan el estilo igual que en el
+    resto de los prompts. Reutiliza los bloques existentes de este modulo.
+    """
+    prompt = (
+        _base_narrativa(narrativa, entrenamiento)
+        + _reglas_registro(registro)
+        + "\nTIPO DE CONTENIDO: POST ORIGINAL CON HASHTAG.\n"
+        "TAREA: redactar publicaciones ORIGINALES con opinion propia sobre el "
+        "CONTEXTO indicado.\n"
+        "- PROHIBIDO copiar el contexto tal cual o parafrasearlo de forma plana: "
+        "cada texto debe OPINAR, comentar, reaccionar y aportar algo propio "
+        "(una emocion, un ejemplo, una comparacion, una anecdota breve) con la "
+        "voz de la cuenta.\n"
+        "- Cada texto debe tener un ENFOQUE, una apertura y una estructura "
+        "DISTINTOS: no repitas frases, ideas, muletillas ni el mismo angulo.\n"
+        "- El resultado NO debe ser el contexto ni el contexto con el hashtag "
+        "pegado: debe sonar como una publicacion espontanea y humana.\n"
+        "- Los hashtags van SIEMPRE bien escritos (sin deformarlos) e "
+        "integrados EN MEDIO del texto; NUNCA al final ni en una lista aparte.\n"
+        + _bloque_tema_personalidad("", personalidad)
+    )
+    if hashtags:
+        prompt += (
+            "\nHASHTAGS OBLIGATORIOS:\n"
+            f"- Usa EXACTAMENTE estos hashtags (bien escritos): {hashtags}\n"
+            "- Deben aparecer dentro de una oracion, integrados EN MEDIO del "
+            "texto; NUNCA al final ni como cierre.\n"
+        )
+    if contexto:
+        prompt += (
+            "\nCONTEXTO (tema sobre el que debes opinar; NO copies su redacción):\n"
+            f"{contexto}"
+        )
+    prompt += _reglas_formato(cantidad)
+    prompt += bloque_estilo_perfil(perfil)
+    return prompt
+
+
 def get_prompt_verificado_ambiental(contexto_links: str) -> str:
     return (
         "ERES UN VERIFICADOR DE HECHOS OBJETIVO PERO CON SESGO SUTIL PRO-GOBIERNO DE QUINTANA ROO.\n\n"

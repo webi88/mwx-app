@@ -12,9 +12,11 @@ from core.perfiles import (
     normalizar_perfil,
     tiene_hashtag,
 )
+from core.registros import normalizar_tipo_cuenta
 from ia.prompts import (
     bloque_estilo_perfil,
     get_prompt_generico,
+    get_prompt_hashtags,
     get_prompt_verificado_ambiental,
     get_prompt_harfuch,
     get_prompt_por_tipo,
@@ -1854,3 +1856,548 @@ def generar_textos_campana_3_3_3(
         temas=temas,
         callback=callback,
     )
+
+
+# ===================================================================== #
+# Rol "hashtags": post ORIGINAL por cuenta sobre un contexto, con los
+# hashtags pedidos SIEMPRE bien escritos e integrados EN MEDIO del texto.
+# ===================================================================== #
+_MAX_CUENTAS_HASHTAGS_POR_LLAMADA = 15
+
+# Plantillas locales (fallback sin OpenAI) para el rol "hashtags".
+# Estructura: registro -> perfil -> plantillas. `{contexto}` y `{tag}` se usan
+# SIEMPRE dentro de una opinion propia (prohibido devolver el contexto pelado o
+# "contexto + hashtag"). La clave "generico" aplica cuando el registro o el
+# perfil no se reconocen. El estilo humano ciudadano se aplica despues con
+# `_humanizar_si_ciudadano` (protege el hashtag para no deformarlo).
+_PLANTILLAS_HASHTAGS = {
+    "politica": {
+        "formal": (
+            "Compromiso con lo nuestro\n\n"
+            "Hablando de {contexto}, conviene reconocer su valor en la vida "
+            "diaria y el orgullo que despierta; {tag} expresa bien ese "
+            "sentimiento colectivo.\n\n"
+            "Sigamos construyendo identidad con información y respeto.",
+            "Una mirada serena\n\n"
+            "El tema de {contexto} merece atención y calma para valorar lo que "
+            "aporta a la comunidad; {tag} acompaña esta reflexión.\n\n"
+            "Mantengamos el diálogo informado.",
+            "Orgullo bien entendido\n\n"
+            "Reconocer {contexto} es reconocer lo que somos y lo que podemos "
+            "compartir; {tag} lo resume con claridad.\n\n"
+            "Ese orgullo se demuestra con hechos.",
+        ),
+        "ciudadano": (
+            "Con esto de {contexto}, uno se da cuenta de lo mucho que tenemos; "
+            "{tag} lo dice todo sin exagerar.",
+            "Vale la pena detenerse en {contexto}: hay cosas que se disfrutan "
+            "más cuando se comparten; {tag} va bien con esa idea.",
+            "A veces se nos olvida lo bueno de {contexto}, y {tag} nos recuerda "
+            "de dónde viene ese orgullo.",
+        ),
+        "popular": (
+            "Con {contexto} y {tag}, así se siente el orgullo de lo nuestro.",
+            "Hay que disfrutar {contexto}: {tag} y buena compañía lo dicen todo.",
+            "Lo bueno de {contexto} merece contarse; {tag} lo resume en pocas "
+            "palabras.",
+        ),
+    },
+    "activista": {
+        "formal": (
+            "Apunte ciudadano\n\n"
+            "Hablando de {contexto}, hay q reconocer el valor q tiene pa la "
+            "comunidad; {tag} lo resume bien.\n\n"
+            "Mantengamos el ojo en lo importante.",
+            "Una reflexión breve\n\n"
+            "Con esto de {contexto} queda claro q hay cosas q se defienden "
+            "desde el barrio; {tag} acompaña ese ánimo.\n\n"
+            "Sigamos informados.",
+            "Contrapunto\n\n"
+            "El debate sobre {contexto} merece seriedad y pa no perder el rumbo "
+            "hay q escuchar a la gente; {tag} apunta a esa conversación.\n\n"
+            "No nos distraigamos.",
+        ),
+        "ciudadano": (
+            "Con esto de {contexto}, la verdad es q hay cosas q vale la pena "
+            "defender; {tag} me parece un buen recordatorio.",
+            "Tons con {contexto} queda claro q no todo está perdido; {tag} lo "
+            "dice bien clarito.",
+            "Hablando de {contexto}, xq hay motivos pa estar orgullosos; {tag} "
+            "resume bien el sentimiento.",
+        ),
+        "popular": (
+            "tons {tag} y {contexto}, todo cuenta pa sentirse bien",
+            "q chido es {contexto}, pa eso esta {tag} y las ganas de compartir",
+            "con {contexto} y {tag} queda claro q lo nuestro vale",
+        ),
+    },
+    "ciudadana": {
+        "formal": (
+            "La neta de lo nuestro\n\n"
+            "Me pongo a pensar en {contexto} y {tag} me hace sentir orgulloso "
+            "de mi tierra.\n\n"
+            "Hay que querer lo que tenemos.",
+            "Orgullo de barrio\n\n"
+            "Hablando de {contexto}, la neta hay mucho que agradecer; {tag} lo "
+            "dice mejor que yo.\n\n"
+            "Ojalá todos lo valoren.",
+            "Así se siente\n\n"
+            "Cuando se trata de {contexto}, {tag} me recuerda que lo bueno sí "
+            "existe.\n\n"
+            "Y no hay que olvidarlo.",
+        ),
+        "ciudadano": (
+            "Con esto de {contexto}, la neta me dan ganas de compartir; {tag} "
+            "lo resume bien.",
+            "Hablando de {contexto}, la verdad {tag} dice lo que muchos "
+            "pensamos.",
+            "A mí me gusta {contexto} y {tag} lo deja bien claro, no manches.",
+        ),
+        "popular": (
+            "tons {tag} y {contexto}, puro amor",
+            "la neta {contexto} esta bien chido, {tag} y ya",
+            "k chido es {contexto}, con {tag} todo se dice mejor",
+        ),
+    },
+    "generico": {
+        "formal": (
+            "Una buena noticia\n\n"
+            "Hablando de {contexto}, conviene valorar lo que tenemos; {tag} "
+            "resume esa idea.\n\n"
+            "Es un orgullo compartirlo.",
+            "Motivo de conversación\n\n"
+            "El tema de {contexto} da para comentar y reconocer lo bueno; {tag} "
+            "invita a opinar.\n\n"
+            "Sigamos conversando.",
+            "Para reflexionar\n\n"
+            "Detenerse en {contexto} ayuda a mirar lo que nos une; {tag} lo dice "
+            "de forma sencilla.\n\n"
+            "Compartamos la idea.",
+        ),
+        "ciudadano": (
+            "Con esto de {contexto}, vale la pena conversar un rato; {tag} "
+            "invita a opinar.",
+            "Hablando de {contexto}, hay cosas buenas que conviene contar; "
+            "{tag} lo resume bien.",
+            "A veces no valoramos {contexto} hasta que lo vemos de cerca; {tag} "
+            "lo recuerda.",
+        ),
+        "popular": (
+            "con {contexto} y {tag}, así de simple",
+            "hay cosas como {contexto} que se disfrutan, {tag} y ya",
+            "que bueno es {contexto}, {tag} y a disfrutar",
+        ),
+        "generico": (
+            "Con esto de {contexto} uno aprende a valorar lo que tiene; {tag} "
+            "lo dice bien.",
+            "Hablando de {contexto}, siempre hay algo bueno que contar; {tag} "
+            "resume esa idea.",
+            "Cuando se trata de {contexto}, conviene opinar con calma; {tag} "
+            "invita al diálogo.",
+        ),
+    },
+}
+
+
+def _normalizar_hashtags_pedidos(hashtags) -> list[str]:
+    """Normaliza los hashtags pedidos (helper local, nunca lanza).
+
+    Acepta un string ("#mexico, #futbol") o una lista; separa por comas,
+    espacios y saltos de linea; garantiza el '#' y deduplica sin distinguir
+    mayusculas/minusculas (conserva la grafia de la primera aparicion).
+    """
+    try:
+        if not hashtags:
+            return []
+        if isinstance(hashtags, (list, tuple, set)):
+            crudos = []
+            for item in hashtags:
+                crudos.extend(re.split(r"[,\s]+", str(item or "")))
+        else:
+            crudos = re.split(r"[,\s]+", str(hashtags))
+    except Exception:
+        return []
+
+    resultado: list[str] = []
+    vistos: set = set()
+    for crudo in crudos:
+        limpio = str(crudo or "").strip().lstrip("#").strip()
+        if not limpio:
+            continue
+        partes = re.findall(r"[A-Za-z0-9ÁÉÍÓÚÜÑáéíóúüñ_]+", limpio)
+        if not partes:
+            continue
+        tag = "#" + "".join(partes)
+        clave = tag.lower()
+        if clave in vistos:
+            continue
+        vistos.add(clave)
+        resultado.append(tag)
+    return resultado
+
+
+def _plantillas_hashtags(registro: str = "", perfil: str = "") -> tuple:
+    """Plantillas locales del rol hashtags para el (registro, perfil) dado.
+
+    Cadena de fallback: (registro, perfil) -> (registro, generico) ->
+    (generico, perfil) -> (generico, generico). Nunca lanza.
+    """
+    try:
+        reg = normalizar_tipo_cuenta(registro) or "generico"
+    except Exception:
+        reg = "generico"
+    try:
+        perf = normalizar_perfil(perfil) or "generico"
+    except Exception:
+        perf = "generico"
+
+    generico = _PLANTILLAS_HASHTAGS.get("generico", {})
+    por_registro = _PLANTILLAS_HASHTAGS.get(reg) or generico
+    plantillas = (
+        por_registro.get(perf)
+        or por_registro.get("generico")
+        or generico.get(perf)
+        or generico.get("generico")
+    )
+    return tuple(plantillas or ())
+
+
+def _registro_normalizado(info) -> str:
+    """Registro canonico de la cuenta ('politica'/'activista'/'ciudadana'/'')."""
+    try:
+        return normalizar_tipo_cuenta((info or {}).get("registro"))
+    except Exception:
+        return ""
+
+
+def _perfil_normalizado(info) -> str:
+    """Perfil canonico de la cuenta ('formal'/'ciudadano'/'popular'/'')."""
+    try:
+        return normalizar_perfil((info or {}).get("perfil"))
+    except Exception:
+        return ""
+
+
+def _contiene_algun_hashtag(texto: str, tags) -> bool:
+    """True si el texto contiene alguno de los hashtags (case-insensitive)."""
+    bajo = str(texto or "").lower()
+    if not bajo:
+        return False
+    for tag in tags or []:
+        if str(tag or "").lower() in bajo:
+            return True
+    return False
+
+
+def _hashtag_al_final(texto: str) -> bool:
+    """True si el texto termina con un hashtag (regla del proyecto: nunca)."""
+    t = re.sub(r"[\s.,;:!?)…\"']+$", "", str(texto or "").rstrip())
+    return bool(re.search(r"#[A-Za-z0-9ÁÉÍÓÚÜÑáéíóúüñ_]+$", t))
+
+
+def _es_copia_contexto(texto: str, contexto: str) -> bool:
+    """True si el texto es el contexto pelado o 'contexto + hashtag'."""
+    t = " ".join(str(texto or "").lower().split())
+    ctx = " ".join(str(contexto or "").lower().split())
+    if not t or not ctx:
+        return False
+    if t == ctx:
+        return True
+    sin_tags = re.sub(r"#[A-Za-z0-9ÁÉÍÓÚÜÑáéíóúüñ_]+", " ", t)
+    return " ".join(sin_tags.split()) == ctx
+
+
+def _personalidad_del_lote(cuentas_info, indices) -> str:
+    """Personalidad del lote si TODAS los indices comparten una; si no, ''."""
+    try:
+        valores: list[str] = []
+        for i in indices:
+            info = _info_cuenta(cuentas_info, i)
+            p = " ".join(str(info.get("personalidad") or "").split())
+            if p and p not in valores:
+                valores.append(p)
+        if len(valores) == 1:
+            return valores[0]
+    except Exception:
+        pass
+    return ""
+
+
+def _texto_hashtag_local(
+    info, contexto: str, tags, indice, j, rng, inicio: int | None = None
+) -> str:
+    """Construye un post ORIGINAL local con el contexto y el tag en medio.
+
+    Elige una plantilla por (registro, perfil), sustituye `{contexto}` y
+    `{tag}` de forma natural y rota las plantillas con aleatoriedad para que
+    los textos varíen entre cuentas y entre llamadas. ``inicio`` permite fijar
+    el punto de rotacion por cuenta para que dos textos consecutivos de la
+    misma cuenta NO repitan plantilla. Nunca lanza.
+    """
+    try:
+        registro = _registro_normalizado(info)
+        perfil = _perfil_normalizado(info)
+        plantillas = _plantillas_hashtags(registro, perfil) or (
+            "Con esto de {contexto} uno valora lo que tiene; {tag} lo dice bien.",
+        )
+        ctx = " ".join(str(contexto or "").split()) or "lo que tenemos"
+        if tags:
+            try:
+                tag = tags[int(indice + j) % len(tags)]
+            except Exception:
+                tag = tags[0]
+        else:
+            try:
+                tag = elegir_hashtag("", rng=rng)
+            except Exception:
+                tag = "#Mexico"
+        k = int(indice) + int(j)
+        if inicio is None:
+            try:
+                inicio = rng.randrange(len(plantillas))
+            except Exception:
+                inicio = 0
+        plantilla = plantillas[(int(inicio) + k) % len(plantillas)]
+        return (
+            str(plantilla)
+            .replace("{contexto}", ctx)
+            .replace("{tag}", str(tag or ""))
+            .strip()
+        )
+    except Exception as e:
+        logger.error(f"Error construyendo texto local de hashtag: {e}")
+        ctx = " ".join(str(contexto or "").split()) or "lo que tenemos"
+        tag = (tags or ["#Mexico"])[0]
+        return f"Con esto de {ctx} uno aprende a valorarlo; {tag} lo dice bien."
+
+
+def _garantizar_hashtag_pedido(texto: str, tags, semilla: int = 0) -> str:
+    """Garantiza un hashtag pedido (y EN MEDIO) en el texto; nunca lanza.
+
+    Sin tags pedidos igual aplica la regla del proyecto: todo texto lleva al
+    menos un hashtag integrado en medio (nunca al final).
+    """
+    t = str(texto or "").strip()
+    if not t:
+        return t
+    if not tags:
+        if not tiene_hashtag(t):
+            return _con_hashtag_en_medio(t)
+        return t
+    try:
+        rng = random.Random(int(semilla))
+    except Exception:
+        rng = random.Random(0)
+    try:
+        tag = tags[rng.randrange(len(tags))]
+    except Exception:
+        tag = tags[0]
+    if not _contiene_algun_hashtag(t, tags) or _hashtag_al_final(t):
+        try:
+            movido = colocar_hashtag_en_medio(t, hashtag=tag)
+            if movido and _contiene_algun_hashtag(movido, tags):
+                return movido
+        except Exception as e:
+            logger.error(f"Error asegurando hashtag pedido: {e}")
+    return t
+
+
+def generar_textos_hashtags_por_cuenta(
+    cuentas_info,
+    hashtags="",
+    contexto="",
+    n_por_cuenta=1,
+    narrativa="",
+    entrenamiento="",
+    callback=None,
+) -> dict:
+    """Genera posts ORIGINALES con hashtag(s), ``n_por_cuenta`` por cuenta.
+
+    ``cuentas_info``: lista de dicts con "usuario", "registro"
+    ("politica"/"activista"/"ciudadana"/""), "personalidad", "seccion",
+    "nombre" y "perfil" ("formal"/"ciudadano"/"popular"/""); tolerante a
+    claves faltantes o valores invalidos.
+
+    Devuelve ``{usuario: [textos]}`` con EXACTAMENTE ``n_por_cuenta`` textos
+    por cuenta. Cada texto es una publicacion ORIGINAL sobre ``contexto``
+    (NUNCA el contexto copiado ni "contexto + hashtag"), respeta el registro y
+    el perfil de la cuenta y lleva los ``hashtags`` pedidos bien escritos e
+    integrados EN MEDIO del texto (nunca al final).
+
+    Agrupa por (registro, perfil) y pide a OpenAI en lotes de <=15 cuentas
+    (``get_prompt_hashtags`` + temperature 0.9). Si OpenAI falla o devuelve
+    menos, rellena con plantillas locales por registro/perfil. Nunca lanza.
+    ``callback(hechas, total)`` opcional para progreso. Firma congelada.
+    """
+    try:
+        lista = list(cuentas_info or [])
+    except Exception:
+        lista = []
+
+    try:
+        n = int(n_por_cuenta)
+    except (TypeError, ValueError):
+        n = 1
+    if n < 0:
+        n = 0
+
+    tags = _normalizar_hashtags_pedidos(hashtags)
+    contexto = " ".join(str(contexto or "").split())
+    total = len(lista)
+    total_textos = total * n
+    hechas = 0
+
+    def _reportar() -> None:
+        if callback is None:
+            return
+        try:
+            callback(hechas, total_textos)
+        except Exception as e:
+            logger.error(f"Error en callback de hashtags: {e}")
+
+    resultado: list[list] = [[None] * n for _ in range(total)]
+    vistos: set = set()
+    rng = random.Random()
+
+    # 1) OpenAI: lotes de <=15 cuentas agrupadas por (registro, perfil).
+    if total and n:
+        generador = None
+        try:
+            generador = GeneradorContenido()
+        except Exception as e:
+            logger.error(f"No se pudo crear GeneradorContenido para hashtags: {e}")
+
+        if generador is not None:
+            reglas = []
+            for i in range(total):
+                info = _info_cuenta(lista, i)
+                reglas.append(
+                    (_registro_normalizado(info), _perfil_normalizado(info))
+                )
+            grupos: dict = {}
+            for i, clave in enumerate(reglas):
+                grupos.setdefault(clave, []).append(i)
+
+            for (registro, perfil), indices in grupos.items():
+                for inicio in range(
+                    0, len(indices), _MAX_CUENTAS_HASHTAGS_POR_LLAMADA
+                ):
+                    lote = indices[
+                        inicio:inicio + _MAX_CUENTAS_HASHTAGS_POR_LLAMADA
+                    ]
+                    cantidad = n * len(lote)
+                    try:
+                        prompt = get_prompt_hashtags(
+                            hashtags=" ".join(tags),
+                            contexto=contexto,
+                            narrativa=narrativa,
+                            entrenamiento=entrenamiento,
+                            cantidad=cantidad,
+                            registro=registro,
+                            personalidad=_personalidad_del_lote(lista, lote),
+                            perfil=perfil,
+                        )
+                        content = generador._chat(prompt, temperature=0.9)
+                        textos_lote = generador._parsear_textos(content, cantidad)
+                    except Exception as e:
+                        logger.error(f"Error OpenAI en lote de hashtags: {e}")
+                        textos_lote = []
+
+                    limpios: list[str] = []
+                    vistos_lote: set = set()
+                    for t in textos_lote or []:
+                        t = generador._limpiar_texto(t)
+                        if t and t not in vistos_lote:
+                            vistos_lote.add(t)
+                            limpios.append(t)
+
+                    pos = 0
+                    for idx_cuenta in lote:
+                        for j in range(n):
+                            if pos >= len(limpios):
+                                break
+                            if resultado[idx_cuenta][j] is None:
+                                resultado[idx_cuenta][j] = limpios[pos]
+                                pos += 1
+                    _reportar()
+
+    # 2) Normalizacion final por cuenta: relleno local, estilo del registro,
+    #    contexto siempre original, hashtag pedido EN MEDIO y unicidad global.
+    for i in range(total):
+        info = _info_cuenta(lista, i)
+        registro = _registro_normalizado(info)
+        # Punto de rotacion de plantillas fijo por cuenta: como el indice j
+        # avanza, los textos consecutivos de la MISMA cuenta no repiten
+        # plantilla (salvo que el registro/perfil tenga una sola).
+        try:
+            inicio_cuenta = rng.randrange(10 ** 6)
+        except Exception:
+            inicio_cuenta = i * 97
+
+        def _estilizar(texto: str, semilla: int) -> str:
+            if registro == "ciudadana":
+                return _humanizar_si_ciudadano(texto, registro, semilla=semilla)
+            return texto
+
+        for j in range(n):
+            t = str(resultado[i][j] or "").strip()
+            if not t:
+                t = _texto_hashtag_local(
+                    info, contexto, tags, i, j, rng, inicio=inicio_cuenta
+                )
+            t = _estilizar(t, rng.randint(1, 10 ** 9))
+            t = _garantizar_hashtag_pedido(t, tags, i * 1000 + j)
+
+            # Prohibido: contexto pelado o simple concatenacion contexto+tag.
+            if _es_copia_contexto(t, contexto):
+                t = _texto_hashtag_local(
+                    info, contexto, tags, i + 7919, j, rng,
+                    inicio=inicio_cuenta + 7919,
+                )
+                t = _estilizar(t, rng.randint(1, 10 ** 9))
+                t = _garantizar_hashtag_pedido(t, tags, i * 1000 + j + 17)
+
+            # Unicidad global (y por cuenta, que es subconjunto).
+            if t in vistos:
+                alterno = _texto_hashtag_local(
+                    info, contexto, tags, i + 104729, j + len(vistos), rng,
+                    inicio=inicio_cuenta + 104729,
+                )
+                alterno = _estilizar(alterno, rng.randint(1, 10 ** 9))
+                alterno = _garantizar_hashtag_pedido(
+                    alterno, tags, i * 1000 + j + 997
+                )
+                if (
+                    alterno
+                    and alterno not in vistos
+                    and not _es_copia_contexto(alterno, contexto)
+                ):
+                    t = alterno
+                else:
+                    t = _variar_hasta_unico(t, vistos)
+                    t = _garantizar_hashtag_pedido(
+                        t, tags, i * 1000 + j + 1999
+                    )
+
+            vistos.add(t)
+            resultado[i][j] = t
+            hechas += 1
+            _reportar()
+
+    # 3) Salida {usuario: [n textos]} (tolerante a usuario faltante/duplicado).
+    salida: dict = {}
+    usados: set = set()
+    for i, cu in enumerate(lista):
+        info = cu if isinstance(cu, dict) else {}
+        usuario = str(info.get("usuario") or "").strip()
+        clave = usuario or f"cuenta_{i + 1}"
+        if clave in usados:
+            sufijo = 2
+            while f"{clave}_{sufijo}" in usados:
+                sufijo += 1
+            clave = f"{clave}_{sufijo}"
+        usados.add(clave)
+        salida[clave] = [
+            str(resultado[i][j] or "").strip() for j in range(n)
+        ]
+    return salida
