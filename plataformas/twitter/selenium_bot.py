@@ -232,9 +232,15 @@ class TwitterBot:
             proxy = self._proxy_para_x()
             if proxy:
                 ProxyManager().aplicar_a_options(options, proxy, tag=self.usuario)
-            
+
+            # X es una SPA pesada: "eager" devuelve el control al terminar el
+            # HTML sin esperar todos los subrecursos (con "normal", en Railway
+            # el renderer se saturaba y saltaba el page_load_timeout).
+            options.page_load_strategy = "eager"
+
             self.driver = crear_chrome(options, version_main=detectar_chrome_version())
-            self.driver.set_page_load_timeout(30)
+            self.driver.set_page_load_timeout(60)
+            self.driver.set_script_timeout(60)
 
             # Stealth en cada documento nuevo + UA por CDP (incluye
             # userAgentMetadata y Accept-Language coherentes con el UA).
@@ -941,13 +947,23 @@ class TwitterBot:
             
             time.sleep(1)
             
-            # Busqueda forzosa del boton "Post" (por texto y por testid)
-            publicar_btn = self._buscar_boton_post()
+            # Esperar a que el boton "Post" se HABILITE: X lo mantiene
+            # deshabilitado hasta que el editor registra el texto. Si en 10s no
+            # se habilita, el texto no quedo en el editor y hay que cortar aqui
+            # (antes se clicaba un boton muerto y se reportaba un falso
+            # "X no confirmo la publicacion").
+            publicar_btn = self._esperar_boton_post_habilitado(10)
+            if publicar_btn is None:
+                raise Exception(
+                    "boton Post deshabilitado: el texto no quedo registrado en el editor"
+                )
             self.driver.execute_script("arguments[0].click();", publicar_btn)
             
             # Verificar que el tweet REALMENTE se publico (no basta con hacer clic)
             if not self._verificar_publicacion():
-                self.ultimo_error = "X no confirmó la publicación"
+                # _verificar_publicacion deja el detalle real (p. ej. toast de
+                # error de X) en ultimo_error; solo se rellena si quedo vacio.
+                self.ultimo_error = self.ultimo_error or "X no confirmó la publicación"
                 logger.error(f"No se confirmo la publicacion del tweet por {self.usuario}")
                 try:
                     self.driver.save_screenshot(resolver_ruta("data/temp/twitter_no_publicado.png"))
@@ -976,9 +992,52 @@ class TwitterBot:
                 pass
             return None
 
-    def _verificar_publicacion(self, tiempo_max: int = 12) -> bool:
-        """Confirma que el tweet realmente se publico. Tras publicar, X muestra un
-        toast ('Your post was sent' / 'Tu post fue enviado') y saca de /compose/post."""
+    # Frases con las que X RECHAZA un post (toast o aviso en la pagina). Si
+    # aparecen durante la verificacion, se corta de inmediato: el post NO se
+    # publico y hay que reportar el motivo real, no un timeout.
+    _TOASTS_ERROR = (
+        "something went wrong",
+        "algo salió mal",
+        "no pudimos enviar",
+        "try again",
+        "inténtalo de nuevo",
+        "you are over the daily limit",
+        "rate limit",
+        "unable to send",
+    )
+
+    def _texto_toast(self) -> str:
+        """Devuelve el texto del toast/alert visible de X ('' si no hay)."""
+        partes = []
+        for sel in (
+            "[data-testid='toast']",
+            "[role='alert']",
+            "[data-testid='toast'] span",
+        ):
+            try:
+                for elem in self.driver.find_elements(By.CSS_SELECTOR, sel):
+                    try:
+                        if elem.is_displayed():
+                            texto = (elem.text or "").strip()
+                            if texto:
+                                partes.append(texto)
+                    except Exception:
+                        continue
+            except Exception:
+                continue
+        return " ".join(partes)
+
+    def _verificar_publicacion(self, tiempo_max: int = 25) -> bool:
+        """Confirma que el tweet realmente se publico.
+
+        Tras publicar, X muestra un toast ('Your post was sent' / 'Tu post fue
+        enviado') y saca de /compose/post. Si X RECHAZA el post aparece un toast
+        de error: se detecta, se corta antes de agotar `tiempo_max` y el motivo
+        queda en `self.ultimo_error`. Los `TimeoutException` del renderer
+        durante el polling se toleran (se cuentan y se avisa a los 3 seguidos),
+        porque en Railway el renderer se satura y lanza timeouts transitorios.
+        Al fallar de verdad se registra URL + fragmento de la pagina.
+        """
         senales = [
             "your post was sent",
             "your reply was sent",
@@ -989,13 +1048,27 @@ class TwitterBot:
             "tweet publicado",
         ]
         inicio = time.time()
+        fallos_renderer = 0
         while time.time() - inicio < tiempo_max:
             try:
                 url = self.driver.current_url.lower()
                 src = self.driver.page_source.lower()
+                fallos_renderer = 0
 
                 if any(s in src for s in senales):
                     return True
+
+                # Toasts de rechazo de X: cortar YA (no esperar el timeout).
+                toast = self._texto_toast()
+                fuente = f"{src} {(toast or '').lower()}"
+                for frase in self._TOASTS_ERROR:
+                    if frase in fuente:
+                        fragmento = re.sub(r"\s+", " ", (toast or frase)).strip()[:120]
+                        self.ultimo_error = f"X rechazó el post: {fragmento}"
+                        logger.error(
+                            f"X rechazo la publicacion de {self.usuario}: {fragmento}"
+                        )
+                        return False
 
                 if "compose" not in url and ("home" in url or "status" in url):
                     try:
@@ -1004,8 +1077,34 @@ class TwitterBot:
                         return True
 
             except Exception:
-                pass
+                # TimeoutException del renderer: transitorio, no cambia el
+                # resultado; solo se avisa si se encadenan 3+ seguidos.
+                fallos_renderer += 1
+                if fallos_renderer >= 3 and fallos_renderer % 3 == 0:
+                    logger.warning(
+                        "renderer sin responder durante la verificacion de publicacion"
+                    )
             time.sleep(1)
+
+        # Diagnostico final antes de devolver False.
+        try:
+            url_actual = self.driver.current_url
+        except Exception:
+            url_actual = "(no disponible)"
+        try:
+            toast = (self._texto_toast() or "").strip()
+        except Exception:
+            toast = ""
+        try:
+            pagina = self.driver.page_source
+        except Exception:
+            pagina = ""
+        fragmento = toast or re.sub(r"<[^>]+>", " ", pagina)
+        fragmento = re.sub(r"\s+", " ", fragmento).strip()[:300]
+        logger.error(
+            f"No se confirmo la publicacion de {self.usuario}. "
+            f"URL: {url_actual} | fragmento: {fragmento}"
+        )
         return False
     
     def _buscar_boton_post(self):
@@ -1043,6 +1142,68 @@ class TwitterBot:
                 continue
 
         raise Exception("No se encontro el boton 'Post'/'Publicar' en la pagina")
+
+    def _post_habilitado(self, boton) -> bool:
+        """True si el boton Post esta realmente habilitado.
+
+        `is_enabled()` no ve `aria-disabled`: X usa `div[role='button']` con
+        `aria-disabled='true'` cuando el editor esta vacio. Se revisa el propio
+        boton y su ancestro `[role='button']/button` mas cercano.
+        """
+        try:
+            if not boton.is_enabled():
+                return False
+        except Exception:
+            return False
+        try:
+            if (boton.get_attribute("aria-disabled") or "").lower() == "true":
+                return False
+        except Exception:
+            pass
+        try:
+            # Recorre el boton y sus ancestros `[role='button']/button`: X marca
+            # `aria-disabled='true'` tanto en el propio div como en un wrapper.
+            estado = self.driver.execute_script(
+                "var el = arguments[0];"
+                "while (el) {"
+                "  if (el.getAttribute && el.getAttribute('aria-disabled') === 'true') return 'true';"
+                "  if (el.disabled) return 'true';"
+                "  var p = el.parentElement ? el.parentElement.closest('[role=\\\"button\\\"],button') : null;"
+                "  if (!p || p === el) break;"
+                "  el = p;"
+                "}"
+                "return '';",
+                boton,
+            )
+            return (estado or "").lower() != "true"
+        except Exception:
+            return True
+
+    def _esperar_boton_post_habilitado(self, timeout: int = 10):
+        """Espera hasta `timeout`s a que el boton "Post" se habilite.
+
+        X mantiene el boton deshabilitado mientras el editor no tenga texto.
+        Devuelve el boton habilitado o None si no aparecio en el plazo.
+        """
+        fin = time.time() + max(1, timeout)
+        candidato = None
+        while time.time() < fin:
+            try:
+                posible = self._buscar_boton_post()
+            except Exception:
+                posible = None
+            if posible is not None:
+                candidato = posible
+                if self._post_habilitado(posible):
+                    logger.info("Boton Post habilitado, procediendo a publicar")
+                    return posible
+            time.sleep(0.5)
+        if candidato is not None:
+            logger.warning(
+                "El boton Post no se habilito en el tiempo esperado "
+                "(el texto podria no estar en el editor)"
+            )
+        return None
 
     def _buscar_opcion_quote(self):
         """Busca la opcion 'Quote' (Citar) del menu desplegable de retweet.
@@ -1419,20 +1580,108 @@ class TwitterBot:
             return f"{izquierda} {tags}".strip()
         return f"{izquierda} {tags} {derecha}".strip()
     
-    def _pegar_texto(self, elemento, texto: str):
-        import pyperclip
-        
+    def _normalizar_texto_editor(self, texto: str) -> str:
+        """Normaliza para comparar (sin espacios ni signos, en minusculas)."""
+        return re.sub(r"[\W_]+", "", texto or "", flags=re.UNICODE).lower()
+
+    def _leer_texto_editor(self, elemento) -> str:
+        """Junta el texto visible del editor contenteditable/input."""
+        partes = []
         try:
+            partes.append(elemento.text or "")
+        except Exception:
+            pass
+        for atributo in ("textContent", "innerText", "value"):
+            try:
+                valor = elemento.get_attribute(atributo)
+                if valor:
+                    partes.append(valor)
+            except Exception:
+                continue
+        return "\n".join(partes)
+
+    def _verificar_texto_en_editor(
+        self, elemento, texto: str, intentos: int = 3, espera: float = 0.3
+    ) -> bool:
+        """True si el editor contiene (aprox) el texto recien escrito.
+
+        Compara por los primeros 20 caracteres alfanumericos normalizados: el
+        editor de X puede cambiar saltos/espacios, pero nunca el inicio del
+        texto. Sondea unas cuantas veces porque el portapapeles/React pueden
+        tardar unos milisegundos en reflejarlo.
+        """
+        aguja = self._normalizar_texto_editor(texto)[:20]
+        if not aguja:
+            return True
+        for _ in range(max(1, intentos)):
+            contenido = self._normalizar_texto_editor(self._leer_texto_editor(elemento))
+            if aguja in contenido:
+                return True
+            time.sleep(espera)
+        return False
+
+    def _pegar_texto(self, elemento, texto: str):
+        """Escribe `texto` en el editor verificando que REALMENTE quedo.
+
+        Metodos en orden, cada uno verificado leyendo el contenido del editor:
+          1. Portapapeles (`pyperclip.copy` + Ctrl/Cmd+V).
+          2. `send_keys(texto)` en UNA sola llamada (nada de bucle char por
+             char: miles de comandos al renderer son los que provocan los
+             `Timed out receiving message from renderer` en el contenedor).
+          3. `document.execCommand('insertText')` via JS sobre el elemento.
+        Si ninguno deja el texto en el editor lanza una excepcion explicita para
+        que el fallo se reporte como tal, en vez de publicar en vacio y terminar
+        en un falso "X no confirmo la publicacion".
+        """
+        texto = texto or ""
+        if not texto:
+            return
+
+        # 1) Portapapeles (rapido y natural). Todo dentro del try: en Railway
+        #    falta xclip y pyperclip puede fallar; si el pegado no deja el
+        #    texto, se continua con los fallbacks.
+        try:
+            import pyperclip
+
             pyperclip.copy(texto)
-            
             modifier = Keys.COMMAND if os.name == "posix" else Keys.CONTROL
             elemento.click()
             ActionChains(self.driver).key_down(modifier).send_keys("a").key_up(modifier).perform()
             ActionChains(self.driver).key_down(modifier).send_keys("v").key_up(modifier).perform()
-        except:
-            for char in texto:
-                elemento.send_keys(char)
-                time.sleep(0.01)
+            if self._verificar_texto_en_editor(elemento, texto):
+                return
+            logger.warning("El portapapeles no dejo el texto en el editor; probando send_keys")
+        except Exception as e:
+            logger.warning(
+                f"No se pudo pegar por portapapeles ({type(e).__name__}: {e}); "
+                f"probando send_keys"
+            )
+
+        # 2) send_keys en UNA sola llamada.
+        try:
+            elemento.click()
+            elemento.send_keys(texto)
+            if self._verificar_texto_en_editor(elemento, texto):
+                return
+            logger.warning("send_keys no dejo el texto en el editor; probando execCommand")
+        except Exception as e:
+            logger.warning(
+                f"send_keys fallo ({type(e).__name__}: {e}); probando execCommand"
+            )
+
+        # 3) Fallback JS: insertText sobre el elemento enfocado.
+        try:
+            self.driver.execute_script(
+                "arguments[0].focus(); document.execCommand('insertText', false, arguments[1]);",
+                elemento,
+                texto,
+            )
+            if self._verificar_texto_en_editor(elemento, texto):
+                return
+        except Exception as e:
+            logger.warning(f"execCommand fallo ({type(e).__name__}: {e})")
+
+        raise Exception("no se pudo escribir el texto en el editor de X")
     
     def _subir_imagen(self, imagen_path: str):
         try:

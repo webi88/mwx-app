@@ -158,6 +158,179 @@ def _roles_objetivo(cuentas: list, usuarios: list | None,
     }
 
 
+# ============================ PROGRESO EN VIVO ============================
+
+def _formato_tiempo(segundos) -> str:
+    """Formatea segundos como MM:SS (o H:MM:SS si pasa de una hora).
+
+    Ejemplos: 0 -> "00:00", 65 -> "01:05", 3661 -> "1:01:01".
+    """
+    try:
+        total = int(float(segundos))
+    except (TypeError, ValueError, OverflowError):
+        total = 0
+    if total < 0:
+        total = 0
+    horas, resto = divmod(total, 3600)
+    minutos, segs = divmod(resto, 60)
+    if horas:
+        return f"{horas}:{minutos:02d}:{segs:02d}"
+    return f"{minutos:02d}:{segs:02d}"
+
+
+def _invocar_lanzar(lanzar, callback):
+    """Llama `lanzar(callback)` si acepta un parametro; si no, `lanzar()`.
+
+    Permite que el lanzamiento reciba el callback que guarda el `total` sin
+    romper a callables de cero argumentos (p. ej. en pruebas).
+    """
+    import inspect
+
+    try:
+        parametros = inspect.signature(lanzar).parameters
+    except (TypeError, ValueError):
+        parametros = {}
+    if parametros:
+        return lanzar(callback)
+    return lanzar()
+
+
+def _recortar(texto, limite: int = 80) -> str:
+    """Detalle de una linea de feed: sin saltos y truncado a `limite` chars."""
+    plano = " ".join(str(texto or "").split())
+    if len(plano) <= limite:
+        return plano
+    return plano[: max(0, int(limite) - 1)].rstrip() + "…"
+
+
+def _linea_evento(evento: dict) -> str:
+    """Linea de feed de un evento: `✅ @usuario · Ronda N — detalle`."""
+    icono = "✅" if evento.get("ok") else "❌"
+    usuario = str(evento.get("usuario") or "?").strip().lstrip("@")
+    linea = f"{icono} @{usuario}"
+    ronda = evento.get("ronda")
+    if ronda not in (None, ""):
+        linea += f" · Ronda {ronda}"
+    rol = str(evento.get("rol") or "").strip()
+    if rol:
+        linea += f" · {rol}"
+    detalle = _recortar(evento.get("detalle"), 80)
+    if detalle:
+        linea += f" — {detalle}"
+    return linea
+
+
+def _lanzar_con_progreso(lanzar, motor, duracion_min: int, repetir: bool) -> dict:
+    """Ejecuta `lanzar()` en un hilo y pinta contador, barra y feed en vivo.
+
+    `lanzar` es un callable que llama al motor (bloqueante) y devuelve el
+    resumen; si acepta un parametro, recibe un callback que SOLO guarda el
+    total de cuentas en un dict (los callbacks del motor corren en hilos y
+    nunca deben tocar `st.*`). El hilo principal refresca cada ~1s la barra,
+    las metricas y el feed leyendo `motor.snapshot_progreso()`.
+
+    Con `repetir=True` la barra avanza por tiempo (`duracion_min`); con
+    `repetir=False` avanza por cuentas hechas sobre el total estimado.
+
+    Si `lanzar()` lanza, la excepcion se re-lanza aqui tras cerrar la barra.
+    Devuelve el resumen del motor.
+    """
+    import threading
+    import time
+
+    resultado: dict = {}
+    estado: dict = {"total": 0}
+
+    def _cb_total(hechas, total, usuario, ok):
+        try:
+            estado["total"] = int(total or 0)
+        except (TypeError, ValueError):
+            pass
+
+    def _runner():
+        try:
+            resultado["resumen"] = _invocar_lanzar(lanzar, _cb_total)
+        except BaseException as e:  # re-lanzada en el hilo principal
+            resultado["error"] = e
+
+    hilo = threading.Thread(target=_runner, daemon=True)
+    inicio = time.monotonic()
+    hilo.start()
+
+    barra = st.progress(0.0)
+    metricas = st.empty()
+    feed = st.empty()
+    snapshot_fn = getattr(motor, "snapshot_progreso", None)
+    limite_segundos = max(1.0, float(int(duracion_min or 0)) * 60.0)
+
+    while hilo.is_alive():
+        snap = {}
+        if callable(snapshot_fn):
+            try:
+                snap = snapshot_fn() or {}
+            except Exception:
+                snap = {}
+        hechas = int(snap.get("hechas") or 0)
+        exitosas = int(snap.get("exitosas") or 0)
+        fallidas = int(snap.get("fallidas") or 0)
+        ronda_actual = int(snap.get("ronda_actual") or 1)
+        transcurrido = max(0.0, time.monotonic() - inicio)
+
+        if repetir:
+            avance = min(1.0, transcurrido / limite_segundos)
+            tiempo_txt = (
+                f"⏱️ Faltan "
+                f"{_formato_tiempo(max(0.0, limite_segundos - transcurrido))}"
+            )
+        else:
+            total_estimado = int(estado.get("total") or 0)
+            referencia = total_estimado if total_estimado > 0 else max(1, hechas)
+            avance = min(1.0, hechas / max(1, referencia))
+            tiempo_txt = f"⏳ Transcurrido {_formato_tiempo(transcurrido)}"
+
+        barra.progress(avance, text=tiempo_txt)
+        metricas.markdown(
+            f"**🔄 Ronda {ronda_actual}** · ✅ {exitosas} exitosas · "
+            f"❌ {fallidas} fallidas · 🧮 {hechas} hechas · {tiempo_txt}"
+        )
+
+        eventos = snap.get("eventos") or []
+        lineas = [_linea_evento(ev) for ev in eventos[-8:]]
+        if lineas:
+            feed.markdown("  \n".join(lineas))
+        else:
+            feed.markdown("⏳ Esperando las primeras cuentas…")
+        time.sleep(1)
+
+    hilo.join()
+    barra.progress(1.0, text="✅ Campaña finalizada")
+
+    if "error" in resultado:
+        error = resultado["error"]
+        feed.markdown(f"❌ Campaña interrumpida: {_recortar(error, 160)}")
+        raise error
+
+    resumen = resultado.get("resumen") or {}
+    exitosas = int(resumen.get("exitosas") or 0)
+    fallidas = int(resumen.get("fallidas") or 0)
+    rondas = resumen.get("rondas")
+    linea_final = f"✅ Campaña finalizada: {exitosas} ok / {fallidas} errores"
+    if rondas not in (None, ""):
+        linea_final += f" · {rondas} rondas"
+
+    snap_final = {}
+    if callable(snapshot_fn):
+        try:
+            snap_final = snapshot_fn() or {}
+        except Exception:
+            snap_final = {}
+    eventos = snap_final.get("eventos") or []
+    lineas = [_linea_evento(ev) for ev in eventos[-8:]]
+    lineas.append(f"**{linea_final}**")
+    feed.markdown("  \n".join(lineas))
+    return resumen
+
+
 # ============================ ACCESO A DATOS ============================
 
 def _cargar_cuentas_con_roles() -> list:
@@ -404,28 +577,25 @@ def _cita_masiva():
         from activaciones.motor import MotorActivacion
 
         motor = MotorActivacion(max_concurrente=int(navegadores))
-        progreso = st.progress(0.0)
-        estado = st.empty()
-
-        def callback(hechas, total, usuario, ok):
-            progreso.progress(hechas / total if total else 0)
-            icono = "✅" if ok else "❌"
-            estado.write(f"⏳ {icono} **@{usuario}** ({hechas}/{total})")
-
-        resultados = motor.ejecutar(
-            urls=urls,
-            texto_base=texto_base,
-            cantidad_cuentas=(
-                None if todas_cuentas else (int(cantidad) if cantidad > 0 else None)
+        resultados = _lanzar_con_progreso(
+            lambda cb: motor.ejecutar(
+                urls=urls,
+                texto_base=texto_base,
+                cantidad_cuentas=(
+                    None if todas_cuentas else (int(cantidad) if cantidad > 0 else None)
+                ),
+                grupo=grupo.strip() or None,
+                dar_like=dar_like,
+                duracion_min=int(duracion_min),
+                cohortes=int(cohortes),
+                callback=cb,
+                hashtags=hashtags,
+                repetir=bool(repetir),
+                solo_con_registro=bool(todas_cuentas),
             ),
-            grupo=grupo.strip() or None,
-            dar_like=dar_like,
+            motor,
             duracion_min=int(duracion_min),
-            cohortes=int(cohortes),
-            callback=callback,
-            hashtags=hashtags,
             repetir=bool(repetir),
-            solo_con_registro=bool(todas_cuentas),
         )
 
         st.markdown("---")
@@ -696,28 +866,25 @@ def _por_roles():
         from activaciones.motor import MotorActivacion
 
         motor = MotorActivacion(max_concurrente=int(navegadores))
-        progreso = st.progress(0.0)
-        estado = st.empty()
-
-        def callback(hechas, total, usuario, ok):
-            progreso.progress(hechas / total if total else 0)
-            icono = "✅" if ok else "❌"
-            estado.write(f"⏳ {icono} **@{usuario}** ({hechas}/{total})")
-
-        resultados = motor.ejecutar_por_roles(
-            urls=urls,
-            texto_base=texto_base,
-            hashtags=hashtags,
-            menciones=menciones,
-            dar_like=dar_like,
+        resultados = _lanzar_con_progreso(
+            lambda cb: motor.ejecutar_por_roles(
+                urls=urls,
+                texto_base=texto_base,
+                hashtags=hashtags,
+                menciones=menciones,
+                dar_like=dar_like,
+                duracion_min=int(duracion_min),
+                cohortes=int(cohortes),
+                usuarios=usuarios_param,
+                solo_roles=solo_roles_param,
+                callback=cb,
+                contexto=contexto,
+                repetir=bool(repetir),
+                solo_con_registro=bool(todas_cuentas),
+            ),
+            motor,
             duracion_min=int(duracion_min),
-            cohortes=int(cohortes),
-            usuarios=usuarios_param,
-            solo_roles=solo_roles_param,
-            callback=callback,
-            contexto=contexto,
             repetir=bool(repetir),
-            solo_con_registro=bool(todas_cuentas),
         )
         _mostrar_resultados_roles(resultados)
 

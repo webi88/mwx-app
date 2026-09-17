@@ -23,7 +23,7 @@ from core.models import Cuenta
 from core.config import settings, resolver_ruta
 from core.roles import normalizar_rol_activacion
 from core.registros import normalizar_tipo_cuenta
-from core.perfiles import normalizar_perfil
+from core.perfiles import normalizar_perfil, colocar_hashtag_en_medio
 from activaciones.variaciones import generar_pool_variaciones_openai, variar_texto
 from core.registro import registrar_accion, marcar_cuenta_suspendida
 
@@ -102,6 +102,16 @@ _SENALES_ERROR_DRIVER_TRANSITORIO = (
 )
 
 
+# Fallos de publicacion en los que X NUNCA recibio el contenido: nada se
+# publico, asi que reintentar no puede duplicar el post. (Los fallos ambiguos,
+# como "X no confirmó la publicación", NO se reintentan a proposito: el tweet
+# pudo haberse enviado antes de perder la confirmacion.)
+_SENALES_ERROR_PUBLICACION_SEGURA = (
+    "post deshabilitado",
+    "no se pudo escribir el texto en el editor",
+)
+
+
 def _es_error_driver_transitorio(detalle) -> bool:
     """True si el detalle parece un fallo transitorio de driver/navegador.
 
@@ -115,6 +125,22 @@ def _es_error_driver_transitorio(detalle) -> bool:
     except Exception:
         return False
     return any(senal in texto for senal in _SENALES_ERROR_DRIVER_TRANSITORIO)
+
+
+def _es_error_reintentable(detalle) -> bool:
+    """True si el fallo amerita UN reintento sin riesgo de duplicar el post.
+
+    Incluye los fallos transitorios de driver/navegador y los fallos de
+    publicacion donde el texto no llego a enviarse (boton Post deshabilitado o
+    editor que no registro el texto). Nunca lanza.
+    """
+    if _es_error_driver_transitorio(detalle):
+        return True
+    try:
+        texto = "" if detalle is None else str(detalle).lower()
+    except Exception:
+        return False
+    return any(senal in texto for senal in _SENALES_ERROR_PUBLICACION_SEGURA)
 
 
 def _tiene_credencial_sesion(cuenta) -> bool:
@@ -220,13 +246,170 @@ def _agregar_menciones(texto: str, menciones_norm: list[str]) -> str:
         return t
 
 
+_RE_HASHTAG = r"#[A-Za-z0-9ÁÉÍÓÚÜÑáéíóúüñ_]+"
+
+
+def _narrativa_con_ronda(narrativa: str, ronda: int) -> str:
+    """Aumenta la narrativa con la instruccion anti-repeticion de la ronda.
+
+    A partir de la ronda 2 pide a la IA un texto completamente distinto al de
+    las rondas anteriores. Con `ronda` 0/1 (modo clasico) devuelve la
+    narrativa intacta.
+    """
+    base = str(narrativa or "").strip()
+    try:
+        numero = int(ronda or 0)
+    except (TypeError, ValueError):
+        numero = 0
+    if numero <= 1:
+        return base
+    bloque = (
+        f"RONDA {numero}: escribe un texto COMPLETAMENTE distinto a las "
+        "rondas anteriores: otro enfoque, otras palabras, otra apertura y "
+        "otro cierre; prohibido repetir frases o el mismo mensaje."
+    )
+    return f"{base}\n{bloque}" if base else bloque
+
+
+def _clave_texto(texto) -> str:
+    """Normaliza un texto para comparar repeticiones entre rondas."""
+    try:
+        return re.sub(r"\s+", " ", str(texto or "")).strip().lower()
+    except Exception:
+        return str(texto or "")
+
+
+def _variar_protegiendo_hashtags(texto: str) -> str:
+    """Varía el cuerpo de `texto` sin destruir los hashtags.
+
+    Extrae los hashtags ANTES de variar (los sinonimos de `variar_texto`
+    podrian convertir "mexico" en "nuestro país"), varia el cuerpo con
+    `variar_texto(n_hashtags=0)`, reinserta el PRIMER hashtag EN EL MEDIO con
+    `colocar_hashtag_en_medio` restaurando su grafia original (ese helper
+    normaliza mayusculas, p.ej. #mexico -> #Mexico) y re-agrega los demas al
+    final. Nunca lanza: devuelve el texto original si algo falla.
+    """
+    try:
+        original = str(texto or "").strip()
+        if not original:
+            return original
+        tags = re.findall(_RE_HASHTAG, original)
+        cuerpo = re.sub(_RE_HASHTAG, " ", original)
+        cuerpo = re.sub(r"[ \t]+", " ", cuerpo)
+        cuerpo = re.sub(r"\n{3,}", "\n\n", cuerpo).strip()
+        if not cuerpo:
+            return original
+        variado = str(variar_texto(cuerpo, n_hashtags=0) or "").strip()
+        if not variado:
+            return original
+        if not tags:
+            return variado
+        variado = colocar_hashtag_en_medio(variado, hashtag=tags[0])
+        variado = re.sub(
+            _RE_HASHTAG,
+            lambda m: (
+                tags[0] if m.group(0).lower() == tags[0].lower()
+                else m.group(0)
+            ),
+            variado,
+        )
+        if len(tags) > 1:
+            variado = f"{variado} {' '.join(tags[1:])}".strip()
+        return variado
+    except Exception:
+        return str(texto or "").strip()
+
+
+def _aplicar_anti_repeticion(asignaciones: dict, usados: dict) -> dict:
+    """Evita que una MISMA cuenta repita texto entre rondas de la campana.
+
+    `usados` vive toda la campana y mapea {usuario: set(claves)}. Si el texto
+    asignado ya se uso, aplica hasta 3 variaciones protegiendo los hashtags y
+    vuelve a comprobar; si sigue repitiendose, lo deja variado. Nunca lanza.
+    """
+    if not isinstance(asignaciones, dict):
+        return {}
+    if not isinstance(usados, dict):
+        usados = {}
+    finales = {}
+    for usuario, texto in asignaciones.items():
+        t = str(texto or "")
+        clave = _clave_texto(t)
+        vistos = usados.get(usuario)
+        if not isinstance(vistos, set):
+            vistos = set()
+            usados[usuario] = vistos
+        intentos = 0
+        while clave in vistos and intentos < 3:
+            t = _variar_protegiendo_hashtags(t)
+            clave = _clave_texto(t)
+            intentos += 1
+        vistos.add(clave)
+        finales[usuario] = t
+    return finales
+
+
 class MotorActivacion:
     """Ejecuta una campaña de activacion (RT con cita) sobre N cuentas."""
 
     def __init__(self, max_concurrente: int = None):
         self.max_concurrente = max_concurrente or settings.max_browsers
         self._lock = threading.Lock()
-        self.progreso = {"hechas": 0, "exitosas": 0, "fallidas": 0}
+        self.progreso = {
+            "hechas": 0,
+            "exitosas": 0,
+            "fallidas": 0,
+            "ronda_actual": 1,
+            "eventos": [],
+        }
+
+    def _registrar_evento_locked(self, usuario, ok, detalle, ronda=1, rol="",
+                                 url="") -> None:
+        """Agrega un evento al progreso; REQUIERE `self._lock` ya tomado."""
+        try:
+            eventos = self.progreso.get("eventos")
+            if not isinstance(eventos, list):
+                eventos = []
+                self.progreso["eventos"] = eventos
+            try:
+                numero = int(ronda or 1)
+            except (TypeError, ValueError):
+                numero = 1
+            eventos.append({
+                "usuario": str(usuario or ""),
+                "ok": bool(ok),
+                "detalle": str(detalle or ""),
+                "ronda": numero,
+                "rol": str(rol or ""),
+                "url": str(url or ""),
+            })
+            if len(eventos) > 100:
+                del eventos[:-100]
+        except Exception:
+            pass
+
+    def _registrar_evento(self, usuario, ok, detalle, ronda=1, rol="",
+                          url="") -> None:
+        """Version thread-safe de `_registrar_evento_locked`."""
+        with self._lock:
+            self._registrar_evento_locked(usuario, ok, detalle, ronda, rol, url)
+
+    def snapshot_progreso(self) -> dict:
+        """Copia thread-safe del progreso en vivo para la UI.
+
+        Devuelve un dict con hechas/exitosas/fallidas, la ronda actual y los
+        ultimos eventos (el mas reciente al final). La lista de eventos es una
+        copia: mutarla no altera el progreso real.
+        """
+        with self._lock:
+            eventos = self.progreso.get("eventos")
+            return {
+                "hechas": self.progreso.get("hechas", 0),
+                "exitosas": self.progreso.get("exitosas", 0),
+                "fallidas": self.progreso.get("fallidas", 0),
+                "ronda_actual": self.progreso.get("ronda_actual", 1),
+                "eventos": list(eventos) if isinstance(eventos, list) else [],
+            }
 
     def _obtener_cuentas(self, cantidad: int = None, tags: list[str] = None,
                          grupo: str = None) -> list[Cuenta]:
@@ -354,7 +537,8 @@ class MotorActivacion:
                                 hashtags: str = "", menciones: str = "",
                                 narrativa: str = "",
                                 entrenamiento: str = "",
-                                contexto: str = "") -> dict:
+                                contexto: str = "",
+                                ronda: int = 1) -> dict:
         """Arma {usuario: texto} para una ronda de la campana por roles.
 
         - "cita": variaciones OpenAI/fallback del texto base con los hashtags
@@ -367,6 +551,7 @@ class MotorActivacion:
         """
         asignaciones: dict = {}
         tags = _normalizar_hashtags(hashtags)
+        narrativa = _narrativa_con_ronda(narrativa, ronda)
 
         citas = list(grupos_ejec.get("cita") or [])
         if citas:
@@ -484,6 +669,8 @@ class MotorActivacion:
 
         def _iniciar_ronda_locked() -> None:
             estado["ronda"] += 1
+            with self._lock:
+                self.progreso["ronda_actual"] = estado["ronda"]
             estado["orden"] = list(procesables)
             random.shuffle(estado["orden"])
             estado["cursor"] = 0
@@ -596,7 +783,7 @@ class MotorActivacion:
             time.sleep(retardo)
 
         resultado = self._intentar_quote_rt(cuenta, urls, texto, dar_like)
-        if not resultado[1] and _es_error_driver_transitorio(resultado[2]):
+        if not resultado[1] and _es_error_reintentable(resultado[2]):
             pausa = random.uniform(2, 4)
             logger.warning(
                 f"Reintento de quote-RT para @{cuenta.usuario} por error de "
@@ -736,7 +923,7 @@ class MotorActivacion:
             time.sleep(retardo)
 
         resultado = self._intentar_accion_rol(cuenta, rol, urls, texto, dar_like)
-        if not resultado[2] and _es_error_driver_transitorio(resultado[3]):
+        if not resultado[2] and _es_error_reintentable(resultado[3]):
             pausa = random.uniform(2, 4)
             logger.warning(
                 f"Reintento de acción '{rol}' para @{cuenta.usuario} por error "
@@ -776,6 +963,8 @@ class MotorActivacion:
         - repetir: con True las cuentas trabajan en rondas hasta agotar
           `duracion_min`, regenerando textos nuevos en cada ronda.
         """
+        with self._lock:
+            self.progreso["ronda_actual"] = 1
         cuentas = self._obtener_cuentas(cantidad_cuentas, tags, grupo)
 
         sin_registro = []
@@ -816,6 +1005,9 @@ class MotorActivacion:
             with self._lock:
                 self.progreso["hechas"] += 1
                 self.progreso["fallidas"] += 1
+                self._registrar_evento_locked(
+                    cuenta.usuario, False, MENSAJE_SIN_SESION[:120], 1, "", ""
+                )
             registrar_accion(
                 cuenta.usuario, "activacion", "fallido", "",
                 MENSAJE_SIN_SESION[:120],
@@ -870,11 +1062,13 @@ class MotorActivacion:
                 "rondas": 0,
             }
 
+            usados: dict = {}
+
             def _generar_textos_ronda(_ronda):
                 nuevo = generar_pool_variaciones_openai(
                     texto_base,
                     cantidad=len(con_sesion),
-                    narrativa=narrativa,
+                    narrativa=_narrativa_con_ronda(narrativa, _ronda),
                     entrenamiento=entrenamiento,
                 )
                 if tags_pedidos:
@@ -883,7 +1077,7 @@ class MotorActivacion:
                         for t in nuevo
                     ]
                 random.shuffle(nuevo)
-                return {
+                asignaciones_ronda = {
                     cuenta.usuario: (
                         nuevo[i] if i < len(nuevo)
                         else _garantizar_hashtags_texto(
@@ -892,6 +1086,7 @@ class MotorActivacion:
                     )
                     for i, cuenta in enumerate(con_sesion)
                 }
+                return _aplicar_anti_repeticion(asignaciones_ronda, usados)
 
             def _ejecutar_una_cuenta(cuenta, texto):
                 try:
@@ -910,6 +1105,9 @@ class MotorActivacion:
                     self.progreso["hechas"] += 1
                     self.progreso["exitosas" if ok else "fallidas"] += 1
                     resumen["exitosas" if ok else "fallidas"] += 1
+                    self._registrar_evento_locked(
+                        usuario_res, ok, detalle, ronda, "cita", url
+                    )
                     registrar_accion(
                         usuario_res,
                         "activacion",
@@ -1003,6 +1201,9 @@ class MotorActivacion:
                         self.progreso["exitosas"] += 1
                     else:
                         self.progreso["fallidas"] += 1
+                    self._registrar_evento_locked(
+                        usuario_res, ok, detalle, 1, "cita", url
+                    )
                     registrar_accion(
                         usuario_res,
                         "activacion",
@@ -1190,16 +1391,24 @@ class MotorActivacion:
             f"concurrencia {self.max_concurrente}"
         )
 
-        self.progreso = {
-            "hechas": len(sin_sesion),
-            "exitosas": 0,
-            "fallidas": len(sin_sesion),
-        }
+        with self._lock:
+            self.progreso = {
+                "hechas": len(sin_sesion),
+                "exitosas": 0,
+                "fallidas": len(sin_sesion),
+                "ronda_actual": 1,
+                "eventos": [],
+            }
         for cuenta in sin_sesion:
             registrar_accion(
                 cuenta.usuario, "activacion", "fallido", "",
                 MENSAJE_SIN_SESION[:120],
             )
+            with self._lock:
+                self._registrar_evento_locked(
+                    cuenta.usuario, False, MENSAJE_SIN_SESION[:120], 1,
+                    rol_de.get(cuenta.usuario, ""), "",
+                )
             if callback:
                 callback(
                     self.progreso["hechas"], len(procesables),
@@ -1208,8 +1417,10 @@ class MotorActivacion:
         intervalo_cohorte = max(1, (duracion_min * 60) // max(cohortes, 1))
 
         if repetir:
+            usados: dict = {}
+
             def _generar_textos_ronda(_ronda):
-                return self._generar_textos_por_rol(
+                textos = self._generar_textos_por_rol(
                     grupos_ejec,
                     texto_base,
                     hashtags=hashtags,
@@ -1217,7 +1428,9 @@ class MotorActivacion:
                     narrativa=narrativa,
                     entrenamiento=entrenamiento,
                     contexto=contexto,
+                    ronda=_ronda,
                 )
+                return _aplicar_anti_repeticion(textos, usados)
 
             def _ejecutar_una_rol(cuenta, texto):
                 rol = rol_por_usuario.get(cuenta.usuario, "")
@@ -1241,6 +1454,9 @@ class MotorActivacion:
                         resumen["por_rol"][rol_res][
                             "exitosas" if ok else "fallidas"
                         ] += 1
+                    self._registrar_evento_locked(
+                        usuario_res, ok, detalle, ronda, rol_res, url
+                    )
                     registrar_accion(
                         usuario_res,
                         "activacion",
@@ -1320,6 +1536,9 @@ class MotorActivacion:
                         resumen["por_rol"][rol_res][
                             "exitosas" if ok else "fallidas"
                         ] += 1
+                    self._registrar_evento_locked(
+                        usuario_res, ok, detalle, 1, rol_res, url
+                    )
                     registrar_accion(
                         usuario_res,
                         "activacion",
@@ -1504,7 +1723,14 @@ class MotorActivacion:
 
         mapa_tipo = {"hashtags": "post", "post": "post",
                      "comentario": "comentario", "rt": "retweet", "cita": "comentario"}
-        self.progreso = {"hechas": 0, "exitosas": 0, "fallidas": 0}
+        with self._lock:
+            self.progreso = {
+                "hechas": 0,
+                "exitosas": 0,
+                "fallidas": 0,
+                "ronda_actual": 1,
+                "eventos": [],
+            }
 
         for cuenta in sin_sesion:
             for slot in range(9):
@@ -1529,6 +1755,10 @@ class MotorActivacion:
                 with self._lock:
                     self.progreso["hechas"] += 1
                     self.progreso["fallidas"] += 1
+                    self._registrar_evento_locked(
+                        cuenta.usuario, False, MENSAJE_SIN_SESION[:120], 1,
+                        rol_slot, "",
+                    )
                 registrar_accion(
                     cuenta.usuario, "campana_3_3_3", "fallido", "",
                     MENSAJE_SIN_SESION[:120],
@@ -1630,6 +1860,9 @@ class MotorActivacion:
                         base_resumen["exitosas" if ok else "fallidas"] += 1
                         base_resumen["por_tipo"][tipo]["total"] += 1
                         base_resumen["por_tipo"][tipo]["exitosas" if ok else "fallidas"] += 1
+                        self._registrar_evento_locked(
+                            usuario_res, ok, detalle, 1, rol_res, url
+                        )
                         registrar_accion(
                             usuario_res, "campana_3_3_3",
                             "exito" if ok else "fallido", url, detalle,

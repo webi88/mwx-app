@@ -48,7 +48,7 @@ except Exception:  # pragma: no cover
     MaxRetryError = None
 
 
-__all__ = ["crear_chrome", "FLAGS_AHORRO"]
+__all__ = ["crear_chrome", "FLAGS_AHORRO", "FLAGS_ESTABILIDAD"]
 
 
 # ---------------------------------------------------------------------------
@@ -68,6 +68,18 @@ FLAGS_AHORRO = [
     "--disable-client-side-phishing-detection",
     "--metrics-recording-only",
     "--disable-features=Translate,TranslateUI,OptimizationHints,OptimizationGuideModelDownloading,MediaRouter,AutofillServerCommunication,CalculateNativeWinOcclusion",
+]
+
+# Flags de ESTABILIDAD del renderer: en Railway (CPU compartida, 3 Chrome a la
+# vez, headless) Chrome congela pestanas ocultas y limita los timers, lo que
+# provoca `Timed out receiving message from renderer` en medio de la
+# publicacion. Estos flags evitan ese throttling y los cuelgues del renderer.
+FLAGS_ESTABILIDAD = [
+    "--disable-renderer-backgrounding",
+    "--disable-background-timer-throttling",
+    "--disable-backgrounding-occluded-windows",
+    "--disable-hang-monitor",
+    "--disable-ipc-flooding-protection",
 ]
 
 # Dominios que Chrome visita en segundo plano y que no hacen falta para operar
@@ -106,8 +118,8 @@ def _flags_extra() -> list:
     return flags
 
 
-def _aplicar_flags_ahorro(options):
-    """Aplica ``FLAGS_AHORRO`` (+ flags de datos) de forma IDEMPOTENTE.
+def _aplicar_flags(options, flags):
+    """Aplica `flags` de forma IDEMPOTENTE sobre `options`.
 
     Se puede llamar varias veces sobre las mismas ``options``: los flags ya
     presentes no se duplican.
@@ -116,11 +128,21 @@ def _aplicar_flags_ahorro(options):
         existentes = list(getattr(options, "arguments", []) or [])
     except Exception:
         existentes = []
-    for flag in FLAGS_AHORRO + _flags_extra():
+    for flag in flags:
         if flag not in existentes:
             options.add_argument(flag)
             existentes.append(flag)
     return options
+
+
+def _aplicar_flags_ahorro(options):
+    """Aplica ``FLAGS_AHORRO`` (+ flags de datos) de forma IDEMPOTENTE."""
+    return _aplicar_flags(options, FLAGS_AHORRO + _flags_extra())
+
+
+def _aplicar_flags_estabilidad(options):
+    """Aplica ``FLAGS_ESTABILIDAD`` (renderer) de forma IDEMPOTENTE."""
+    return _aplicar_flags(options, FLAGS_ESTABILIDAD)
 
 
 # ---------------------------------------------------------------------------
@@ -411,7 +433,8 @@ def _resetear_options(options, argumentos_originales) -> None:
 def crear_chrome(options, version_main=None, intentos=2):
     """Devuelve un driver uc.Chrome listo (driver compartido pre-parcheado, sin carreras).
 
-    - Aplica los flags de ahorro de datos (idempotente) antes de crear el driver.
+    - Aplica los flags de ahorro de datos y de estabilidad del renderer
+      (idempotente) antes de crear el driver.
     - Usa SIEMPRE el chromedriver pre-parcheado de ``data/bin/`` (se prepara una
       sola vez bajo lock de archivo entre procesos).
     - ``intentos`` (default 2): reintenta ante fallos transitorios tipicos de la
@@ -426,6 +449,7 @@ def crear_chrome(options, version_main=None, intentos=2):
             version = None
 
     _aplicar_flags_ahorro(options)
+    _aplicar_flags_estabilidad(options)
     ruta_estable = _driver_compartido(version)
 
     try:
