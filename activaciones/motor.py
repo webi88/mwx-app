@@ -109,6 +109,8 @@ _SENALES_ERROR_DRIVER_TRANSITORIO = (
 _SENALES_ERROR_PUBLICACION_SEGURA = (
     "post deshabilitado",
     "no se pudo escribir el texto en el editor",
+    "boton de retweet no encontrado",
+    "botón de retweet no encontrado",
 )
 
 
@@ -709,6 +711,8 @@ class MotorActivacion:
                         logger.error(
                             f"Error reportando el resultado de activacion: {e}"
                         )
+                if time.monotonic() < fin:
+                    time.sleep(random.uniform(2, 6))
 
         if not procesables:
             return 0

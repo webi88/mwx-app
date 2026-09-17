@@ -748,7 +748,14 @@ class TwitterBot:
 
     def _obtener_ultimo_enlace(self, usuario: str) -> Optional[str]:
         try:
-            self.driver.get(f"{self.base_url}/{usuario}")
+            try:
+                self.driver.get(f"{self.base_url}/{usuario}")
+            except TimeoutException:
+                # Carga lenta (proxy intermitente): el HTML suele seguir
+                # llegando; las esperas explicitas de elementos deciden.
+                logger.warning(
+                    f"Carga lenta de {self.base_url}/{usuario}; sigo con esperas explicitas"
+                )
             time.sleep(4)
             
             tweets = self.driver.find_elements(By.CSS_SELECTOR, "article[data-testid='tweet']")
@@ -932,7 +939,14 @@ class TwitterBot:
             return None
         
         try:
-            self.driver.get(f"{self.base_url}/compose/post")
+            try:
+                self.driver.get(f"{self.base_url}/compose/post")
+            except TimeoutException:
+                # Carga lenta (proxy intermitente): la SPA termina de cargar
+                # igual y la espera explicita del editor de abajo decide.
+                logger.warning(
+                    f"Carga lenta de {self.base_url}/compose/post; sigo con esperas explicitas"
+                )
             time.sleep(3)
             
             editor = WebDriverWait(self.driver, 10).until(
@@ -974,9 +988,11 @@ class TwitterBot:
             
             logger.info(f"Tweet publicado por {self.usuario}")
             
-            # 5 segundos de vista a la pantalla para confirmacion visual
-            logger.info("Dejando 5s la pantalla visible para confirmacion visual...")
-            time.sleep(5)
+            # 5 segundos de vista a la pantalla para confirmacion visual.
+            # En headless (Railway) no hay pantalla que mirar: omitir la espera.
+            if not settings.headless:
+                logger.info("Dejando 5s la pantalla visible para confirmacion visual...")
+                time.sleep(5)
             
             url = self._obtener_ultimo_enlace(self.usuario)
             self.ultima_url_publicada = url or ""
@@ -1205,22 +1221,18 @@ class TwitterBot:
             )
         return None
 
-    def _buscar_opcion_quote(self):
+    def _buscar_opcion_quote(self, timeout: float = 10.0):
         """Busca la opcion 'Quote' (Citar) del menu desplegable de retweet.
-        En X el menu muestra 'Repost' y 'Quote'; el quote usa data-testid='quote'."""
+        En X el menu muestra 'Repost' y 'Quote'; el quote usa data-testid='quote'.
+
+        El menu puede tardar en renderizar con carga lenta, por eso se
+        reintenta con los MISMOS selectores hasta `timeout`s (0.5s entre
+        intentos) antes de lanzar el error.
+        """
         selectores = [
             "[data-testid='quote']",
             "a[href*='/intent/post']",
         ]
-        for sel in selectores:
-            try:
-                btn = self.driver.find_element(By.CSS_SELECTOR, sel)
-                if btn.is_displayed():
-                    logger.info(f"Opcion Quote encontrada con selector: {sel}")
-                    return btn
-            except Exception:
-                continue
-
         xpaths = [
             "//span[text()='Quote']",
             "//span[text()='Citar']",
@@ -1229,14 +1241,29 @@ class TwitterBot:
             "//a[@role='menuitem'][.//span[text()='Quote']]",
             "//a[@role='menuitem'][.//span[text()='Citar']]",
         ]
-        for xp in xpaths:
-            try:
-                btn = self.driver.find_element(By.XPATH, xp)
-                if btn.is_displayed():
-                    logger.info(f"Opcion Quote encontrada por texto con XPath: {xp}")
-                    return btn
-            except Exception:
-                continue
+        fin = time.time() + max(0.5, timeout)
+        while True:
+            for sel in selectores:
+                try:
+                    btn = self.driver.find_element(By.CSS_SELECTOR, sel)
+                    if btn.is_displayed():
+                        logger.info(f"Opcion Quote encontrada con selector: {sel}")
+                        return btn
+                except Exception:
+                    continue
+
+            for xp in xpaths:
+                try:
+                    btn = self.driver.find_element(By.XPATH, xp)
+                    if btn.is_displayed():
+                        logger.info(f"Opcion Quote encontrada por texto con XPath: {xp}")
+                        return btn
+                except Exception:
+                    continue
+
+            if time.time() >= fin:
+                break
+            time.sleep(0.5)
 
         raise Exception("No se encontro la opcion 'Quote'/'Citar' en el menu de retweet")
     
@@ -1252,7 +1279,14 @@ class TwitterBot:
                 return None
         
         try:
-            self.driver.get(f"{self.base_url}/compose/post")
+            try:
+                self.driver.get(f"{self.base_url}/compose/post")
+            except TimeoutException:
+                # Carga lenta (proxy intermitente): la SPA termina de cargar
+                # igual y la espera explicita del editor de abajo decide.
+                logger.warning(
+                    f"Carga lenta de {self.base_url}/compose/post; sigo con esperas explicitas"
+                )
             time.sleep(3)
             
             for idx, tweet_texto in enumerate(tweets):
@@ -1287,8 +1321,11 @@ class TwitterBot:
             
             logger.info(f"Hilo publicado por {self.usuario}: {len(tweets)} tweets")
             
-            # 5 segundos de vista a la pantalla para confirmacion visual
-            time.sleep(5)
+            # 5 segundos de vista a la pantalla para confirmacion visual.
+            # En headless (Railway) no hay pantalla que mirar: omitir la espera.
+            if not settings.headless:
+                logger.info("Dejando 5s la pantalla visible para confirmacion visual...")
+                time.sleep(5)
             
             url = self._obtener_ultimo_enlace(self.usuario)
             self.ultima_url_publicada = url or ""
@@ -1474,7 +1511,12 @@ class TwitterBot:
                 return None
 
         try:
-            self.driver.get(url)
+            try:
+                self.driver.get(url)
+            except TimeoutException:
+                # Carga lenta (proxy intermitente): la pagina suele seguir
+                # cargando; las esperas explicitas de elementos deciden.
+                logger.warning(f"Carga lenta de {url}; sigo con esperas explicitas")
             time.sleep(random.uniform(2.5, 4.0))
 
             if self._detectar_limite_cuenta():
@@ -1741,25 +1783,71 @@ class TwitterBot:
         
         for url in targets:
             try:
-                self.driver.get(url)
+                try:
+                    self.driver.get(url)
+                except TimeoutException:
+                    # Carga lenta (proxy intermitente): la pagina suele seguir
+                    # cargando; las esperas explicitas de elementos deciden.
+                    logger.warning(f"Carga lenta de {url}; sigo con esperas explicitas")
                 time.sleep(3)
                 
                 if self._detectar_limite_cuenta():
                     self.ultimo_error = "cuenta limitada por X"
                     break
 
+                # Si el tweet objetivo YA esta retwitteado (p. ej. un timeout
+                # ambiguo anterior), X reemplaza 'retweet' por 'unretweet' y el
+                # boton no aparecera nunca: se cuenta como exito sin duplicar.
+                # Solo RT simple: en cita, un RT simple existente no es la cita.
+                if not mensaje_cita:
+                    try:
+                        articulos = self.driver.find_elements(
+                            By.CSS_SELECTOR, "article[data-testid='tweet']"
+                        )
+                        if articulos and articulos[0].find_elements(
+                            By.CSS_SELECTOR, "[data-testid='unretweet']"
+                        ):
+                            logger.info(
+                                f"El tweet ya estaba retwitteado, se cuenta como exito: {url}"
+                            )
+                            resultados["exitos"] += 1
+                            url_perfil = f"https://twitter.com/{usuario}"
+                            resultados["urls"].append(url_perfil)
+                            self.ultima_url_publicada = url_perfil
+                            time.sleep(random.uniform(1.0, 2.5))
+                            continue
+                    except Exception:
+                        pass
+
                 try:
-                    rt_btn = WebDriverWait(self.driver, 12).until(
+                    rt_btn = WebDriverWait(self.driver, 30).until(
                         EC.element_to_be_clickable((By.CSS_SELECTOR, "[data-testid='retweet']"))
                     )
                 except TimeoutException:
-                    if self._detectar_cuenta_propia_suspendida():
-                        self.cuenta_suspendida = True
-                        raise Exception("cuenta suspendida/bloqueada por X")
-                    motivo = self._detectar_tweet_no_disponible()
-                    raise Exception(
-                        motivo or "boton de retweet no encontrado (carga lenta o cambio de interfaz)"
+                    # Un timeout no siempre significa que no se pueda
+                    # retwittear: con proxys lentos el primer render queda a
+                    # medias. UN refresh + espera explicita extra suele bastar.
+                    logger.warning(
+                        "Boton de retweet no aparecio en 30s; refrescando la pagina e intentando de nuevo"
                     )
+                    try:
+                        self.driver.refresh()
+                    except TimeoutException:
+                        logger.warning(
+                            f"Refresh lento de {url}; sigo con esperas explicitas"
+                        )
+                    try:
+                        rt_btn = WebDriverWait(self.driver, 20).until(
+                            EC.element_to_be_clickable((By.CSS_SELECTOR, "[data-testid='retweet']"))
+                        )
+                    except TimeoutException:
+                        if self._detectar_cuenta_propia_suspendida():
+                            self.cuenta_suspendida = True
+                            raise Exception("cuenta suspendida/bloqueada por X")
+                        motivo = self._detectar_tweet_no_disponible()
+                        raise Exception(
+                            motivo or "boton de retweet no encontrado (carga lenta o cambio de interfaz)"
+                        )
                 rt_btn.click()
                 time.sleep(1)
                 
