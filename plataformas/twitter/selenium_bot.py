@@ -949,11 +949,14 @@ class TwitterBot:
                 )
             time.sleep(3)
             
-            editor = WebDriverWait(self.driver, 10).until(
-                EC.presence_of_element_located((By.CSS_SELECTOR, "[data-testid='tweetTextarea_0']"))
-            )
+            # Editor VISIBLE: X puede tener varios composers montados y el
+            # `presence` agarraba uno oculto (el texto se escribia en el
+            # equivocado, el composer visible quedaba vacio y el boton Post
+            # nunca se habilitaba).
+            editor = self._esperar_editor_visible()
             
             contenido = self._reorganizar_hashtags(contenido)
+            contenido = self._recortar_para_x(contenido)
             self._pegar_texto(editor, contenido)
             
             if imagen_path and os.path.exists(imagen_path):
@@ -966,10 +969,11 @@ class TwitterBot:
             # se habilita, el texto no quedo en el editor y hay que cortar aqui
             # (antes se clicaba un boton muerto y se reportaba un falso
             # "X no confirmo la publicacion").
-            publicar_btn = self._esperar_boton_post_habilitado(10)
+            publicar_btn = self._esperar_boton_post_habilitado(10, texto=contenido)
             if publicar_btn is None:
                 raise Exception(
-                    "boton Post deshabilitado: el texto no quedo registrado en el editor"
+                    "boton Post deshabilitado: el texto no quedo registrado en el editor "
+                    f"({len(contenido)} chars)"
                 )
             self.driver.execute_script("arguments[0].click();", publicar_btn)
             
@@ -1135,12 +1139,12 @@ class TwitterBot:
             try:
                 btn = self.driver.find_element(By.CSS_SELECTOR, sel)
                 if btn.is_displayed() and btn.is_enabled():
-                    logger.info(f"Boton Post encontrado con selector: {sel}")
+                    logger.debug(f"Boton Post encontrado con selector: {sel}")
                     return btn
             except Exception:
                 continue
 
-        logger.info("Buscando boton Post por texto visible...")
+        logger.debug("Buscando boton Post por texto visible...")
         xpaths = [
             "//span[text()='Post']/ancestor::*[self::div[@role='button']]",
             "//span[text()='Post']",
@@ -1152,7 +1156,7 @@ class TwitterBot:
             try:
                 btn = self.driver.find_element(By.XPATH, xp)
                 if btn.is_displayed():
-                    logger.info(f"Boton Post encontrado por texto con XPath: {xp}")
+                    logger.debug(f"Boton Post encontrado por texto con XPath: {xp}")
                     return btn
             except Exception:
                 continue
@@ -1195,30 +1199,43 @@ class TwitterBot:
         except Exception:
             return True
 
-    def _esperar_boton_post_habilitado(self, timeout: int = 10):
+    def _esperar_boton_post_habilitado(self, timeout: int = 10, texto: str = ""):
         """Espera hasta `timeout`s a que el boton "Post" se habilite.
 
         X mantiene el boton deshabilitado mientras el editor no tenga texto.
-        Devuelve el boton habilitado o None si no aparecio en el plazo.
+        Devuelve el boton habilitado o None si no aparecio en el plazo. `texto`
+        (opcional) es el texto que se intento escribir, para el diagnostico.
         """
         fin = time.time() + max(1, timeout)
-        candidato = None
         while time.time() < fin:
             try:
                 posible = self._buscar_boton_post()
             except Exception:
                 posible = None
             if posible is not None:
-                candidato = posible
                 if self._post_habilitado(posible):
                     logger.info("Boton Post habilitado, procediendo a publicar")
                     return posible
             time.sleep(0.5)
-        if candidato is not None:
-            logger.warning(
-                "El boton Post no se habilito en el tiempo esperado "
-                "(el texto podria no estar en el editor)"
-            )
+
+        # Diagnostico al fallar: longitud del texto que realmente quedo en el
+        # editor VISIBLE (si se puede leer) y del que se intento escribir.
+        largo_editor = None
+        try:
+            editor = self._primer_editor_visible()
+            if editor is not None:
+                largo_editor = len(self._leer_texto_editor(editor))
+        except Exception:
+            largo_editor = None
+        detalle_editor = (
+            f"{largo_editor} chars en el editor visible"
+            if largo_editor is not None
+            else "no se pudo leer el editor visible"
+        )
+        logger.warning(
+            f"El boton Post no se habilito en {timeout}s "
+            f"(se intentaron escribir {len(texto or '')} chars; {detalle_editor})"
+        )
         return None
 
     def _buscar_opcion_quote(self, timeout: float = 10.0):
@@ -1290,11 +1307,12 @@ class TwitterBot:
             time.sleep(3)
             
             for idx, tweet_texto in enumerate(tweets):
-                editor = WebDriverWait(self.driver, 10).until(
-                    EC.presence_of_element_located((By.CSS_SELECTOR, "[data-testid='tweetTextarea_0']"))
-                )
+                # Editor VISIBLE (ver `_esperar_editor_visible`): evita escribir
+                # en un composer oculto y que el boton Post quede muerto.
+                editor = self._esperar_editor_visible()
                 
                 texto = self._reorganizar_hashtags(tweet_texto)
+                texto = self._recortar_para_x(texto)
                 self._pegar_texto(editor, texto)
                 
                 time.sleep(1)
@@ -1431,6 +1449,92 @@ class TwitterBot:
             time.sleep(0.5)
         return None
 
+    # Selectores del compositor de X. El `data-testid` es el principal; los
+    # contenteditables quedan como respaldo por si X cambia el testid.
+    _EDITOR_SELECTORES = (
+        "[data-testid='tweetTextarea_0']",
+        "div[role='textbox'][contenteditable='true']",
+        "div[contenteditable='true'][role='textbox']",
+    )
+
+    def _primer_editor_visible(self, selectores: Optional[list] = None, preferir_dialogo: bool = False):
+        """Devuelve el PRIMER editor VISIBLE de la pagina (None si no hay).
+
+        X puede tener varios `[data-testid='tweetTextarea_0']` montados en el
+        DOM (composers viejos/ocultos): buscar con `presence` agarra el primero
+        aunque no se vea, el texto se escribe en el editor equivocado y el
+        composer visible queda vacio (boton Post deshabilitado). Por eso aqui
+        se exige `is_displayed()`. Con `preferir_dialogo=True` (modal de
+        respuesta) se busca primero dentro de un `div[role='dialog']` visible.
+        """
+        selectores = list(selectores or self._EDITOR_SELECTORES)
+        if preferir_dialogo:
+            try:
+                for dlg in self.driver.find_elements(By.CSS_SELECTOR, "div[role='dialog']"):
+                    try:
+                        if not dlg.is_displayed():
+                            continue
+                    except Exception:
+                        continue
+                    for sel in selectores:
+                        try:
+                            for editor in dlg.find_elements(By.CSS_SELECTOR, sel):
+                                if editor.is_displayed():
+                                    return editor
+                        except Exception:
+                            continue
+            except Exception:
+                pass
+        for sel in selectores:
+            try:
+                for editor in self.driver.find_elements(By.CSS_SELECTOR, sel):
+                    if editor.is_displayed():
+                        return editor
+            except Exception:
+                continue
+        return None
+
+    def _esperar_editor_visible(
+        self,
+        timeout: int = 30,
+        preferir_dialogo: bool = False,
+        reintento_timeout: int = 20,
+    ):
+        """Espera a que monte un editor VISIBLE y lo devuelve.
+
+        Se usa en TODOS los flujos de escritura (tweet, hilo, quote y
+        respuesta). Si en `timeout` segundos no aparece ningun editor visible,
+        hace UN `driver.refresh()` (tolerando el TimeoutException de carga
+        lenta del proxy) y espera `reintento_timeout` segundos mas. Si sigue
+        sin aparecer lanza `Exception("compositor de X no cargo: el editor
+        visible no aparecio")` (mensaje que el motor de activaciones reconoce).
+        """
+        fin = time.time() + max(0.2, float(timeout))
+        while time.time() < fin:
+            editor = self._primer_editor_visible(preferir_dialogo=preferir_dialogo)
+            if editor is not None:
+                return editor
+            time.sleep(0.5)
+
+        logger.warning(
+            f"Editor visible de X no aparecio en {timeout}s; refrescando la pagina"
+        )
+        try:
+            self.driver.refresh()
+        except TimeoutException:
+            logger.warning("Refresh lento del compositor; sigo con esperas explicitas")
+        except Exception as e:
+            logger.warning(f"Refresh del compositor fallo ({type(e).__name__}: {e})")
+
+        fin = time.time() + max(0.2, float(reintento_timeout))
+        while time.time() < fin:
+            editor = self._primer_editor_visible(preferir_dialogo=preferir_dialogo)
+            if editor is not None:
+                return editor
+            time.sleep(0.5)
+
+        raise Exception("compositor de X no cargo: el editor visible no aparecio")
+
     @staticmethod
     def _status_id(url: str) -> str:
         """Extrae el id numerico de un enlace `/status/<id>` ('' si no hay)."""
@@ -1539,13 +1643,19 @@ class TwitterBot:
             self.driver.execute_script("arguments[0].click();", reply_btn)
             time.sleep(random.uniform(1.0, 2.0))
 
-            editor = self._buscar_editor_respuesta()
-            if editor is None:
-                self.ultimo_error = "no se encontro el cuadro de composicion de la respuesta"
+            try:
+                # Preferir el editor del modal de respuesta y, sobre todo, que
+                # este VISIBLE (X monta varios composers: el texto podia caer
+                # en uno oculto y el boton Responder quedar deshabilitado).
+                editor = self._esperar_editor_visible(preferir_dialogo=True)
+            except Exception as e:
+                self.ultimo_error = str(e)
                 logger.warning(self.ultimo_error)
                 return None
 
-            self._pegar_texto(editor, self._reorganizar_hashtags(texto))
+            texto = self._reorganizar_hashtags(texto)
+            texto = self._recortar_para_x(texto)
+            self._pegar_texto(editor, texto)
             time.sleep(random.uniform(0.8, 1.5))
 
             if imagen_path and os.path.exists(imagen_path):
@@ -1621,7 +1731,36 @@ class TwitterBot:
         if not derecha:
             return f"{izquierda} {tags}".strip()
         return f"{izquierda} {tags} {derecha}".strip()
-    
+
+    def _recortar_para_x(self, texto: str, limite: int = 280) -> str:
+        """Recorta `texto` al limite de X sin partir palabras (nunca lanza).
+
+        X deshabilita el boton Post cuando el texto excede 280 caracteres.
+        Si el texto no cabe, se corta en el ultimo espacio ANTERIOR al limite
+        y se agrega `…`; si no hay espacios se corta duro. El resultado nunca
+        excede `limite`. Se usa DESPUES de `_reorganizar_hashtags`.
+        """
+        texto = texto or ""
+        try:
+            limite = int(limite)
+        except Exception:
+            limite = 280
+        if limite <= 0 or len(texto) <= limite:
+            return texto
+
+        # Ultimo espacio con indice < limite (para reservar 1 char al `…`).
+        corte = texto.rfind(" ", 0, limite)
+        if corte <= 0:
+            recortado = texto[: max(0, limite - 1)].rstrip() + "…"
+        else:
+            recortado = texto[:corte].rstrip() + "…"
+        if len(recortado) > limite:  # salvaguarda: jamas exceder el limite
+            recortado = recortado[:limite]
+        logger.warning(
+            f"Texto recortado para X: {len(texto)} -> {len(recortado)} chars"
+        )
+        return recortado
+
     def _normalizar_texto_editor(self, texto: str) -> str:
         """Normaliza para comparar (sin espacios ni signos, en minusculas)."""
         return re.sub(r"[\W_]+", "", texto or "", flags=re.UNICODE).lower()
@@ -1694,10 +1833,19 @@ class TwitterBot:
                 return
             logger.warning("El portapapeles no dejo el texto en el editor; probando send_keys")
         except Exception as e:
-            logger.warning(
-                f"No se pudo pegar por portapapeles ({type(e).__name__}: {e}); "
-                f"probando send_keys"
-            )
+            # PyperclipException = el contenedor no tiene mecanismo de
+            # portapapeles (sin xclip/xsel en Railway): es ESPERADO, no un
+            # problema del bot; se registra en debug y se sigue con send_keys.
+            if any(cls.__name__ == "PyperclipException" for cls in type(e).__mro__):
+                logger.debug(
+                    f"Sin portapapeles disponible ({type(e).__name__}: {e}); "
+                    f"usando send_keys"
+                )
+            else:
+                logger.warning(
+                    f"No se pudo pegar por portapapeles ({type(e).__name__}: {e}); "
+                    f"probando send_keys"
+                )
 
         # 2) send_keys en UNA sola llamada.
         try:
@@ -1857,10 +2005,9 @@ class TwitterBot:
                     self.driver.execute_script("arguments[0].click();", quote_btn)
                     time.sleep(2)
                     
-                    editor = WebDriverWait(self.driver, 10).until(
-                        EC.presence_of_element_located((By.CSS_SELECTOR, "[data-testid='tweetTextarea_0']"))
-                    )
-                    self._pegar_texto(editor, mensaje_cita)
+                    editor = self._esperar_editor_visible()
+                    mensaje = self._recortar_para_x(mensaje_cita)
+                    self._pegar_texto(editor, mensaje)
                     time.sleep(1)
                     
                     if imagen_path and os.path.exists(imagen_path):

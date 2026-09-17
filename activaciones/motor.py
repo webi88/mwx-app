@@ -111,6 +111,7 @@ _SENALES_ERROR_PUBLICACION_SEGURA = (
     "no se pudo escribir el texto en el editor",
     "boton de retweet no encontrado",
     "botón de retweet no encontrado",
+    "compositor de x no cargo",
 )
 
 
