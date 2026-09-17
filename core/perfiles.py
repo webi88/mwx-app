@@ -12,8 +12,9 @@ guarda en ``Cuenta.perfil_personalidad`` y viaja por los pools de generacion
     - ``popular``   -> Popular/Organico: muy casual, de un solo renglon y con
                        faltas de ortografia intencionales.
 
-Tambien centraliza la regla de hashtags (obligatorio y en MEDIO del texto,
-nunca al final): ``elegir_hashtag()`` y ``colocar_hashtag_en_medio()``.
+Tambien centraliza la regla de hashtags (obligatorio y en un LIMITE NATURAL
+cercano al MEDIO del texto, nunca al final): ``elegir_hashtag()`` y
+``colocar_hashtag_en_medio()``.
 
 Interfaz congelada: otros modulos (ia, cuentas, web, cli) importan las
 constantes y funciones publicas de aqui sin duplicarlas. Sin dependencias
@@ -182,13 +183,38 @@ def _quitar_hashtags(texto: str) -> str:
     return limpio.strip()
 
 
+def _limpiar_espacios(texto) -> str:
+    """Quita espacios antes de puntuacion y colapsa espacios repetidos.
+
+    Evita los huecos que dejan los hashtags al extraerse o reinsertarse
+    (p.ej. ``"el desfile del ,"`` -> ``"el desfile del,"``). Nunca lanza.
+    """
+    limpio = re.sub(r"\s+([,.;:!?])", r"\1", str(texto or ""))
+    limpio = re.sub(r"[ \t]{2,}", " ", limpio)
+    return limpio.strip()
+
+
+# Limites naturales de clausula: puntuacion (con cierre de cita/parentesis
+# opcional) o salto de linea. El hashtag se inserta justo DESPUES del limite.
+_RE_LIMITE_CLAUSULA = re.compile(r"""[.!?,;:]+["'»”’)\]]*|\n+""")
+
+
 def colocar_hashtag_en_medio(texto, hashtag: str = "", rng=random) -> str:
     """Devuelve el texto con UN hashtag integrado en el MEDIO (nunca al final).
 
-    - Si el texto ya tiene hashtag(s) al final, se mueven al medio.
-    - El punto de insercion es el espacio/enter natural mas cercano a la mitad
-      del texto (tras la primera frase si el texto es corto).
+    El punto de insercion prioriza un LIMITE NATURAL de clausula: la posicion
+    inmediatamente DESPUES de una puntuacion (``.``, ``!``, ``?``, ``,``,
+    ``;``, ``:``) o de un salto de linea, siempre que caiga dentro de la
+    ventana central (20%-80% del largo del texto); entre los candidatos se
+    elige el mas cercano a la mitad. Asi el hashtag no parte frases por la
+    mitad (nunca queda entre un articulo y su sustantivo). Si no hay
+    puntuacion en esa ventana, se usa el espacio mas cercano a la mitad
+    (comportamiento clasico) y, si el texto no tiene espacios, el corte duro
+    actual por la mitad.
+
+    - Si el texto ya tiene hashtag(s), el primero se reubica en el medio.
     - Garantiza al menos un hashtag: si no hay, usa ``hashtag`` o uno aleatorio.
+    - Limpia espacios antes de puntuacion (``"texto ,"`` -> ``"texto,"``).
     - Nunca lanza: devuelve el texto original si algo falla.
     """
     try:
@@ -196,28 +222,44 @@ def colocar_hashtag_en_medio(texto, hashtag: str = "", rng=random) -> str:
         if not original:
             return original
         tag = _normalizar_hashtag(hashtag) or elegir_hashtag(original, rng=rng)
-        base = _quitar_hashtags(original)
+        base = _limpiar_espacios(_quitar_hashtags(original))
         if not base:
             return tag
         if not tag:
             return base
 
         mitad = len(base) // 2
-        # Punto natural mas cercano a la mitad: espacio o salto de linea.
-        espacios = [m.start() for m in re.finditer(r"(?:\s|\n)", base)]
-        if espacios:
-            punto = min(espacios, key=lambda p: abs(p - mitad))
+        # 1) Limite de clausula mas cercano a la mitad dentro de la ventana
+        #    central (20%-80%): no parte frases entre articulo y sustantivo.
+        margen_inf = int(len(base) * 0.2)
+        margen_sup = int(len(base) * 0.8)
+        candidatos = [
+            m.end()
+            for m in _RE_LIMITE_CLAUSULA.finditer(base)
+            if margen_inf <= m.end() <= margen_sup
+        ]
+        if candidatos:
+            punto = min(candidatos, key=lambda p: abs(p - mitad))
+        else:
+            # 2) Sin puntuacion util: espacio/salto mas cercano a la mitad.
+            espacios = [m.start() for m in re.finditer(r"\s", base)]
+            punto = min(espacios, key=lambda p: abs(p - mitad)) if espacios else None
+
+        if punto is not None:
             izquierda = base[:punto].rstrip()
             derecha = base[punto:].lstrip()
-        else:
-            izquierda, derecha = base, ""
+            if izquierda and derecha:
+                return _limpiar_espacios(f"{izquierda} {tag} {derecha}")
 
-        if not izquierda:
-            return f"{tag} {derecha}".strip()
-        if not derecha:
-            # Texto de un solo bloque sin espacios: parte a la mitad exacta.
-            corte = max(1, len(base) // 2)
-            return f"{base[:corte].rstrip()} {tag} {base[corte:].lstrip()}".strip()
-        return f"{izquierda} {tag} {derecha}".strip()
+        # 3) Texto de un solo bloque sin espacios: corte duro por la mitad.
+        corte = max(1, len(base) // 2)
+        izquierda = base[:corte].rstrip()
+        derecha = base[corte:].lstrip()
+        if izquierda and derecha:
+            return _limpiar_espacios(f"{izquierda} {tag} {derecha}")
+        if izquierda:
+            # Texto de 1 caracter: el tag va delante para no cerrar con hashtag.
+            return _limpiar_espacios(f"{tag} {izquierda}")
+        return tag
     except Exception:
         return str(texto or "").strip()

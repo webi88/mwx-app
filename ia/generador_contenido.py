@@ -1864,6 +1864,98 @@ def generar_textos_campana_3_3_3(
 # ===================================================================== #
 _MAX_CUENTAS_HASHTAGS_POR_LLAMADA = 15
 
+# Limite DURO de largo para los posts del rol "hashtags". El prompt pide 240
+# caracteres y X corta en 280; el margen de 40 cubre menciones o URLs que se
+# agreguen despues. TODO texto de `generar_textos_hashtags_por_cuenta` y de
+# `_texto_hashtag_local` sale con len(texto) <= _MAX_LARGO_HASHTAG.
+_MAX_LARGO_HASHTAG = 240
+
+
+def _recortar_limite_hashtag(
+    texto, tags=None, limite: int = _MAX_LARGO_HASHTAG
+) -> str:
+    """Recorta un texto a ``limite`` caracteres sin dejarlo a medias si puede.
+
+    - Si ya cabe, se devuelve tal cual.
+    - Busca el ultimo cierre de frase (``.``, ``!`` o ``?``) dentro del limite
+      y a partir del 50% del limite; si existe, corta ahi (conservando el
+      signo y la frase completa, sin ``…``).
+    - Si no hay cierre, corta en el ultimo espacio antes del limite y agrega
+      ``…`` SOLO en ese caso (corte de palabra).
+    - Preserva los ``tags`` pedidos: si el recorte se llevo el hashtag (quedo
+      mas alla del corte), lo reinserta EN MEDIO del texto recortado sin
+      volver a pasarse del limite.
+    Nunca lanza: ante cualquier error devuelve el texto original.
+    """
+    try:
+        t = str(texto or "").strip()
+        if len(t) <= limite:
+            return t
+        limite = max(40, int(limite))
+
+        # 1) Ultimo cierre de frase dentro del limite y desde la mitad.
+        corte = None
+        for signo in (".", "!", "?"):
+            pos = t.rfind(signo, 0, limite)
+            if pos >= limite // 2 and (corte is None or pos > corte):
+                corte = pos
+        if corte is not None:
+            rec = t[: corte + 1].strip()
+        else:
+            # 2) Corte en el ultimo espacio (frontera de palabra).
+            pos = t.rfind(" ", 0, limite)
+            if pos <= 0:
+                pos = limite
+            rec = t[:pos].rstrip() + "…"
+
+        # 3) Seguridad: si el recorte se llevo el hashtag pedido, se reinserta
+        #    en medio dejando margen para no exceder de nuevo el limite.
+        if tags and not _contiene_algun_hashtag(rec, tags):
+            tag = str(tags[0] or "").strip()
+            margen = len(tag) + 2
+            if tag and margen < limite:
+                cola = "…" if rec.endswith("…") else ""
+                base = rec.rstrip("…").strip()
+                if len(base) > limite - margen:
+                    recorte = base[: limite - margen]
+                    espacio = recorte.rfind(" ")
+                    if espacio >= limite // 3:
+                        recorte = recorte[:espacio]
+                    base = recorte.rstrip()
+                try:
+                    con_tag = (
+                        colocar_hashtag_en_medio(base, hashtag=tag) + cola
+                    ).strip()
+                    if (
+                        con_tag
+                        and _contiene_algun_hashtag(con_tag, tags)
+                        and len(con_tag) <= limite
+                    ):
+                        rec = con_tag
+                except Exception:
+                    pass
+
+        # 4) Regla del proyecto: el texto NUNCA termina en hashtag. Si el corte
+        #    dejo el tag al final (aunque sea antes del punto), se mueve al
+        #    medio del texto recortado.
+        if _hashtag_al_final(rec):
+            tag_presente = ""
+            for tg in (tags or []):
+                if str(tg or "").strip().lower() in rec.lower():
+                    tag_presente = str(tg).strip()
+                    break
+            try:
+                movido = colocar_hashtag_en_medio(rec, hashtag=tag_presente)
+                if movido and len(movido) <= limite:
+                    rec = re.sub(r"[ \t]+([.,;:!?])", r"\1", movido).strip()
+            except Exception:
+                pass
+        return rec
+    except Exception as e:
+        logger.error(f"Error recortando texto de hashtag: {e}")
+        return str(texto or "").strip()
+
+
 # Plantillas locales (fallback sin OpenAI) para el rol "hashtags".
 # Estructura: registro -> perfil -> plantillas. `{contexto}` y `{tag}` se usan
 # SIEMPRE dentro de una opinion propia (prohibido devolver el contexto pelado o
@@ -2158,17 +2250,22 @@ def _texto_hashtag_local(
             except Exception:
                 inicio = 0
         plantilla = plantillas[(int(inicio) + k) % len(plantillas)]
-        return (
+        texto = (
             str(plantilla)
             .replace("{contexto}", ctx)
             .replace("{tag}", str(tag or ""))
             .strip()
         )
+        # Contrato de largo tambien para el fallback local.
+        return _recortar_limite_hashtag(texto, [str(tag or "").strip()])
     except Exception as e:
         logger.error(f"Error construyendo texto local de hashtag: {e}")
         ctx = " ".join(str(contexto or "").split()) or "lo que tenemos"
         tag = (tags or ["#Mexico"])[0]
-        return f"Con esto de {ctx} uno aprende a valorarlo; {tag} lo dice bien."
+        return _recortar_limite_hashtag(
+            f"Con esto de {ctx} uno aprende a valorarlo; {tag} lo dice bien.",
+            [str(tag or "").strip()],
+        )
 
 
 def _garantizar_hashtag_pedido(texto: str, tags, semilla: int = 0) -> str:
@@ -2379,6 +2476,17 @@ def generar_textos_hashtags_por_cuenta(
                         t, tags, i * 1000 + j + 1999
                     )
 
+            # Contrato de largo: ningun texto sale > _MAX_LARGO_HASHTAG.
+            t = _recortar_limite_hashtag(t, tags)
+            if t in vistos:
+                # El recorte pudo colisionar: se varía y se vuelve a acotar.
+                alterno = _variar_hasta_unico(t, vistos)
+                alterno = _garantizar_hashtag_pedido(
+                    alterno, tags, i * 1000 + j + 4919
+                )
+                alterno = _recortar_limite_hashtag(alterno, tags)
+                if alterno and alterno not in vistos:
+                    t = alterno
             vistos.add(t)
             resultado[i][j] = t
             hechas += 1

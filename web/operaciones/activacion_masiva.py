@@ -10,7 +10,12 @@ SUBCUENTAS por rol (`Cuenta.rol_activacion`, ver `core/roles.py`):
   - "rt"       -> Retweet simple.
 Permite asignar el rol a la seleccion (selector masivo de `web.operaciones.
 cuentas`), repartir en 3 tercios automaticamente, ver conteos/ejemplos y
-lanzar `MotorActivacion.ejecutar_por_roles`. Las cuentas sin rol se saltan.
+lanzar `MotorActivacion.ejecutar_por_roles`.
+
+Con "🎲 Rol aleatorio por cuenta en cada ronda" (default) el rol guardado NO
+se usa como filtro: en cada ronda el motor sortea cita/hashtags/rt por cuenta
+(`roles_aleatorios=True`) y `cooldown_min` evita que una misma cuenta repita
+accion antes de ese descanso. Las cuentas sin registro siguen saltandose.
 
 Pestana C ("📋 Campaña 3+3+3"): por cuenta 3 posts + 3 comentarios + 3 RTs
 del tweet principal (9 acciones). Genera los 9 textos con
@@ -121,6 +126,27 @@ def _tabla_roles(cuentas: list, ejemplos: int = 8) -> list:
     return filas
 
 
+def _cuentas_objetivo(cuentas: list, usuarios: list | None) -> list:
+    """Cuentas que cumplen el filtro `usuarios` (sin '@', case-insensitive).
+
+    Mismo criterio que `MotorActivacion._obtener_cuentas_por_rol`: sin
+    `usuarios` devuelve todas. Sirve para validar que el modo de rol aleatorio
+    tiene al menos una cuenta que procesar aunque no tenga rol guardado.
+    """
+    base = list(cuentas or [])
+    if not usuarios:
+        return base
+    deseados = {
+        str(u).strip().lstrip("@").lower()
+        for u in usuarios
+        if str(u).strip()
+    }
+    return [
+        f for f in base
+        if str(f.get("usuario") or "").strip().lstrip("@").lower() in deseados
+    ]
+
+
 def _roles_objetivo(cuentas: list, usuarios: list | None,
                     solo_roles: list | None) -> set:
     """Roles (no vacios) de las cuentas que la campana realmente procesara.
@@ -131,17 +157,7 @@ def _roles_objetivo(cuentas: list, usuarios: list | None,
     """
     from core.roles import normalizar_rol_activacion
 
-    base = cuentas or []
-    if usuarios:
-        deseados = {
-            str(u).strip().lstrip("@").lower()
-            for u in usuarios
-            if str(u).strip()
-        }
-        base = [
-            f for f in base
-            if str(f.get("usuario") or "").strip().lstrip("@").lower() in deseados
-        ]
+    base = _cuentas_objetivo(cuentas, usuarios)
 
     if solo_roles:
         permitidos = {normalizar_rol_activacion(r) for r in solo_roles}
@@ -232,6 +248,10 @@ def _lanzar_con_progreso(lanzar, motor, duracion_min: int, repetir: bool) -> dic
     Con `repetir=True` la barra avanza por tiempo (`duracion_min`); con
     `repetir=False` avanza por cuentas hechas sobre el total estimado.
 
+    La linea de metricas incluye un indicador de VELOCIDAD calculado con
+    `hechas` del snapshot y el tiempo transcurrido:
+    `⚡ N acciones · r/min ≈ R/h`.
+
     Si `lanzar()` lanza, la excepcion se re-lanza aqui tras cerrar la barra.
     Devuelve el resumen del motor.
     """
@@ -275,6 +295,7 @@ def _lanzar_con_progreso(lanzar, motor, duracion_min: int, repetir: bool) -> dic
         fallidas = int(snap.get("fallidas") or 0)
         ronda_actual = int(snap.get("ronda_actual") or 1)
         transcurrido = max(0.0, time.monotonic() - inicio)
+        ritmo = (hechas / transcurrido * 60.0) if transcurrido > 0 else 0.0
 
         if repetir:
             avance = min(1.0, transcurrido / limite_segundos)
@@ -291,7 +312,9 @@ def _lanzar_con_progreso(lanzar, motor, duracion_min: int, repetir: bool) -> dic
         barra.progress(avance, text=tiempo_txt)
         metricas.markdown(
             f"**🔄 Ronda {ronda_actual}** · ✅ {exitosas} exitosas · "
-            f"❌ {fallidas} fallidas · 🧮 {hechas} hechas · {tiempo_txt}"
+            f"❌ {fallidas} fallidas · 🧮 {hechas} hechas · "
+            f"⚡ {hechas} acciones · {ritmo:.1f}/min ≈ {ritmo * 60.0:.0f}/h · "
+            f"{tiempo_txt}"
         )
 
         eventos = snap.get("eventos") or []
@@ -440,6 +463,16 @@ def _mostrar_resultados_roles(resultados: dict):
         )
     for col, (etiqueta, valor) in zip(st.columns(len(metricas)), metricas):
         col.metric(etiqueta, valor)
+
+    if resultados.get("roles_aleatorios"):
+        try:
+            cooldown = float(resultados.get("cooldown_min") or 0)
+        except (TypeError, ValueError):
+            cooldown = 0.0
+        st.caption(
+            f"🎲 Roles sorteados por cuenta en cada ronda · "
+            f"descanso por cuenta: {cooldown:g} min"
+        )
 
     st.markdown("#### 🗂️ Subcuentas por rol")
     por_rol = resultados.get("por_rol") or {}
@@ -774,7 +807,7 @@ def _por_roles():
             key="act_roles_menciones",
         )
 
-    col_dur, col_coh, col_nav = st.columns(3)
+    col_dur, col_coh, col_nav, col_cool = st.columns(4)
     with col_dur:
         duracion_min = st.number_input(
             "Duración (min)", min_value=1, max_value=360, value=60, step=5,
@@ -795,6 +828,36 @@ def _por_roles():
                 "conviene 3 (configurable con la variable MAX_BROWSERS)."
             ),
         )
+    with col_cool:
+        cooldown_min = st.number_input(
+            "Descanso por cuenta (min)",
+            min_value=0, max_value=60, value=4, step=1,
+            key="act_roles_cooldown",
+            help=(
+                "Tiempo mínimo entre dos acciones de la MISMA cuenta (protege "
+                "de spam). Con muchas cuentas casi no afecta la velocidad; "
+                "0 = sin descanso."
+            ),
+        )
+
+    st.caption(
+        "⚡ Rendimiento estimado: con **3 navegadores** y ~45-60s por acción "
+        "se logran **~200-260 publicaciones/hora**; ajusta navegadores y "
+        "descanso según tus proxies."
+    )
+
+    roles_aleatorios = st.checkbox(
+        "🎲 Rol aleatorio por cuenta en cada ronda",
+        value=True,
+        key="act_roles_aleatorio",
+        help=(
+            "La IA sortea cita/RT/hashtags de forma aleatoria para cada "
+            "cuenta en cada ronda: acelera y evita patrones. Los inputs "
+            "definen qué roles entran (sin URLs no hay cita/rt; sin hashtags "
+            "ni contexto no hay posts con hashtag). Al marcarlo se ignora el "
+            "rol guardado y se desactiva el filtro «Solo cuentas con rol»."
+        ),
+    )
 
     col_like, col_solo, col_rep = st.columns(3)
     with col_like:
@@ -803,8 +866,22 @@ def _por_roles():
         )
     with col_solo:
         solo_con_rol = st.checkbox(
-            "Solo cuentas con rol", value=True, key="act_roles_solo_rol"
+            "Solo cuentas con rol",
+            value=True,
+            key="act_roles_solo_rol",
+            disabled=roles_aleatorios,
+            help=(
+                "Ignorado con «Rol aleatorio por cuenta»: el rol guardado no "
+                "filtra; todas las cuentas con registro entran al sorteo."
+                if roles_aleatorios
+                else "Limita la campaña a las cuentas que ya tienen rol."
+            ),
         )
+        if roles_aleatorios:
+            st.caption(
+                "🎲 Deshabilitado: el rol se sortea por cuenta en cada ronda, "
+                "sin usar el rol guardado."
+            )
     with col_rep:
         repetir = st.checkbox(
             "🔁 Repetir hasta agotar el tiempo (textos nuevos en cada ronda)",
@@ -828,40 +905,64 @@ def _por_roles():
     if todas_cuentas:
         st.caption(
             "📢 **Todas las cuentas publican**: se ignora el selector de "
-            "cuentas y se usan todas las activas que cumplan el filtro de rol. "
-            "Solo publican las que tengan registro definido "
-            "(político/activista/ciudadanía); las cuentas sin registro no hacen nada."
+            "cuentas y se usan todas las activas (con rol aleatorio, sin "
+            "filtrar por rol guardado). Solo publican las que tengan registro "
+            "definido (político/activista/ciudadanía); las cuentas sin "
+            "registro no hacen nada."
         )
 
     if st.button(
         "🗂️ Lanzar campaña por roles",
         type="primary",
         key="btn_act_roles_launch",
+        help=(
+            "Con «Rol aleatorio por cuenta» (recomendado) cada cuenta recibe "
+            "un rol sorteado en cada ronda; desmárcalo para usar el rol "
+            "guardado de cada subcuenta."
+        ),
     ):
         urls = [u.strip() for u in urls_text.splitlines() if u.strip()]
-        solo_roles_param = list(ORDEN_ROLES) if solo_con_rol else None
+        solo_roles_param = (
+            None
+            if roles_aleatorios
+            else (list(ORDEN_ROLES) if solo_con_rol else None)
+        )
         usuarios_param = None if todas_cuentas else (usuarios_sel or None)
         base_objetivo = (
             [f for f in cuentas if f.get("tipo_cuenta")]
             if todas_cuentas
             else cuentas
         )
-        roles_objetivo = _roles_objetivo(
-            base_objetivo, usuarios_param, solo_roles_param
-        )
 
-        if not roles_objetivo:
-            st.warning(
-                "No hay cuentas con rol que cumplan la selección. Asigna roles "
-                "en «🏷️ Asignar roles» o revisa el selector."
+        if roles_aleatorios:
+            if not _cuentas_objetivo(base_objetivo, usuarios_param):
+                st.warning(
+                    "No hay cuentas que cumplan la selección. Revisa el "
+                    "selector o el registro de las cuentas."
+                )
+                return
+            if not urls and not str(hashtags or "").strip():
+                st.warning(
+                    "Pega al menos una URL objetivo o hashtags: sin URLs el "
+                    "rol aleatorio solo puede usar posts con hashtag."
+                )
+                return
+        else:
+            roles_objetivo = _roles_objetivo(
+                base_objetivo, usuarios_param, solo_roles_param
             )
-            return
-        if not urls and (roles_objetivo & {"cita", "rt"}):
-            st.warning(
-                "Pega al menos una URL objetivo: la selección incluye cuentas "
-                "de 'Retweet con cita' y/o 'Retweet simple'."
-            )
-            return
+            if not roles_objetivo:
+                st.warning(
+                    "No hay cuentas con rol que cumplan la selección. Asigna "
+                    "roles en «🏷️ Asignar roles» o revisa el selector."
+                )
+                return
+            if not urls and (roles_objetivo & {"cita", "rt"}):
+                st.warning(
+                    "Pega al menos una URL objetivo: la selección incluye "
+                    "cuentas de 'Retweet con cita' y/o 'Retweet simple'."
+                )
+                return
 
         from activaciones.motor import MotorActivacion
 
@@ -881,6 +982,8 @@ def _por_roles():
                 contexto=contexto,
                 repetir=bool(repetir),
                 solo_con_registro=bool(todas_cuentas),
+                roles_aleatorios=bool(roles_aleatorios),
+                cooldown_min=float(cooldown_min),
             ),
             motor,
             duracion_min=int(duracion_min),

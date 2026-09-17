@@ -922,12 +922,22 @@ class TwitterBot:
         except Exception:
             return ""
 
-    def publicar_tweet(self, contenido: str, imagen_path: Optional[str] = None) -> Optional[str]:
+    def publicar_tweet(
+        self,
+        contenido: str,
+        imagen_path: Optional[str] = None,
+        buscar_url: bool = True,
+    ) -> Optional[str]:
         """Publica un tweet y devuelve la URL del post recien publicado.
 
         Devuelve la URL del tweet publicado (str) si se obtuvo, `True` como
         fallback truthy si se publico pero no se pudo extraer la URL, o `None`
         si la publicacion fallo.
+
+        `buscar_url=False` omite visitar el perfil para extraer la URL (cuesta
+        ~10-15s y datos de proxy por cada post): para campanas masivas basta la
+        verificacion real de la publicacion. En ese caso `ultima_url_publicada`
+        queda vacia y se devuelve `True`.
         """
         if not self.driver:
             if not self.login_con_cookies():
@@ -998,6 +1008,16 @@ class TwitterBot:
                 logger.info("Dejando 5s la pantalla visible para confirmacion visual...")
                 time.sleep(5)
             
+            if not buscar_url:
+                # Activaciones masivas: visitar el perfil solo para conocer la
+                # URL del tweet cuesta ~10-15s y datos de proxy por cada post;
+                # la verificacion real del toast ya confirma la publicacion.
+                logger.debug(
+                    f"Búsqueda de URL omitida (buscar_url=False) para {self.usuario}"
+                )
+                self.ultima_url_publicada = ""
+                return True
+
             url = self._obtener_ultimo_enlace(self.usuario)
             self.ultima_url_publicada = url or ""
             return url or True   # True como fallback truthy si no se pudo obtener la URL
@@ -1700,45 +1720,120 @@ class TwitterBot:
                 pass
             return None
 
+    def _limpiar_texto_x(self, texto: str) -> str:
+        """Limpieza comun del texto a publicar en X (nunca lanza).
+
+        - Colapsa espacios/tabs multiples.
+        - Quita el espacio antes de puntuacion (` ,` -> `,`).
+        - Colapsa puntuacion duplicada separada por espacio (`frase. ,` /
+          `frase. .` -> `frase.`), artefacto de quitar un hashtag intercalado;
+          no toca `...` (sin espacios intermedios).
+        - Colapsa 3+ saltos de linea a 2 y quita espacios al inicio/fin de linea.
+        """
+        texto = texto or ""
+        try:
+            texto = re.sub(r"[ \t]+", " ", texto)
+            texto = re.sub(r"([.!?,;:])\s+([.!?,;:])", r"\1", texto)
+            texto = re.sub(r"\s+([,.;:!?])", r"\1", texto)
+            texto = re.sub(r"\n{3,}", "\n\n", texto)
+            texto = re.sub(r"[ \t]+\n", "\n", texto)
+            texto = re.sub(r"\n[ \t]+", "\n", texto)
+            texto = re.sub(r"[ \t]+", " ", texto)
+        except Exception:
+            pass
+        return texto.strip()
+
     def _reorganizar_hashtags(self, texto: str) -> str:
-        """Reubica los hashtags sueltos del texto en un unico punto natural
-        cercano a la mitad (mismo criterio que
-        ``core.perfiles.colocar_hashtag_en_medio``: nunca al final, nunca
-        partidos a la mitad de una palabra, sin espacios/saltos sueltos)."""
-        hashtags = re.findall(r"#[A-Za-z0-9ÁÉÍÓÚÜÑáéíóúüñ_]+", texto)
-        if not hashtags:
-            return texto
+        """Deja los hashtags en un punto natural del texto (nunca lanza).
 
-        base = re.sub(r"#[A-Za-z0-9ÁÉÍÓÚÜÑáéíóúüñ_]+", " ", texto)
-        base = re.sub(r"[ \t]+", " ", base)
-        base = re.sub(r"\n{3,}", "\n\n", base).strip()
-        tags = " ".join(hashtags)
-        if not base:
-            return tags
+        - Si la IA YA los integro (el texto no termina ni empieza con hashtag),
+          se respetan donde estan: solo se limpian espacios y puntuacion.
+          Esto evita el bug de "el desfile del , junto a" (hashtag borrado y
+          espacio/coma huerfanos) y de partir frases por moverlos a la fuerza.
+        - Si quedaron al final (o al inicio), se mueven EN GRUPO a la posicion
+          justo despues de una puntuacion de frase/clausula (`.`, `!`, `?`,
+          `,`, `;`, `:`, salto de linea) mas cercana a la mitad; si no hay
+          puntuacion, al espacio mas cercano a la mitad; si no hay espacios,
+          al final como ultimo recurso.
+        - Nunca parte un hashtag y nunca deja ` ,`.
+        """
+        try:
+            texto = texto or ""
+            hashtags = re.findall(r"#[A-Za-z0-9ÁÉÍÓÚÜÑáéíóúüñ_]+", texto)
+            if not hashtags:
+                return texto
 
-        mitad = len(base) // 2
-        puntos = [m.start() for m in re.finditer(r"(?:\s|\n)", base)]
-        if puntos:
-            punto = min(puntos, key=lambda p: abs(p - mitad))
+            limpio = self._limpiar_texto_x(texto)
+
+            # ¿Ya estan integrados en el cuerpo? Entonces NO se mueven.
+            sin_cierre = limpio.rstrip(" \t\r\n.,;:!?…")
+            termina_en_tag = bool(
+                re.search(r"#[A-Za-z0-9ÁÉÍÓÚÜÑáéíóúüñ_]+$", sin_cierre)
+            )
+            empieza_con_tag = bool(
+                re.match(r"#[A-Za-z0-9ÁÉÍÓÚÜÑáéíóúüñ_]+", limpio.lstrip(" \t\r\n"))
+            )
+            if not termina_en_tag and not empieza_con_tag:
+                return limpio
+
+            base = re.sub(r"#[A-Za-z0-9ÁÉÍÓÚÜÑáéíóúüñ_]+", " ", limpio)
+            base = self._limpiar_texto_x(base)
+            tags = " ".join(hashtags)
+            if not base:
+                return tags
+
+            mitad = len(base) // 2
+
+            # Candidatos: justo despues de puntuacion + su espacio, o de un
+            # salto de linea. Siempre con contenido despues (no al final).
+            candidatos = []
+            for m in re.finditer(r"[.!?,;:]\s+", base):
+                if m.end() > 0 and base[m.end():].strip():
+                    candidatos.append(m.end())
+            for m in re.finditer(r"\n\s*", base):
+                if m.end() > 0 and base[m.end():].strip():
+                    candidatos.append(m.end())
+
+            punto = None
+            if candidatos:
+                # Prefiere los que caen entre el 20% y el 80% del largo.
+                minimo, maximo = len(base) * 0.2, len(base) * 0.8
+                en_banda = [p for p in candidatos if minimo <= p <= maximo]
+                punto = min(en_banda or candidatos, key=lambda p: abs(p - mitad))
+            else:
+                espacios = [m.start() for m in re.finditer(r"(?:\s|\n)", base)]
+                if espacios:
+                    punto = min(espacios, key=lambda p: abs(p - mitad))
+
+            if punto is None:
+                # Sin puntuacion ni espacios: ultimo recurso, al final.
+                return self._limpiar_texto_x(f"{base} {tags}")
+
             izquierda = base[:punto].rstrip()
             derecha = base[punto:].lstrip()
-        else:
-            corte = max(1, len(base) // 2)
-            izquierda, derecha = base[:corte].rstrip(), base[corte:].lstrip()
-
-        if not izquierda:
-            return f"{tags} {derecha}".strip()
-        if not derecha:
-            return f"{izquierda} {tags}".strip()
-        return f"{izquierda} {tags} {derecha}".strip()
+            if not izquierda:
+                resultado = f"{tags} {derecha}".strip()
+            elif not derecha:
+                resultado = f"{izquierda} {tags}".strip()
+            else:
+                resultado = f"{izquierda} {tags} {derecha}"
+            return self._limpiar_texto_x(resultado)
+        except Exception as e:
+            logger.debug(f"_reorganizar_hashtags no pudo procesar el texto: {e}")
+            return texto
 
     def _recortar_para_x(self, texto: str, limite: int = 280) -> str:
-        """Recorta `texto` al limite de X sin partir palabras (nunca lanza).
+        """Recorta `texto` al limite de X sin partir palabras ni hashtags.
 
         X deshabilita el boton Post cuando el texto excede 280 caracteres.
-        Si el texto no cabe, se corta en el ultimo espacio ANTERIOR al limite
-        y se agrega `…`; si no hay espacios se corta duro. El resultado nunca
-        excede `limite`. Se usa DESPUES de `_reorganizar_hashtags`.
+        Si no cabe:
+        1. Se corta en el ULTIMO cierre de frase (`.`, `!`, `?`) que quede
+           dentro del limite y a partir del 55% del limite; queda una frase
+           completa y NO se agrega `…`.
+        2. Si no hay cierre de frase, se corta en el ultimo espacio anterior
+           al limite y se agrega `…` (como antes).
+        Si el corte cae dentro de un hashtag, se retrocede hasta antes del `#`.
+        El resultado nunca excede `limite`. Nunca lanza.
         """
         texto = texto or ""
         try:
@@ -1748,12 +1843,46 @@ class TwitterBot:
         if limite <= 0 or len(texto) <= limite:
             return texto
 
-        # Ultimo espacio con indice < limite (para reservar 1 char al `…`).
+        def _corte_fuera_de_hashtag(pos: int) -> int:
+            """Retrocede `pos` si cae dentro de un token `#...`."""
+            for m in re.finditer(r"#[A-Za-z0-9ÁÉÍÓÚÜÑáéíóúüñ_]+", texto):
+                if m.start() < pos < m.end():
+                    return m.start()
+            return pos
+
+        # 1) Ultimo cierre de frase completo dentro del limite.
+        minimo = int(limite * 0.55)
+        mejor = None
+        for m in re.finditer(r"[.!?](?=\s|$)", texto[:limite]):
+            fin = m.end()
+            if (
+                fin == limite
+                and len(texto) > limite
+                and not texto[limite].isspace()
+            ):
+                # El `$` era el borde de la rebanada, no un cierre real.
+                continue
+            if fin >= minimo:
+                mejor = fin
+        if mejor is not None:
+            corte_frase = _corte_fuera_de_hashtag(mejor)
+            if corte_frase == mejor:
+                recortado = texto[:mejor].rstrip()
+            else:  # defensa: nunca dejar un hashtag partido
+                recortado = self._limpiar_texto_x(texto[:corte_frase]) + "…"
+            if recortado and len(recortado) <= limite:
+                logger.warning(
+                    f"Texto recortado para X (frase completa): "
+                    f"{len(texto)} -> {len(recortado)} chars"
+                )
+                return recortado
+
+        # 2) Ultimo espacio con indice < limite (reservando 1 char para `…`).
         corte = texto.rfind(" ", 0, limite)
         if corte <= 0:
-            recortado = texto[: max(0, limite - 1)].rstrip() + "…"
-        else:
-            recortado = texto[:corte].rstrip() + "…"
+            corte = max(0, limite - 1)
+        corte = _corte_fuera_de_hashtag(corte)
+        recortado = self._limpiar_texto_x(texto[:corte]) + "…"
         if len(recortado) > limite:  # salvaguarda: jamas exceder el limite
             recortado = recortado[:limite]
         logger.warning(

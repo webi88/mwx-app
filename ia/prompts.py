@@ -607,16 +607,29 @@ def get_prompt_hashtags(
         "DISTINTOS: no repitas frases, ideas, muletillas ni el mismo angulo.\n"
         "- El resultado NO debe ser el contexto ni el contexto con el hashtag "
         "pegado: debe sonar como una publicacion espontanea y humana.\n"
-        "- Los hashtags van SIEMPRE bien escritos (sin deformarlos) e "
-        "integrados EN MEDIO del texto; NUNCA al final ni en una lista aparte.\n"
+        "- HASHTAG NATURAL: el hashtag (o grupo de hashtags) debe integrarse "
+        "de forma NATURAL, preferentemente al final de una frase o despues de "
+        "una coma/punto cercano a la MITAD del texto.\n"
+        "- El hashtag no debe romper la frase: no partir ninguna oración con "
+        "el (PROHIBIDO insertarlo entre un artículo o demostrativo y su "
+        "sustantivo, ejemplo PROHIBIDO: \"el orgullo #Mexico nacional\"); el "
+        "texto debe leerse con sentido completo aunque el hashtag no "
+        "estuviera.\n"
+        "- PROHIBIDO dejar el hashtag al final del texto: nunca al final ni "
+        "como cierre ni en una lista aparte.\n"
+        "- EXTENSION: maximo 240 caracteres por texto. El texto debe quedar "
+        "COMPLETO y con sentido (incluida su frase de cierre), nunca cortado "
+        "a la mitad.\n"
         + _bloque_tema_personalidad("", personalidad)
     )
     if hashtags:
         prompt += (
             "\nHASHTAGS OBLIGATORIOS:\n"
             f"- Usa EXACTAMENTE estos hashtags (bien escritos): {hashtags}\n"
-            "- Deben aparecer dentro de una oracion, integrados EN MEDIO del "
-            "texto; NUNCA al final ni como cierre.\n"
+            "- Integrados EN MEDIO del texto, de forma NATURAL: al final de "
+            "una frase o despues de una coma/punto cercano a la mitad; nunca "
+            "entre un articulo y su sustantivo, nunca partiendo la frase y "
+            "nunca al final del texto.\n"
         )
     if contexto:
         prompt += (

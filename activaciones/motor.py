@@ -211,6 +211,63 @@ def _sugerencia_registro(n: int) -> str:
     )
 
 
+def _normalizar_rol_sorteo(valor) -> str:
+    """Normaliza un rol para el sorteo; acepta el alias "post" -> hashtags."""
+    rol = normalizar_rol_activacion(valor)
+    if not rol and str(valor or "").strip().lower() in ("post", "posts"):
+        rol = "hashtags"
+    return rol
+
+
+def _roles_disponibles_aleatorios(urls, hashtags="", contexto="",
+                                  texto_base="", solo_roles=None) -> list[str]:
+    """Roles que se pueden sortear con los inputs dados (modo aleatorio).
+
+    - "cita" y "rt" requieren al menos una URL objetivo.
+    - "hashtags" requiere hashtags, contexto o texto base.
+    - `solo_roles`, si viene, limita el sorteo a su interseccion con los
+      disponibles; si la interseccion queda vacia se usan todos los
+      disponibles. Nunca lanza: ante cualquier valor raro devuelve lo que
+      se pudo calcular.
+    """
+    try:
+        disponibles = []
+        try:
+            hay_urls = any(str(u or "").strip() for u in (urls or []))
+        except TypeError:
+            hay_urls = False
+        if hay_urls:
+            disponibles.extend(["cita", "rt"])
+        if (
+            str(hashtags or "").strip()
+            or str(contexto or "").strip()
+            or str(texto_base or "").strip()
+        ):
+            disponibles.append("hashtags")
+        if solo_roles:
+            try:
+                permitidos = {_normalizar_rol_sorteo(r) for r in solo_roles}
+            except TypeError:
+                permitidos = set()
+            permitidos.discard("")
+            if permitidos:
+                filtrados = [r for r in disponibles if r in permitidos]
+                if filtrados:
+                    disponibles = filtrados
+        return disponibles
+    except Exception:
+        return []
+
+
+def _sugerencia_roles_aleatorios() -> str:
+    """Accion sugerida cuando el modo aleatorio no tiene ningun rol posible."""
+    return (
+        "Rol aleatorio sin roles disponibles: pega al menos una URL objetivo "
+        "(habilita cita/rt) o escribe hashtags, contexto o texto base "
+        "(habilita hashtags); no se abrió ningún navegador."
+    )
+
+
 def _garantizar_hashtags_texto(texto: str, tags: list[str]) -> str:
     """Garantiza que el texto traiga al menos un hashtag de `tags`.
 
@@ -536,6 +593,31 @@ class MotorActivacion:
             sufijo += 1
         return pool[:cantidad]
 
+    @staticmethod
+    def _asignar_roles_aleatorios(cuentas: list, disponibles: list) -> dict:
+        """Sortea un rol de `disponibles` para cada cuenta de `cuentas`.
+
+        Devuelve `{usuario: rol}`; con `disponibles` vacio deja "" (defensivo,
+        el llamador ya valida que haya al menos uno). Nunca lanza.
+        """
+        roles = {}
+        for cuenta in (cuentas or []):
+            try:
+                roles[cuenta.usuario] = random.choice(disponibles)
+            except Exception:
+                roles[cuenta.usuario] = ""
+        return roles
+
+    @staticmethod
+    def _grupos_desde_roles(cuentas: list, roles_por_usuario: dict) -> dict:
+        """Agrupa cuentas por el rol REAL sorteado (ignora el rol guardado)."""
+        grupos = {"cita": [], "hashtags": [], "rt": []}
+        for cuenta in (cuentas or []):
+            rol = roles_por_usuario.get(cuenta.usuario, "")
+            if rol in grupos:
+                grupos[rol].append(cuenta)
+        return grupos
+
     def _generar_textos_por_rol(self, grupos_ejec: dict, texto_base: str,
                                 hashtags: str = "", menciones: str = "",
                                 narrativa: str = "",
@@ -652,7 +734,8 @@ class MotorActivacion:
         return asignaciones
 
     def _bucle_rondas(self, procesables: list, duracion_min: int,
-                      generar_textos, ejecutar_uno, reportar) -> int:
+                      generar_textos, ejecutar_uno, reportar,
+                      cooldown_min: float = 0) -> int:
         """Ejecuta acciones en rondas hasta agotar `duracion_min`.
 
         Worker-pool con cola compartida: `self.max_concurrente` workers toman
@@ -660,15 +743,43 @@ class MotorActivacion:
         siguiente ronda, vuelven a barajar y reinician el cursor. Las cuentas
         que no alcanzan a ejecutar antes del deadline se omiten sin abrir
         navegador. Devuelve el numero de rondas iniciadas. Nunca lanza.
+
+        `generar_textos(ronda)` puede devolver `{usuario: texto}` o la tupla
+        `({usuario: texto}, {usuario: rol})`; ambos mapas se guardan JUNTOS en
+        el mismo lock, de modo que el rol viaja con su texto y ninguna ronda
+        pisa el mapa de otra. `ejecutar_uno(cuenta, texto, rol)` recibe ese
+        rol ("" cuando no aplica).
+
+        `cooldown_min` > 0: la MISMA cuenta no repite accion antes de ese
+        numero de minutos (medidos desde su ultimo despacho). Si la cuenta en
+        turno esta en descanso se mueve al final del orden de la ronda y se
+        toma la siguiente; si todas las revisadas descansan, el worker suelta
+        el lock, duerme 2-5s y reintenta mientras quede tiempo.
         """
         try:
             minutos = max(0, int(duracion_min or 0))
         except (TypeError, ValueError):
             minutos = 0
+        try:
+            cooldown_seg = max(0.0, float(cooldown_min or 0)) * 60.0
+        except (TypeError, ValueError):
+            cooldown_seg = 0.0
         fin = time.monotonic() + minutos * 60
         n_workers = max(1, int(self.max_concurrente or 1))
-        estado = {"cursor": 0, "ronda": 0, "orden": [], "textos": {}}
+        estado = {
+            "cursor": 0, "ronda": 0, "orden": [],
+            "textos": {}, "roles": {},
+        }
+        ultima_accion: dict = {}
         lock = threading.Lock()
+
+        def _en_descanso(usuario) -> bool:
+            if cooldown_seg <= 0:
+                return False
+            ultima = ultima_accion.get(usuario)
+            if ultima is None:
+                return False
+            return (time.monotonic() - ultima) < cooldown_seg
 
         def _iniciar_ronda_locked() -> None:
             estado["ronda"] += 1
@@ -678,28 +789,62 @@ class MotorActivacion:
             random.shuffle(estado["orden"])
             estado["cursor"] = 0
             try:
-                textos = generar_textos(estado["ronda"]) or {}
+                generado = generar_textos(estado["ronda"])
             except Exception as e:
                 logger.error(
                     f"Activacion (rondas): no se pudieron generar los textos "
                     f"de la ronda {estado['ronda']}: {e}"
                 )
-                textos = {}
+                generado = {}
+            textos, roles = {}, {}
+            if isinstance(generado, tuple) and len(generado) == 2:
+                textos, roles = generado
+            else:
+                textos = generado
             estado["textos"] = textos if isinstance(textos, dict) else {}
+            estado["roles"] = roles if isinstance(roles, dict) else {}
+
+        def _tomar_cuenta_locked():
+            """Toma (cuenta, texto, rol) o None si todas descansan; con lock."""
+            orden = estado["orden"]
+            if estado["cursor"] >= len(orden):
+                _iniciar_ronda_locked()
+                orden = estado["orden"]
+            revisados = 0
+            while revisados < len(orden):
+                if estado["cursor"] >= len(orden):
+                    return None
+                candidata = orden[estado["cursor"]]
+                if _en_descanso(candidata.usuario):
+                    orden.pop(estado["cursor"])
+                    orden.append(candidata)
+                    revisados += 1
+                    continue
+                estado["cursor"] += 1
+                ultima_accion[candidata.usuario] = time.monotonic()
+                return (
+                    candidata,
+                    estado["textos"].get(candidata.usuario, ""),
+                    estado["roles"].get(candidata.usuario, ""),
+                )
+            return None
 
         def _worker() -> None:
             while time.monotonic() < fin:
                 with lock:
-                    if estado["cursor"] >= len(estado["orden"]):
-                        _iniciar_ronda_locked()
-                    cuenta = estado["orden"][estado["cursor"]]
-                    estado["cursor"] += 1
-                    texto = estado["textos"].get(cuenta.usuario, "")
+                    elegido = _tomar_cuenta_locked()
                     ronda = estado["ronda"]
+                if elegido is None:
+                    # Todas las cuentas revisadas estan en descanso: soltar el
+                    # lock y reintentar sin bloquear a los demas workers.
+                    if time.monotonic() < fin:
+                        time.sleep(random.uniform(2, 5))
+                    continue
+                cuenta, texto, rol = elegido
                 if time.monotonic() >= fin:
                     return
                 try:
-                    resultado = ejecutar_uno(cuenta, texto)
+                    resultado = ejecutar_uno(cuenta, texto, rol)
                 except Exception as e:
                     logger.error(
                         f"Error en la ronda {ronda} para @{cuenta.usuario}: {e}"
@@ -876,7 +1021,7 @@ class MotorActivacion:
                 return (cuenta.usuario, rol, ok, detalle[:120], url_objetivo)
 
             # rol == "hashtags"
-            res = bot.publicar_tweet(texto)
+            res = bot.publicar_tweet(texto, buscar_url=False)
             ok = bool(res)
             if isinstance(res, str):
                 url_publicada = res
@@ -1093,7 +1238,9 @@ class MotorActivacion:
                 }
                 return _aplicar_anti_repeticion(asignaciones_ronda, usados)
 
-            def _ejecutar_una_cuenta(cuenta, texto):
+            def _ejecutar_una_cuenta(cuenta, texto, rol=""):
+                # `ejecutar` siempre hace quote-RT (rol "cita"); se acepta el
+                # rol del nuevo contrato de `_bucle_rondas` y se ignora aqui.
                 try:
                     return self._quote_rt_una_cuenta(
                         cuenta, urls, texto, dar_like, 0
@@ -1258,11 +1405,14 @@ class MotorActivacion:
         contexto: str = "",
         solo_con_registro: bool = False,
         repetir: bool = False,
+        roles_aleatorios: bool = False,
+        cooldown_min: float = 0,
     ) -> dict:
         """Campaña masiva dividida en subcuentas por rol.
 
         - Carga cuentas twitter activas; si `usuarios` se pasa, limita a esos
-          usuarios; si `solo_roles`, filtra a esos roles.
+          usuarios; si `solo_roles`, filtra a esos roles (salvo en modo
+          aleatorio, donde `solo_roles` es el subconjunto a sortear).
         - Agrupa por Cuenta.rol_activacion (normalizado con core/roles.py):
             * "cita": quote-RT con texto del pool (OpenAI + fallback local)
               con los hashtags pedidos garantizados.
@@ -1278,12 +1428,58 @@ class MotorActivacion:
           activista/ciudadana) sin abrir navegador y las cuenta aparte.
         - `repetir`: con True las cuentas trabajan en rondas hasta agotar
           `duracion_min`, regenerando textos nuevos en cada ronda.
+        - `roles_aleatorios`: en vez del rol guardado, a CADA cuenta le toca
+          un rol sorteado (cita/rt con URLs, hashtags con hashtags/contexto/
+          texto base) en cada ronda. `solo_roles` limita el sorteo a esa
+          interseccion; sin roles posibles devuelve el resumen vacio con
+          `sugerencia_roles` sin abrir ningun navegador.
+        - `cooldown_min`: minutos minimos entre dos acciones de la MISMA
+          cuenta (0 = sin descanso). Las cuentas en descanso se mueven al
+          final de la ronda y no se ejecutan antes de tiempo.
         - Cohortes temporales + delay aleatorio y concurrencia limitada,
           igual que `ejecutar()`.
         - Nunca lanza: cada cuenta fallida se reporta en `detalles`.
         """
         urls = [str(u).strip() for u in (urls or []) if str(u).strip()]
-        cuentas = self._obtener_cuentas_por_rol(usuarios, solo_roles)
+        try:
+            cooldown_val = max(0.0, float(cooldown_min or 0))
+        except (TypeError, ValueError):
+            cooldown_val = 0.0
+        roles_sortear = (
+            _roles_disponibles_aleatorios(
+                urls, hashtags, contexto, texto_base, solo_roles
+            )
+            if roles_aleatorios else []
+        )
+        if roles_aleatorios and not roles_sortear:
+            sugerencia_roles = _sugerencia_roles_aleatorios()
+            logger.warning(f"Activacion por roles: {sugerencia_roles}")
+            return {
+                "total": 0,
+                "exitosas": 0,
+                "fallidas": 0,
+                "sin_rol": 0,
+                "sin_sesion": 0,
+                "por_rol": {
+                    "cita": {"total": 0, "exitosas": 0, "fallidas": 0},
+                    "hashtags": {"total": 0, "exitosas": 0, "fallidas": 0},
+                    "rt": {"total": 0, "exitosas": 0, "fallidas": 0},
+                },
+                "detalles": [],
+                "sin_rol_usuarios": [],
+                "sin_sesion_usuarios": [],
+                "sugerencia_sesion": "",
+                "sin_registro": 0,
+                "sin_registro_usuarios": [],
+                "sugerencia_registro": "",
+                "rondas": 0 if repetir else 1,
+                "roles_aleatorios": True,
+                "cooldown_min": cooldown_val,
+                "sugerencia_roles": sugerencia_roles,
+            }
+        cuentas = self._obtener_cuentas_por_rol(
+            usuarios, None if roles_aleatorios else solo_roles
+        )
 
         sin_registro = []
         if solo_con_registro:
@@ -1300,26 +1496,35 @@ class MotorActivacion:
 
         grupos = {"cita": [], "hashtags": [], "rt": []}
         sin_rol_usuarios = []
-        for cuenta in cuentas:
-            rol = normalizar_rol_activacion(getattr(cuenta, "rol_activacion", ""))
-            if rol in grupos:
-                grupos[rol].append(cuenta)
-            else:
-                sin_rol_usuarios.append(cuenta.usuario)
+        if roles_aleatorios:
+            # El rol guardado no filtra: cada cuenta recibe un rol sorteado en
+            # cada ronda (los roles posibles ya se validaron arriba).
+            procesables = list(cuentas)
+            rol_de: dict = {}
+        else:
+            for cuenta in cuentas:
+                rol = normalizar_rol_activacion(
+                    getattr(cuenta, "rol_activacion", "")
+                )
+                if rol in grupos:
+                    grupos[rol].append(cuenta)
+                else:
+                    sin_rol_usuarios.append(cuenta.usuario)
 
-        procesables = grupos["cita"] + grupos["hashtags"] + grupos["rt"]
-        rol_de = {
-            cuenta.usuario: normalizar_rol_activacion(
-                getattr(cuenta, "rol_activacion", "")
-            )
-            for cuenta in procesables
-        }
+            procesables = grupos["cita"] + grupos["hashtags"] + grupos["rt"]
+            rol_de = {
+                cuenta.usuario: normalizar_rol_activacion(
+                    getattr(cuenta, "rol_activacion", "")
+                )
+                for cuenta in procesables
+            }
         ejecutables, sin_sesion = _partir_por_sesion(procesables)
         sin_sesion_usuarios = [c.usuario for c in sin_sesion]
         sugerencia_sesion = _sugerencia_sesion(len(sin_sesion)) if sin_sesion else ""
         grupos_ejec = {"cita": [], "hashtags": [], "rt": []}
-        for cuenta in ejecutables:
-            grupos_ejec[rol_de.get(cuenta.usuario, "")].append(cuenta)
+        if not roles_aleatorios:
+            for cuenta in ejecutables:
+                grupos_ejec[rol_de.get(cuenta.usuario, "")].append(cuenta)
 
         resumen = {
             "total": len(procesables),
@@ -1346,6 +1551,8 @@ class MotorActivacion:
             "sin_registro_usuarios": sin_registro_usuarios,
             "sugerencia_registro": sugerencia_registro,
             "rondas": 0 if repetir else 1,
+            "roles_aleatorios": bool(roles_aleatorios),
+            "cooldown_min": cooldown_val,
         }
         for cuenta in sin_sesion:
             rol = rol_de.get(cuenta.usuario, "")
@@ -1425,6 +1632,27 @@ class MotorActivacion:
             usados: dict = {}
 
             def _generar_textos_ronda(_ronda):
+                if roles_aleatorios:
+                    roles_ronda = self._asignar_roles_aleatorios(
+                        ejecutables, roles_sortear
+                    )
+                    grupos_ronda = self._grupos_desde_roles(
+                        ejecutables, roles_ronda
+                    )
+                    textos = self._generar_textos_por_rol(
+                        grupos_ronda,
+                        texto_base,
+                        hashtags=hashtags,
+                        menciones=menciones,
+                        narrativa=narrativa,
+                        entrenamiento=entrenamiento,
+                        contexto=contexto,
+                        ronda=_ronda,
+                    )
+                    return (
+                        _aplicar_anti_repeticion(textos, usados),
+                        roles_ronda,
+                    )
                 textos = self._generar_textos_por_rol(
                     grupos_ejec,
                     texto_base,
@@ -1437,15 +1665,15 @@ class MotorActivacion:
                 )
                 return _aplicar_anti_repeticion(textos, usados)
 
-            def _ejecutar_una_rol(cuenta, texto):
-                rol = rol_por_usuario.get(cuenta.usuario, "")
+            def _ejecutar_una_rol(cuenta, texto, rol=""):
+                rol_efectivo = rol or rol_por_usuario.get(cuenta.usuario, "")
                 try:
                     return self._ejecutar_accion_rol(
-                        cuenta, rol, urls, texto, dar_like, 0
+                        cuenta, rol_efectivo, urls, texto, dar_like, 0
                     )
                 except Exception as e:
                     return (
-                        cuenta.usuario, rol, False,
+                        cuenta.usuario, rol_efectivo, False,
                         f"{type(e).__name__}: {e}"[:120], "",
                     )
 
@@ -1456,6 +1684,8 @@ class MotorActivacion:
                     self.progreso["exitosas" if ok else "fallidas"] += 1
                     resumen["exitosas" if ok else "fallidas"] += 1
                     if rol_res in resumen["por_rol"]:
+                        if roles_aleatorios:
+                            resumen["por_rol"][rol_res]["total"] += 1
                         resumen["por_rol"][rol_res][
                             "exitosas" if ok else "fallidas"
                         ] += 1
@@ -1491,6 +1721,7 @@ class MotorActivacion:
                 _generar_textos_ronda,
                 _ejecutar_una_rol,
                 _reportar_rol,
+                cooldown_min=cooldown_val,
             )
             logger.info(
                 f"Activacion por roles finalizada (rondas): "
@@ -1502,8 +1733,14 @@ class MotorActivacion:
             return resumen
 
         # --- Pool de textos por rol (una sola ronda) ---
+        if roles_aleatorios:
+            roles_una = self._asignar_roles_aleatorios(ejecutables, roles_sortear)
+            grupos_ejec_una = self._grupos_desde_roles(ejecutables, roles_una)
+        else:
+            roles_una = dict(rol_por_usuario)
+            grupos_ejec_una = grupos_ejec
         asignaciones = self._generar_textos_por_rol(
-            grupos_ejec,
+            grupos_ejec_una,
             texto_base,
             hashtags=hashtags,
             menciones=menciones,
@@ -1518,7 +1755,7 @@ class MotorActivacion:
             futuros = []
             for idx, bloque in enumerate(bloques):
                 for cuenta in bloque:
-                    rol = rol_por_usuario.get(cuenta.usuario, "")
+                    rol = roles_una.get(cuenta.usuario, "")
                     retardo = idx * intervalo_cohorte + random.uniform(0, 15)
                     futuros.append((retardo, pool_exec.submit(
                         self._ejecutar_accion_rol, cuenta, rol, urls,
@@ -1530,7 +1767,7 @@ class MotorActivacion:
                     usuario_res, rol_res, ok, detalle, url = futuro.result()
                 except Exception as e:
                     usuario_res = usuario
-                    rol_res = rol_por_usuario.get(usuario, "")
+                    rol_res = roles_una.get(usuario, "")
                     ok, detalle, url = False, str(e)[:80], ""
 
                 with self._lock:
@@ -1538,6 +1775,8 @@ class MotorActivacion:
                     self.progreso["exitosas" if ok else "fallidas"] += 1
                     resumen["exitosas" if ok else "fallidas"] += 1
                     if rol_res in resumen["por_rol"]:
+                        if roles_aleatorios:
+                            resumen["por_rol"][rol_res]["total"] += 1
                         resumen["por_rol"][rol_res][
                             "exitosas" if ok else "fallidas"
                         ] += 1

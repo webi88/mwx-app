@@ -113,11 +113,11 @@ class Settings(BaseSettings):
     # Selenium
     chrome_driver_path: Optional[str] = None
     headless: bool = Field(default_factory=_headless_por_defecto, env="HEADLESS")
-    # 1 navegador por defecto: mas estable con proxy residencial y evita
-    # contencion de CPU/RAM en Railway. Sube con MAX_BROWSERS si tienes margen
-    # (proxy con GB de sobra y mas RAM) o desde el campo "Navegadores
+    # 3 navegadores permiten ~200+ publicaciones/hora (cada navegador ejecuta
+    # una cuenta a la vez). Bajalo a 1 si el proxy va justo de GB/RAM; subelo
+    # solo con margen. Tambien se ajusta desde el campo "Navegadores
     # simultaneos" de la operacion Activacion Masiva.
-    max_browsers: int = Field(default=1, env="MAX_BROWSERS")
+    max_browsers: int = Field(default=3, env="MAX_BROWSERS")
     
     # Rate Limiting
     twitter_delay_min: float = 2.5
