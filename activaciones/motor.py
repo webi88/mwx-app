@@ -82,6 +82,41 @@ def _sugerencia_sesion(n: int) -> str:
     )
 
 
+_SENALES_ERROR_DRIVER_TRANSITORIO = (
+    "connection refused",
+    "failed to establish a new connection",
+    "max retries",
+    "maxretry",
+    "newconnectionerror",
+    "nosuchdriver",
+    "unable to obtain driver",
+    "text file busy",
+    "connection aborted",
+    "remotedisconnected",
+    "errno 111",
+    "errno 26",
+    "chrome not reachable",
+    "invalid session id",
+    "disconnected",
+    "no such file or directory",
+)
+
+
+def _es_error_driver_transitorio(detalle) -> bool:
+    """True si el detalle parece un fallo transitorio de driver/navegador.
+
+    Revisa las senales tipicas de chromedriver/Selenium caido o reiniciandose
+    (conexion rechazada, driver no obtenible, archivo en uso, etc.). Tolera
+    None y tipos raros; nunca lanza.
+    """
+    try:
+        texto = "" if detalle is None else str(detalle)
+        texto = texto.lower()
+    except Exception:
+        return False
+    return any(senal in texto for senal in _SENALES_ERROR_DRIVER_TRANSITORIO)
+
+
 def _tiene_credencial_sesion(cuenta) -> bool:
     """True si la cuenta tiene alguna credencial de sesion usable.
 
@@ -501,17 +536,14 @@ class MotorActivacion:
 
         return estado["ronda"]
 
-    def _quote_rt_una_cuenta(self, cuenta: Cuenta, urls: list[str],
-                             texto: str, dar_like: bool, retardo: float = 0) -> tuple:
-        """Ejecuta el quote-RT para UNA cuenta con su propio navegador/proxy.
+    def _intentar_quote_rt(self, cuenta: Cuenta, urls: list[str],
+                           texto: str, dar_like: bool) -> tuple:
+        """Un intento de quote-RT para UNA cuenta; cierra el bot siempre.
 
         Devuelve una tupla de 4 elementos:
         (usuario, exito, detalle, url_publicada).
         """
-        if not _tiene_credencial_sesion(cuenta):
-            return (cuenta.usuario, False, MENSAJE_SIN_SESION[:120], "")
-        if retardo > 0:
-            time.sleep(retardo)
+        bot = None
         try:
             from plataformas.twitter.selenium_bot import TwitterBot
 
@@ -521,8 +553,6 @@ class MotorActivacion:
             if not bot.login_con_cookies():
                 motivo = getattr(bot, "ultimo_error", "") or "login fallido"
                 logger.warning(f"Login fallido para @{cuenta.usuario}: {motivo}")
-                if getattr(bot, "cuenta_suspendida", False):
-                    marcar_cuenta_suspendida(cuenta.usuario)
                 return (cuenta.usuario, False, motivo[:120], "")
 
             res = bot.solo_retwittear(
@@ -531,9 +561,6 @@ class MotorActivacion:
                 mensaje_cita=texto,
                 dar_like=dar_like,
             )
-            if getattr(bot, "cuenta_suspendida", False):
-                marcar_cuenta_suspendida(cuenta.usuario)
-            bot.cerrar()
 
             ok = res.get("exitos", 0) > 0
             url_publicada = (res.get("urls") or [""])[0] if res.get("urls") else ""
@@ -542,10 +569,46 @@ class MotorActivacion:
         except Exception as e:
             logger.error(f"Error en @{cuenta.usuario}: {e}")
             return (cuenta.usuario, False, str(e)[:80], "")
+        finally:
+            if bot is not None:
+                if getattr(bot, "cuenta_suspendida", False):
+                    marcar_cuenta_suspendida(cuenta.usuario)
+                try:
+                    bot.cerrar()
+                except Exception as e:
+                    logger.warning(
+                        f"No se pudo cerrar el navegador de @{cuenta.usuario}: {e}"
+                    )
 
-    def _ejecutar_accion_rol(self, cuenta: Cuenta, rol: str, urls: list[str],
+    def _quote_rt_una_cuenta(self, cuenta: Cuenta, urls: list[str],
                              texto: str, dar_like: bool, retardo: float = 0) -> tuple:
-        """Ejecuta UNA accion segun el rol de activacion de la cuenta.
+        """Ejecuta el quote-RT para UNA cuenta con su propio navegador/proxy.
+
+        Si el primer intento falla por un error transitorio de
+        driver/navegador, espera 2-4s y reintenta UNA vez con un bot nuevo.
+
+        Devuelve una tupla de 4 elementos:
+        (usuario, exito, detalle, url_publicada).
+        """
+        if not _tiene_credencial_sesion(cuenta):
+            return (cuenta.usuario, False, MENSAJE_SIN_SESION[:120], "")
+        if retardo > 0:
+            time.sleep(retardo)
+
+        resultado = self._intentar_quote_rt(cuenta, urls, texto, dar_like)
+        if not resultado[1] and _es_error_driver_transitorio(resultado[2]):
+            pausa = random.uniform(2, 4)
+            logger.warning(
+                f"Reintento de quote-RT para @{cuenta.usuario} por error de "
+                f"driver/navegador ({resultado[2]}); espero {pausa:.1f}s"
+            )
+            time.sleep(pausa)
+            resultado = self._intentar_quote_rt(cuenta, urls, texto, dar_like)
+        return resultado
+
+    def _intentar_accion_rol(self, cuenta: Cuenta, rol: str, urls: list[str],
+                             texto: str, dar_like: bool) -> tuple:
+        """Un intento de UNA accion segun el rol de activacion de la cuenta.
 
         - "cita": quote-RT con el texto asignado.
         - "hashtags": publica el texto con hashtags/menciones ("post" es alias).
@@ -556,11 +619,6 @@ class MotorActivacion:
         (usuario, rol, exito, detalle, url).
         Nunca lanza: cualquier error se reporta como fallo.
         """
-        if not _tiene_credencial_sesion(cuenta):
-            return (cuenta.usuario, rol, False, MENSAJE_SIN_SESION[:120], "")
-        if retardo > 0:
-            time.sleep(retardo)
-
         if rol == "post":
             rol = "hashtags"
 
@@ -660,6 +718,33 @@ class MotorActivacion:
                     logger.warning(
                         f"No se pudo cerrar el navegador de @{cuenta.usuario}: {e}"
                     )
+
+    def _ejecutar_accion_rol(self, cuenta: Cuenta, rol: str, urls: list[str],
+                             texto: str, dar_like: bool, retardo: float = 0) -> tuple:
+        """Ejecuta UNA accion segun el rol de activacion de la cuenta.
+
+        Si el primer intento falla por un error transitorio de
+        driver/navegador, espera 2-4s y reintenta UNA vez con un bot nuevo.
+
+        Devuelve una tupla de 5 elementos:
+        (usuario, rol, exito, detalle, url).
+        Nunca lanza: cualquier error se reporta como fallo.
+        """
+        if not _tiene_credencial_sesion(cuenta):
+            return (cuenta.usuario, rol, False, MENSAJE_SIN_SESION[:120], "")
+        if retardo > 0:
+            time.sleep(retardo)
+
+        resultado = self._intentar_accion_rol(cuenta, rol, urls, texto, dar_like)
+        if not resultado[2] and _es_error_driver_transitorio(resultado[3]):
+            pausa = random.uniform(2, 4)
+            logger.warning(
+                f"Reintento de acción '{rol}' para @{cuenta.usuario} por error "
+                f"de driver/navegador ({resultado[3]}); espero {pausa:.1f}s"
+            )
+            time.sleep(pausa)
+            resultado = self._intentar_accion_rol(cuenta, rol, urls, texto, dar_like)
+        return resultado
 
     def ejecutar(
         self,

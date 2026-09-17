@@ -10,6 +10,7 @@ from typing import Optional
 from loguru import logger
 
 from core.config import settings, resolver_ruta, detectar_chrome_version
+from plataformas.chrome_driver import crear_chrome
 from utils.anti_detection import aplicar_stealth
 
 
@@ -51,7 +52,7 @@ class FacebookBot:
             options.add_argument("--headless=new")
         
         try:
-            self.driver = uc.Chrome(options=options, version_main=detectar_chrome_version(), use_subprocess=False)
+            self.driver = crear_chrome(options, version_main=detectar_chrome_version())
             self.driver.set_page_load_timeout(30)
             aplicar_stealth(self.driver)
             return True

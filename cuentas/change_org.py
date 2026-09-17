@@ -42,7 +42,9 @@ class ChangeOrgBot:
             options.add_argument("--disable-dev-shm-usage")
             options.add_argument("--window-size=1920,1080")
             
-            self.driver = uc.Chrome(options=options, version_main=detectar_chrome_version(), use_subprocess=False)
+            from plataformas.chrome_driver import crear_chrome
+
+            self.driver = crear_chrome(options, version_main=detectar_chrome_version())
             self.driver.set_page_load_timeout(30)
             
             logger.info("Navegador configurado para Change.org")

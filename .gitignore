@@ -10,5 +10,6 @@ data/perfiles_chrome/
 data/temp/
 data/logs/
 data/proxies.txt
+data/bin/
 .DS_Store
 Thumbs.db

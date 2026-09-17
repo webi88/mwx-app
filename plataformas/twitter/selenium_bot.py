@@ -16,6 +16,7 @@ from datetime import datetime, timedelta
 from loguru import logger
 
 from core.config import settings, resolver_ruta, detectar_chrome_version
+from plataformas.chrome_driver import crear_chrome
 from utils.proxies import ProxyManager
 from utils.anti_detection import (
     aplicar_stealth,
@@ -232,7 +233,7 @@ class TwitterBot:
             if proxy:
                 ProxyManager().aplicar_a_options(options, proxy, tag=self.usuario)
             
-            self.driver = uc.Chrome(options=options, version_main=detectar_chrome_version(), use_subprocess=False)
+            self.driver = crear_chrome(options, version_main=detectar_chrome_version())
             self.driver.set_page_load_timeout(30)
 
             # Stealth en cada documento nuevo + UA por CDP (incluye
