@@ -4,7 +4,14 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.common.action_chains import ActionChains
-from selenium.common.exceptions import TimeoutException
+from selenium.common.exceptions import (
+    InvalidSessionIdException,
+    NoSuchDriverException,
+    NoSuchWindowException,
+    TimeoutException,
+    WebDriverException,
+)
+from urllib3.exceptions import MaxRetryError
 import pickle
 import time
 import random
@@ -949,21 +956,13 @@ class TwitterBot:
             return None
         
         try:
-            try:
-                self.driver.get(f"{self.base_url}/compose/post")
-            except TimeoutException:
-                # Carga lenta (proxy intermitente): la SPA termina de cargar
-                # igual y la espera explicita del editor de abajo decide.
-                logger.warning(
-                    f"Carga lenta de {self.base_url}/compose/post; sigo con esperas explicitas"
-                )
-            time.sleep(3)
-            
-            # Editor VISIBLE: X puede tener varios composers montados y el
-            # `presence` agarraba uno oculto (el texto se escribia en el
-            # equivocado, el composer visible quedaba vacio y el boton Post
-            # nunca se habilitaba).
-            editor = self._esperar_editor_visible()
+            # Compositor de POST NUEVO: prueba /compose/post, /compose/tweet y
+            # el boton "Nuevo post" de /home, y distingue la sesion caida o
+            # una pagina de error de X del simple retraso de la SPA (ver
+            # `_abrir_compositor`). El editor devuelto es SIEMPRE visible
+            # (evita escribir en un composer oculto que deja el boton Post
+            # deshabilitado).
+            editor = self._abrir_compositor()
             
             contenido = self._reorganizar_hashtags(contenido)
             contenido = self._recortar_para_x(contenido)
@@ -1316,20 +1315,16 @@ class TwitterBot:
                 return None
         
         try:
-            try:
-                self.driver.get(f"{self.base_url}/compose/post")
-            except TimeoutException:
-                # Carga lenta (proxy intermitente): la SPA termina de cargar
-                # igual y la espera explicita del editor de abajo decide.
-                logger.warning(
-                    f"Carga lenta de {self.base_url}/compose/post; sigo con esperas explicitas"
-                )
-            time.sleep(3)
+            # Compositor de POST NUEVO (mismo helper que `publicar_tweet`):
+            # /compose/post, /compose/tweet y el boton "Nuevo post" de /home.
+            editor = self._abrir_compositor()
             
             for idx, tweet_texto in enumerate(tweets):
-                # Editor VISIBLE (ver `_esperar_editor_visible`): evita escribir
-                # en un composer oculto y que el boton Post quede muerto.
-                editor = self._esperar_editor_visible()
+                # El primer editor lo devuelve `_abrir_compositor`; los
+                # siguientes (tweets 2..n) los monta "agregar" y hay que
+                # esperarlos de nuevo.
+                if idx > 0:
+                    editor = self._esperar_editor_visible()
                 
                 texto = self._reorganizar_hashtags(tweet_texto)
                 texto = self._recortar_para_x(texto)
@@ -1469,6 +1464,105 @@ class TwitterBot:
             time.sleep(0.5)
         return None
 
+    # Frases visibles de X cuando la pagina esta rota/limitada (no un simple
+    # retraso de la SPA): permiten cortar rapido en vez de agotar el timeout
+    # completo del compositor.
+    _FRASES_ERROR_PAGINA = (
+        "something went wrong",
+        "algo salió mal",
+        "algo salio mal",
+        "rate limit",
+        "try again",
+    )
+
+    # Errores de `_abrir_compositor` que NO deben seguir probando rutas: la
+    # sesion esta caida o X sirvio una pagina de error.
+    _ERRORES_FATALES_COMPOSITOR = (
+        "sesión de x expirada",
+        "sesion de x expirada",
+        "se pidió login",
+        "se pidio login",
+        "página de error",
+        "pagina de error",
+    )
+
+    def _hay_muro_login(self) -> bool:
+        """True si X pidio login en la pagina actual (sesion caida).
+
+        Detecta por URL (`login`, `/i/flow`, `account/access`) y por
+        formularios VISIBLES de login (username, loginButton,
+        ocfEnterTextTextInput, password). Nunca lanza: si el driver esta
+        muerto devuelve False y las esperas del flujo deciden.
+        """
+        try:
+            url = (self.driver.current_url or "").lower()
+        except Exception:
+            url = ""
+        if any(frag in url for frag in ("login", "/i/flow", "account/access")):
+            return True
+
+        for sel in (
+            "input[name='text'][autocomplete='username']",
+            "[data-testid='loginButton']",
+            "[data-testid='ocfEnterTextTextInput']",
+            "input[name='password']",
+        ):
+            try:
+                for elem in self.driver.find_elements(By.CSS_SELECTOR, sel):
+                    if elem.is_displayed():
+                        return True
+            except Exception:
+                continue
+        return False
+
+    def _frase_error_pagina(self) -> str:
+        """Primera frase de error visible en la pagina ('' si no hay).
+
+        Revisa "something went wrong"/"algo salió mal"/"rate limit"/"try
+        again". Nunca lanza.
+        """
+        try:
+            page_source = (self.driver.page_source or "").lower()
+        except Exception:
+            return ""
+        for frase in self._FRASES_ERROR_PAGINA:
+            if frase in page_source:
+                return frase
+        return ""
+
+    def _diagnostico_pagina(self) -> str:
+        """Diagnostico legible de la pagina actual para logs/errores.
+
+        Formato: `url=<...> title=<...> login=<bool> error=<frase>`. Nunca
+        lanza: si el driver esta muerto devuelve lo que pueda.
+        """
+        try:
+            url = self.driver.current_url or ""
+        except Exception:
+            url = "<sin url>"
+        try:
+            title = self.driver.title or ""
+        except Exception:
+            title = "<sin title>"
+        try:
+            login = self._hay_muro_login()
+        except Exception:
+            login = False
+        try:
+            error = self._frase_error_pagina()
+        except Exception:
+            error = ""
+        return f"url={url} title={title} login={bool(login)} error={error}"
+
+    @classmethod
+    def _es_error_fatal_compositor(cls, error) -> bool:
+        """True si el error indica sesion caida o pagina de error de X."""
+        try:
+            texto = str(error or "").lower()
+        except Exception:
+            return False
+        return any(senal in texto for senal in cls._ERRORES_FATALES_COMPOSITOR)
+
     # Selectores del compositor de X. El `data-testid` es el principal; los
     # contenteditables quedan como respaldo por si X cambia el testid.
     _EDITOR_SELECTORES = (
@@ -1523,17 +1617,72 @@ class TwitterBot:
         """Espera a que monte un editor VISIBLE y lo devuelve.
 
         Se usa en TODOS los flujos de escritura (tweet, hilo, quote y
-        respuesta). Si en `timeout` segundos no aparece ningun editor visible,
-        hace UN `driver.refresh()` (tolerando el TimeoutException de carga
-        lenta del proxy) y espera `reintento_timeout` segundos mas. Si sigue
-        sin aparecer lanza `Exception("compositor de X no cargo: el editor
-        visible no aparecio")` (mensaje que el motor de activaciones reconoce).
+        respuesta). Tolera los `WebDriverException` transitorios de la SPA
+        saturada, pero re-lanza de inmediato:
+        - los fallos duros de driver (`InvalidSessionIdException`,
+          `NoSuchDriverException`, `MaxRetryError`, "connection refused"):
+          el motor de activaciones los reconoce como transitorios y reintenta
+          con un navegador nuevo;
+        - la sesion caida (`_hay_muro_login`) o una pagina de error de X: no
+          tiene sentido esperar 30s ni refrescar, hay que renovar cookies.
+
+        Si en `timeout` segundos no aparece ningun editor visible, hace UN
+        `driver.refresh()` (tolerando el TimeoutException de carga lenta del
+        proxy) y espera `reintento_timeout` segundos mas. Si sigue sin
+        aparecer lanza `Exception("compositor de X no cargo: el editor visible
+        no aparecio (<diagnostico>)")` (mensaje que el motor reconoce).
         """
+
+        def buscar_editor():
+            try:
+                return self._primer_editor_visible(preferir_dialogo=preferir_dialogo)
+            except (InvalidSessionIdException, NoSuchDriverException, MaxRetryError):
+                raise
+            except NoSuchWindowException as e:
+                # Ventana cerrada o driver rotando: seguir esperando; si el
+                # navegador murio de verdad, el timeout lanza "compositor de X
+                # no cargo" (reintentable por el motor).
+                logger.debug(
+                    f"Editor visible: NoSuchWindowException transitoria "
+                    f"({type(e).__name__}: {e})"
+                )
+                return None
+            except WebDriverException as e:
+                mensaje = str(e).lower()
+                if (
+                    "connection refused" in mensaje
+                    or "err_connection_refused" in mensaje
+                    or "max retries" in mensaje
+                    or "maxretry" in mensaje
+                    or "newconnectionerror" in mensaje
+                ):
+                    raise
+                # Timeout/ventana cerrada transitoria de la SPA: seguir esperando.
+                logger.debug(
+                    f"Editor visible: WebDriverException transitorio ignorado "
+                    f"({type(e).__name__}: {e})"
+                )
+                return None
+
+        def verificar_pagina():
+            if self._hay_muro_login():
+                raise Exception(
+                    "sesión de X expirada o inválida: se pidió login al abrir "
+                    f"el compositor ({self._diagnostico_pagina()})"
+                )
+            error = self._frase_error_pagina()
+            if error:
+                raise Exception(
+                    "X mostró una página de error al abrir el compositor "
+                    f"({self._diagnostico_pagina()})"
+                )
+
         fin = time.time() + max(0.2, float(timeout))
         while time.time() < fin:
-            editor = self._primer_editor_visible(preferir_dialogo=preferir_dialogo)
+            editor = buscar_editor()
             if editor is not None:
                 return editor
+            verificar_pagina()
             time.sleep(0.5)
 
         logger.warning(
@@ -1548,12 +1697,135 @@ class TwitterBot:
 
         fin = time.time() + max(0.2, float(reintento_timeout))
         while time.time() < fin:
-            editor = self._primer_editor_visible(preferir_dialogo=preferir_dialogo)
+            editor = buscar_editor()
             if editor is not None:
                 return editor
+            verificar_pagina()
             time.sleep(0.5)
 
-        raise Exception("compositor de X no cargo: el editor visible no aparecio")
+        raise Exception(
+            "compositor de X no cargo: el editor visible no aparecio "
+            f"({self._diagnostico_pagina()})"
+        )
+
+    def _clic_nuevo_post(self) -> bool:
+        """Clica el boton "Nuevo post"/New post de /home (True si lo logro).
+
+        Selectores en orden: `SideNav_NewTweet_Button`, enlaces a
+        `/compose/post` y `/compose/tweet`, y aria-label "Post"/"Publicar".
+        El clic se hace por JS para que el sidebar no intercepte el evento.
+        Nunca lanza.
+        """
+        selectores = (
+            "[data-testid='SideNav_NewTweet_Button']",
+            "a[href='/compose/post']",
+            "a[href='/compose/tweet']",
+            "[aria-label*='Post']",
+            "[aria-label*='Publicar']",
+        )
+        for sel in selectores:
+            try:
+                for btn in self.driver.find_elements(By.CSS_SELECTOR, sel):
+                    if not btn.is_displayed():
+                        continue
+                    try:
+                        self.driver.execute_script("arguments[0].click();", btn)
+                    except Exception:
+                        btn.click()
+                    return True
+            except Exception:
+                continue
+        return False
+
+    def _abrir_compositor(self):
+        """Abre el compositor de un POST NUEVO y devuelve el editor visible.
+
+        Prueba en orden:
+        1. `/compose/post` (ruta clasica, timeout 35/20).
+        2. `/compose/tweet` (solo si no aparecio y no hay muro de login).
+        3. `/home` + boton "Nuevo post" (25/15).
+
+        Si alguna ruta detecta sesion caida o pagina de error, el error de
+        `_esperar_editor_visible` se propaga de inmediato (no se siguen
+        probando rutas, no sirve de nada con las mismas cookies). Si ninguna
+        da editor, lanza Exception con la frase "compositor de X no cargo"
+        (el motor la usa) + el diagnostico de la pagina. NO se usa para
+        citas/respuestas: esas abren un modal y llaman directamente a
+        `_esperar_editor_visible`.
+        """
+
+        def abrir_con_espera(ruta, espera, reintento):
+            """Abre `ruta` y devuelve el editor visible o lanza."""
+            try:
+                self.driver.get(f"{self.base_url}{ruta}")
+            except TimeoutException:
+                logger.warning(
+                    f"Carga lenta de {self.base_url}{ruta}; sigo con esperas explicitas"
+                )
+            time.sleep(3)
+
+            # Si X ya redirigio al login no hay SPA que esperar: cortar ya.
+            if self._hay_muro_login():
+                raise Exception(
+                    "sesión de X expirada o inválida: se pidió login al abrir "
+                    f"el compositor ({self._diagnostico_pagina()})"
+                )
+            return self._esperar_editor_visible(
+                timeout=espera, reintento_timeout=reintento
+            )
+
+        for ruta, espera, reintento in (
+            ("/compose/post", 35, 20),
+            ("/compose/tweet", 25, 15),
+        ):
+            try:
+                editor = abrir_con_espera(ruta, espera, reintento)
+            except (WebDriverException, MaxRetryError):
+                # Driver muerto (o reconexion rechazada): que el motor
+                # reintente con un navegador nuevo.
+                raise
+            except Exception as e:
+                if self._es_error_fatal_compositor(e):
+                    # Sesion caida/pagina de error: probar otra ruta no ayuda.
+                    raise
+                logger.warning(f"Compositor no disponible en {ruta}: {e}")
+                continue
+            logger.info(f"compositor abierto via {ruta}")
+            return editor
+
+        # 3) /home + boton "Nuevo post" (ultima ruta de la SPA)
+        try:
+            self.driver.get(f"{self.base_url}/home")
+        except TimeoutException:
+            logger.warning(
+                f"Carga lenta de {self.base_url}/home; sigo con esperas explicitas"
+            )
+        time.sleep(8)
+        if self._hay_muro_login():
+            raise Exception(
+                "sesión de X expirada o inválida: se pidió login al abrir "
+                f"el compositor ({self._diagnostico_pagina()})"
+            )
+        if self._clic_nuevo_post():
+            logger.info("Boton 'Nuevo post' cliqueado en /home")
+        else:
+            logger.warning("No se encontro el boton 'Nuevo post' en /home")
+        try:
+            editor = self._esperar_editor_visible(timeout=25, reintento_timeout=15)
+        except (WebDriverException, MaxRetryError):
+            raise
+        except Exception as e:
+            if self._es_error_fatal_compositor(e):
+                raise
+            logger.warning(f"Compositor no disponible en /home: {e}")
+        else:
+            logger.info("compositor abierto via /home + boton Nuevo post")
+            return editor
+
+        raise Exception(
+            "compositor de X no cargo: el editor visible no aparecio "
+            f"({self._diagnostico_pagina()})"
+        )
 
     @staticmethod
     def _status_id(url: str) -> str:

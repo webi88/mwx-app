@@ -295,6 +295,29 @@ class GeneradorContenido:
 
         limpios = self._deduplicar(self._limpiar_texto(t) for t in textos)
 
+        # Red de seguridad: la narrativa/noticias son SOLO trasfondo. Si una
+        # variacion de la IA filtra material reconocible de la narrativa, se
+        # DESCARTA; el relleno local de abajo (generar_pool_variaciones) no
+        # lee la narrativa y garantiza la cantidad pedida.
+        if narrativa and limpios:
+            sin_fuga = []
+            for t in limpios:
+                if _fuga_narrativa(t, narrativa):
+                    logger.warning(
+                        "Se detecto fuga de la narrativa; se descarta la "
+                        "variacion de IA y se usa fallback local"
+                    )
+                    continue
+                sin_fuga.append(t)
+            limpios = sin_fuga
+
+        # Signos de apertura: activista/ciudadana NUNCA abren "¿"/"¡"
+        # (aplica tambien a los textos de la IA); politica conserva los suyos.
+        if limpios:
+            limpios = [
+                _quitar_signos_por_registro(t, registro) for t in limpios
+            ]
+
         # Relleno 1: variaciones locales (sinonimos/hashtags).
         if len(limpios) < cantidad:
             try:
@@ -303,12 +326,12 @@ class GeneradorContenido:
             except Exception as e:
                 logger.error(f"Error en fallback local de variaciones: {e}")
                 fallback = []
-            # Con registro ciudadano el fallback local tambien se humaniza
+            # El fallback local tambien se humaniza segun el registro
             # (antes del hashtag para no deformar el tag).
             humanizados = []
             for idx, t in enumerate(fallback):
                 t = self._limpiar_texto(t)
-                t = _humanizar_si_ciudadano(
+                t = _humanizar_por_registro(
                     t, registro, semilla=len(limpios) + idx
                 )
                 humanizados.append(t)
@@ -321,7 +344,7 @@ class GeneradorContenido:
             variante = f"{base} ({sufijo})" if base else f"Variacion {sufijo}"
             sufijo += 1
             if variante not in vistos:
-                variante = _humanizar_si_ciudadano(
+                variante = _humanizar_por_registro(
                     variante, registro, semilla=len(limpios) + sufijo + 5000
                 )
                 if variante in vistos:
@@ -549,9 +572,9 @@ def generar_pool_por_cuenta(
                     if variante not in vistos:
                         relleno = variante
                         break
-            # Estilo ciudadano en fallback (antes del hashtag) + hashtag en medio.
+            # Estilo local segun registro (antes del hashtag) + hashtag en medio.
             try:
-                relleno = _humanizar_si_ciudadano(
+                relleno = _humanizar_por_registro(
                     relleno, reglas[i][0], semilla=i + sufijo
                 )
             except Exception:
@@ -582,174 +605,174 @@ _TEMAS_MANTENIMIENTO = ("azteca", "dia", "tendencias", "gustos")
 _PLANTILLAS_MANTENIMIENTO = {
     "azteca": {
         "formal": (
-            "Nuestras raices prehispanicas\n\n"
-            "La grandeza de Mexico-Tenochtitlan se construyo con organizacion, "
+            "Nuestras raíces prehispánicas\n\n"
+            "La grandeza de México-Tenochtitlan se construyó con organización, "
             "conocimiento y comunidad; sus aportes siguen presentes en nuestra "
             "cultura.\n\n"
-            "Recordar de donde venimos fortalece la identidad y el orgullo nacional.",
+            "Recordar de dónde venimos fortalece la identidad y el orgullo nacional.",
             "El legado mexica\n\n"
-            "La astronomia, el arte y la herbolaria de nuestros antepasados son "
-            "testimonio de una civilizacion sofisticada y profunda.\n\n"
-            "Honrar esa memoria es reconocer la sabiduria que nos antecede.",
+            "La astronomía, el arte y la herbolaria de nuestros antepasados son "
+            "testimonio de una civilización sofisticada y profunda.\n\n"
+            "Honrar esa memoria es reconocer la sabiduría que nos antecede.",
             "Memoria viva\n\n"
-            "El Templo Mayor y los mercados prehispanicos recuerdan que Mexico ya "
+            "El Templo Mayor y los mercados prehispánicos recuerdan que México ya "
             "era grande antes de la conquista.\n\n"
             "Su historia merece difundirse con respeto y orgullo.",
         ),
         "ciudadano": (
-            "A veces se nos olvida que nuestra historia prehispanica sigue viva "
-            "en la comida, las palabras y las tradiciones de todos los dias.",
+            "A veces se nos olvida que nuestra historia prehispánica sigue viva "
+            "en la comida, las palabras y las tradiciones de todos los días.",
             "Los mexicas nos dejaron una ciudad enorme y bien organizada; saber "
-            "eso da orgullo y ganas de conocer mas de nuestras raices.",
+            "eso da orgullo y ganas de conocer más de nuestras raíces.",
             "Me gusta pensar que parte de lo que somos viene de siglos de arte, "
-            "astronomia y comunidad; no es poca cosa.",
+            "astronomía y comunidad; no es poca cosa.",
         ),
         "popular": (
-            "q chido es recordar q nuestros abuelos ya sabian un buen, puro "
+            "q chido es recordar q nuestros abuelos ya sabían un buen, puro "
             "orgullo mexica",
-            "los aztecas andaban bien adelantados pa su epoca, xq eso si es cultura",
-            "tons si andas orgulloso de tus raices, presuma q es gratis",
+            "los aztecas andaban bien adelantados pa su época, xq eso sí es cultura",
+            "tons si andas orgulloso de tus raíces, presume q es gratis",
         ),
         "generico": (
             "Ayer me puse a pensar en todo lo que construyeron nuestros abuelos. "
-            "Mexico-Tenochtitlan no se entiende sin su gente. Puro orgullo mexica.",
-            "El Templo Mayor sigue contandonos historias: cada piedra y cada ofrenda "
+            "México-Tenochtitlan no se entiende sin su gente. Puro orgullo mexica.",
+            "El Templo Mayor sigue contándonos historias: cada piedra y cada ofrenda "
             "son memoria viva de lo que fuimos y de lo que seguimos siendo.",
-            "No hay nada como recordar de donde venimos: arte mexica, herbolaria, "
-            "mercados, palabra y comunidad. Raices que siguen bien firmes.",
-            "Los mexicas median el tiempo con el sol y las estrellas. Su sabiduria "
+            "No hay nada como recordar de dónde venimos: arte mexica, herbolaria, "
+            "mercados, palabra y comunidad. Raíces que siguen bien firmes.",
+            "Los mexicas medían el tiempo con el sol y las estrellas. Su sabiduría "
             "sigue viva en nuestra memoria y en nuestras tradiciones.",
-            "Un chocolate caliente y una platica de historia: asi sabe Mexico. "
-            "Nuestras tradiciones ancestrales estan mas vivas que nunca.",
-            "La grandeza de Mexico viene de siglos de sabiduria, astronomia, poesia "
-            "y organizacion. Recordarlo es un acto de orgullo y de identidad.",
+            "Un chocolate caliente y una platica de historia: así sabe México. "
+            "Nuestras tradiciones ancestrales están más vivas que nunca.",
+            "La grandeza de México viene de siglos de sabiduría, astronomía, poesía "
+            "y organización. Recordarlo es un acto de orgullo y de identidad.",
         ),
     },
     "dia": {
         "formal": (
-            "Buen dia\n\n"
+            "Buen día\n\n"
             "La jornada comienza y conviene ordenar prioridades con calma, sin "
-            "perder el animo ni la claridad.\n\n"
+            "perder el ánimo ni la claridad.\n\n"
             "Que el esfuerzo de hoy acerque cada meta pendiente.",
             "Agenda y actitud\n\n"
-            "Cada dia trae pendientes, pero tambien oportunidades para avanzar y "
+            "Cada día trae pendientes, pero también oportunidades para avanzar y "
             "aprender algo nuevo.\n\n"
-            "Cumplir con lo planeado tambien es una forma de cuidar el futuro.",
-            "Reflexion de la manana\n\n"
-            "Las efemerides y la actualidad recuerdan que la historia tambien se "
+            "Cumplir con lo planeado también es una forma de cuidar el futuro.",
+            "Reflexión de la mañana\n\n"
+            "Las efemérides y la actualidad recuerdan que la historia también se "
             "escribe en lo cotidiano.\n\n"
-            "Buen dia a todas y todos.",
+            "Buen día a todas y todos.",
         ),
         "ciudadano": (
-            "Buenos dias, hoy toca levantarse con animo y sacar los pendientes "
+            "Buenos días, hoy toca levantarse con ánimo y sacar los pendientes "
             "aunque la semana venga pesada.",
-            "¿Como va su dia? Por aca ya con cafe en mano y ganas de que salgan "
+            "¿Cómo va su día? Por acá ya con café en mano y ganas de que salgan "
             "bien las cosas.",
-            "Hay dias que empiezan lentos, pero con buena actitud todo se acomoda "
+            "Hay días que empiezan lentos, pero con buena actitud todo se acomoda "
             "mejor.",
         ),
         "popular": (
-            "buenos dias, a levantarse q la chamba no se hace sola",
-            "tons ya listos pa arrancar el dia? yo ando en modo cafe",
-            "k tal ese animo? hoy si se puede con todo",
+            "buenos días, a levantarse q la chamba no se hace sola",
+            "tons ya listos pa arrancar el día? yo ando en modo café",
+            "k tal ese ánimo? hoy sí se puede con todo",
         ),
         "generico": (
-            "Buenos dias. Hoy toca levantarse con animo, cumplir la agenda y no "
-            "perder el humor. ¿Que trae su dia?",
-            "Se va la semana y queda la sensacion de que hay mucho por hacer. "
-            "¿Como va su dia, gente?",
-            "Hoy amanecio fresco y con buena vibra por aca. Aprovechen para sacar "
+            "Buenos días. Hoy toca levantarse con ánimo, cumplir la agenda y no "
+            "perder el humor. ¿Qué trae su día?",
+            "Se va la semana y queda la sensación de que hay mucho por hacer. "
+            "¿Cómo va su día, gente?",
+            "Hoy amaneció fresco y con buena vibra por acá. Aprovechen para sacar "
             "eso que traen pendiente.",
-            "Las efemerides nos recuerdan que la historia tambien se escribe en lo "
-            "cotidiano. Buen dia a todos.",
-            "El trafico, la chamba y los pendientes... pero aqui seguimos. "
-            "¿Un cafe para arrancar?",
-            "Dia de ordenar pendientes y proponerse algo nuevo. ¿Ustedes que plan "
+            "Las efemérides nos recuerdan que la historia también se escribe en lo "
+            "cotidiano. Buen día a todos.",
+            "El tráfico, la chamba y los pendientes... pero aquí seguimos. "
+            "¿Un café para arrancar?",
+            "Día de ordenar pendientes y proponerse algo nuevo. ¿Ustedes qué plan "
             "traen para hoy?",
         ),
     },
     "tendencias": {
         "formal": (
-            "Conversacion digital\n\n"
+            "Conversación digital\n\n"
             "Temas como los del momento muestran que la sociedad participa y opina "
-            "mas alla del ruido.\n\n"
-            "Escuchar y contrastar informacion fortalece el debate publico.",
+            "más allá del ruido.\n\n"
+            "Escuchar y contrastar información fortalece el debate público.",
             "El debate de hoy\n\n"
-            "La conversacion en redes refleja intereses legitimos de la ciudadania "
+            "La conversación en redes refleja intereses legítimos de la ciudadanía "
             "y merece analizarse con seriedad.\n\n"
             "Participar con respeto eleva la calidad del intercambio.",
-            "Agenda publica\n\n"
-            "Lo que hoy domina la conversacion digital tambien anticipa "
+            "Agenda pública\n\n"
+            "Lo que hoy domina la conversación digital también anticipa "
             "preocupaciones reales de la gente.\n\n"
             "Conviene informarse antes de opinar.",
         ),
         "ciudadano": (
-            "Se esta hablando de ese tema en todos lados y la verdad vale la pena "
+            "Se está hablando de ese tema en todos lados y la verdad vale la pena "
             "escuchar las distintas opiniones.",
-            "¿Ya vieron lo que anda circulando hoy en redes? Esta bueno el debate, "
+            "¿Ya vieron lo que anda circulando hoy en redes? Está bueno el debate, "
             "aunque hay de todo.",
             "El tema del momento tiene a la gente dividida pero conversando, y eso "
             "ya es avance.",
         ),
         "popular": (
-            "ya viste q andan diciendo? esta bueno el chisme pero con respeto",
-            "tons de q se esta hablando hoy? ando perdido en el timeline",
+            "ya viste q andan diciendo? está bueno el chisme pero con respeto",
+            "tons de q se está hablando hoy? ando perdido en el timeline",
             "las redes andan q arden jajaja k opinan ustedes?",
         ),
         "generico": (
-            "Vi que Mexico esta otra vez en la conversacion. Cuentenme, ¿de que se "
-            "esta hablando hoy en sus redes?",
-            "El tema del momento tiene a todos opinando. ¿Ustedes que piensan de lo "
-            "que se esta diciendo?",
-            "Las redes andan que arden hoy. ¿Ya vieron los memes que estan "
+            "Vi que México está otra vez en la conversación. Cuéntenme, ¿de qué se "
+            "está hablando hoy en sus redes?",
+            "El tema del momento tiene a todos opinando. ¿Ustedes qué piensan de lo "
+            "que se está diciendo?",
+            "Las redes andan que arden hoy. ¿Ya vieron los memes que están "
             "circulando?",
-            "Se puso de moda hablar de esto y se agradece la conversacion. "
-            "¿Cual es su opinion?",
-            "Lo que hoy esta sonando en internet: musica nueva, estrenos y un par "
-            "de sorpresas. ¿Que me recomiendan?",
-            "El timeline esta que no se puede con tanto contenido bueno. "
-            "¿Que estan viendo ustedes?",
+            "Se puso de moda hablar de esto y se agradece la conversación. "
+            "¿Cuál es su opinión?",
+            "Lo que hoy está sonando en internet: música nueva, estrenos y un par "
+            "de sorpresas. ¿Qué me recomiendan?",
+            "El timeline está que no se puede con tanto contenido bueno. "
+            "¿Qué están viendo ustedes?",
         ),
     },
     "gustos": {
         "formal": (
             "Cocina y memoria\n\n"
             "La comida de casa conserva sabores e historias que ninguna moda "
-            "gastronomica puede sustituir.\n\n"
-            "Sentarse a la mesa tambien es un acto de identidad.",
-            "Futbol y comunidad\n\n"
-            "Un partido reune familias, amigos y vecinos alrededor de una misma "
-            "pasion.\n\n"
+            "gastronómica puede sustituir.\n\n"
+            "Sentarse a la mesa también es un acto de identidad.",
+            "Fútbol y comunidad\n\n"
+            "Un partido reúne familias, amigos y vecinos alrededor de una misma "
+            "pasión.\n\n"
             "Esos rituales cotidianos construyen pertenencia.",
-            "Musica de siempre\n\n"
-            "Las canciones que heredamos de nuestros mayores acompanan momentos "
+            "Música de siempre\n\n"
+            "Las canciones que heredamos de nuestros mayores acompañan momentos "
             "que no vuelven.\n\n"
-            "Cuidar esa musica es cuidar la memoria afectiva.",
+            "Cuidar esa música es cuidar la memoria afectiva.",
         ),
         "ciudadano": (
-            "Unos tacos con la familia arreglan cualquier dia pesado, la verdad.",
-            "¿Cual es su cancion de domingo? A mi me gana la musica de antes.",
+            "Unos tacos con la familia arreglan cualquier día pesado, la verdad.",
+            "¿Cuál es su canción de domingo? A mí me gana la música de antes.",
             "Me encanta desconectar con buena comida y una platica larga con los "
-            "mios.",
+            "míos.",
         ),
         "popular": (
-            "unos taquitos y ya, pa q mas",
+            "unos taquitos y ya, pa q más",
             "k rico es comer en casa, nada le gana",
-            "tons cual es su rolita favorita? yo ando en modo cumbia",
+            "tons cuál es su rolita favorita? yo ando en modo cumbia",
         ),
         "generico": (
-            "Partido, buena compania y algo rico para botanear: no hay plan mas "
+            "Partido, buena compañía y algo rico para botanear: no hay plan más "
             "mexicano que ese.",
             "No hay tristeza que aguante unos tacos a la hora correcta. "
-            "¿Cuales son sus favoritos?",
-            "Me encanta la musica de antes: Jose Alfredo, Juan Gabriel, Los Bukis. "
-            "¿Cual es su cancion de domingo?",
-            "Con esto de la tecnologia hasta mi abuela pide videollamada. "
-            "El mundo cambio y uno sigue extrañando las cartas a mano.",
+            "¿Cuáles son sus favoritos?",
+            "Me encanta la música de antes: José Alfredo, Juan Gabriel, Los Bukis. "
+            "¿Cuál es su canción de domingo?",
+            "Con esto de la tecnología hasta mi abuela pide videollamada. "
+            "El mundo cambió y uno sigue extrañando las cartas a mano.",
             "Un viaje en carretera, una playlist y paisaje mexicano: plan perfecto "
             "para desconectar.",
             "La comida de casa sigue siendo el mejor restaurante del planeta. "
-            "¿Cual es su platillo de la infancia?",
+            "¿Cuál es su platillo de la infancia?",
         ),
     },
 }
@@ -761,32 +784,32 @@ _PLANTILLAS_COMENTARIO = {
         "De acuerdo con el planteamiento\n\n"
         "El argumento invita a reflexionar con seriedad sobre el tema.\n\n"
         "Conviene mantener el debate informado.",
-        "Punto valido\n\n"
-        "La publicacion aporta elementos que merecen considerarse con calma.\n\n"
-        "Gracias por abrir la conversacion.",
-        "Reflexion necesaria\n\n"
-        "Es un tema que exige analisis y no solo reacciones inmediatas.\n\n"
-        "Ojala se siga discutiendo con respeto.",
-        "Buena aportacion\n\n"
+        "Punto válido\n\n"
+        "La publicación aporta elementos que merecen considerarse con calma.\n\n"
+        "Gracias por abrir la conversación.",
+        "Reflexión necesaria\n\n"
+        "Es un tema que exige análisis y no solo reacciones inmediatas.\n\n"
+        "Ojalá se siga discutiendo con respeto.",
+        "Buena aportación\n\n"
         "Comparto la importancia de mirar el asunto con profundidad.\n\n"
         "Seguimos conversando.",
     ),
     "ciudadano": (
-        "Buen punto, la verdad es que el tema da para pensar y conversar mas.",
+        "Buen punto, la verdad es que el tema da para pensar y conversar más.",
         "Totalmente de acuerdo, hace falta hablar de esto con calma.",
         "Interesante lo que planteas, yo lo veo parecido aunque con matices.",
-        "Asi es, ojala mas gente se sume a la conversacion.",
+        "Así es, ojalá más gente se sume a la conversación.",
     ),
     "popular": (
-        "x2, q bueno q se hable de esto",
-        "jaja tienes razon, q bueno q lo dices",
-        "tons q bueno q alguien lo dice, ya era hora",
-        "k buen punto, pa eso estan las redes",
+        "x2, qué bueno que se hable de esto",
+        "jaja tienes razón, qué bueno que lo dices",
+        "qué bueno que alguien lo dice, ya era hora",
+        "qué buen punto, para eso están las redes.",
     ),
     "generico": (
         "Buen punto, hace falta seguir hablando de esto.",
         "Interesante lo que compartes, vale la pena conversarlo.",
-        "De acuerdo, ojala se sume mas gente a la conversacion.",
+        "De acuerdo, ojalá se sume más gente a la conversación.",
     ),
 }
 
@@ -922,9 +945,13 @@ def _con_hashtag_en_medio(texto: str) -> str:
 
 
 # ===================================================================== #
-# Estilo ciudadano local: humaniza el fallback sin OpenAI.
-# Faltas frecuentes pero legibles + dislexias variadas + mayusculas
-# inconsistentes + abreviaturas. Politico/activista NO usan esto.
+# Estilos locales por REGISTRO (fallback sin OpenAI):
+# - ciudadana: persona real "sin estudios" -> malos signos de puntuacion
+#   (casi sin comas/puntos, nunca "¿"/"¡") + 4-7 errores legibles.
+# - activista: tecnico-coloquial -> 2-3 errores ortograficos leves y
+#   NUNCA signos de apertura "¿"/"¡".
+# - politica: no se toca localmente (ortografia cuidada, maximo 1 error
+#   leve opcional permitido por el prompt).
 # ===================================================================== #
 _MAPA_SIN_TILDES = str.maketrans({
     "á": "a", "é": "e", "í": "i", "ó": "o", "ú": "u", "ü": "u",
@@ -955,9 +982,12 @@ _DISLEXIAS_CIUDADANO = (
     (r"\bcasa\b", "casa"),  # testigo (no cambia, evita sobre-corregir)
     (r"\bcansado\b", "kansado"),
     # b/v
-    (r"\bhaber\b", "haver"),
+    (r"\bhaber\b", "aver"),
+    (r"\ba ver\b", "aver"),
     (r"\bvolver\b", "bolber"),
     (r"\bbueno\b", "bueno"),  # testigo
+    # haya -> haiga (h + y/ll)
+    (r"\bhaya\b", "haiga"),
     # y/ll
     (r"\bllegó\b", "yego"),
     (r"\bllego\b", "yego"),
@@ -966,6 +996,34 @@ _DISLEXIAS_CIUDADANO = (
     (r"\bgente\b", "jente"),
     (r"\bméxico\b", "mejico"),
     (r"\bmexico\b", "mejico"),
+)
+
+# Errores ORTOGRAFICOS leves del registro activista (2-3 por texto).
+# Maximo 1 por palabra; ninguno impide entender el mensaje.
+_ERRORES_ACTIVISTA = (
+    (r"\bhola\b", "ola"),
+    (r"\bhacer\b", "aser"),
+    (r"\bhace\b", "ase"),
+    (r"\bhasta\b", "asta"),
+    (r"\bhay\b", "ay"),
+    (r"\bhaber\b", "aver"),
+    (r"\bvez\b", "ves"),
+    (r"\bgracias\b", "grasias"),
+    (r"\btambién\b", "tmbn"),
+    (r"\btambien\b", "tmbn"),
+    (r"\bllegó\b", "yego"),
+    (r"\bllego\b", "yego"),
+    (r"\bcalle\b", "caye"),
+    (r"\bgente\b", "jente"),
+)
+
+# Licencias de redes del activista (q/pa/xq/tons/k ocasionales). Solo se
+# aplican si los errores ortograficos de arriba no alcanzaron el objetivo.
+_LICENCIAS_ACTIVISTA = (
+    (r"\bque\b", "q"),
+    (r"\bporque\b", "xq"),
+    (r"\bpara\b", "pa"),
+    (r"\bentonces\b", "tons"),
 )
 
 _MULETILLAS_CIUDADANO_INICIO = (
@@ -986,6 +1044,353 @@ _MULETILLAS_CIUDADANO_CIERRE = (
     "",
     "",
 )
+
+
+# ------------------------------------------------------------------ #
+# Edits genericos de un solo error leve. Devuelven
+# (texto, aplicado, palabra_tocada) y aceptan `evitar` (palabras ya
+# editadas) para no revertir ni encadenar errores sobre la misma palabra
+# (maximo 1 error por palabra).
+# ------------------------------------------------------------------ #
+
+# Palabras de funcion que NUNCA se deforman (p.ej. "se"->"ce", "es"->"ec"):
+# deformarlas vuelve ilegible el texto. Todos los edits genericos las
+# saltan y buscan la siguiente candidata.
+_PALABRAS_FUNCION = {
+    "se", "es", "son", "era", "un", "una", "unos", "unas",
+    "el", "la", "los", "las", "lo", "de", "del", "al", "en", "con",
+    "sin", "por", "para", "su", "sus", "mi", "mis", "tu", "tus",
+    "no", "si", "ya", "mas", "más", "muy", "me", "le", "les", "nos",
+    "da", "di", "ni", "tan", "te", "os",
+}
+
+
+def _es_palabra_funcion(palabra) -> bool:
+    """True si la palabra (lower, sin signos) es de funcion (nunca lanza)."""
+    try:
+        limpia = re.sub(
+            r"^[^\wáéíóúüñÁÉÍÓÚÜÑ]+|[^\wáéíóúüñÁÉÍÓÚÜÑ]+$",
+            "",
+            str(palabra or ""),
+        ).lower()
+    except Exception:
+        return False
+    return limpia in _PALABRAS_FUNCION
+
+
+def _error_h_muda(texto: str, evitar: set | None = None):
+    """Quita una h muda inicial ('hacer'->'acer', 'hay'->'ay').
+
+    Devuelve (texto, aplicado, palabra_nueva); la palabra nueva es la que se
+    registra en `evitar` para que otro edit no la revierta.
+    """
+    try:
+        for m in re.finditer(r"\b[Hh][aeiouáéíóú]\w*", texto):
+            palabra = m.group(0)
+            # "ha"/"he" (2 letras) se conservan; "hay"/"hola" si se editan.
+            if len(palabra) < 3:
+                continue
+            if _es_palabra_funcion(palabra):
+                continue
+            if evitar and palabra.lower() in evitar:
+                continue
+            nueva = palabra[1:]
+            return (
+                texto[:m.start()] + nueva + texto[m.end():], True, nueva
+            )
+    except Exception:
+        pass
+    return (texto, False, "")
+
+
+def _error_ll_y(texto: str, evitar: set | None = None):
+    """Cambia una 'll' por 'y' ('calle'->'caye', 'llegar'->'yegar')."""
+    try:
+        for m in re.finditer(r"\w*ll\w*", texto):
+            palabra = m.group(0)
+            if "\x00" in palabra:
+                continue
+            if len(palabra) < 4:
+                continue
+            if _es_palabra_funcion(palabra):
+                continue
+            if evitar and palabra.lower() in evitar:
+                continue
+            nueva = palabra.replace("ll", "y", 1)
+            return (
+                texto[:m.start()] + nueva + texto[m.end():], True, nueva
+            )
+    except Exception:
+        pass
+    return (texto, False, "")
+
+
+def _error_c_s(texto: str, evitar: set | None = None):
+    """Cambia c+e/i por s ('hacer'->'haser', 'gracias'->'grasias')."""
+    try:
+        for m in re.finditer(r"\b[Cc][eiéí]\w*", texto):
+            palabra = m.group(0)
+            if len(palabra) < 4:
+                continue
+            if _es_palabra_funcion(palabra):
+                continue
+            if evitar and palabra.lower() in evitar:
+                continue
+            nueva = "s" + palabra[1:]
+            return (
+                texto[:m.start()] + nueva + texto[m.end():], True, nueva
+            )
+    except Exception:
+        pass
+    return (texto, False, "")
+
+
+def _error_s_c(texto: str, evitar: set | None = None):
+    """Inversa s+e/i -> c ('sentirse'->'centirse'); s/c/z leve."""
+    try:
+        for m in re.finditer(r"\b[Ss][eiéí]\w*", texto):
+            palabra = m.group(0)
+            if len(palabra) < 4:
+                continue
+            if _es_palabra_funcion(palabra):
+                continue
+            if evitar and palabra.lower() in evitar:
+                continue
+            nueva = "c" + palabra[1:]
+            return (
+                texto[:m.start()] + nueva + texto[m.end():], True, nueva
+            )
+    except Exception:
+        pass
+    return (texto, False, "")
+
+
+def _error_bv(texto: str, evitar: set | None = None):
+    """Intercambia b<->v en UNA palabra ('volver'->'bolber', 'base'->'vase')."""
+    try:
+        for m in re.finditer(r"\b\w*[bvBV]\w*\b", texto):
+            palabra = m.group(0)
+            if len(palabra) <= 3:
+                continue
+            if _es_palabra_funcion(palabra):
+                continue
+            if evitar and palabra.lower() in evitar:
+                continue
+            if "b" in palabra.lower():
+                nueva = palabra.replace("b", "v", 1).replace("B", "V", 1)
+            else:
+                nueva = palabra.replace("v", "b", 1).replace("V", "B", 1)
+            if nueva != palabra:
+                return (
+                    texto[:m.start()] + nueva + texto[m.end():], True, nueva
+                )
+    except Exception:
+        pass
+    return (texto, False, "")
+
+
+def _error_tilde(texto: str, evitar: set | None = None):
+    """Omite UNA tilde ('también'->'tambien'); error leve permitido."""
+    try:
+        for m in re.finditer(r"\w*[áéíóú]\w*", texto):
+            palabra = m.group(0)
+            if _es_palabra_funcion(palabra):
+                continue
+            if evitar and palabra.lower() in evitar:
+                continue
+            nueva = re.sub(
+                r"[áéíóú]",
+                lambda c: _MAPA_SIN_TILDES.get(c.group(0), c.group(0)),
+                palabra,
+                count=1,
+            )
+            if nueva != palabra:
+                return (
+                    texto[:m.start()] + nueva + texto[m.end():], True, nueva
+                )
+    except Exception:
+        pass
+    return (texto, False, "")
+
+
+def _error_que_k(texto: str, evitar: set | None = None):
+    """Cambia 'que'/'qué' por 'ke' y la 'q' suelta por 'k' (licencia k)."""
+    try:
+        for m in re.finditer(r"\bqu[eé]\w*|\bq\b", texto):
+            palabra = m.group(0)
+            if _es_palabra_funcion(palabra):
+                continue
+            if evitar and palabra.lower() in evitar:
+                continue
+            nueva = "ke" if palabra.lower() in ("que", "qué") else "k"
+            if nueva != palabra:
+                return (
+                    texto[:m.start()] + nueva + texto[m.end():], True, nueva
+                )
+    except Exception:
+        pass
+    return (texto, False, "")
+
+
+def _error_g_j(texto: str, evitar: set | None = None):
+    """Cambia g+e/i por j ('gente'->'jente', 'general'->'jeneral')."""
+    try:
+        for m in re.finditer(r"\b[Gg][eiéí]\w*", texto):
+            palabra = m.group(0)
+            if len(palabra) < 4:
+                continue
+            if _es_palabra_funcion(palabra):
+                continue
+            if evitar and palabra.lower() in evitar:
+                continue
+            nueva = "j" + palabra[1:]
+            return (
+                texto[:m.start()] + nueva + texto[m.end():], True, nueva
+            )
+    except Exception:
+        pass
+    return (texto, False, "")
+
+
+def _error_z_s(texto: str, evitar: set | None = None):
+    """Cambia una z final de palabra por s ('vez'->'ves')."""
+    try:
+        for m in re.finditer(r"\b\w*z\b", texto):
+            palabra = m.group(0)
+            # Minimo 3 letras: "vez"->"ves" se conserva como licencia.
+            if len(palabra) < 3:
+                continue
+            if _es_palabra_funcion(palabra):
+                continue
+            if evitar and palabra.lower() in evitar:
+                continue
+            nueva = palabra[:-1] + "s"
+            return (
+                texto[:m.start()] + nueva + texto[m.end():], True, nueva
+            )
+    except Exception:
+        pass
+    return (texto, False, "")
+
+
+def _error_s_final(texto: str, evitar: set | None = None):
+    """Quita la s final de una palabra larga ('tenemos'->'tenemo', 'cosas'->'cosa').
+
+    Error tipico de escritura con poca escuela; nunca toca palabras funcion,
+    hashtags ni palabras ya editadas. Exige >=5 letras para no romper plurales
+    cortos que ya estan protegidos como funcion.
+    """
+    try:
+        for m in re.finditer(r"\b\w{5,}s\b", texto):
+            palabra = m.group(0)
+            if "\x00" in palabra:
+                continue
+            if _es_palabra_funcion(palabra):
+                continue
+            if evitar and palabra.lower() in evitar:
+                continue
+            nueva = palabra[:-1]
+            return (
+                texto[:m.start()] + nueva + texto[m.end():], True, nueva
+            )
+    except Exception:
+        pass
+    return (texto, False, "")
+
+
+def _error_qu_k(texto: str, evitar: set | None = None):
+    """Cambia la 'qu' de una palabra por 'k' ('quiero'->'kiero', 'aqui'->'aki').
+
+    Licencia tipica de redes; exige >=4 letras y respeta palabras funcion.
+    """
+    try:
+        for m in re.finditer(r"\b\w*[Qq]u[eiéíí]\w*", texto):
+            palabra = m.group(0)
+            if "\x00" in palabra:
+                continue
+            if _es_palabra_funcion(palabra):
+                continue
+            if len(re.sub(r"\W", "", palabra)) < 4:
+                continue
+            if evitar and palabra.lower() in evitar:
+                continue
+            nueva = re.sub(
+                r"[Qq]u", "k" if palabra[0].islower() else "K", palabra, count=1
+            )
+            if nueva == palabra:
+                continue
+            return (
+                texto[:m.start()] + nueva + texto[m.end():], True, nueva
+            )
+    except Exception:
+        pass
+    return (texto, False, "")
+
+
+# Edits genericos usados por los estilos locales (cada uno aplica como
+# maximo UNA vez por texto, sobre una palabra distinta).
+_GENERICOS_ESTILO = (
+    _error_h_muda,
+    _error_c_s,
+    _error_s_c,
+    _error_ll_y,
+    _error_bv,
+    _error_g_j,
+    _error_z_s,
+    _error_s_final,
+    _error_qu_k,
+    _error_que_k,
+)
+
+
+def _aplicar_genericos_estilo(
+    cuerpo: str,
+    restantes: int,
+    evitar: set,
+    rng,
+    incluir_tilde: bool = False,
+):
+    """Aplica hasta ``restantes`` edits genericos (1 por palabra); nunca lanza.
+
+    Devuelve ``(texto, aplicados)``. Cada funcion aplica una sola vez y las
+    palabras tocadas se acumulan en ``evitar`` para no encadenar ni revertir
+    errores sobre la misma palabra.
+    """
+    hechas = 0
+    intentos = 0
+    while hechas < restantes and intentos < 40:
+        intentos += 1
+        pendientes = list(_GENERICOS_ESTILO)
+        rng.shuffle(pendientes)
+        aplicado_alguno = False
+        for fn in pendientes:
+            try:
+                nuevo, aplicado, palabra = fn(cuerpo, evitar)
+            except Exception:
+                continue
+            if aplicado:
+                cuerpo = nuevo
+                hechas += 1
+                # `evitar` guarda la PALABRA NUEVA: evita que otro edit la
+                # revierta, pero permite reutilizar el genérico en otra
+                # palabra (textos cortos necesitan mas de un error).
+                if palabra:
+                    evitar.add(str(palabra).lower())
+                aplicado_alguno = True
+                break
+        if not aplicado_alguno:
+            break
+    if incluir_tilde and hechas < restantes:
+        try:
+            nuevo, aplicado, palabra = _error_tilde(cuerpo, evitar)
+        except Exception:
+            aplicado = False
+        if aplicado:
+            cuerpo = nuevo
+            hechas += 1
+            if palabra:
+                evitar.add(str(palabra).lower())
+    return cuerpo, hechas
 
 
 def _quitar_tildes(texto: str) -> str:
@@ -1020,13 +1425,147 @@ def _es_registro_ciudadano(registro) -> bool:
     return r.startswith("ciudadan")
 
 
+def _es_registro_activista(registro) -> bool:
+    """True si el registro pide el estilo tecnico-coloquial (nunca lanza)."""
+    try:
+        r = str(registro or "").strip().lower()
+    except Exception:
+        return False
+    return r.startswith("activis")
+
+
+# ===================================================================== #
+# RED DE SEGURIDAD DETERMINISTA: la narrativa/noticias son SOLO trasfondo.
+# El modelo (gpt-4o-mini) a veces filtra palabras de la noticia aunque el
+# prompt lo prohiba; aqui se detecta y se sustituye/descarta ese texto por
+# el fallback local (que JAMAS lee la narrativa). Ademas se garantiza que
+# los registros activista/ciudadana NUNCA abran "¿" ni "¡" (tambien en
+# textos de IA); el registro politica conserva sus signos correctos.
+# ===================================================================== #
+_FUGA_STOPLIST = {
+    "gobierno", "gobiernos", "presidente", "presidenta", "mexico",
+    "ciudad", "ciudades", "ciudadania", "seguridad", "pueblo", "nacion",
+    "nacional", "federal", "estado", "estados", "publica", "publico",
+    "millones", "nosotros", "tambien", "porque", "entonces", "mientras",
+    "durante", "trabajo", "trabajadores", "noticia", "noticias",
+    "informacion", "personas", "social", "sociedad", "politica", "politico",
+    "economia", "mexicano", "mexicana", "mexicanos", "mexicanas", "pais",
+}
+
+
+def _normalizar_para_fuga(texto) -> str:
+    """Minusculas sin acentos/signos raros, palabras separadas (nunca lanza)."""
+    try:
+        t = str(texto or "").lower()
+        t = _quitar_tildes(t)
+        t = "".join(
+            c for c in unicodedata.normalize("NFD", t)
+            if unicodedata.category(c) != "Mn"
+        )
+        t = unicodedata.normalize("NFC", t)
+        return re.sub(r"[^a-z0-9ñ]+", " ", t).strip()
+    except Exception:
+        return ""
+
+
+def _fuga_narrativa(texto, narrativa) -> bool:
+    """True si ``texto`` filtra material reconocible de ``narrativa``.
+
+    Compara palabras completas tras normalizar (minusculas, sin acentos ni
+    signos). Cuenta como fuga cuando aparecen **>=2 tokens distintos** de la
+    narrativa (palabras de >=7 letras, sin la stoplist de genericos) o **UN
+    token de >=10 letras** (suficientemente distintivo, p. ej. "descuentazo").
+    Nunca lanza: ante cualquier error/entrada rara devuelve False.
+    """
+    try:
+        if not texto or not narrativa:
+            return False
+        texto_norm = _normalizar_para_fuga(texto)
+        narrativa_norm = _normalizar_para_fuga(narrativa)
+        if not texto_norm or not narrativa_norm:
+            return False
+        tokens = {
+            tok for tok in re.findall(r"[a-záéíóúüñ]{7,}", narrativa_norm)
+            if tok not in _FUGA_STOPLIST
+        }
+        apariciones = 0
+        for tok in tokens:
+            if re.search(r"\b" + re.escape(tok) + r"\b", texto_norm):
+                if len(tok) >= 10:
+                    return True
+                apariciones += 1
+                if apariciones >= 2:
+                    return True
+        return False
+    except Exception:
+        return False
+
+
+def _reemplazo_sin_fuga(texto, narrativa, reemplazo_fn):
+    """Devuelve ``texto`` intacto o el fallback local si hay fuga (nunca lanza).
+
+    Si ``_fuga_narrativa(texto, narrativa)`` es True, loguea WARNING y
+    devuelve el resultado de ``reemplazo_fn()`` (texto local que no lee la
+    narrativa). Si no hay fuga, devuelve el texto tal cual. Ante error en el
+    reemplazo devuelve "" para que el llamador use su propio fallback.
+    """
+    try:
+        if not _fuga_narrativa(texto, narrativa):
+            return texto
+        logger.warning(
+            "Se detecto fuga de la narrativa; se reemplaza el texto por "
+            "fallback local"
+        )
+        try:
+            return reemplazo_fn() or ""
+        except Exception as e:
+            logger.error(f"Error construyendo reemplazo sin fuga: {e}")
+            return ""
+    except Exception:
+        return texto
+
+
+def _quitar_signos_apertura(texto: str) -> str:
+    """Elimina "¿" y "¡" conservando "?"/"!" y los hashtags (nunca lanza)."""
+    try:
+        t = str(texto or "")
+        if not t:
+            return t
+        # Quita el signo y normaliza el hueco que deja ("¿ Que" -> "Que").
+        t = re.sub(r"[ \t]*[¿¡][ \t]*", " ", t)
+        t = re.sub(r"[ \t]{2,}", " ", t)
+        t = re.sub(r"^[ \t]+", "", t)
+        t = re.sub(r"[ \t]+$", "", t)
+        return t
+    except Exception:
+        return texto
+
+
+def _quitar_signos_por_registro(texto: str, registro) -> str:
+    """Quita "¿"/"¡" SOLO para activista/ciudadana (politica intacta)."""
+    try:
+        canon = normalizar_tipo_cuenta(registro)
+    except Exception:
+        canon = ""
+    if (
+        canon in ("activista", "ciudadana")
+        or _es_registro_activista(registro)
+        or _es_registro_ciudadano(registro)
+    ):
+        return _quitar_signos_apertura(texto)
+    return texto
+
+
 def _aplicar_estilo_ciudadano_local(texto: str, semilla: int = 0) -> str:
     """Humaniza un texto al registro ciudadano (fallback local, nunca lanza).
 
-    Aplica, con un RNG sembrado para variar entre textos: 3-6 rasgos humanos
-    legibles (sin tildes, abreviaturas q/pa/xq/tons/k/tmb, dislexias b/d-q/p-
-    s/c/z-h muda-y/ll, mayusculas inconsistentes, muletilla distinta). Maximo
-    1 error por palabra; los hashtags se conservan intactos y bien escritos.
+    Persona real "sin estudios": aplica, con un RNG sembrado para variar entre
+    textos, 4-7 errores ortograficos legibles (sin tildes, abreviaturas
+    q/pa/xq/tons/k/tmb, dislexias b/v-s/c/z-h muda-y/ll-g/j y confusiones
+    hay/ay, haber/a ver->aver, haya->haiga), MALOS SIGNOS de puntuacion
+    (nunca "¿" ni "¡", casi sin comas ni puntos internos, "..." ocasional al
+    cierre), mayusculas inconsistentes y muletilla distinta. Maximo 1 error
+    por palabra; los hashtags se conservan intactos y bien escritos.
     """
     t = (texto or "").strip()
     if not t:
@@ -1044,35 +1583,34 @@ def _aplicar_estilo_ciudadano_local(texto: str, semilla: int = 0) -> str:
         # 2) Sin tildes (casi siempre en ciudadano).
         cuerpo = _quitar_tildes(cuerpo)
 
-        # 3) Abreviaturas: 2-4 sustituciones por texto.
-        cuerpo_low = cuerpo
-        n_abrev = rng.randint(2, 4)
+        # 3) 4-7 errores en total: primero abreviaturas (2-3) y luego
+        #    dislexias/genericos hasta cumplir el objetivo.
+        objetivo = rng.randint(4, 7)
+        hechas = 0
+
+        n_abrev = min(max(1, objetivo - 1), rng.randint(2, 3))
         candidatas = list(_ABREVIATURAS_CIUDADANO)
         rng.shuffle(candidatas)
-        aplicadas = 0
         for patron, repl in candidatas:
-            if aplicadas >= n_abrev:
+            if hechas >= n_abrev:
                 break
-            nuevo, n = re.subn(patron, repl, cuerpo_low, count=1,
+            nuevo, n = re.subn(patron, repl, cuerpo, count=1,
                                flags=re.IGNORECASE)
             if n:
-                # Respeta minusculas del entorno ciudadano.
-                cuerpo_low = nuevo
-                aplicadas += 1
-        cuerpo = cuerpo_low
-        # 'que' -> 'k' ocasional (una sola vez, para variar).
-        if rng.random() < 0.35:
-            cuerpo = re.sub(r"\bq\b", "k", cuerpo, count=1)
+                cuerpo = nuevo
+                hechas += 1
 
-        # 4) Dislexias: 1-3 sustituciones distintas por texto (lista + genericos
-        #    para que CUALQUIER texto quede humanizado aunque no traiga las
-        #    palabras exactas de la lista).
-        n_dis = rng.randint(1, 3)
+        # 'que' -> 'q' -> 'k' ocasional (cuenta como un error mas).
+        if hechas < objetivo and re.search(r"\bq\b", cuerpo):
+            if rng.random() < 0.5:
+                cuerpo = re.sub(r"\bq\b", "k", cuerpo, count=1)
+                hechas += 1
+
+        # 4) Dislexias variadas de la lista (una por palabra).
         dis = list(_DISLEXIAS_CIUDADANO)
         rng.shuffle(dis)
-        hechas = 0
         for patron, repl in dis:
-            if hechas >= n_dis:
+            if hechas >= objetivo:
                 break
             if patron in (r"\bcasa\b", r"\bbueno\b"):
                 continue  # testigos, no cambian
@@ -1082,47 +1620,40 @@ def _aplicar_estilo_ciudadano_local(texto: str, semilla: int = 0) -> str:
                 cuerpo = nuevo
                 hechas += 1
 
-        # 4b) Genericos (si la lista no alcanzo): una edicion legible sobre una
-        # palabra cualquiera; maximo 1 error por palabra para seguir legible.
-        if hechas < n_dis:
-            # h muda inicial omitida: "hace"->"ace", "hay"->"ay", "hola"->"ola".
-            if hechas < n_dis and rng.random() < 0.8:
-                nuevo, n = re.subn(r"\b[Hh]([aeiouáéíóú])", r"\1", cuerpo,
-                                   count=1)
-                if n:
-                    cuerpo, hechas = nuevo, hechas + 1
-            # ll -> y: "llegar"->"yegar", "calle"->"caye" (una sola palabra).
-            if hechas < n_dis and rng.random() < 0.6:
-                nuevo, n = re.subn(r"ll", "y", cuerpo, count=1)
-                # Evita romper el placeholder de hashtag.
-                if n and "\x00" in cuerpo and nuevo.count("\x00") != cuerpo.count("\x00"):
-                    pass
-                elif n:
-                    cuerpo, hechas = nuevo, hechas + 1
-            # c+e/i -> s ("hacer"->"haser", "gracias"->"grasias").
-            if hechas < n_dis and rng.random() < 0.6:
-                nuevo, n = re.subn(r"[Cc]([eiéí])", r"s\1", cuerpo, count=1)
-                if n:
-                    cuerpo, hechas = nuevo, hechas + 1
-            # b <-> v en una palabra ("volver"->"bolber", "bien"->"vien").
-            if hechas < n_dis and rng.random() < 0.5:
-                m = re.search(r"\b\w*[bvBV]\w*\b", cuerpo)
-                if m:
-                    palabra = m.group(0)
-                    if "b" in palabra.lower():
-                        nueva = palabra.replace("b", "v", 1).replace("B", "V", 1)
-                    else:
-                        nueva = palabra.replace("v", "b", 1).replace("V", "B", 1)
-                    if nueva != palabra and len(palabra) > 3:
-                        cuerpo = cuerpo[:m.start()] + nueva + cuerpo[m.end():]
-                        hechas += 1
+        # 4b) Genericos hasta cumplir 4-7 (h muda, ll->y, c->s, s->c, b<->v,
+        #     que/q->k, g->j, z->s); maximo 1 error por palabra. (Tilde no
+        #     aplica: el paso 2 ya quito todas las tildes.)
+        evitar: set = set()
+        cuerpo, extra = _aplicar_genericos_estilo(
+            cuerpo, objetivo - hechas, evitar, rng
+        )
+        hechas += extra
 
-        # 5) Mayusculas/minusculas inconsistentes: inicio en minuscula +
-        #    una palabra en MAYUSCULA suelta para enfasis (ocasional).
+        # 5) MALOS SIGNOS: nunca "¿" ni "¡"; casi sin comas ni puntos
+        #    internos (se conserva el punto final si lo habia).
         cuerpo = cuerpo.strip()
-        if cuerpo and rng.random() < 0.7:
+        cuerpo = cuerpo.replace("¿", "").replace("¡", "")
+        termina_punto = cuerpo.endswith(".") and not cuerpo.endswith("...")
+        final = ""
+        nucleo = cuerpo
+        if termina_punto:
+            nucleo = cuerpo[:-1]
+            final = "."
+        nucleo = re.sub(
+            r",", lambda _m: "" if rng.random() < 0.85 else ",", nucleo
+        )
+        nucleo = re.sub(
+            r"(?<!\.)\.(?!\.)",
+            lambda _m: "" if rng.random() < 0.8 else ".",
+            nucleo,
+        )
+        cuerpo = (nucleo + final).strip()
+
+        # 6) Mayusculas/minusculas inconsistentes: inicio en minuscula
+        #    frecuente + una palabra en MAYUSCULA suelta para enfasis.
+        if cuerpo and rng.random() < 0.85:
             cuerpo = cuerpo[0].lower() + cuerpo[1:]
-        if rng.random() < 0.35:
+        if cuerpo and rng.random() < 0.35:
             palabras = cuerpo.split()
             if len(palabras) >= 3:
                 idx = rng.randrange(1, len(palabras))
@@ -1131,15 +1662,26 @@ def _aplicar_estilo_ciudadano_local(texto: str, semilla: int = 0) -> str:
                     palabras[idx] = palabras[idx].upper()
                     cuerpo = " ".join(palabras)
 
-        # 6) Muletilla de apertura/cierre distinta por semilla (variacion).
+        # 7) Muletilla de apertura/cierre distinta por semilla (variacion).
         apertura = rng.choice(_MULETILLAS_CIUDADANO_INICIO)
         cierre = rng.choice(_MULETILLAS_CIUDADANO_CIERRE)
         if apertura and not cuerpo.lower().startswith(apertura.strip()[:4]):
             cuerpo = f"{apertura}{cuerpo}"
         if cierre and cierre.strip() not in cuerpo.lower()[-20:]:
             cuerpo = f"{cuerpo}{cierre}"
+        # Limpieza de puntuacion duplicada ("., " / ",.") tras la muletilla.
+        cuerpo = re.sub(r"([.!?])\s*,", r"\1", cuerpo)
+        cuerpo = re.sub(r",\s*([.!?])", r"\1", cuerpo)
 
-        # 7) Restaura hashtags intactos.
+        # 8) "..." ocasional al cierre (a veces, modo sin estudios).
+        cuerpo = cuerpo.rstrip()
+        if cuerpo and rng.random() < 0.35:
+            if cuerpo.endswith(".") and not cuerpo.endswith("..."):
+                cuerpo = cuerpo[:-1] + "..."
+            elif not cuerpo.endswith((".", "!", "?", "…")):
+                cuerpo = cuerpo + "..."
+
+        # 9) Restaura hashtags intactos.
         for tag in tags:
             cuerpo = cuerpo.replace("\x00", tag, 1)
         cuerpo = cuerpo.replace("\x00", "").strip()
@@ -1150,14 +1692,100 @@ def _aplicar_estilo_ciudadano_local(texto: str, semilla: int = 0) -> str:
         return t
 
 
-def _humanizar_si_ciudadano(texto: str, registro, semilla: int = 0) -> str:
-    """Aplica el estilo ciudadano solo si el registro lo pide (nunca lanza)."""
+def _aplicar_estilo_activista_local(texto: str, semilla: int = 0) -> str:
+    """Humaniza un texto al registro activista (fallback local, nunca lanza).
+
+    Tecnico-coloquial: aplica EXACTAMENTE 2-3 errores ortograficos leves
+    (tildes omitidas, hay->ay, haber->aver, vez->ves, hacer->aser,
+    gracias->grasias, tambien->tmbn, b/v suave, q/pa/xq/tons/k ocasionales),
+    maximo 1 por palabra, y ELIMINA los signos de apertura "¿" y "¡" (los
+    cierres "?" y "!" se conservan). El mensaje sigue siendo legible y los
+    hashtags se conservan intactos y bien escritos.
+    """
+    t = (texto or "").strip()
+    if not t:
+        return t
     try:
-        if _es_registro_ciudadano(registro):
-            return _aplicar_estilo_ciudadano_local(texto, semilla)
+        rng = random.Random(int(semilla))
     except Exception:
-        pass
+        rng = random.Random(0)
+
+    try:
+        # 1) Protege hashtags para no deformarlos.
+        tags = re.findall(r"#[A-Za-z0-9ÁÉÍÓÚÜÑáéíóúüñ_]+", t)
+        cuerpo = re.sub(r"#[A-Za-z0-9ÁÉÍÓÚÜÑáéíóúüñ_]+", "\x00", t)
+
+        # 2) Exactamente 2-3 errores: primero los ORTOGRAFICOS (obligatorios)
+        #    y solo si no alcanzan, licencias q/pa/xq/tons y genericos.
+        objetivo = rng.randint(2, 3)
+        hechas = 0
+
+        candidatos = list(_ERRORES_ACTIVISTA)
+        rng.shuffle(candidatos)
+        for patron, repl in candidatos:
+            if hechas >= objetivo:
+                break
+            nuevo, n = re.subn(patron, repl, cuerpo, count=1,
+                               flags=re.IGNORECASE)
+            if n:
+                cuerpo = nuevo
+                hechas += 1
+
+        # Genericos (con tilde como ultimo recurso de ortografia).
+        evitar: set = set()
+        cuerpo, extra = _aplicar_genericos_estilo(
+            cuerpo, objetivo - hechas, evitar, rng, incluir_tilde=True
+        )
+        hechas += extra
+
+        # Licencias de redes al final: solo si los errores ortograficos y los
+        # genericos no alcanzaron (el activista no debe vivir de q/pa/xq/tons).
+        licencias = list(_LICENCIAS_ACTIVISTA)
+        rng.shuffle(licencias)
+        for patron, repl in licencias:
+            if hechas >= objetivo:
+                break
+            nuevo, n = re.subn(patron, repl, cuerpo, count=1,
+                               flags=re.IGNORECASE)
+            if n:
+                cuerpo = nuevo
+                hechas += 1
+
+        # 3) PROHIBIDO abrir signos: nunca "¿" ni "¡" (cierres intactos).
+        cuerpo = cuerpo.replace("¿", "").replace("¡", "")
+        cuerpo = re.sub(r"[ \t]{2,}", " ", cuerpo)
+
+        # 4) Restaura hashtags intactos.
+        for tag in tags:
+            cuerpo = cuerpo.replace("\x00", tag, 1)
+        cuerpo = cuerpo.replace("\x00", "").strip()
+        return cuerpo.strip() or t
+    except Exception as e:
+        logger.error(f"Error humanizando estilo activista: {e}")
+        return t
+
+
+def _humanizar_por_registro(texto: str, registro, semilla: int = 0) -> str:
+    """Aplica el estilo local del REGISTRO (nunca lanza).
+
+    - "ciudadana" -> modo humano completo (4-7 errores + malos signos).
+    - "activista" -> 2-3 errores ortograficos leves SIN abrir "¿"/"¡".
+    - "politica" / vacio / desconocido -> texto intacto (ortografia cuidada).
+    """
+    try:
+        canon = normalizar_tipo_cuenta(registro)
+    except Exception:
+        canon = ""
+    if canon == "ciudadana" or (not canon and _es_registro_ciudadano(registro)):
+        return _aplicar_estilo_ciudadano_local(texto, semilla)
+    if canon == "activista" or (not canon and _es_registro_activista(registro)):
+        return _aplicar_estilo_activista_local(texto, semilla)
     return texto
+
+
+def _humanizar_si_ciudadano(texto: str, registro, semilla: int = 0) -> str:
+    """Alias historico de `_humanizar_por_registro` (compatibilidad)."""
+    return _humanizar_por_registro(texto, registro, semilla)
 
 
 def _prompt_lote_mantenimiento(
@@ -1253,11 +1881,14 @@ def _prompt_lote_mantenimiento(
         "- Un texto por PERFIL, en el MISMO ORDEN en que aparecen.\n"
         "- Cada texto debe respetar el TEMA, la PERSONALIDAD, el REGISTRO y el "
         "FORMATO OBLIGATORIO POR PERFIL de su cuenta.\n"
-        "- Con REGISTRO CIUDADANO: cada texto con 3-6 rasgos humanos legibles "
-        "(faltas frecuentes, dislexias b/d-q/p-s/c/z-h muda-y/ll, mayusculas "
-        "inconsistentes, abreviaturas q/pa/xq/tons/k) y variacion total entre "
-        "textos; con REGISTRO POLITICO/ACTIVISTA: PROHIBIDOS los errores fuertes "
-        "(politico ortografia impecable, activista maximo 2-3 licencias leves).\n"
+        "- Con REGISTRO CIUDADANO: cada texto con 4-7 errores ortograficos "
+        "legibles (hay/ay, haber/a ver->aver, haya->haiga, b/v, s/c/z, h muda, "
+        "g/j, y/ll, abreviaturas q/pa/xq/tons/k), MALOS SIGNOS (casi sin comas "
+        "ni puntos, nunca '¿' ni '¡') y variacion total entre textos.\n"
+        "- Con REGISTRO ACTIVISTA: 2-3 errores ortograficos leves por texto, "
+        "PROHIBIDO abrir '¿' y '¡' (los cierres '?' y '!' se usan normales).\n"
+        "- Con REGISTRO POLITICO: ortografia cuidada; se permite COMO MÁXIMO UN "
+        "error leve opcional (p. ej. una tilde omitida) y ninguna abreviatura.\n"
         "- Los textos de COMENTARIO/RESPUESTA deben ser breves y conversacionales "
         "(1-2 frases; el perfil formal con sus 3 bloques pero cortos).\n"
         "- TODOS los textos DEBEN incluir al menos un hashtag INTEGRADO EN MEDIO "
@@ -1273,8 +1904,8 @@ def _fallback_estructura_mantenimiento(cuentas_info, n_por_cuenta) -> list[list[
     """Ultimo recurso: estructura valida con textos no vacios (nunca lanza).
 
     Respeta el perfil/tipo_accion/registro de cada cuenta y garantiza hashtag
-    en medio. Con registro ciudadano aplica el estilo humano local (faltas
-    legibles + dislexias + mayusculas inconsistentes + abreviaturas).
+    en medio. Aplica el estilo local de cada registro (ciudadana: malos signos
+    + 4-7 errores; activista: 2-3 errores sin abrir "¿"/"¡"; politica intacta).
     """
     try:
         lista = list(cuentas_info or [])
@@ -1301,12 +1932,12 @@ def _fallback_estructura_mantenimiento(cuentas_info, n_por_cuenta) -> list[list[
         vistos: set = set()
         for j in range(n):
             t = plantillas[(i + j) % len(plantillas)]
-            # Estilo ciudadano ANTES del hashtag (no deforma el tag).
-            t = _humanizar_si_ciudadano(t, registro, semilla=i * 100 + j)
+            # Estilo local por registro ANTES del hashtag (no deforma el tag).
+            t = _humanizar_por_registro(t, registro, semilla=i * 100 + j)
             t = _con_hashtag_en_medio(t)
             if t in vistos:
                 t = _variar_hasta_unico(t, vistos)
-                t = _humanizar_si_ciudadano(t, registro, semilla=i * 100 + j + 997)
+                t = _humanizar_por_registro(t, registro, semilla=i * 100 + j + 997)
                 t = _con_hashtag_en_medio(t)
             vistos.add(t)
             fila.append(t)
@@ -1423,36 +2054,53 @@ def _generar_textos_mantenimiento_impl(
 
         fila: list[str] = []
         vistos: set = set()
+
+        def _plantilla_local(j: int) -> str:
+            """Plantilla local (NO lee narrativa) del tema/perfil/accion."""
+            tema = temas_limpios[(i * n + j) % len(temas_limpios)]
+            if accion == "comentario":
+                plantillas = _plantillas_comentario(perfil)
+            else:
+                plantillas = _plantillas_por_perfil(tema, perfil)
+            base_t = (
+                plantillas[(i * n + j) % len(plantillas)]
+                .replace("{nombre}", nombre or "amig@")
+                .strip()
+            )
+            return base_t + _pie_personal(nombre, personalidad)
+
         for j in range(n):
             t = (resultado[i][j] or "").strip()
             es_fallback = not bool(t)
             if not t:
-                tema = temas_limpios[(i * n + j) % len(temas_limpios)]
-                if accion == "comentario":
-                    plantillas = _plantillas_comentario(perfil)
-                else:
-                    plantillas = _plantillas_por_perfil(tema, perfil)
-                t = (
-                    plantillas[(i * n + j) % len(plantillas)]
-                    .replace("{nombre}", nombre or "amig@")
-                    .strip()
-                )
-                t += _pie_personal(nombre, personalidad)
+                t = _plantilla_local(j)
                 hechas += 1
                 _reportar()
-            # Estilo ciudadano en TODOS los textos de ese registro (OpenAI y
+            elif narrativa:
+                # Red de seguridad: si el texto de la IA filtra la narrativa,
+                # se cambia por la plantilla local del mismo tema/perfil (que
+                # NO lee la narrativa) y conserva registro/perfil de la cuenta.
+                t = _reemplazo_sin_fuga(
+                    t, narrativa, lambda j=j: _plantilla_local(j)
+                )
+                if not t:
+                    t = _plantilla_local(j)
+            # Estilo local por registro en TODOS los textos (OpenAI y
             # fallback): el LLM tiende a devolver texto limpio aunque el prompt
             # pida errores, asi que se garantiza aqui. Se aplica ANTES del
             # hashtag para no deformar el tag; con semilla por (cuenta, texto)
             # para que cada texto varie.
-            t = _humanizar_si_ciudadano(t, registro, semilla=i * 100 + j)
+            t = _humanizar_por_registro(t, registro, semilla=i * 100 + j)
             t = _con_hashtag_en_medio(t)
             if t in vistos:
                 t = _variar_hasta_unico(t, vistos)
-                t = _humanizar_si_ciudadano(
+                t = _humanizar_por_registro(
                     t, registro, semilla=i * 100 + j + 997
                 )
                 t = _con_hashtag_en_medio(t)
+            # Signos de apertura: activista/ciudadana NUNCA abren "¿"/"¡"
+            # (aplica tambien a los textos de la IA); politica intacta.
+            t = _quitar_signos_por_registro(t, registro)
             vistos.add(t)
             fila.append(t)
         resultado[i] = fila
@@ -1681,11 +2329,11 @@ def _generar_citas_campana(
             t = (resultado[i][j] or "").strip()
             if not t:
                 t = f"{base} ({j + 1})" if base else f"Cita {j + 1}"
-            t = _humanizar_si_ciudadano(t, registro, semilla=i * 100 + j + 7)
+            t = _humanizar_por_registro(t, registro, semilla=i * 100 + j + 7)
             t = _con_hashtag_en_medio(t)
             if t in vistos_local:
                 t = _variar_hasta_unico(t, vistos_local)
-                t = _humanizar_si_ciudadano(
+                t = _humanizar_por_registro(
                     t, registro, semilla=i * 100 + j + 1997
                 )
                 t = _con_hashtag_en_medio(t)
@@ -1805,7 +2453,7 @@ def generar_pool_campana_por_cuenta(
             t = _con_hashtag_en_medio(t)
             if t in vistos:
                 t = _variar_hasta_unico(t, vistos)
-                t = _humanizar_si_ciudadano(t, registro, semilla=semilla)
+                t = _humanizar_por_registro(t, registro, semilla=semilla)
                 t = _con_hashtag_en_medio(t)
             vistos.add(t)
             return t
@@ -1972,7 +2620,7 @@ def _recortar_limite_hashtag(
 # SIEMPRE dentro de una opinion propia (prohibido devolver el contexto pelado o
 # "contexto + hashtag"). La clave "generico" aplica cuando el registro o el
 # perfil no se reconocen. El estilo humano ciudadano se aplica despues con
-# `_humanizar_si_ciudadano` (protege el hashtag para no deformarlo).
+# `_humanizar_por_registro` (protege el hashtag para no deformarlo).
 _PLANTILLAS_HASHTAGS = {
     "politica": {
         "formal": (
@@ -2088,7 +2736,7 @@ _PLANTILLAS_HASHTAGS = {
         "popular": (
             "con {contexto} y {tag}, así de simple",
             "hay cosas como {contexto} que se disfrutan, {tag} y ya",
-            "que bueno es {contexto}, {tag} y a disfrutar",
+            "qué bueno es {contexto}, {tag} y a disfrutar",
         ),
         "generico": (
             "Con esto de {contexto} uno aprende a valorar lo que tiene; {tag} "
@@ -2443,9 +3091,7 @@ def generar_textos_hashtags_por_cuenta(
             inicio_cuenta = i * 97
 
         def _estilizar(texto: str, semilla: int) -> str:
-            if registro == "ciudadana":
-                return _humanizar_si_ciudadano(texto, registro, semilla=semilla)
-            return texto
+            return _humanizar_por_registro(texto, registro, semilla=semilla)
 
         for j in range(n):
             t = str(resultado[i][j] or "").strip()
@@ -2453,6 +3099,21 @@ def generar_textos_hashtags_por_cuenta(
                 t = _texto_hashtag_local(
                     info, contexto, tags, i, j, rng, inicio=inicio_cuenta
                 )
+            elif narrativa:
+                # Red de seguridad: si el texto de la IA filtra la narrativa,
+                # se cambia por el texto local de la MISMA maquinaria (que no
+                # lee la narrativa), conservando hashtag pedido y estilo.
+                t = _reemplazo_sin_fuga(
+                    t,
+                    narrativa,
+                    lambda j=j: _texto_hashtag_local(
+                        info, contexto, tags, i, j, rng, inicio=inicio_cuenta
+                    ),
+                )
+                if not t:
+                    t = _texto_hashtag_local(
+                        info, contexto, tags, i, j, rng, inicio=inicio_cuenta
+                    )
             t = _estilizar(t, rng.randint(1, 10 ** 9))
             t = _garantizar_hashtag_pedido(t, tags, i * 1000 + j)
 
@@ -2487,6 +3148,9 @@ def generar_textos_hashtags_por_cuenta(
                         t, tags, i * 1000 + j + 1999
                     )
 
+            # Signos de apertura: activista/ciudadana nunca "¿"/"¡" (IA
+            # incluida); politica conserva los signos correctos.
+            t = _quitar_signos_por_registro(t, registro)
             # Contrato de largo: ningun texto sale > _MAX_LARGO_HASHTAG.
             t = _recortar_limite_hashtag(t, tags)
             if t in vistos:

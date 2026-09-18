@@ -633,6 +633,32 @@ python -m bot.main
 - **UI** (`web/operaciones/activacion_masiva.py`): se separaron los canales — `contexto` = tema manual (opinable), `narrativa` = noticias (trasfondo invisible). El panel ahora dice "solo trasfondo"; con solo noticias se puede lanzar en "solo posts" (`contexto=""`, `narrativa=noticias`).
 - Verificado: compileall global OK; suites motor 49/49 + 20/20 + 20/20 + 23/23 + 19/19; en pruebas con `narrativa="NOTICIA aviario Durango Toño Ochoa…"` los textos publicados (IA caída y local) NO contienen "aviario/Durango/Toño/Ochoa/zoológico" y respetan el registro de cada cuenta; AppTest de separación y regresión 15/15 pestañas con 0 excepciones.
 
+### Estilos de escritura por registro: ciudadana sin estudios, activista 2-3 errores, politica exacta (2026-09-18)
+- **Reglas nuevas del usuario** (aplican a posts, comentarios y variaciones de RT con cita):
+  - **politica**: texto exacto, bien puntuado; máximo **1 error leve opcional** (p. ej. una tilde); signos de apertura "¿"/"¡" correctos.
+  - **activista / técnico-coloquial**: 2-3 **errores ortográficos** obligatorios por texto (tildes omitidas, hay→ay, haber→aver, vez→ves, hacer→aser, gracias→grasias, también→tmbn, más q/pa/xq/tons/k ocasionales) y **PROHIBIDO abrir "¿" ni "¡"** (solo cierres "?"/"!"); argumento claro.
+  - **ciudadana / persona real "sin estudios"**: **4-7 errores** legibles por texto (hay/ay, "haber/a ver"→aver, haya→haiga, b/v, s/c/z, h muda, g/j, y/ll, s final en palabras largas →"tenemo", qu→k →"kiero", abreviaturas), **malos signos de puntuación** (casi sin comas/puntos, nunca "¿"/"¡", "..." ocasional al cierre), mayúsculas inconsistentes; el hashtag siempre intacto.
+- `ia/prompts.py`: `_REGLAS_REGISTRO` reescrito para los 3 registros y `_BLOQUES_ESTILO_PERFIL` alineado (ya no dicen "CERO faltas/impecable"); como `get_prompt_hashtags`, `get_prompt_comentario` y `generar_variaciones_masivas` pasan por `_reglas_registro`, la regla aplica a todos los flujos.
+- `ia/generador_contenido.py` (fallback local, IA caída):
+  - Nuevo `_aplicar_estilo_activista_local` (exactamente 2-3 errores, quita "¿"/"¡") y `_aplicar_estilo_ciudadano_local` reforzado (4-7 errores + malos signos); dispatcher `_humanizar_por_registro` en los 11 call sites (`_humanizar_si_ciudadano` queda como alias).
+  - Guarda `_PALABRAS_FUNCION` + longitudes mínimas en los edits genéricos: no se deforman palabras función (se acabó el `"ce able"` por `"se hable"`); `_GENERICOS_ESTILO` ahora suma `s` final (`tenemo`) y `qu→k` (`kiero`).
+  - Plantillas base de comentarios/mantenimiento/hashtags **acentuadas** (Reflexión, análisis, Ojalá, publicación…): los errores se inyectan DESPUÉS según el registro, así politica queda limpia y ciudadana/activista igual se ven humanos.
+- Verificado: compileall global OK; suites ia 43/43 estilos (3 corridas aleatorias), 23/23 palabras función, 55/55 trasfondo, 29/29 mantenimiento offline, 21/21 dedup; suites motor 49/49 + 20/20 + 20/20 + 23/23 + 19/19. Ejemplos reales con IA caída: politica `"Reflexión necesaria / Es un tema que exige análisis… #Informacion Ojalá se siga discutiendo con respeto."`; activista `"Totalmente de acuerdo, #Comunidad ase falta havlar de esto con calma."`; ciudadana `"oigan, x2 k weno ke se able de esto #Organizacion Asi soy: espontanea pues..."`.
+
+### Compositor de X robusto + detección de sesión expirada (2026-09-18)
+- **Bug en Railway**: `Exception: compositor de X no cargo: el editor visible no aparecio` al publicar posts (Sajtiagosal21, elreydelchitpos...). Causa: con la sesión caída X redirige `/compose/post` a `/i/flow/login` (o sirve un interstitial "Something went wrong") y la SPA no monta el diálogo; el bot hacía UN refresh, esperaba ~50s y lanzaba el error genérico, que el motor reintentaba con las MISMAS cookies vencidas.
+- `plataformas/twitter/selenium_bot.py`: `_hay_muro_login()` + `_frase_error_pagina()` + `_diagnostico_pagina()`; `_esperar_editor_visible` corta de inmediato con "sesión de X expirada o inválida: se pidió login al abrir el compositor (url=… title=…)" o "X mostró una página de error…", tolera `WebDriverException` transitorios y re-lanza los duros (`InvalidSessionId`/`NoSuchDriver`/`MaxRetry`/`connection refused`) para que el motor reintente con navegador nuevo; el mensaje final conserva "compositor de X no cargo" + diagnóstico.
+- `_abrir_compositor()`: 3 rutas (`/compose/post` → `/compose/tweet` → `/home` + botón "Nuevo post") con log de la ruta que funcionó; `publicar_tweet` y el post nuevo de `publicar_hilo` lo usan (cita/respuesta intactas).
+- `activaciones/motor.py`: `_SENALES_SESION_INVALIDA` + `_es_error_sesion_invalida`; la sesión expirada NO se reintenta y el detalle es "sesión de X expirada: renueva cookies/login" (no marca suspendida); "compositor de x no cargo" sigue reintentable.
+- Verificado: FakeDriver 40/40 (login wall rápido, página de error, fallbacks de ruta, transitorios, diagnóstico) + suites motor 49/20/20/23/19 + like 29.
+
+### Anti-fuga de narrativa + signos de apertura en textos de IA (2026-09-18)
+- **Red de seguridad determinista**: `ia/generador_contenido.py::_fuga_narrativa(texto, narrativa)` detecta si un texto de IA repite términos distintivos de la narrativa (tokens ≥7 letras como palabra completa; True con ≥2 distintos o 1 de ≥10; stoplist de genéricos) y `_reemplazo_sin_fuga()` lo sustituye por el fallback local (que jamás lee narrativa). Aplicado en hashtags, comentarios/mantenimiento y variaciones de cita.
+- `_quitar_signos_apertura` + `_quitar_signos_por_registro`: en textos de IA y locales de activista/ciudadana se eliminan "¿"/"¡" (se conservan "?"/"!"); política los conserva.
+- Caso real: texto con "aviario/descuentazo/#ZoologicoDurango" → reemplazado por local genérico sin rastro.
+- Verificado: 45/45 red de seguridad + suites ia (43/23/55/29) y motor (49/20/20/23/19).
+- ⚠ **Railway debe redeployarse**: la instancia que publicó el texto con la noticia literal corría una versión anterior a los cambios de trasfondo/registros; tras redeploy los posts se generan con las reglas nuevas y la red anti-fuga.
+
 ### Pendiente
 - Probar `ia/contexto_noticias.generar_contexto_desde_links` con `OPENAI_API_KEY` real (hoy verificado con IA simulada; el fallback local ya funciona)
 - Reemplazar tokens placeholder en `.env` por claves reales (Telegram, Gemini, Grizzly)

@@ -116,6 +116,47 @@ _SENALES_ERROR_PUBLICACION_SEGURA = (
 )
 
 
+# Sesion de X caida (cookies vencidas o login pedido al abrir el compositor):
+# reintentar con las MISMAS cookies solo repetiria el fallo, asi que NO es
+# reintentable ni significa que la cuenta este suspendida. El detalle se
+# normaliza para indicar la accion real (renovar cookies/login).
+_SENALES_SESION_INVALIDA = (
+    "sesión de x expirada",
+    "sesion de x expirada",
+    "se pidió login",
+    "se pidio login",
+)
+
+MENSAJE_SESION_INVALIDA = "sesión de X expirada: renueva cookies/login"
+
+
+def _es_error_sesion_invalida(detalle) -> bool:
+    """True si el detalle indica que la sesion de X ya no es valida.
+
+    Tolera None y tipos raros; nunca lanza.
+    """
+    try:
+        texto = "" if detalle is None else str(detalle).lower()
+    except Exception:
+        return False
+    return any(senal in texto for senal in _SENALES_SESION_INVALIDA)
+
+
+def _detalle_con_sesion(motivo) -> str:
+    """Devuelve el detalle listo para reportar, normalizando la sesion caida.
+
+    Si `motivo` corresponde a sesion expirada/invalida se reemplaza por
+    `MENSAJE_SESION_INVALIDA`; si no, se devuelve el texto original ('' si
+    viene vacio o no es convertible).
+    """
+    if _es_error_sesion_invalida(motivo):
+        return MENSAJE_SESION_INVALIDA
+    try:
+        return "" if motivo is None else str(motivo)
+    except Exception:
+        return ""
+
+
 def _es_error_driver_transitorio(detalle) -> bool:
     """True si el detalle parece un fallo transitorio de driver/navegador.
 
@@ -136,8 +177,12 @@ def _es_error_reintentable(detalle) -> bool:
 
     Incluye los fallos transitorios de driver/navegador y los fallos de
     publicacion donde el texto no llego a enviarse (boton Post deshabilitado o
-    editor que no registro el texto). Nunca lanza.
+    editor que no registro el texto). EXCLUYE la sesion expirada/invalida:
+    reintentar con las mismas cookies no arregla nada y hay que renovarlas.
+    Nunca lanza.
     """
+    if _es_error_sesion_invalida(detalle):
+        return False
     if _es_error_driver_transitorio(detalle):
         return True
     try:
@@ -1205,7 +1250,8 @@ class MotorActivacion:
             if not bot.login_con_cookies():
                 motivo = getattr(bot, "ultimo_error", "") or "login fallido"
                 logger.warning(f"Login fallido para @{cuenta.usuario}: {motivo}")
-                return (cuenta.usuario, False, motivo[:120], "")
+                detalle = _detalle_con_sesion(motivo) or "login fallido"
+                return (cuenta.usuario, False, detalle[:120], "")
 
             res = bot.solo_retwittear(
                 [url],
@@ -1216,11 +1262,16 @@ class MotorActivacion:
 
             ok = res.get("exitos", 0) > 0
             url_publicada = (res.get("urls") or [""])[0] if res.get("urls") else ""
-            return (cuenta.usuario, ok, "ok" if ok else "sin exito", url_publicada)
+            if ok:
+                return (cuenta.usuario, True, "ok", url_publicada)
+            motivo = getattr(bot, "ultimo_error", "") or "sin exito"
+            detalle = _detalle_con_sesion(motivo) or "sin exito"
+            return (cuenta.usuario, False, detalle[:120], url_publicada)
 
         except Exception as e:
             logger.error(f"Error en @{cuenta.usuario}: {e}")
-            return (cuenta.usuario, False, str(e)[:80], "")
+            detalle = _detalle_con_sesion(f"{type(e).__name__}: {e}") or str(e)
+            return (cuenta.usuario, False, detalle[:120], "")
         finally:
             if bot is not None:
                 if getattr(bot, "cuenta_suspendida", False):
@@ -1288,7 +1339,8 @@ class MotorActivacion:
             if not bot.login_con_cookies():
                 motivo = getattr(bot, "ultimo_error", "") or "login fallido"
                 logger.warning(f"Login fallido para @{cuenta.usuario}: {motivo}")
-                return (cuenta.usuario, rol, False, motivo[:120], url_objetivo)
+                detalle = _detalle_con_sesion(motivo) or "login fallido"
+                return (cuenta.usuario, rol, False, detalle[:120], url_objetivo)
 
             if rol == "cita":
                 res = bot.solo_retwittear(
@@ -1301,7 +1353,8 @@ class MotorActivacion:
                 urls_pub = res.get("urls") or []
                 url_publicada = urls_pub[0] if urls_pub else url_objetivo
                 detalle = "ok" if ok else (
-                    getattr(bot, "ultimo_error", "") or "sin exito"
+                    _detalle_con_sesion(getattr(bot, "ultimo_error", ""))
+                    or "sin exito"
                 )
                 return (cuenta.usuario, rol, ok, detalle[:120], url_publicada)
 
@@ -1317,7 +1370,8 @@ class MotorActivacion:
                 # ya devuelve el perfil de quien retwittea, no el tweet original.
                 url_publicada = urls_pub[0] if urls_pub else f"https://twitter.com/{cuenta.usuario}"
                 detalle = "ok" if ok else (
-                    getattr(bot, "ultimo_error", "") or "sin exito"
+                    _detalle_con_sesion(getattr(bot, "ultimo_error", ""))
+                    or "sin exito"
                 )
                 return (cuenta.usuario, rol, ok, detalle[:120], url_publicada)
 
@@ -1332,7 +1386,9 @@ class MotorActivacion:
                     detalle = "comentario publicado"
                 else:
                     motivo = getattr(bot, "ultimo_error", "") or "sin exito"
-                    detalle = f"comentario: {motivo}"
+                    # La sesion caida se reporta sin prefijo, con la accion
+                    # concreta (renovar cookies/login); no es suspension.
+                    detalle = _detalle_con_sesion(f"comentario: {motivo}")
                 return (cuenta.usuario, rol, ok, detalle[:120], url_objetivo)
 
             # rol == "hashtags"
@@ -1348,14 +1404,15 @@ class MotorActivacion:
                 detalle = "hashtags publicados"
             else:
                 motivo = getattr(bot, "ultimo_error", "") or "sin exito"
-                detalle = f"hashtags: {motivo}"
+                detalle = _detalle_con_sesion(f"hashtags: {motivo}")
             return (cuenta.usuario, rol, ok, detalle[:120], url_publicada)
 
         except Exception as e:
             logger.error(f"Error en @{cuenta.usuario} (rol {rol}): {e}")
+            detalle = _detalle_con_sesion(f"{type(e).__name__}: {e}")
             return (
                 cuenta.usuario, rol, False,
-                f"{type(e).__name__}: {e}"[:120], url_objetivo,
+                detalle[:120], url_objetivo,
             )
         finally:
             if bot is not None:
