@@ -22,6 +22,7 @@ from core.database import get_db_session
 from core.models import Cuenta
 from core.config import settings, resolver_ruta
 from core.roles import normalizar_rol_activacion
+from core.secciones import normalizar_seccion
 from core.registros import normalizar_tipo_cuenta
 from core.perfiles import normalizar_perfil, colocar_hashtag_en_medio
 from activaciones.variaciones import generar_pool_variaciones_openai, variar_texto
@@ -211,11 +212,105 @@ def _sugerencia_registro(n: int) -> str:
     )
 
 
+def _filtrar_por_seccion(cuentas: list, secciones) -> list:
+    """Filtra cuentas por seccion canonica (CI/IP/LIB/JUS...).
+
+    Normaliza las secciones pedidas con `core.secciones.normalizar_seccion` y
+    descarta las que no son validas (""). Si `secciones` viene vacio o None NO
+    hay filtro: devuelve todas las cuentas. Si se pidieron secciones pero
+    ninguna normaliza a un codigo valido, devuelve [] (nada coincide). Filtra
+    objetos cuyo `getattr(c, "seccion", "")` normalizado este en el set.
+    Nunca lanza.
+    """
+    try:
+        lista = list(cuentas or [])
+    except TypeError:
+        return []
+    if not secciones:
+        return lista
+    if isinstance(secciones, str):
+        valores = [secciones]
+    else:
+        try:
+            valores = list(secciones)
+        except TypeError:
+            valores = [secciones]
+    pedidas = set()
+    for valor in valores:
+        try:
+            clave = normalizar_seccion(valor)
+        except Exception:
+            clave = ""
+        if clave:
+            pedidas.add(clave)
+    if not pedidas:
+        return []
+    resultado = []
+    for cuenta in lista:
+        try:
+            propia = normalizar_seccion(getattr(cuenta, "seccion", ""))
+        except Exception:
+            propia = ""
+        if propia in pedidas:
+            resultado.append(cuenta)
+    return resultado
+
+
+def _clamp_porcentaje(valor, default: float) -> float:
+    """Acota un porcentaje a [1, 100]; con None/raros usa `default`."""
+    try:
+        numero = float(valor)
+    except (TypeError, ValueError):
+        return float(default)
+    if numero != numero:  # NaN
+        return float(default)
+    return min(100.0, max(1.0, numero))
+
+
+def _calcular_k_ronda(n: int, min_pct: float, max_pct: float) -> int:
+    """Cantidad de cuentas de una ronda con subconjunto aleatorio.
+
+    Devuelve estrictamente mas del minimo y estrictamente menos que todas
+    (nunca todas), salvo que con `n` tan pequeno (<=2) o un rango imposible no
+    se pueda: ahi devuelve n. Nunca lanza.
+    """
+    try:
+        n = int(n)
+    except (TypeError, ValueError):
+        return 0
+    if n <= 0:
+        return 0
+    if n <= 2:
+        return n
+    try:
+        k_min = max(2, int(n * float(min_pct) / 100.0) + 1)
+        k_max = min(n - 1, max(1, int(n * float(max_pct) / 100.0)))
+        if float(max_pct) >= 100.0:
+            k_max = n - 1
+    except (TypeError, ValueError):
+        return n
+    if k_min > k_max:
+        return n
+    k = random.randint(k_min, k_max)
+    return max(1, min(n, k))
+
+
 def _normalizar_rol_sorteo(valor) -> str:
-    """Normaliza un rol para el sorteo; acepta el alias "post" -> hashtags."""
+    """Normaliza un rol para el sorteo; acepta el alias "post" -> hashtags.
+
+    Incluye el rol nuevo "comentario" (y sus variantes) por si core/roles.py
+    aun no lo conoce: el sorteo nunca debe quedarse sin ese rol.
+    """
     rol = normalizar_rol_activacion(valor)
-    if not rol and str(valor or "").strip().lower() in ("post", "posts"):
-        rol = "hashtags"
+    if not rol:
+        texto = str(valor or "").strip().lower()
+        if texto in ("post", "posts"):
+            rol = "hashtags"
+        elif texto in (
+            "comentario", "comentarios", "comentar", "comenta",
+            "respuesta", "respuestas", "reply", "replies",
+        ):
+            rol = "comentario"
     return rol
 
 
@@ -223,7 +318,8 @@ def _roles_disponibles_aleatorios(urls, hashtags="", contexto="",
                                   texto_base="", solo_roles=None) -> list[str]:
     """Roles que se pueden sortear con los inputs dados (modo aleatorio).
 
-    - "cita" y "rt" requieren al menos una URL objetivo.
+    - "cita", "rt" y "comentario" requieren al menos una URL objetivo (el
+      comentario responde al tweet ancla).
     - "hashtags" requiere hashtags, contexto o texto base.
     - `solo_roles`, si viene, limita el sorteo a su interseccion con los
       disponibles; si la interseccion queda vacia se usan todos los
@@ -237,7 +333,7 @@ def _roles_disponibles_aleatorios(urls, hashtags="", contexto="",
         except TypeError:
             hay_urls = False
         if hay_urls:
-            disponibles.extend(["cita", "rt"])
+            disponibles.extend(["cita", "rt", "comentario"])
         if (
             str(hashtags or "").strip()
             or str(contexto or "").strip()
@@ -472,7 +568,7 @@ class MotorActivacion:
             }
 
     def _obtener_cuentas(self, cantidad: int = None, tags: list[str] = None,
-                         grupo: str = None) -> list[Cuenta]:
+                         grupo: str = None, secciones=None) -> list[Cuenta]:
         with get_db_session() as db:
             query = db.query(Cuenta).filter(
                 Cuenta.plataforma == "twitter",
@@ -491,17 +587,21 @@ class MotorActivacion:
         if cantidad:
             cuentas = cuentas[:cantidad]
 
+        cuentas = _filtrar_por_seccion(cuentas, secciones)
+
         return cuentas
 
     def _obtener_cuentas_por_rol(self, usuarios: list | None = None,
-                                 solo_roles: list | None = None) -> list[Cuenta]:
+                                 solo_roles: list | None = None,
+                                 secciones=None) -> list[Cuenta]:
         """Cuentas twitter activas filtradas por usuarios y/o roles.
 
         Reutiliza `_obtener_cuentas` (sin modificarlo) y agrega los filtros:
         - usuarios: limita a esos nombres de usuario (ignora '@' y mayusculas).
         - solo_roles: limita a los roles normalizados indicados (core/roles.py).
+        - secciones: pasa el filtro de seccion a `_obtener_cuentas`.
         """
-        cuentas = self._obtener_cuentas()
+        cuentas = self._obtener_cuentas(secciones=secciones)
 
         if usuarios:
             deseados = {
@@ -594,24 +694,40 @@ class MotorActivacion:
         return pool[:cantidad]
 
     @staticmethod
-    def _asignar_roles_aleatorios(cuentas: list, disponibles: list) -> dict:
+    def _asignar_roles_aleatorios(cuentas: list, disponibles: list,
+                                  roles_previos: dict | None = None) -> dict:
         """Sortea un rol de `disponibles` para cada cuenta de `cuentas`.
 
-        Devuelve `{usuario: rol}`; con `disponibles` vacio deja "" (defensivo,
-        el llamador ya valida que haya al menos uno). Nunca lanza.
+        Devuelve `{usuario: rol}`. Con `roles_previos` ({usuario: rol}) la
+        cuenta recibe un rol DISTINTO al de su participacion anterior cuando
+        hay mas de una opcion; si `disponibles` solo trae un rol (o ninguno),
+        se usa la lista completa como fallback y puede repetirlo. Con
+        `disponibles` vacio deja "" (defensivo, el llamador ya valida que haya
+        al menos uno). Nunca lanza.
         """
         roles = {}
+        previos = roles_previos if isinstance(roles_previos, dict) else {}
+        try:
+            opciones = list(disponibles or [])
+        except TypeError:
+            opciones = []
         for cuenta in (cuentas or []):
             try:
-                roles[cuenta.usuario] = random.choice(disponibles)
+                usuario = cuenta.usuario
+                previo = previos.get(usuario)
+                candidatos = [r for r in opciones if r != previo] or opciones
+                roles[usuario] = random.choice(candidatos) if candidatos else ""
             except Exception:
-                roles[cuenta.usuario] = ""
+                try:
+                    roles[cuenta.usuario] = ""
+                except Exception:
+                    pass
         return roles
 
     @staticmethod
     def _grupos_desde_roles(cuentas: list, roles_por_usuario: dict) -> dict:
         """Agrupa cuentas por el rol REAL sorteado (ignora el rol guardado)."""
-        grupos = {"cita": [], "hashtags": [], "rt": []}
+        grupos = {"cita": [], "hashtags": [], "comentario": [], "rt": []}
         for cuenta in (cuentas or []):
             rol = roles_por_usuario.get(cuenta.usuario, "")
             if rol in grupos:
@@ -631,6 +747,10 @@ class MotorActivacion:
         - "hashtags": posts ORIGINALES por cuenta con IA (registro/perfil);
           si la IA falla o no devuelve texto, rellena con `_pool_hashtags`
           (comportamiento anterior) y agrega las menciones al final.
+        - "comentario": respuestas ORIGINALES por cuenta con IA
+          (`generar_textos_comentario`, registro/perfil) sobre el tweet ancla
+          (contexto/texto base); si la IA falla, cae al pool de variaciones y,
+          en ultimo caso, a un texto local con los hashtags pedidos.
         - "rt": sin texto ("").
         Nunca lanza por la IA: ante cualquier fallo usa el pool de respaldo.
         """
@@ -728,6 +848,104 @@ class MotorActivacion:
                         textos_ia[cuenta.usuario], menciones_norm
                     )
 
+        cuentas_comentario = list(grupos_ejec.get("comentario") or [])
+        if cuentas_comentario:
+            material = (
+                str(contexto or "").strip() or str(texto_base or "").strip()
+            )
+            narrativa_com = narrativa
+            if material:
+                instruccion = f"Comenta el tweet ancla sobre: {material}"
+                narrativa_com = (
+                    f"{instruccion}\n{narrativa}" if narrativa else instruccion
+                )
+            textos_ia_com: dict = {}
+            try:
+                from ia.generador_contenido import generar_textos_comentario
+
+                cuentas_info = []
+                for cuenta in cuentas_comentario:
+                    cuentas_info.append({
+                        "usuario": cuenta.usuario,
+                        "registro": normalizar_tipo_cuenta(
+                            getattr(cuenta, "tipo_cuenta", "")
+                        ),
+                        "personalidad": (
+                            getattr(cuenta, "personalidad", "") or ""
+                        ),
+                        "seccion": getattr(cuenta, "seccion", "") or "",
+                        "nombre": (
+                            getattr(cuenta, "nombre_mostrado", "")
+                            or cuenta.usuario
+                        ),
+                        "perfil": normalizar_perfil(
+                            getattr(cuenta, "perfil_personalidad", "")
+                        ),
+                    })
+                resultado_ia = generar_textos_comentario(
+                    cuentas_info,
+                    n_por_cuenta=1,
+                    narrativa=narrativa_com,
+                    entrenamiento=entrenamiento,
+                )
+                for i, cuenta in enumerate(cuentas_comentario):
+                    lista = None
+                    if isinstance(resultado_ia, dict):
+                        lista = resultado_ia.get(cuenta.usuario)
+                    elif (
+                        isinstance(resultado_ia, (list, tuple))
+                        and i < len(resultado_ia)
+                    ):
+                        lista = resultado_ia[i]
+                    if isinstance(lista, str):
+                        lista = [lista]
+                    if lista:
+                        texto_ia = str(lista[0] or "").strip()
+                        if texto_ia:
+                            textos_ia_com[cuenta.usuario] = texto_ia
+            except Exception as e:
+                logger.error(
+                    f"Activacion por roles: IA de comentarios fallo "
+                    f"({type(e).__name__}: {e}); se usa el pool de respaldo"
+                )
+
+            faltantes = [
+                c for c in cuentas_comentario
+                if c.usuario not in textos_ia_com
+            ]
+            if faltantes:
+                base_respaldo = (
+                    str(texto_base or "").strip()
+                    or str(contexto or "").strip()
+                )
+                respaldo = []
+                if base_respaldo:
+                    try:
+                        respaldo = generar_pool_variaciones_openai(
+                            base_respaldo,
+                            cantidad=len(faltantes),
+                            narrativa=narrativa,
+                            entrenamiento=entrenamiento,
+                        )
+                    except Exception:
+                        respaldo = []
+                if not isinstance(respaldo, list):
+                    respaldo = []
+                random.shuffle(respaldo)
+                for i, cuenta in enumerate(faltantes):
+                    texto = (
+                        str(respaldo[i] or "").strip()
+                        if i < len(respaldo) else ""
+                    )
+                    if not texto and tags:
+                        semilla = base_respaldo or " ".join(tags)
+                        texto = _garantizar_hashtags_texto(semilla, tags)
+                    textos_ia_com[cuenta.usuario] = texto
+            for cuenta in cuentas_comentario:
+                asignaciones[cuenta.usuario] = textos_ia_com.get(
+                    cuenta.usuario, ""
+                )
+
         for cuenta in (grupos_ejec.get("rt") or []):
             asignaciones[cuenta.usuario] = ""
 
@@ -735,7 +953,8 @@ class MotorActivacion:
 
     def _bucle_rondas(self, procesables: list, duracion_min: int,
                       generar_textos, ejecutar_uno, reportar,
-                      cooldown_min: float = 0) -> int:
+                      cooldown_min: float = 0, porcentaje_min_ronda=40,
+                      porcentaje_max_ronda=90) -> int:
         """Ejecuta acciones en rondas hasta agotar `duracion_min`.
 
         Worker-pool con cola compartida: `self.max_concurrente` workers toman
@@ -744,11 +963,18 @@ class MotorActivacion:
         que no alcanzan a ejecutar antes del deadline se omiten sin abrir
         navegador. Devuelve el numero de rondas iniciadas. Nunca lanza.
 
-        `generar_textos(ronda)` puede devolver `{usuario: texto}` o la tupla
-        `({usuario: texto}, {usuario: rol})`; ambos mapas se guardan JUNTOS en
-        el mismo lock, de modo que el rol viaja con su texto y ninguna ronda
-        pisa el mapa de otra. `ejecutar_uno(cuenta, texto, rol)` recibe ese
-        rol ("" cuando no aplica).
+        Cada ronda (incluida la primera) trabaja sobre un SUBCONJUNTO
+        ALEATORIO de `procesables`: entre `porcentaje_min_ronda` (estricto) y
+        `porcentaje_max_ronda` de las cuentas, nunca todas (salvo con <=2
+        cuentas o un rango imposible). El subconjunto se pasa a
+        `generar_textos(ronda, [usuarios])`; si el callback solo acepta un
+        argumento (TypeError) se reintenta como `generar_textos(ronda)`.
+
+        `generar_textos(ronda, usuarios=None)` puede devolver `{usuario:
+        texto}` o la tupla `({usuario: texto}, {usuario: rol})`; ambos mapas se
+        guardan JUNTOS en el mismo lock, de modo que el rol viaja con su texto
+        y ninguna ronda pisa el mapa de otra. `ejecutar_uno(cuenta, texto,
+        rol)` recibe ese rol ("" cuando no aplica).
 
         `cooldown_min` > 0: la MISMA cuenta no repite accion antes de ese
         numero de minutos (medidos desde su ultimo despacho). Si la cuenta en
@@ -764,6 +990,10 @@ class MotorActivacion:
             cooldown_seg = max(0.0, float(cooldown_min or 0)) * 60.0
         except (TypeError, ValueError):
             cooldown_seg = 0.0
+        min_pct = _clamp_porcentaje(porcentaje_min_ronda, 40)
+        max_pct = _clamp_porcentaje(porcentaje_max_ronda, 90)
+        if min_pct > max_pct:
+            min_pct, max_pct = max_pct, min_pct
         fin = time.monotonic() + minutos * 60
         n_workers = max(1, int(self.max_concurrente or 1))
         estado = {
@@ -785,11 +1015,23 @@ class MotorActivacion:
             estado["ronda"] += 1
             with self._lock:
                 self.progreso["ronda_actual"] = estado["ronda"]
-            estado["orden"] = list(procesables)
-            random.shuffle(estado["orden"])
+            k = _calcular_k_ronda(len(procesables), min_pct, max_pct)
+            if k >= len(procesables):
+                subset = list(procesables)
+            else:
+                try:
+                    subset = random.sample(procesables, k)
+                except Exception:
+                    subset = list(procesables)
+            random.shuffle(subset)
+            estado["orden"] = subset
             estado["cursor"] = 0
+            usuarios = [c.usuario for c in subset]
             try:
-                generado = generar_textos(estado["ronda"])
+                try:
+                    generado = generar_textos(estado["ronda"], usuarios)
+                except TypeError:
+                    generado = generar_textos(estado["ronda"])
             except Exception as e:
                 logger.error(
                     f"Activacion (rondas): no se pudieron generar los textos "
@@ -1100,6 +1342,9 @@ class MotorActivacion:
         hashtags: str = "",
         solo_con_registro: bool = False,
         repetir: bool = False,
+        secciones=None,
+        porcentaje_min_ronda=40,
+        porcentaje_max_ronda=90,
     ) -> dict:
         """Lanza la campaña completa.
 
@@ -1111,11 +1356,18 @@ class MotorActivacion:
         - solo_con_registro: salta las cuentas sin registro (politica/
           activista/ciudadana) sin abrir navegador y las cuenta aparte.
         - repetir: con True las cuentas trabajan en rondas hasta agotar
-          `duracion_min`, regenerando textos nuevos en cada ronda.
+          `duracion_min`, regenerando textos nuevos en cada ronda y con un
+          subconjunto aleatorio de cuentas por ronda (ver porcentajes).
+        - secciones: limita a las cuentas de esas secciones (CI/IP/LIB/JUS...);
+          vacio o None = todas.
+        - porcentaje_min_ronda/porcentaje_max_ronda: con `repetir=True`, rango
+          de cuentas por ronda (estricto: mas del minimo, menos que todas).
         """
         with self._lock:
             self.progreso["ronda_actual"] = 1
-        cuentas = self._obtener_cuentas(cantidad_cuentas, tags, grupo)
+        cuentas = self._obtener_cuentas(
+            cantidad_cuentas, tags, grupo, secciones
+        )
 
         sin_registro = []
         if solo_con_registro:
@@ -1214,10 +1466,18 @@ class MotorActivacion:
 
             usados: dict = {}
 
-            def _generar_textos_ronda(_ronda):
+            def _generar_textos_ronda(_ronda, usuarios=None):
+                if usuarios is None:
+                    base = list(con_sesion)
+                else:
+                    try:
+                        deseados = {str(u) for u in usuarios}
+                    except TypeError:
+                        deseados = set()
+                    base = [c for c in con_sesion if c.usuario in deseados]
                 nuevo = generar_pool_variaciones_openai(
                     texto_base,
-                    cantidad=len(con_sesion),
+                    cantidad=len(base),
                     narrativa=_narrativa_con_ronda(narrativa, _ronda),
                     entrenamiento=entrenamiento,
                 )
@@ -1234,7 +1494,7 @@ class MotorActivacion:
                             texto_base, tags_pedidos
                         )
                     )
-                    for i, cuenta in enumerate(con_sesion)
+                    for i, cuenta in enumerate(base)
                 }
                 return _aplicar_anti_repeticion(asignaciones_ronda, usados)
 
@@ -1293,6 +1553,8 @@ class MotorActivacion:
                 _generar_textos_ronda,
                 _ejecutar_una_cuenta,
                 _reportar_ronda,
+                porcentaje_min_ronda=porcentaje_min_ronda,
+                porcentaje_max_ronda=porcentaje_max_ronda,
             )
             logger.info(
                 f"Activacion finalizada (rondas): {resumen['exitosas']} exitosas, "
@@ -1407,18 +1669,25 @@ class MotorActivacion:
         repetir: bool = False,
         roles_aleatorios: bool = False,
         cooldown_min: float = 0,
+        secciones=None,
+        porcentaje_min_ronda=40,
+        porcentaje_max_ronda=90,
     ) -> dict:
         """Campaña masiva dividida en subcuentas por rol.
 
         - Carga cuentas twitter activas; si `usuarios` se pasa, limita a esos
           usuarios; si `solo_roles`, filtra a esos roles (salvo en modo
-          aleatorio, donde `solo_roles` es el subconjunto a sortear).
+          aleatorio, donde `solo_roles` es el subconjunto a sortear); si
+          `secciones`, limita a esas secciones (CI/IP/LIB/JUS...).
         - Agrupa por Cuenta.rol_activacion (normalizado con core/roles.py):
             * "cita": quote-RT con texto del pool (OpenAI + fallback local)
               con los hashtags pedidos garantizados.
             * "hashtags": posts ORIGINALES por cuenta con IA (registro/perfil)
               sobre `contexto`; si la IA falla, cae al pool de respaldo
               base + hashtags + menciones.
+            * "comentario": respuestas ORIGINALES por cuenta con IA sobre el
+              tweet ancla (`contexto`/`texto_base`); si la IA falla, cae al
+              pool de variaciones.
             * "rt": retweet simple (con like opcional).
         - Cuentas SIN rol se saltan y se cuentan en `sin_rol`.
         - Cuentas SIN ninguna credencial de sesion (.pkl, cookies_json ni
@@ -1427,15 +1696,21 @@ class MotorActivacion:
         - `solo_con_registro`: salta las cuentas sin registro (politica/
           activista/ciudadana) sin abrir navegador y las cuenta aparte.
         - `repetir`: con True las cuentas trabajan en rondas hasta agotar
-          `duracion_min`, regenerando textos nuevos en cada ronda.
+          `duracion_min`, regenerando textos nuevos en cada ronda y con un
+          subconjunto aleatorio de cuentas por ronda (ver porcentajes).
         - `roles_aleatorios`: en vez del rol guardado, a CADA cuenta le toca
-          un rol sorteado (cita/rt con URLs, hashtags con hashtags/contexto/
-          texto base) en cada ronda. `solo_roles` limita el sorteo a esa
-          interseccion; sin roles posibles devuelve el resumen vacio con
-          `sugerencia_roles` sin abrir ningun navegador.
+          un rol sorteado (cita/comentario/rt con URLs, hashtags con hashtags/
+          contexto/texto base) en cada ronda; una cuenta que participa en
+          rondas seguidas NUNCA repite su rol anterior mientras haya 2+ roles
+          posibles. `solo_roles` limita el sorteo a esa interseccion; sin
+          roles posibles devuelve el resumen vacio con `sugerencia_roles` sin
+          abrir ningun navegador.
         - `cooldown_min`: minutos minimos entre dos acciones de la MISMA
           cuenta (0 = sin descanso). Las cuentas en descanso se mueven al
           final de la ronda y no se ejecutan antes de tiempo.
+        - `porcentaje_min_ronda`/`porcentaje_max_ronda`: con `repetir=True`,
+          rango de cuentas por ronda (estricto: mas del minimo, menos que
+          todas).
         - Cohortes temporales + delay aleatorio y concurrencia limitada,
           igual que `ejecutar()`.
         - Nunca lanza: cada cuenta fallida se reporta en `detalles`.
@@ -1463,6 +1738,7 @@ class MotorActivacion:
                 "por_rol": {
                     "cita": {"total": 0, "exitosas": 0, "fallidas": 0},
                     "hashtags": {"total": 0, "exitosas": 0, "fallidas": 0},
+                    "comentario": {"total": 0, "exitosas": 0, "fallidas": 0},
                     "rt": {"total": 0, "exitosas": 0, "fallidas": 0},
                 },
                 "detalles": [],
@@ -1478,7 +1754,7 @@ class MotorActivacion:
                 "sugerencia_roles": sugerencia_roles,
             }
         cuentas = self._obtener_cuentas_por_rol(
-            usuarios, None if roles_aleatorios else solo_roles
+            usuarios, None if roles_aleatorios else solo_roles, secciones
         )
 
         sin_registro = []
@@ -1494,7 +1770,7 @@ class MotorActivacion:
                 f"registro definido, se omiten. {sugerencia_registro}"
             )
 
-        grupos = {"cita": [], "hashtags": [], "rt": []}
+        grupos = {"cita": [], "hashtags": [], "comentario": [], "rt": []}
         sin_rol_usuarios = []
         if roles_aleatorios:
             # El rol guardado no filtra: cada cuenta recibe un rol sorteado en
@@ -1511,7 +1787,10 @@ class MotorActivacion:
                 else:
                     sin_rol_usuarios.append(cuenta.usuario)
 
-            procesables = grupos["cita"] + grupos["hashtags"] + grupos["rt"]
+            procesables = (
+                grupos["cita"] + grupos["hashtags"]
+                + grupos["comentario"] + grupos["rt"]
+            )
             rol_de = {
                 cuenta.usuario: normalizar_rol_activacion(
                     getattr(cuenta, "rol_activacion", "")
@@ -1521,7 +1800,7 @@ class MotorActivacion:
         ejecutables, sin_sesion = _partir_por_sesion(procesables)
         sin_sesion_usuarios = [c.usuario for c in sin_sesion]
         sugerencia_sesion = _sugerencia_sesion(len(sin_sesion)) if sin_sesion else ""
-        grupos_ejec = {"cita": [], "hashtags": [], "rt": []}
+        grupos_ejec = {"cita": [], "hashtags": [], "comentario": [], "rt": []}
         if not roles_aleatorios:
             for cuenta in ejecutables:
                 grupos_ejec[rol_de.get(cuenta.usuario, "")].append(cuenta)
@@ -1538,6 +1817,10 @@ class MotorActivacion:
                 },
                 "hashtags": {
                     "total": len(grupos["hashtags"]), "exitosas": 0, "fallidas": 0,
+                },
+                "comentario": {
+                    "total": len(grupos["comentario"]), "exitosas": 0,
+                    "fallidas": 0,
                 },
                 "rt": {
                     "total": len(grupos["rt"]), "exitosas": 0, "fallidas": 0,
@@ -1630,14 +1913,24 @@ class MotorActivacion:
 
         if repetir:
             usados: dict = {}
+            roles_ultimos: dict = {}
 
-            def _generar_textos_ronda(_ronda):
+            def _generar_textos_ronda(_ronda, usuarios=None):
+                if usuarios is None:
+                    base = list(ejecutables)
+                else:
+                    try:
+                        deseados = {str(u) for u in usuarios}
+                    except TypeError:
+                        deseados = set()
+                    base = [c for c in ejecutables if c.usuario in deseados]
                 if roles_aleatorios:
                     roles_ronda = self._asignar_roles_aleatorios(
-                        ejecutables, roles_sortear
+                        base, roles_sortear, roles_previos=roles_ultimos
                     )
+                    roles_ultimos.update(roles_ronda)
                     grupos_ronda = self._grupos_desde_roles(
-                        ejecutables, roles_ronda
+                        base, roles_ronda
                     )
                     textos = self._generar_textos_por_rol(
                         grupos_ronda,
@@ -1653,8 +1946,15 @@ class MotorActivacion:
                         _aplicar_anti_repeticion(textos, usados),
                         roles_ronda,
                     )
+                if usuarios is None:
+                    grupos_ronda = grupos_ejec
+                else:
+                    grupos_ronda = {
+                        rol: [c for c in cuentas if c.usuario in deseados]
+                        for rol, cuentas in grupos_ejec.items()
+                    }
                 textos = self._generar_textos_por_rol(
-                    grupos_ejec,
+                    grupos_ronda,
                     texto_base,
                     hashtags=hashtags,
                     menciones=menciones,
@@ -1722,6 +2022,8 @@ class MotorActivacion:
                 _ejecutar_una_rol,
                 _reportar_rol,
                 cooldown_min=cooldown_val,
+                porcentaje_min_ronda=porcentaje_min_ronda,
+                porcentaje_max_ronda=porcentaje_max_ronda,
             )
             logger.info(
                 f"Activacion por roles finalizada (rondas): "

@@ -1,5 +1,5 @@
 """Página de CUENTAS: carga masiva de credenciales, validación de sesión
-(sin navegador, vía httpx), secciones CI/CD/IP, sincronización del perfil real
+(sin navegador, vía httpx), secciones (IP/CI/Libertad/Justicia), sincronización del perfil real
 desde X (httpx, sin Chrome), cambio de nombre/@ (Selenium + Chrome) e
 inventario/exportación.
 
@@ -51,7 +51,7 @@ HANDLE_RE = re.compile(r"^[A-Za-z0-9_]{4,15}$")
 TABS = [
     "📥 Importar",
     "🔎 Validar",
-    "🗂️ Secciones CI/CD/IP",
+    "🗂️ Secciones (IP/CI/Libertad/Justicia)",
     "🎭 Registro",
     "🎨 Perfiles",
     "🏷️ Nombres",
@@ -110,7 +110,7 @@ def _seccion_desde_filtro(opcion: str):
     """Traduce una opción de filtro a clave de sección.
 
     Devuelve None para "Todas" (sin filtro), "" para "Sin asignar" y
-    "CI"/"CD"/"IP" para una sección concreta."""
+    "CI"/"IP"/"LIB"/"JUS" para una sección concreta."""
     if opcion == OPCION_TODAS:
         return None
     if opcion == OPCION_SIN_ASIGNAR:
@@ -282,7 +282,7 @@ def _listar_cuentas(status_filtro: str = OPCION_TODAS, seccion_filtro=None) -> l
     """Inventario de cuentas twitter como lista de dicts (datos desacoplados).
 
     `status_filtro`: "todas" o un status concreto.
-    `seccion_filtro`: None = todas; "" = sin asignar; "CI"/"CD"/"IP" = concreta.
+    `seccion_filtro`: None = todas; "" = sin asignar; "CI"/"IP"/"LIB"/"JUS" = concreta.
     Nunca lanza: ante error de BD muestra st.error y devuelve [].
 
     Cacheada 15s (`st.cache_data`) para que cambiar de pestaña no repita la
@@ -988,10 +988,11 @@ def _tab_validar():
 
 
 def _tab_secciones():
-    st.markdown("### 🗂️ Secciones CI / CD / IP")
+    st.markdown("### 🗂️ Secciones (IP/CI/Libertad/Justicia)")
     st.caption(
-        "Clasifica cada cuenta de Twitter en **CI** (Centro-Izquierda), "
-        "**CD** (Centro-Derecha) o **IP** (Institución Privada)."
+        "Clasifica cada cuenta de Twitter en "
+        + ", ".join(f"**{etiqueta_seccion(clave)}**" for clave in SECCIONES)
+        + "."
     )
 
     todas = _listar_cuentas(OPCION_TODAS)
@@ -1001,11 +1002,12 @@ def _tab_secciones():
     for fila in todas:
         conteos[fila["seccion"] or ""] = conteos.get(fila["seccion"] or "", 0) + 1
 
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("CI — Centro-Izquierda", conteos.get("CI", 0))
-    c2.metric("CD — Centro-Derecha", conteos.get("CD", 0))
-    c3.metric("IP — Institución Privada", conteos.get("IP", 0))
-    c4.metric("Sin asignar", conteos.get("", 0))
+    # Una métrica por cada sección de `core.secciones.SECCIONES` + "Sin asignar"
+    # (generado dinámicamente: si mañana cambian las secciones, la UI se adapta).
+    columnas = st.columns(len(SECCIONES) + 1)
+    for col, clave in zip(columnas, SECCIONES):
+        col.metric(etiqueta_seccion(clave), conteos.get(clave, 0))
+    columnas[-1].metric(OPCION_SIN_ASIGNAR, conteos.get("", 0))
 
     st.markdown("---")
 
@@ -3745,7 +3747,7 @@ def _on_cambio_pestana():
 def render(usuario):
     cabecera(
         "🗂️ CUENTAS",
-        "Perfiles, secciones CI/CD/IP, registro de lenguaje, nombres y validación",
+        "Perfiles, secciones (IP/CI/Libertad/Justicia), registro de lenguaje, nombres y validación",
     )
 
     flash = st.session_state.pop("cuentas_flash", "")
@@ -3755,7 +3757,7 @@ def render(usuario):
     paginas = {
         "📥 Importar": _tab_importar,
         "🔎 Validar": _tab_validar,
-        "🗂️ Secciones CI/CD/IP": _tab_secciones,
+        "🗂️ Secciones (IP/CI/Libertad/Justicia)": _tab_secciones,
         "🎭 Registro": _tab_registro,
         "🎨 Perfiles": _tab_perfiles,
         "🏷️ Nombres": _tab_nombres,

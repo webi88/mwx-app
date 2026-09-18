@@ -2032,6 +2032,91 @@ class TwitterBot:
             time.sleep(0.5)
         return False
 
+    def _tweet_ya_tiene_like(self) -> bool:
+        """True si el tweet de la pagina actual ya tiene like (NO navega).
+
+        En X el boton cambia de estado: sin like suele ser
+        `[data-testid='like']` y con like `[data-testid='unlike']`; algunas
+        versiones mantienen el testid `like` con `aria-pressed='true'`. Se
+        soportan AMBOS casos. Nunca lanza: ante cualquier error devuelve False.
+        """
+        try:
+            if self.driver is None:
+                return False
+            if self.driver.find_elements(By.CSS_SELECTOR, "[data-testid='unlike']"):
+                return True
+            for btn in self.driver.find_elements(By.CSS_SELECTOR, "[data-testid='like']"):
+                try:
+                    pressed = (btn.get_attribute("aria-pressed") or "").strip().lower()
+                except Exception:
+                    pressed = ""
+                if pressed == "true":
+                    return True
+            return False
+        except Exception as e:
+            logger.debug(f"No se pudo leer el estado del like: {e}")
+            return False
+
+    def _dar_like_en_pagina_actual(self) -> bool:
+        """Da like al tweet de la pagina actual de forma IDEMPOTENTE.
+
+        - Si el tweet ya tiene like (`_tweet_ya_tiene_like`) no toca nada.
+        - Si no, busca `[data-testid='like']` (WebDriverWait corto), clica con
+          JS y verifica; si el primer clic no registro, hace UN solo reintento
+          (re-buscando el boton, porque X re-renderiza el DOM).
+        - NUNCA clica `[data-testid='unlike']`: eso QUITARIA el like.
+
+        Devuelve True si el tweet quedo con like (ya fuera o nuevo); False si no
+        se pudo. Nunca lanza.
+        """
+        try:
+            if self.driver is None:
+                return False
+
+            if self._tweet_ya_tiene_like():
+                logger.info("el tweet ya tenía like; no se toca")
+                return True
+
+            try:
+                btn = WebDriverWait(self.driver, 10).until(
+                    EC.presence_of_element_located((By.CSS_SELECTOR, "[data-testid='like']"))
+                )
+            except TimeoutException:
+                logger.warning(
+                    "No aparecio el boton de like (posible 'unlike' con testid raro)"
+                )
+                return False
+
+            # Defensa extra: jamas clicar un boton que quite el like.
+            try:
+                if (btn.get_attribute("data-testid") or "").strip().lower() == "unlike":
+                    logger.info("el tweet ya tenía like; no se toca")
+                    return True
+            except Exception:
+                pass
+
+            for intento in range(2):
+                try:
+                    self.driver.execute_script("arguments[0].click();", btn)
+                except Exception as e:
+                    logger.warning(f"Fallo el clic de like (intento {intento + 1}): {e}")
+                time.sleep(random.uniform(1.0, 2.0))
+                if self._tweet_ya_tiene_like():
+                    logger.info("Like registrado en el tweet")
+                    return True
+                if intento == 0:
+                    logger.warning("El like no registro; reintentando UNA vez")
+                    try:
+                        btn = self.driver.find_element(By.CSS_SELECTOR, "[data-testid='like']")
+                    except Exception:
+                        return False
+
+            logger.warning("El like no se pudo confirmar tras 2 intentos")
+            return False
+        except Exception as e:
+            logger.warning(f"No se pudo dar like: {e}")
+            return False
+
     def solo_retwittear(
         self,
         targets: list[str],
@@ -2163,12 +2248,13 @@ class TwitterBot:
                 time.sleep(2)
                 
                 if dar_like:
-                    try:
-                        like_btn = self.driver.find_element(By.CSS_SELECTOR, "[data-testid='like']")
-                        like_btn.click()
-                        time.sleep(1)
-                    except:
-                        pass
+                    # Idempotente: si la cuenta ya tiene like en este tweet NO
+                    # se toca (antes se clicaba a ciegas y podia QUITARLO). El
+                    # fallo del like no tumba el RT/cita ya confirmado.
+                    if not self._dar_like_en_pagina_actual():
+                        logger.warning(
+                            f"No se pudo confirmar el like (el RT sigue contando): {url}"
+                        )
                 
                 resultados["exitos"] += 1
                 logger.info(f"RT exitoso: {url}")
@@ -2218,25 +2304,71 @@ class TwitterBot:
             logger.error(f"Error en retweet: {e}")
             return False
     
-    def like(self, url: str) -> bool:
+    def asegurar_like(self, url: str) -> bool:
+        """Asegura que el tweet `url` quede con like (idempotente).
+
+        Inicia sesion si hace falta, navega a `url` (tolerando un
+        `TimeoutException` de carga lenta, como el resto del bot), espera a que
+        aparezca `article[data-testid='tweet']` y delega en
+        `_dar_like_en_pagina_actual()`.
+
+        Devuelve True = el tweet quedo con like (ya fuera de antes o recien
+        dado). JAMAS quita un like existente ni da like dos veces: si la cuenta
+        ya tenia like en ese tweet, no hace clic. False = no se pudo confirmar
+        (el motivo queda en `self.ultimo_error`).
+        """
+        self.ultimo_error = ""
+
+        if not (url or "").strip():
+            self.ultimo_error = "falta la URL del tweet para el like"
+            return False
+
         if not self.driver:
             if not self.login_con_cookies():
+                self.ultimo_error = self.ultimo_error or "no se pudo iniciar sesion"
                 return False
-        
+
         try:
-            self.driver.get(url)
-            time.sleep(3)
-            
-            like_btn = self.driver.find_element(By.CSS_SELECTOR, "[data-testid='like']")
-            like_btn.click()
-            
-            time.sleep(2)
-            logger.info(f"Like dado por {self.usuario}")
-            return True
-        
-        except Exception as e:
-            logger.error(f"Error en like: {e}")
+            try:
+                self.driver.get(url)
+            except TimeoutException:
+                # Carga lenta (proxy intermitente): la pagina suele seguir
+                # cargando; las esperas explicitas de elementos deciden.
+                logger.warning(f"Carga lenta de {url}; sigo con esperas explicitas")
+
+            try:
+                WebDriverWait(self.driver, 15).until(
+                    EC.presence_of_element_located(
+                        (By.CSS_SELECTOR, "article[data-testid='tweet']")
+                    )
+                )
+            except TimeoutException:
+                self.ultimo_error = "el tweet no cargo (timeout esperando el articulo)"
+                logger.warning(f"{self.ultimo_error}: {url}")
+                return False
+
+            if self._dar_like_en_pagina_actual():
+                logger.info(f"Like asegurado por {self.usuario}: {url}")
+                return True
+
+            self.ultimo_error = self.ultimo_error or (
+                "no se pudo confirmar el like en el tweet (ya tenia like o la UI no respondio)"
+            )
+            logger.warning(f"No se pudo asegurar el like: {url}")
             return False
+
+        except Exception as e:
+            self.ultimo_error = f"{type(e).__name__}: {e}"
+            logger.error(f"Error asegurando like: {e}")
+            return False
+
+    def like(self, url: str) -> bool:
+        """Da like al tweet `url` SOLO si aun no tiene like (idempotente).
+
+        Delega en `asegurar_like(url)`: True = el tweet quedo con like (ya
+        fuera o nuevo); JAMAS quita un like existente ni da like dos veces.
+        """
+        return self.asegurar_like(url)
     
     def _gestionar_pin_mensajes(self) -> bool:
         try:

@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""CLI de gestion de cuentas (secciones CI/CD/IP, tipo de voz, estado
+"""CLI de gestion de cuentas (secciones CI/IP/LIB/JUS, tipo de voz, estado
 activa/inactiva, propuestas de nombre/@, fotos de perfil/portada,
 sincronizacion y perfil de X).
 
@@ -11,7 +11,7 @@ y no modifica ningun otro archivo.
 
 Subcomandos:
     listar           Inventario de cuentas Twitter en texto plano (solo lectura).
-    seccion          Asigna o limpia la seccion CI/CD/IP de forma masiva.
+    seccion          Asigna o limpia la seccion CI/IP/LIB/JUS de forma masiva.
     preclasificar    Asigna seccion desde el campo heredado 'sector'.
     tipo             Asigna o limpia el tipo de voz (politica/ciudadana).
     desactivar       Marca las cuentas como inactivas (Cuenta.activa=False).
@@ -29,7 +29,7 @@ Ejemplos:
     python cli_cuentas.py listar --status imported --seccion sin-asignar
     python cli_cuentas.py listar --tipo politica
     python cli_cuentas.py listar --estado inactiva
-    python cli_cuentas.py seccion --seccion CD --usuarios u1,u2
+    python cli_cuentas.py seccion --seccion LIB --usuarios u1,u2
     python cli_cuentas.py seccion --seccion ninguna --todas --dry-run
     python cli_cuentas.py preclasificar --dry-run
     python cli_cuentas.py tipo --tipo ciudadana --seccion CI
@@ -192,7 +192,7 @@ def _entero_positivo(texto):
 
 
 def _resolver_seccion_destino(valor):
-    """Destino de asignacion: 'CI'/'CD'/'IP' o '' para limpiar la seccion."""
+    """Destino de asignacion: 'CI'/'IP'/'LIB'/'JUS' o '' para limpiar la seccion."""
     texto = str(valor or "").strip().lower()
     if texto in _TEXTO_SIN_ASIGNAR:
         return ""
@@ -204,7 +204,7 @@ def _resolver_seccion_destino(valor):
 
 
 def _resolver_filtro_seccion(valor):
-    """Filtro de seccion: None = todas; '' = sin asignar; 'CI'/'CD'/'IP'."""
+    """Filtro de seccion: None = todas; '' = sin asignar; 'CI'/'IP'/'LIB'/'JUS'."""
     if valor is None:
         return None
     codigo = _resolver_seccion_destino(valor)
@@ -342,7 +342,7 @@ def _cargar_cuentas(usuarios=None, status=None, seccion=None, tipo=None, estado=
 
     - usuarios: lista de logins internos; None = sin filtro.
     - status: status exacto; None/'' = sin filtro.
-    - seccion: None = sin filtro; '' = sin asignar; 'CI'/'CD'/'IP'.
+    - seccion: None = sin filtro; '' = sin asignar; 'CI'/'IP'/'LIB'/'JUS'.
     - tipo: None = sin filtro; '' = sin definir; 'politica'/'ciudadana'.
     - estado: None = todas; True = activas; False = inactivas. Este filtro NO
       se usa en desactivar/activar: ahi se cargan activas e inactivas.
@@ -519,7 +519,7 @@ def _agregar_selectores_masivos(parser):
                        help="Todas las cuentas twitter (activas e inactivas)")
     grupo.add_argument("--status", metavar="STATUS",
                        help="Solo cuentas con ese status exacto")
-    grupo.add_argument("--seccion", metavar="CI|CD|IP|sin-asignar",
+    grupo.add_argument("--seccion", metavar="CI|IP|LIB|JUS|sin-asignar",
                        help="Solo cuentas de esa seccion; 'sin-asignar' = vacia")
     grupo.add_argument("--tipo", metavar="politica|ciudadana|sin-definir",
                        help="Solo cuentas con ese tipo de voz; 'sin-definir' = vacio")
@@ -582,7 +582,7 @@ def cmd_listar(args):
 
 
 def cmd_seccion(args):
-    """Asigna (o limpia) la seccion CI/CD/IP de las cuentas seleccionadas."""
+    """Asigna (o limpia) la seccion CI/IP/LIB/JUS de las cuentas seleccionadas."""
     destino = _resolver_seccion_destino(args.seccion)
     _exigir_selector(args)
     usuarios = None
@@ -802,7 +802,7 @@ def cmd_activar(args):
 
 
 def cmd_preclasificar(args):
-    """Preclasifica CI/CD/IP las cuentas sin seccion segun su 'sector'."""
+    """Preclasifica CI/IP/LIB/JUS las cuentas sin seccion segun su 'sector'."""
     cuentas = _cargar_cuentas()
     sin_seccion = [c for c in cuentas if not c.seccion]
     cambios = []
@@ -1459,7 +1459,7 @@ def construir_parser():
     parser = _Parser(
         prog="cli_cuentas.py",
         description=(
-            "Gestion masiva de cuentas Twitter/X: secciones CI/CD/IP, tipo de "
+            "Gestion masiva de cuentas Twitter/X: secciones CI/IP/LIB/JUS, tipo de "
             "voz, estado activa/inactiva, propuestas de nombre/@, fotos de "
             "perfil/portada, preclasificacion por sector, sincronizacion de "
             "perfil (httpx), cambio real de nombre/@ (Selenium + Chrome) y "
@@ -1471,7 +1471,7 @@ def construir_parser():
             "  python cli_cuentas.py listar --seccion sin-asignar\n"
             "  python cli_cuentas.py listar --tipo politica\n"
             "  python cli_cuentas.py listar --estado inactiva\n"
-            "  python cli_cuentas.py seccion --seccion CD --usuarios u1,u2\n"
+            "  python cli_cuentas.py seccion --seccion LIB --usuarios u1,u2\n"
             "  python cli_cuentas.py seccion --seccion ninguna --todas --dry-run\n"
             "  python cli_cuentas.py seccion --seccion CI --desde cuenta050 --hasta cuenta120\n"
             "  python cli_cuentas.py preclasificar --dry-run\n"
@@ -1525,7 +1525,7 @@ def construir_parser():
     )
     p.add_argument("--status", default=None, metavar="STATUS",
                    help="Filtra por status exacto (ej. imported, active)")
-    p.add_argument("--seccion", default=None, metavar="CI|CD|IP|sin-asignar",
+    p.add_argument("--seccion", default=None, metavar="CI|IP|LIB|JUS|sin-asignar",
                    help="Filtra por seccion; 'sin-asignar' = seccion vacia")
     p.add_argument("--tipo", default=None, metavar="politica|ciudadana|sin-definir",
                    help="Filtra por tipo de voz; 'sin-definir' = tipo vacio")
@@ -1536,7 +1536,7 @@ def construir_parser():
     # --- seccion -----------------------------------------------------------
     p = sub.add_parser(
         "seccion",
-        help="Asigna o limpia la seccion CI/CD/IP de forma masiva",
+        help="Asigna o limpia la seccion CI/IP/LIB/JUS de forma masiva",
         description=(
             "Asigna la seccion indicada a las cuentas seleccionadas. "
             "'--seccion ninguna' limpia la seccion (cadena vacia). "
@@ -1544,7 +1544,7 @@ def construir_parser():
             "--desde/--hasta/--limite."
         ),
     )
-    p.add_argument("--seccion", required=True, metavar="CI|CD|IP|ninguna",
+    p.add_argument("--seccion", required=True, metavar="CI|IP|LIB|JUS|ninguna",
                    help="Seccion destino; 'ninguna' limpia la asignacion")
     grupo = p.add_mutually_exclusive_group()
     grupo.add_argument("--usuarios", metavar="a,b,c",
@@ -1561,10 +1561,11 @@ def construir_parser():
     # --- preclasificar -----------------------------------------------------
     p = sub.add_parser(
         "preclasificar",
-        help="Preclasifica CI/CD/IP desde el campo heredado 'sector'",
+        help="Preclasifica CI/IP/LIB/JUS desde el campo heredado 'sector'",
         description=(
             "Para cuentas twitter sin seccion, aplica seccion_desde_sector(sector): "
-            "centroizquierda->CI, centroderecha->CD, privados->IP."
+            "privados->IP, centroizquierda->CI, libertad->LIB, justicia->JUS "
+            "(centroderecha queda sin asignar)."
         ),
     )
     p.add_argument("--dry-run", action="store_true",
@@ -1591,7 +1592,7 @@ def construir_parser():
                        help="Todas las cuentas twitter")
     grupo.add_argument("--status", metavar="STATUS",
                        help="Solo cuentas con ese status exacto")
-    grupo.add_argument("--seccion", metavar="CI|CD|IP|sin-asignar",
+    grupo.add_argument("--seccion", metavar="CI|IP|LIB|JUS|sin-asignar",
                        help="Solo cuentas de esa seccion; 'sin-asignar' = vacia")
     _agregar_rango(p)
     p.add_argument("--dry-run", action="store_true",
@@ -1650,7 +1651,7 @@ def construir_parser():
                        help="Todas las cuentas twitter")
     grupo.add_argument("--status", metavar="STATUS",
                        help="Solo cuentas con ese status exacto")
-    grupo.add_argument("--seccion", metavar="CI|CD|IP|sin-asignar",
+    grupo.add_argument("--seccion", metavar="CI|IP|LIB|JUS|sin-asignar",
                        help="Solo cuentas de esa seccion; 'sin-asignar' = vacia")
     _agregar_rango(p)
     p.add_argument("--identidad", choices=["auto", "persona", "movimiento"],
@@ -1739,7 +1740,7 @@ def construir_parser():
                        help="Todas las cuentas twitter (opcion por defecto)")
     grupo.add_argument("--status", metavar="STATUS",
                        help="Solo cuentas con ese status exacto")
-    grupo.add_argument("--seccion", metavar="CI|CD|IP|sin-asignar",
+    grupo.add_argument("--seccion", metavar="CI|IP|LIB|JUS|sin-asignar",
                        help="Solo cuentas de esa seccion; 'sin-asignar' = vacia")
     _agregar_rango(p)
     p.add_argument("--timeout", type=_entero_positivo, default=20, metavar="SEG",

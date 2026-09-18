@@ -62,8 +62,8 @@ class Cuenta(Base):
     avatar_path = Column(String(200), default="")
     # Ruta local de la foto de portada (banner) de la cuenta.
     banner_path = Column(String(200), default="")
-    # Clasificacion operativa: CI=Centro-Izquierda, CD=Centro-Derecha,
-    # IP=Institucion Privada (ver core/secciones.py). 'nombre_mostrado' y
+    # Clasificacion operativa: CI=Ciudadanía, IP=Institución Privada,
+    # LIB=Libertad, JUS=Justicia (ver core/secciones.py). 'nombre_mostrado' y
     # 'handle_actual' guardan como se llama la cuenta REALMENTE en X, porque
     # otros clientes pueden renombrarla. 'usuario' sigue siendo la clave
     # interna de login y no se modifica.

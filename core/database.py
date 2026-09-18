@@ -155,19 +155,22 @@ NUEVAS_COLUMNAS_CUENTAS = {
 
 
 def _backfill_seccion(conn) -> None:
-    """Preclasifica en CI/CD/IP las cuentas ya existentes segun su 'sector'.
+    """Preclasifica en CI/IP/LIB/JUS las cuentas ya existentes segun su 'sector'.
 
     Se ejecuta una sola vez, justo despues de crear la columna 'seccion':
-    valores con 'derech' -> CD, 'izquierd' -> CI, 'privad' -> IP ('' el resto).
-    Solo toca filas con seccion vacia/NULL, asi que es idempotente."""
+    valores con 'izquierd' o 'ciudadan' -> CI, 'privad' -> IP, 'libertad' ->
+    LIB, 'justicia' -> JUS ('' el resto). 'derech' ya NO produce 'CD': esa
+    seccion desaparecio. Solo toca filas con seccion vacia/NULL, asi que es
+    idempotente."""
     from sqlalchemy import text
 
     conn.execute(
         text(
             "UPDATE cuentas SET seccion = CASE "
-            "WHEN lower(sector) LIKE '%derech%' THEN 'CD' "
-            "WHEN lower(sector) LIKE '%izquierd%' THEN 'CI' "
+            "WHEN lower(sector) LIKE '%izquierd%' OR lower(sector) LIKE '%ciudadan%' THEN 'CI' "
             "WHEN lower(sector) LIKE '%privad%' THEN 'IP' "
+            "WHEN lower(sector) LIKE '%libertad%' THEN 'LIB' "
+            "WHEN lower(sector) LIKE '%justicia%' THEN 'JUS' "
             "ELSE '' END "
             "WHERE (seccion IS NULL OR seccion = '')"
         )
@@ -185,6 +188,57 @@ def _limpiar_grupo_por_defecto(conn) -> None:
     conn.execute(text("UPDATE cuentas SET grupo = '' WHERE grupo = 'A'"))
 
 
+def _limpiar_secciones_invalidas(conn) -> None:
+    """Corrige en 'cuentas.seccion' los valores que ya no son validos.
+
+    Recorre los valores DISTINTOS no vacios guardados en la columna y aplica
+    `normalizar_seccion()` de core.secciones: "CD"/"centroderecha" quedan en ''
+    (sin asignar), "ci" pasa a "CI", etc. El UPDATE es parametrizado (text() +
+    bind), por lo que funciona igual en SQLite y PostgreSQL, y es idempotente:
+    una segunda pasada no encuentra nada que corregir. No lanza: si algo
+    falla, solo advierte. Loguea el numero de filas corregidas."""
+    from sqlalchemy import text
+
+    try:
+        # Import local para evitar cualquier ciclo con core.database.
+        from core.secciones import normalizar_seccion
+    except Exception as e:
+        logger.warning(f"No se pudo importar normalizar_seccion: {e}")
+        return
+
+    try:
+        filas = conn.execute(
+            text(
+                "SELECT DISTINCT seccion FROM cuentas "
+                "WHERE seccion IS NOT NULL AND seccion <> ''"
+            )
+        ).fetchall()
+    except Exception as e:
+        logger.warning(f"No se pudieron leer las secciones de cuentas: {e}")
+        return
+
+    corregidas = 0
+    for (valor,) in filas:
+        try:
+            normalizado = normalizar_seccion(valor)
+        except Exception:
+            continue
+        if normalizado == valor:
+            continue
+        try:
+            resultado = conn.execute(
+                text("UPDATE cuentas SET seccion = :nuevo WHERE seccion = :viejo"),
+                {"nuevo": normalizado, "viejo": valor},
+            )
+            corregidas += int(resultado.rowcount or 0)
+        except Exception as e:
+            logger.warning(f"No se pudo corregir la seccion {valor!r}: {e}")
+    if corregidas:
+        logger.info(
+            f"Migracion: {corregidas} cuenta(s) con seccion invalida normalizada"
+        )
+
+
 def _migrar_columnas():
     """Migraciones ligeras: agrega columnas nuevas a tablas existentes.
 
@@ -196,7 +250,8 @@ def _migrar_columnas():
     - PostgreSQL/Supabase: ALTER TABLE ... ADD COLUMN IF NOT EXISTS (idempotente
       y tolerante a fallos: solo advierte si algo no se puede aplicar). No se
       migran tipos DATETIME ('last_checked' ya existe en produccion). Tambien
-      limpia grupo='A' -> '' de la misma forma idempotente."""
+      limpia grupo='A' -> '' y normaliza las secciones invalidas (p.ej. 'CD'
+      -> '') de la misma forma idempotente."""
     from sqlalchemy import text
 
     nuevas_columnas = NUEVAS_COLUMNAS_CUENTAS
@@ -237,6 +292,12 @@ def _migrar_columnas():
                     )
                 except Exception as e_grupo:
                     logger.warning(f"Migracion de grupo (Postgres) no aplicada: {e_grupo}")
+                try:
+                    _limpiar_secciones_invalidas(conn)
+                except Exception as e_seccion:
+                    logger.warning(
+                        f"Migracion de secciones (Postgres) no aplicada: {e_seccion}"
+                    )
         except Exception as e:
             logger.warning(f"Migracion de columnas (Postgres) no aplicada: {e}")
         return
@@ -261,6 +322,11 @@ def _migrar_columnas():
                     )
                 except Exception as e_grupo:
                     logger.warning(f"Migracion de grupo no aplicada: {e_grupo}")
+            if cols:
+                try:
+                    _limpiar_secciones_invalidas(conn)
+                except Exception as e_seccion:
+                    logger.warning(f"Migracion de secciones no aplicada: {e_seccion}")
             conn.commit()
     except Exception as e:
         logger.warning(f"Migracion de columnas no aplicada: {e}")

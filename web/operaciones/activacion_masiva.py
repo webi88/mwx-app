@@ -1,21 +1,33 @@
 """Operacion ACTIVACION MASIVA: cita masiva clasica + campana por roles + 3+3+3.
 
 Pestana A ("🎯 Cita masiva"): quote-RTs aleatorizados sobre N cuentas con
-`MotorActivacion.ejecutar` (mismo formulario de siempre).
+`MotorActivacion.ejecutar` (mismo formulario de siempre). Permite elegir la
+SECCION (CI/IP/Libertad/Justicia o Todas: solo publican sus cuentas) y, con
+"🔁 Repetir", el % minimo/maximo de cuentas que entra en cada ronda
+(subconjunto aleatorio).
 
 Pestana B ("🗂️ Por roles (subcuentas)"): divide las cuentas twitter activas en
 SUBCUENTAS por rol (`Cuenta.rol_activacion`, ver `core/roles.py`):
-  - "cita"     -> Retweet con cita.
-  - "hashtags" -> Hashtags y menciones.
-  - "rt"       -> Retweet simple.
+  - "cita"       -> Retweet con cita.
+  - "hashtags"   -> Hashtags y menciones.
+  - "comentario" -> Comentario en el tweet ancla (reply; requiere URLs).
+  - "rt"         -> Retweet simple.
 Permite asignar el rol a la seleccion (selector masivo de `web.operaciones.
-cuentas`), repartir en 3 tercios automaticamente, ver conteos/ejemplos y
-lanzar `MotorActivacion.ejecutar_por_roles`.
+cuentas`), repartir automaticamente entre los 4 roles, ver conteos/ejemplos y
+lanzar `MotorActivacion.ejecutar_por_roles` limitado a una seccion opcional.
 
 Con "🎲 Rol aleatorio por cuenta en cada ronda" (default) el rol guardado NO
-se usa como filtro: en cada ronda el motor sortea cita/hashtags/rt por cuenta
-(`roles_aleatorios=True`) y `cooldown_min` evita que una misma cuenta repita
-accion antes de ese descanso. Las cuentas sin registro siguen saltandose.
+se usa como filtro: en cada ronda el motor sortea cita/hashtags/comentario/rt
+por cuenta (`roles_aleatorios=True`) y cada cuenta CAMBIA de accion respecto
+a su participacion anterior (si hizo RT, la siguiente puede ser cita, post con
+hashtag o comentario; nunca repite mientras haya 2+ roles posibles).
+`cooldown_min` evita que una misma cuenta repita accion antes de ese descanso.
+Las cuentas sin registro siguen saltandose.
+
+Con "🔁 Repetir hasta agotar el tiempo" (+ porcentajes) cada ronda usa un
+SUBCONJUNTO ALEATORIO de cuentas: mas del minimo% y menos del maximo%, la
+primera ronda tambien. Sin URLs no hay cita/rt/comentario; sin hashtags ni
+contexto no hay posts con hashtag.
 
 Pestana C ("📋 Campaña 3+3+3"): por cuenta 3 posts + 3 comentarios + 3 RTs
 del tweet principal (9 acciones). Genera los 9 textos con
@@ -28,11 +40,21 @@ import streamlit as st
 
 from web.ui import cabecera
 from core.config import settings
+from core.secciones import SECCIONES, etiqueta_seccion, normalizar_seccion
 
 OPCION_SIN_ROL = "Sin rol"
+OPCION_TODAS_SECCIONES = "Todas"
 
 # Orden canonico de los roles en la UI (core/roles.ROLES_ACTIVACION).
-ORDEN_ROLES = ("cita", "hashtags", "rt")
+ORDEN_ROLES = ("cita", "hashtags", "comentario", "rt")
+
+# Icono de cada rol para las metricas (la etiqueta sale de etiqueta_rol_activacion).
+ICONOS_ROL = {
+    "cita": "💬",
+    "hashtags": "🏷️",
+    "comentario": "🗨️",
+    "rt": "🔁",
+}
 
 
 def _navegadores_default() -> int:
@@ -51,17 +73,18 @@ def _navegadores_default() -> int:
 # ============================ LOGICA PURA ============================
 
 def _repartir_tercios(usuarios: list) -> dict:
-    """Reparte 'usuarios' (en orden) en 3 tercios contiguos: cita/hashtags/rt.
+    """Reparte 'usuarios' (en orden) entre los 4 roles en bloques contiguos.
 
     Criterio exacto:
       - Se limpian valores vacios y se quitan duplicados conservando el primer
         orden de aparicion (se ignora un '@' inicial).
-      - Con n usuarios se calcula divmod(n, 3); el resto se reparte de a uno a
-        los primeros roles en el orden cita -> hashtags -> rt.
+      - Con n usuarios se calcula divmod(n, 4); el resto se reparte de a uno a
+        los primeros roles en el orden cita -> hashtags -> comentario -> rt.
       - Los cortes son contiguos, por lo que ningun usuario se pierde y ninguno
         queda en dos roles a la vez.
 
-    Ejemplos: 10 -> cita 4 / hashtags 3 / rt 3; 2 -> 1/1/0; 0 -> 0/0/0.
+    Ejemplos: 10 -> cita 3 / hashtags 3 / comentario 2 / rt 2;
+    2 -> 1/1/0/0; 0 -> 0/0/0/0.
     """
     limpios, vistos = [], set()
     for u in (usuarios or []):
@@ -76,13 +99,15 @@ def _repartir_tercios(usuarios: list) -> dict:
         vistos.add(clave)
         limpios.append(nombre)
 
-    reparto = {"cita": [], "hashtags": [], "rt": []}
+    reparto = {rol: [] for rol in ORDEN_ROLES}
     n = len(limpios)
     if n == 0:
         return reparto
 
-    base, resto = divmod(n, 3)
-    tamanos = [base + (1 if i < resto else 0) for i in range(3)]
+    base, resto = divmod(n, len(ORDEN_ROLES))
+    tamanos = [
+        base + (1 if i < resto else 0) for i in range(len(ORDEN_ROLES))
+    ]
     inicio = 0
     for rol, tam in zip(ORDEN_ROLES, tamanos):
         reparto[rol] = limpios[inicio:inicio + tam]
@@ -94,7 +119,8 @@ def _conteo_por_rol(cuentas: list) -> dict:
     """Cuenta cuentas por rol normalizado; incluye la clave "" (sin rol)."""
     from core.roles import normalizar_rol_activacion
 
-    conteo = {"cita": 0, "hashtags": 0, "rt": 0, "": 0}
+    conteo = {rol: 0 for rol in ORDEN_ROLES}
+    conteo[""] = 0
     for fila in (cuentas or []):
         rol = normalizar_rol_activacion(fila.get("rol_activacion"))
         conteo[rol] = conteo.get(rol, 0) + 1
@@ -105,7 +131,8 @@ def _tabla_roles(cuentas: list, ejemplos: int = 8) -> list:
     """Filas (Rol, Subcuentas, Ejemplos) por rol para `st.dataframe`."""
     from core.roles import etiqueta_rol_activacion, normalizar_rol_activacion
 
-    grupos = {"cita": [], "hashtags": [], "rt": [], "": []}
+    grupos = {rol: [] for rol in ORDEN_ROLES}
+    grupos[""] = []
     for fila in (cuentas or []):
         rol = normalizar_rol_activacion(fila.get("rol_activacion"))
         grupos.setdefault(rol, []).append(fila.get("usuario") or "")
@@ -431,12 +458,15 @@ def _actualizar_roles(usuarios: list, codigo: str) -> int:
 
 def _mostrar_panel_roles(cuentas: list):
     """Metricas + tabla de subcuentas por rol (sin lanzar nada)."""
+    from core.roles import etiqueta_rol_activacion
+
     conteo = _conteo_por_rol(cuentas)
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("💬 Retweet con cita", conteo.get("cita", 0))
-    col2.metric("🏷️ Hashtags y menciones", conteo.get("hashtags", 0))
-    col3.metric("🔁 Retweet simple", conteo.get("rt", 0))
-    col4.metric("➖ Sin rol", conteo.get("", 0))
+    # Una metrica por rol de ORDEN_ROLES (4) + "Sin rol".
+    columnas = st.columns(len(ORDEN_ROLES) + 1)
+    for col, rol in zip(columnas, ORDEN_ROLES):
+        icono = ICONOS_ROL.get(rol, "")
+        col.metric(f"{icono} {etiqueta_rol_activacion(rol)}".strip(), conteo.get(rol, 0))
+    columnas[-1].metric("➖ Sin rol", conteo.get("", 0))
     st.dataframe(
         _tabla_roles(cuentas),
         use_container_width=True,
@@ -563,6 +593,37 @@ def _cita_masiva():
             ),
         )
 
+    opciones_seccion = [OPCION_TODAS_SECCIONES] + [
+        etiqueta_seccion(clave) for clave in SECCIONES
+    ]
+    seccion_opcion = st.selectbox(
+        "Sección",
+        opciones_seccion,
+        key="act_seccion",
+        help=(
+            "Solo publican las cuentas de esa sección. «Todas» no filtra por "
+            "sección; las cuentas sin asignar también entran con «Todas»."
+        ),
+    )
+    secciones_param = (
+        None
+        if seccion_opcion == OPCION_TODAS_SECCIONES
+        else [normalizar_seccion(seccion_opcion)]
+    )
+    cuentas_activas = _cargar_cuentas_con_roles()
+    if secciones_param:
+        n_seccion = sum(
+            1 for f in cuentas_activas if f.get("seccion") == secciones_param[0]
+        )
+        st.caption(
+            f"🚦 Publicarán las cuentas de **{etiqueta_seccion(secciones_param[0])}**: "
+            f"{n_seccion} de {len(cuentas_activas)} activas."
+        )
+    else:
+        st.caption(
+            f"🚦 Publicarán todas las cuentas activas: {len(cuentas_activas)}."
+        )
+
     col4, col5 = st.columns(2)
     with col4:
         dar_like = st.checkbox("Dar like también", value=False, key="act_like")
@@ -598,6 +659,29 @@ def _cita_masiva():
             "registro no hacen nada."
         )
 
+    pct_min, pct_max = 40, 90
+    if repetir:
+        ayuda_pct = (
+            "Cada ronda usa un subconjunto aleatorio de cuentas: más del mín% "
+            "y menos del máx% (ej. 15 cuentas -> entre 7 y 13). La primera "
+            "ronda también."
+        )
+        col_pmin, col_pmax = st.columns(2)
+        with col_pmin:
+            pct_min = st.number_input(
+                "Mín % de cuentas por ronda",
+                min_value=1, max_value=99, value=40, step=5,
+                key="act_pct_min",
+                help=ayuda_pct,
+            )
+        with col_pmax:
+            pct_max = st.number_input(
+                "Máx % de cuentas por ronda",
+                min_value=1, max_value=99, value=90, step=5,
+                key="act_pct_max",
+                help=ayuda_pct,
+            )
+
     if st.button("🎯 Lanzar activación", type="primary", key="btn_act"):
         urls = [u.strip() for u in urls_text.splitlines() if u.strip()]
         if not urls:
@@ -605,6 +689,12 @@ def _cita_masiva():
             return
         if not texto_base:
             st.warning("Escribe el texto base de la cita.")
+            return
+        if repetir and not (1 <= int(pct_min) < int(pct_max) <= 99):
+            st.warning(
+                "Revisa los porcentajes por ronda: el mínimo debe ser menor "
+                "que el máximo y el máximo no puede pasar de 99%."
+            )
             return
 
         from activaciones.motor import MotorActivacion
@@ -625,6 +715,9 @@ def _cita_masiva():
                 hashtags=hashtags,
                 repetir=bool(repetir),
                 solo_con_registro=bool(todas_cuentas),
+                secciones=secciones_param,
+                porcentaje_min_ronda=int(pct_min),
+                porcentaje_max_ronda=int(pct_max),
             ),
             motor,
             duracion_min=int(duracion_min),
@@ -710,9 +803,13 @@ def _por_roles():
             key="btn_act_roles_assign",
         )
     repartir = st.button(
-        "🎲 Repartir en 3 tercios automaticamente",
+        "🎲 Repartir automáticamente entre los 4 roles",
         key="btn_act_roles_tercios",
-        help="En orden alfabetico: un tercio a cita, un tercio a hashtags y el resto a rt.",
+        help=(
+            "En orden alfabético: reparte las cuentas seleccionadas entre "
+            "Retweet con cita, Hashtags y menciones, Comentario en el tweet "
+            "ancla y Retweet simple."
+        ),
     )
 
     if asignar:
@@ -728,14 +825,16 @@ def _por_roles():
 
     if repartir:
         if not usuarios_sel:
-            st.warning("Selecciona al menos una cuenta para repartir en tercios.")
+            st.warning(
+                "Selecciona al menos una cuenta para repartir entre los 4 roles."
+            )
         else:
             reparto = _repartir_tercios(usuarios_sel)
             resumen = []
             for rol in ORDEN_ROLES:
                 n = _actualizar_roles(reparto[rol], rol)
                 resumen.append(f"{etiqueta_rol_activacion(rol)}: {n}")
-            st.success("🎲 Reparto en tercios → " + " · ".join(resumen))
+            st.success("🎲 Reparto entre los 4 roles → " + " · ".join(resumen))
             st.rerun()
 
     # ---------------- Conteos y subcuentas ----------------
@@ -770,8 +869,39 @@ def _por_roles():
 
     # ---------------- Lanzar campana ----------------
     st.markdown("### 🚀 Lanzar campaña por roles")
+    opciones_seccion = [OPCION_TODAS_SECCIONES] + [
+        etiqueta_seccion(clave) for clave in SECCIONES
+    ]
+    seccion_opcion = st.selectbox(
+        "Sección",
+        opciones_seccion,
+        key="act_roles_seccion",
+        help=(
+            "Solo se usan las cuentas de esa sección. «Todas» no filtra por "
+            "sección; las cuentas sin asignar también entran con «Todas»."
+        ),
+    )
+    secciones_param = (
+        None
+        if seccion_opcion == OPCION_TODAS_SECCIONES
+        else [normalizar_seccion(seccion_opcion)]
+    )
+    if secciones_param:
+        n_seccion = sum(
+            1 for f in cuentas if f.get("seccion") == secciones_param[0]
+        )
+        st.caption(
+            f"🚦 La campaña usará las cuentas de "
+            f"**{etiqueta_seccion(secciones_param[0])}**: "
+            f"{n_seccion} de {len(cuentas)} activas."
+        )
+    else:
+        st.caption(
+            f"🚦 La campaña usará todas las cuentas activas: {len(cuentas)}."
+        )
+
     urls_text = st.text_area(
-        "URLs objetivo (una por línea; las usan 'cita' y 'rt')",
+        "URLs objetivo (una por línea; las usan 'cita', 'comentario' y 'rt')",
         height=100,
         key="act_roles_urls",
     )
@@ -851,11 +981,14 @@ def _por_roles():
         value=True,
         key="act_roles_aleatorio",
         help=(
-            "La IA sortea cita/RT/hashtags de forma aleatoria para cada "
-            "cuenta en cada ronda: acelera y evita patrones. Los inputs "
-            "definen qué roles entran (sin URLs no hay cita/rt; sin hashtags "
-            "ni contexto no hay posts con hashtag). Al marcarlo se ignora el "
-            "rol guardado y se desactiva el filtro «Solo cuentas con rol»."
+            "La IA sortea la acción de cada cuenta en cada ronda: RT con cita, "
+            "post con hashtags, comentario en el tweet ancla o RT simple. Una "
+            "cuenta que participa en rondas seguidas cambia de acción respecto "
+            "a su participación anterior (si hizo RT, la siguiente puede ser "
+            "cita, post con hashtag o comentario). Los inputs definen qué roles "
+            "entran: sin URLs no hay cita/rt/comentario; sin hashtags ni "
+            "contexto no hay posts con hashtag. Al marcarlo se ignora el rol "
+            "guardado y se desactiva el filtro «Solo cuentas con rol»."
         ),
     )
 
@@ -893,6 +1026,29 @@ def _por_roles():
             ),
         )
 
+    pct_min, pct_max = 40, 90
+    if repetir:
+        ayuda_pct = (
+            "Cada ronda usa un subconjunto aleatorio de cuentas: más del mín% "
+            "y menos del máx% (ej. 15 cuentas -> entre 7 y 13). La primera "
+            "ronda también."
+        )
+        col_pmin, col_pmax = st.columns(2)
+        with col_pmin:
+            pct_min = st.number_input(
+                "Mín % de cuentas por ronda",
+                min_value=1, max_value=99, value=40, step=5,
+                key="act_roles_pct_min",
+                help=ayuda_pct,
+            )
+        with col_pmax:
+            pct_max = st.number_input(
+                "Máx % de cuentas por ronda",
+                min_value=1, max_value=99, value=90, step=5,
+                key="act_roles_pct_max",
+                help=ayuda_pct,
+            )
+
     todas_cuentas = st.checkbox(
         "📢 Todas las cuentas publican (solo con registro definido)",
         value=False,
@@ -917,11 +1073,18 @@ def _por_roles():
         key="btn_act_roles_launch",
         help=(
             "Con «Rol aleatorio por cuenta» (recomendado) cada cuenta recibe "
-            "un rol sorteado en cada ronda; desmárcalo para usar el rol "
-            "guardado de cada subcuenta."
+            "una acción distinta sorteada en cada ronda (cita, hashtag, "
+            "comentario o rt); desmárcalo para usar el rol guardado de cada "
+            "subcuenta."
         ),
     ):
         urls = [u.strip() for u in urls_text.splitlines() if u.strip()]
+        if repetir and not (1 <= int(pct_min) < int(pct_max) <= 99):
+            st.warning(
+                "Revisa los porcentajes por ronda: el mínimo debe ser menor "
+                "que el máximo y el máximo no puede pasar de 99%."
+            )
+            return
         solo_roles_param = (
             None
             if roles_aleatorios
@@ -933,18 +1096,24 @@ def _por_roles():
             if todas_cuentas
             else cuentas
         )
+        if secciones_param:
+            base_objetivo = [
+                f for f in base_objetivo
+                if f.get("seccion") == secciones_param[0]
+            ]
 
         if roles_aleatorios:
             if not _cuentas_objetivo(base_objetivo, usuarios_param):
                 st.warning(
-                    "No hay cuentas que cumplan la selección. Revisa el "
-                    "selector o el registro de las cuentas."
+                    "No hay cuentas que cumplan la selección (sección, "
+                    "selector o registro). Revisa los filtros."
                 )
                 return
             if not urls and not str(hashtags or "").strip():
                 st.warning(
                     "Pega al menos una URL objetivo o hashtags: sin URLs el "
-                    "rol aleatorio solo puede usar posts con hashtag."
+                    "rol aleatorio no puede hacer cita/rt/comentario y solo "
+                    "quedan posts con hashtag."
                 )
                 return
         else:
@@ -954,13 +1123,14 @@ def _por_roles():
             if not roles_objetivo:
                 st.warning(
                     "No hay cuentas con rol que cumplan la selección. Asigna "
-                    "roles en «🏷️ Asignar roles» o revisa el selector."
+                    "roles en «🏷️ Asignar roles» o revisa los filtros."
                 )
                 return
-            if not urls and (roles_objetivo & {"cita", "rt"}):
+            if not urls and (roles_objetivo & {"cita", "comentario", "rt"}):
                 st.warning(
                     "Pega al menos una URL objetivo: la selección incluye "
-                    "cuentas de 'Retweet con cita' y/o 'Retweet simple'."
+                    "cuentas de 'Retweet con cita', 'Comentario en el tweet "
+                    "ancla' y/o 'Retweet simple'."
                 )
                 return
 
@@ -984,6 +1154,9 @@ def _por_roles():
                 solo_con_registro=bool(todas_cuentas),
                 roles_aleatorios=bool(roles_aleatorios),
                 cooldown_min=float(cooldown_min),
+                secciones=secciones_param,
+                porcentaje_min_ronda=int(pct_min),
+                porcentaje_max_ronda=int(pct_max),
             ),
             motor,
             duracion_min=int(duracion_min),

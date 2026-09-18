@@ -14,7 +14,7 @@ COLUMNAS_CUENTAS = (
     ("usuario", "Usuario_X"),
     ("handle_actual", "Handle_Actual"),
     ("nombre_mostrado", "Nombre_Mostrado"),
-    ("seccion", "Seccion_CI_CD_IP"),
+    ("seccion", "Seccion_CI_IP_LIB_JUS"),
     ("tipo_cuenta", "Tipo_Cuenta"),
     ("nombre_propuesto", "Nombre_Propuesto"),
     ("handle_propuesto", "Handle_Propuesto"),

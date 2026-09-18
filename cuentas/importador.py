@@ -246,7 +246,7 @@ def importar_una(fields: dict, seccion: str = "", tipo_cuenta: str = "") -> str:
 
     Devuelve `"nueva"` si la cuenta no existía y `"actualizada"` si ya existía.
 
-    `seccion` (CI/CD/IP) y `tipo_cuenta` (politica/ciudadana) son OPCIONALES:
+    `seccion` (CI/IP/LIB/JUS) y `tipo_cuenta` (politica/ciudadana) son OPCIONALES:
     - Al crear una cuenta nueva se guardan normalizados (vacíos si no vienen).
     - Al actualizar una existente solo se pisan si llegan con valor; si vienen
       vacíos se respeta lo que ya tiene la cuenta.

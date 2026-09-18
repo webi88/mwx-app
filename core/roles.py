@@ -1,10 +1,11 @@
 # -*- coding: utf-8 -*-
 """Roles de activacion de cuentas en campana.
 
-Tres roles operativos:
-    - cita:     publica retweets con cita (quote tweets).
-    - hashtags: publica hashtags y menciones.
-    - rt:       publica retweets simples.
+Cuatro roles operativos:
+    - cita:       publica retweets con cita (quote tweets).
+    - hashtags:   publica hashtags y menciones.
+    - comentario: comenta en el tweet ancla (reply).
+    - rt:         publica retweets simples.
 
 Interfaz congelada: otros modulos (web, bot, activaciones, ia) importan
 ROLES_ACTIVACION, normalizar_rol_activacion() y etiqueta_rol_activacion().
@@ -17,6 +18,7 @@ from core.secciones import _normalizar_texto
 ROLES_ACTIVACION = {
     "cita": "Retweet con cita",
     "hashtags": "Hashtags y menciones",
+    "comentario": "Comentario en el tweet ancla",
     "rt": "Retweet simple",
 }
 
@@ -41,6 +43,9 @@ def normalizar_rol_activacion(valor) -> str:
         - "cita", "citado", "citar", "quote", "cita con comentario" -> "cita".
         - "hashtag", "hashtags", "hashtags y menciones", "mencion",
           "menciones", "menciones_hashtags" -> "hashtags".
+        - "comentario", "comentar", "comenta", "reply", "responder",
+          "respuesta", "respuestas", "Comentario en el tweet ancla"
+          -> "comentario".
         - "rt", "retweet", "repost", "repostear" -> "rt".
     Cualquier otro valor, vacio o None devuelve "" (sin rol). Las frases con
     "cita" ganan sobre "retweet" (ej. "Retweet con cita" -> "cita")."""
@@ -55,6 +60,12 @@ def normalizar_rol_activacion(valor) -> str:
         if token.startswith("hashtag") or token.startswith("mencion"):
             return "hashtags"
     for token in tokens:
+        if (
+            token.startswith("coment")
+            or token in ("reply", "responder", "respuesta", "respuestas")
+        ):
+            return "comentario"
+    for token in tokens:
         if token == "rt" or token.startswith("retweet") or token.startswith("repost"):
             return "rt"
     return ""
@@ -64,7 +75,8 @@ def etiqueta_rol_activacion(valor) -> str:
     """Devuelve la etiqueta legible de un rol de activacion.
 
     "cita" -> "Retweet con cita"; "hashtags" -> "Hashtags y menciones";
-    "rt" -> "Retweet simple"; "" -> "Sin rol"."""
+    "comentario" -> "Comentario en el tweet ancla"; "rt" -> "Retweet simple";
+    "" -> "Sin rol"."""
     clave = normalizar_rol_activacion(valor)
     if not clave:
         return "Sin rol"
