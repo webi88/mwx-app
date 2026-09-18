@@ -1,5 +1,6 @@
 import base64
 import os
+import queue
 import select
 import socket
 import threading
@@ -36,6 +37,15 @@ def _bloqueo_google_activo() -> bool:
         return True
 
 
+def _env_int(nombre: str, por_defecto: int, minimo: int = 1) -> int:
+    """Lee un entero de entorno con valor minimo; nunca lanza."""
+    try:
+        valor = int(str(os.environ.get(nombre, "")).strip())
+        return max(minimo, valor)
+    except Exception:
+        return por_defecto
+
+
 def _host_bloqueado(host) -> bool:
     """True si `host` (con o sin puerto) es de un dominio bloqueado.
 
@@ -68,7 +78,18 @@ class LocalForwardProxy:
     `--proxy-server`, asi que la forma fiable de usar un proxy con
     usuario/contraseña es apuntar Chrome a un proxy local (127.0.0.1) que
     agregue el header de autenticacion y reenvie el trafico al proxy real.
+
+    Usa un POOL ACOTADO de workers fijos (NO un hilo por conexion): Chrome
+    mantiene keep-alive y con muchos navegadores concurrentes los hilos por
+    conexion agotaban el contenedor (`RuntimeError: can't start new thread`).
+    `_accept_loop` solo acepta y encola; los N workers (env
+    `FORWARD_PROXY_WORKERS`, default 16) atienden la cola. Si la cola esta
+    llena, la conexion se cierra sin crear nada.
     """
+
+    # Tamano maximo de la cola de conexiones pendientes: si se llena, la
+    # conexion se rechaza (evita acumular trabajo/memoria sin limite).
+    COLA_MAX = 256
 
     def __init__(self, host: str, port: int, username: str, password: str):
         self.host = host
@@ -79,8 +100,18 @@ class LocalForwardProxy:
         self._lock = threading.Lock()
         self._running = False
         self.port_local = 0
+        # Pool acotado de workers (tope real de hilos, independiente del
+        # numero de conexiones de Chrome).
+        self._num_workers = _env_int("FORWARD_PROXY_WORKERS", 16)
+        self._queue = None
+        self._workers = []
+        # Modo defensivo si el SO no deja crear NI UN worker (contenedor
+        # agotado): el aceptador atiende la conexion el mismo, sin encolar.
+        self._inline = False
 
     def start(self) -> int:
+        if self._running and self.port_local:
+            return self.port_local
         self._server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self._server.bind(("127.0.0.1", 0))
@@ -88,24 +119,90 @@ class LocalForwardProxy:
         self._server.settimeout(1.0)
         self._running = True
         self.port_local = self._server.getsockname()[1]
+        self._queue = queue.Queue(maxsize=self.COLA_MAX)
         threading.Thread(target=self._accept_loop, daemon=True).start()
+        self._workers = []
+        for indice in range(self._num_workers):
+            try:
+                hilo = threading.Thread(
+                    target=self._worker_loop, name=f"fwd-proxy-{indice}", daemon=True
+                )
+                hilo.start()
+                self._workers.append(hilo)
+            except Exception as e:
+                logger.error(
+                    f"Forward proxy: no se pudo crear el worker {indice + 1}/"
+                    f"{self._num_workers} ({type(e).__name__}: {e})"
+                )
+                break
+        if not self._workers:
+            # Nunca lanzar: al menos se atiende en el hilo aceptador.
+            self._inline = True
+            logger.warning(
+                "Forward proxy: sin workers disponibles; modo inline defensivo "
+                "(se atiende de a una conexion)"
+            )
         logger.info(
             f"Proxy local de auth en 127.0.0.1:{self.port_local} "
-            f"-> {self.host}:{self.port}"
+            f"-> {self.host}:{self.port} "
+            f"({len(self._workers)} worker(s), cola {self.COLA_MAX})"
         )
         return self.port_local
 
     def _accept_loop(self):
         while self._running:
+            servidor = self._server
+            if servidor is None:
+                break
             try:
-                conn, _ = self._server.accept()
+                conn, _ = servidor.accept()
             except socket.timeout:
                 continue
             except OSError:
                 break
+            except Exception as e:
+                logger.error(f"Forward proxy accept error: {type(e).__name__}: {e}")
+                break
+            if not self._running:
+                self._discard(conn)
+                break
             with self._lock:
                 self._conns.add(conn)
-            threading.Thread(target=self._handle, args=(conn,), daemon=True).start()
+            if self._inline or not self._workers:
+                # Defensivo: sin workers, atender en el aceptador.
+                self._handle(conn)
+                continue
+            try:
+                self._queue.put_nowait(conn)
+            except queue.Full:
+                logger.debug("Forward proxy: cola llena; se rechaza la conexion")
+                self._discard(conn)
+
+    def _worker_loop(self):
+        while True:
+            try:
+                conn = self._queue.get(timeout=0.5)
+            except queue.Empty:
+                if not self._running:
+                    return
+                continue
+            except Exception:
+                return
+            try:
+                if not self._running:
+                    self._discard(conn)
+                    continue
+                self._handle(conn)
+            except Exception as e:
+                logger.error(
+                    f"Forward proxy worker error: {type(e).__name__}: {e}"
+                )
+                self._discard(conn)
+            finally:
+                try:
+                    self._queue.task_done()
+                except Exception:
+                    pass
 
     def _upstream(self):
         return socket.create_connection((self.host, self.port), timeout=25)
@@ -252,15 +349,46 @@ class LocalForwardProxy:
             pass
 
     def close(self):
+        """Detiene el proxy por completo: server, cola, conexiones y workers.
+
+        Nunca lanza. Tras el close ya no se aceptan conexiones nuevas y los
+        workers terminan en <=2s (join con timeout corto).
+        """
         self._running = False
-        with self._lock:
-            for c in list(self._conns):
+        self._inline = False
+        servidor, self._server = self._server, None
+        if servidor is not None:
+            try:
+                servidor.close()
+            except Exception:
+                pass
+        cola, self._queue = self._queue, None
+        if cola is not None:
+            while True:
                 try:
-                    c.close()
+                    pendiente = cola.get_nowait()
+                except queue.Empty:
+                    break
                 except Exception:
-                    pass
+                    break
+                self._discard(pendiente)
+        with self._lock:
+            activas = list(self._conns)
             self._conns.clear()
-        try:
-            self._server.close()
-        except Exception:
-            pass
+        for c in activas:
+            try:
+                c.close()
+            except Exception:
+                pass
+        workers, self._workers = self._workers, []
+        limite = time.time() + 2.0
+        for worker in workers:
+            restante = limite - time.time()
+            if restante <= 0:
+                break
+            try:
+                worker.join(timeout=min(0.5, restante))
+            except Exception:
+                pass
+        # Los workers restantes son daemon y saldran solos al ver `_running`
+        # en False y la cola vacia.

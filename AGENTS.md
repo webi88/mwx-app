@@ -677,6 +677,17 @@ python -m bot.main
 - Verificado: suites nuevas 42/42 (`preparar_sesion_cdp`, sleeps, fallback) y 15/15 (RT/respuesta) + compositor 40 + responder 33 + motor 49/20/20/23/19 + like 29; **smoke real Chrome 152** de `Network.setCookie` OK.
 - ⚠ Para ≥10/min: subir "Navegadores simultáneos" en la UI o `MAX_BROWSERS=6` en Railway. Cada Chrome ~300-500MB RAM y el proxy residencial consume ~2-3MB por acción (10/min ≈ 1.2-1.8GB/h): monitorear GB de Smartproxy.
 
+### Fuga de hilos/proxies corregida: estabilidad con varios navegadores (2026-09-18)
+- **Síntoma en Railway (6 navegadores)**: tras ~100 acciones → `RuntimeError: can't start new thread`, `BlockingIOError: [Errno 11] Resource temporarily unavailable`, `WebDriverException: tab crashed`, `net::ERR_PROXY_CONNECTION_FAILED`; la campaña caía a ~4/min con 19 éxitos/17 fallos por ronda.
+- **Causa raíz**: `selenium_bot.iniciar_driver` hacía `ProxyManager().aplicar_a_options(...)` con una instancia NUEVA; el `LocalForwardProxy` (hilo aceptador + **un hilo nuevo por cada conexión**) quedaba vivo por CADA navegador y `TwitterBot.cerrar()` nunca lo cerraba → miles de hilos hasta agotar el contenedor.
+- `utils/forward_proxy.py`: **pool acotado** (16 workers, env `FORWARD_PROXY_WORKERS`) + cola 256; `_accept_loop` solo encola (cola llena → cierra conexión); `close()` cierra server/conexiones y joinea workers (≤2s). Sin hilo por conexión.
+- `utils/proxies.py`: `aplicar_a_options(...)` **devuelve** el `LocalForwardProxy` (fin del estado compartido); `_colapsar_repeticiones()` normaliza credenciales con segmentos duplicados (`_area-MX_life-15_area-MX_life-15`).
+- `plataformas/twitter/selenium_bot.py`: `self._fwd_proxy` por bot; `iniciar_driver` lo guarda; `cerrar()` robusto (`driver.quit()` + fallback `service.stop()/terminate()/kill()` y proxy cerrado en `finally`).
+- `plataformas/chrome_driver.py`: `FLAGS_CONTENEDOR` (`--renderer-process-limit=2`, `--js-flags=--max-old-space-size=256`, `--no-zygote` configurable) + `_fusionar_disable_features()` (una sola `--disable-features` con `site-per-process,IsolateOrigins`); semáforo de lanzamiento (máx 2, env `CHROME_LAUNCH_MAX`) con jitter 0.2-0.5s; `crear_chrome(intentos=3)` con backoff 2-4s solo para fallos de recursos.
+- `activaciones/motor.py`: `_SENALES_ERROR_DRIVER_TRANSITORIO` suma `"can't start new thread"`, `"resource temporarily unavailable"`, `"errno 11"`, `"tab crashed"`, `"err_proxy_connection_failed"` → reintento con navegador nuevo.
+- Verificado: **estrés de 300 conexiones → 10 hilos baseline / pico 27** (antes 300+), tras `close()` vuelve a 10 y rechaza conexiones; suites 42/42 (pool) + 42/42 (CDP/velocidad) + 15/15 + 40/40 (compositor) + 33/33 (responder) + motor 49/20/20/23/19 + like 29.
+- ⚠ Recomendación operativa: con el pool arreglado, 6 navegadores ya son estables; si Railway aún se queda sin RAM, bajar a 5. El log `perf` por acción sirve para verificar ≥10/min.
+
 ### Pendiente
 - Probar `ia/contexto_noticias.generar_contexto_desde_links` con `OPENAI_API_KEY` real (hoy verificado con IA simulada; el fallback local ya funciona)
 - Reemplazar tokens placeholder en `.env` por claves reales (Telegram, Gemini, Grizzly)

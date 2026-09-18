@@ -48,7 +48,7 @@ except Exception:  # pragma: no cover
     MaxRetryError = None
 
 
-__all__ = ["crear_chrome", "FLAGS_AHORRO", "FLAGS_ESTABILIDAD"]
+__all__ = ["crear_chrome", "FLAGS_AHORRO", "FLAGS_ESTABILIDAD", "FLAGS_CONTENEDOR"]
 
 
 # ---------------------------------------------------------------------------
@@ -82,6 +82,23 @@ FLAGS_ESTABILIDAD = [
     "--disable-ipc-flooding-protection",
 ]
 
+# Flags de CONTENEDOR: cada renderer de Chrome es un proceso pesado (fork/exec)
+# y con 6 navegadores concurrentes el contenedor agotaba PIDs/hilos
+# (`BlockingIOError: [Errno 11] Resource temporarily unavailable`). Limitar a 2
+# renderers, capar el heap V8 y desactivar site-per-process (1 proceso por
+# sitio) reduce los forks sin afectar a X/Facebook/Instagram/TikTok. El
+# `--disable-features` extra se fusiona con el de FLAGS_AHORRO en UNA sola
+# bandera (ver `_fusionar_disable_features`).
+FLAGS_CONTENEDOR = [
+    "--renderer-process-limit=2",
+    "--js-flags=--max-old-space-size=256",
+]
+
+# Features que se agregan a la unica bandera --disable-features (site-per-process
+# y IsolateOrigins crean un proceso por sitio en X: con 6 navegadores el
+# contenedor agotaba PIDs).
+_FEATURES_CONTENEDOR = ("site-per-process", "IsolateOrigins")
+
 # Dominios que Chrome visita en segundo plano y que no hacen falta para operar
 # en X/Facebook/Instagram/TikTok con login por cookies.
 _DOMINIOS_GOOGLE = (
@@ -107,6 +124,15 @@ def _env_activo(nombre: str, por_defecto: bool) -> bool:
     return valor.strip().lower() not in ("0", "false", "no", "off")
 
 
+def _env_int(nombre: str, por_defecto: int, minimo: int = 1) -> int:
+    """Lee un entero de entorno con valor minimo; nunca lanza."""
+    try:
+        valor = int(str(os.environ.get(nombre, "")).strip())
+        return max(minimo, valor)
+    except Exception:
+        return por_defecto
+
+
 def _flags_extra() -> list:
     """Flags opcionales segun entorno (Google bloqueado y sin imagenes)."""
     flags = []
@@ -115,6 +141,14 @@ def _flags_extra() -> list:
         flags.append(f"--host-resolver-rules={reglas}")
     if _env_activo("CHROME_SIN_IMAGENES", False):
         flags.append("--blink-settings=imagesEnabled=false")
+    return flags
+
+
+def _flags_contenedor() -> list:
+    """Flags de contenedor + `--no-zygote` opcional (default activo)."""
+    flags = list(FLAGS_CONTENEDOR)
+    if _env_activo("CHROME_NO_ZYGOTE", True):
+        flags.append("--no-zygote")
     return flags
 
 
@@ -143,6 +177,87 @@ def _aplicar_flags_ahorro(options):
 def _aplicar_flags_estabilidad(options):
     """Aplica ``FLAGS_ESTABILIDAD`` (renderer) de forma IDEMPOTENTE."""
     return _aplicar_flags(options, FLAGS_ESTABILIDAD)
+
+
+def _fusionar_disable_features(options, extras=_FEATURES_CONTENEDOR):
+    """Deja UNA SOLA bandera ``--disable-features`` con la union de features.
+
+    ``FLAGS_AHORRO`` ya trae un ``--disable-features=...``; si se agregara otro
+    argumento con el mismo prefijo, Chrome usaria el ULTIMO y se perderian las
+    features del primero. Aqui se recolectan TODAS, se eliminan y se agrega una
+    unica bandera fusionada. Idempotente: llamarla de nuevo no duplica nada.
+    """
+    extras = tuple(extras or ())
+    try:
+        argumentos = list(getattr(options, "arguments", []) or [])
+    except Exception:
+        argumentos = []
+    features = []
+    restantes = []
+    for arg in argumentos:
+        texto = str(arg)
+        if texto.startswith("--disable-features="):
+            for feature in texto.split("=", 1)[1].split(","):
+                feature = feature.strip()
+                if feature and feature not in features:
+                    features.append(feature)
+            continue
+        restantes.append(arg)
+    for feature in extras:
+        if feature and feature not in features:
+            features.append(feature)
+    if features:
+        fusionada = "--disable-features=" + ",".join(features)
+        try:
+            options.arguments[:] = restantes + [fusionada]
+        except Exception:
+            try:
+                options.add_argument(fusionada)
+            except Exception:
+                pass
+    return features
+
+
+def _aplicar_flags_contenedor(options):
+    """Aplica ``FLAGS_CONTENEDOR`` y fusiona ``--disable-features`` en UNA."""
+    _aplicar_flags(options, _flags_contenedor())
+    return _fusionar_disable_features(options, _FEATURES_CONTENEDOR)
+
+
+def _es_fallo_recursos(e) -> bool:
+    """True si el fallo apunta a agotamiento de hilos/procesos/PIDs.
+
+    En Railway con varios Chrome a la vez el fork/exec del chromedriver falla
+    con ``BlockingIOError``/``Errno 11`` o al crear hilos; esos casos merecen
+    un backoff mas largo antes de reintentar.
+    """
+    try:
+        texto = f"{type(e).__name__}: {e}".lower()
+    except Exception:
+        return False
+    senales = (
+        "blockingioerror",
+        "resource temporarily unavailable",
+        "can't start new thread",
+        "can not start new thread",
+        "errno 11",
+        "cannot allocate memory",
+        "cannot fork",
+        "too many open files",
+    )
+    return any(senal in texto for senal in senales)
+
+
+# ---------------------------------------------------------------------------
+# Throttle de lanzamiento (fork/exec sin tormenta)
+# ---------------------------------------------------------------------------
+
+# Limita cuantos Chrome se lanzan a la vez en este proceso: con 6 workers
+# concurrentes el fork/exec simultaneo del chromedriver agotaba PIDs
+# (`BlockingIOError: [Errno 11] Resource temporarily unavailable`) y tumbaba la
+# campana. Configurable con CHROME_LAUNCH_MAX (default 2).
+_LANZAMIENTOS_MAX = _env_int("CHROME_LAUNCH_MAX", 2)
+_SEMAFORO_LANZAMIENTO = threading.Semaphore(_LANZAMIENTOS_MAX)
 
 
 # ---------------------------------------------------------------------------
@@ -430,15 +545,21 @@ def _resetear_options(options, argumentos_originales) -> None:
         pass
 
 
-def crear_chrome(options, version_main=None, intentos=2):
+def crear_chrome(options, version_main=None, intentos=3):
     """Devuelve un driver uc.Chrome listo (driver compartido pre-parcheado, sin carreras).
 
-    - Aplica los flags de ahorro de datos y de estabilidad del renderer
-      (idempotente) antes de crear el driver.
+    - Aplica los flags de ahorro de datos, de estabilidad del renderer y de
+      contenedor (renderer-process-limit, heap capado, site-per-process off y
+      ``--disable-features`` fusionado en UNA sola bandera).
     - Usa SIEMPRE el chromedriver pre-parcheado de ``data/bin/`` (se prepara una
       sola vez bajo lock de archivo entre procesos).
-    - ``intentos`` (default 2): reintenta ante fallos transitorios tipicos de la
-      contencion (Text file busy / NoSuchDriver / Connection refused / timeouts).
+    - Limita los lanzamientos concurrentes (``CHROME_LAUNCH_MAX``, default 2)
+      con un jitter de 0.2-0.5s para que N workers no hagan fork/exec al mismo
+      tiempo (causa de ``BlockingIOError: [Errno 11]``).
+    - ``intentos`` (default 3 = hasta 2 reintentos): ante fallos transitorios
+      tipicos de la contencion (Text file busy / NoSuchDriver / Connection
+      refused / timeouts / agotamiento de PIDs) espera y reintenta. Si el fallo
+      es de recursos (Errno 11, can't start new thread) el backoff es 2-4s.
       Al agotarse, relanza la ultima excepcion para que el bot la reporte.
     """
     version = version_main
@@ -450,6 +571,7 @@ def crear_chrome(options, version_main=None, intentos=2):
 
     _aplicar_flags_ahorro(options)
     _aplicar_flags_estabilidad(options)
+    _aplicar_flags_contenedor(options)
     ruta_estable = _driver_compartido(version)
 
     try:
@@ -463,12 +585,16 @@ def crear_chrome(options, version_main=None, intentos=2):
         _resetear_options(options, argumentos_originales)
         driver = None
         try:
-            driver = uc.Chrome(
-                options=options,
-                version_main=version,
-                use_subprocess=False,
-                driver_executable_path=ruta_estable,
-            )
+            # Throttle: como maximo `_LANZAMIENTOS_MAX` forks a la vez, con un
+            # jitter corto para que no coincidan exactamente.
+            with _SEMAFORO_LANZAMIENTO:
+                time.sleep(0.2 + random.random() * 0.3)
+                driver = uc.Chrome(
+                    options=options,
+                    version_main=version,
+                    use_subprocess=False,
+                    driver_executable_path=ruta_estable,
+                )
             return driver
         except _EXCEPCIONES_TRANSITORIAS as e:
             ultimo_error = e
@@ -478,7 +604,10 @@ def crear_chrome(options, version_main=None, intentos=2):
                 except Exception:
                     pass
             if intento < total:
-                espera = 1.5 + random.random() * 0.5
+                if _es_fallo_recursos(e):
+                    espera = 2.0 + random.random() * 2.0
+                else:
+                    espera = 1.5 + random.random() * 0.5
                 logger.warning(
                     f"[chrome_driver] Fallo transitorio creando Chrome "
                     f"({intento}/{total}): {type(e).__name__}: {e}. "

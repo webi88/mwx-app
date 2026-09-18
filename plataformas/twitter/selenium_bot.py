@@ -46,6 +46,11 @@ class TwitterBot:
         self.ultimo_error = ""
         self.cuenta_suspendida = False
         self._proxy_cache = None
+        # Proxy local de auth (LocalForwardProxy) de ESTE navegador. Se
+        # guarda aqui porque `aplicar_a_options` lo devuelve al llamador y
+        # `cerrar()` debe cerrarlo siempre (antes quedaba vivo un aceptador +
+        # un hilo por conexion de Chrome por CADA navegador lanzado).
+        self._fwd_proxy = None
         # True cuando las cookies se inyectaron por CDP sin navegar
         # (`preparar_sesion_cdp`): los flujos van directo a la URL objetivo y,
         # si X pide login, hacen UN fallback a `login_con_cookies()`.
@@ -260,7 +265,12 @@ class TwitterBot:
             
             proxy = self._proxy_para_x()
             if proxy:
-                ProxyManager().aplicar_a_options(options, proxy, tag=self.usuario)
+                # El proxy local es de ESTE bot: se guarda para cerrarlo en
+                # `cerrar()` (sin esto quedaba un hilo aceptador + workers por
+                # cada navegador lanzado hasta agotar el contenedor).
+                self._fwd_proxy = ProxyManager().aplicar_a_options(
+                    options, proxy, tag=self.usuario
+                )
 
             # X es una SPA pesada: "eager" devuelve el control al terminar el
             # HTML sin esperar todos los subrecursos (con "normal", en Railway
@@ -283,6 +293,8 @@ class TwitterBot:
         except Exception as e:
             self.ultimo_error = f"{type(e).__name__}: {e}"
             logger.exception(f"Error iniciando driver para {self.usuario}: {e}")
+            # Si el driver no llego a crearse, no dejar vivo el proxy local.
+            self._cerrar_fwd_proxy()
             return False
     
     def login_con_cookies(self) -> bool:
@@ -5947,12 +5959,80 @@ class TwitterBot:
                 except Exception:
                     pass
 
-    def cerrar(self):
-        if self.driver:
+    def _cerrar_fwd_proxy(self):
+        """Cierra (tolerante) el proxy local de auth de ESTE navegador."""
+        fwd, self._fwd_proxy = self._fwd_proxy, None
+        if fwd is not None:
             try:
-                self.driver.quit()
+                fwd.close()
+                logger.debug(f"Proxy local cerrado para {self.usuario}")
             except Exception as e:
-                logger.error(f"Error cerrando driver: {e}")
+                logger.debug(
+                    f"Error cerrando el proxy local de {self.usuario}: "
+                    f"{type(e).__name__}: {e}"
+                )
+
+    def _matar_driver(self):
+        """Cierra el driver y, si queda huerfano, mata su chromedriver.
+
+        `driver.quit()` a veces lanza o deja el proceso del service vivo
+        (especialmente con `tab crashed` o contenedor agotado): aqui se
+        intenta `service.stop()` y, si sigue, `terminate()/kill()`. Nunca
+        lanza.
+        """
+        driver = self.driver
+        if driver is None:
+            return
+        try:
+            driver.quit()
+        except Exception as e:
+            logger.error(f"Error cerrando driver: {e}")
+            try:
+                servicio = getattr(driver, "service", None)
+                if servicio is not None and hasattr(servicio, "stop"):
+                    servicio.stop()
+                proceso = getattr(servicio, "process", None) if servicio else None
+                if proceso is not None and proceso.poll() is None:
+                    proceso.terminate()
+                    try:
+                        proceso.wait(timeout=5)
+                    except Exception:
+                        proceso.kill()
+            except Exception as e2:
+                logger.debug(
+                    f"No se pudo detener el chromedriver de {self.usuario}: "
+                    f"{type(e2).__name__}: {e2}"
+                )
+            return
+        # quit() no lanzo: comprobar por si el proceso del service siguio vivo.
+        try:
+            proceso = getattr(getattr(driver, "service", None), "process", None)
+            if proceso is not None and proceso.poll() is None:
+                logger.warning(
+                    f"chromedriver de {self.usuario} seguia vivo tras quit(); "
+                    "matandolo"
+                )
+                proceso.terminate()
+                try:
+                    proceso.wait(timeout=3)
+                except Exception:
+                    proceso.kill()
+        except Exception:
+            pass
+
+    def cerrar(self):
+        """Cierra el navegador Y el proxy local de auth. Nunca lanza.
+
+        Antes solo hacia `driver.quit()`: el LocalForwardProxy (aceptador +
+        workers) quedaba vivo para siempre, uno por cada navegador lanzado,
+        hasta agotar los hilos del contenedor (`can't start new thread`).
+        """
+        try:
+            self._matar_driver()
+        except Exception as e:
+            logger.debug(f"Error cerrando driver de {self.usuario}: {e}")
+        finally:
+            self._cerrar_fwd_proxy()
 
 
 def abrir_para_brandeo_manual(usuario: str, minutos: int = 5) -> bool:

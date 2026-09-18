@@ -101,6 +101,25 @@ class ProxyManager:
     # Bright Data (brd.superproxy.io) usa GUION para el pais: -country-XX.
     RE_COUNTRY_DASH = re.compile(r"-country-([A-Za-z]{2})(?:-|:|$)", re.IGNORECASE)
 
+    # Segmentos de credenciales que en el log real aparecian DUPLICADOS de
+    # forma consecutiva (proxies base ya modificados a los que se les volvio a
+    # agregar el modificador): `_area-MX_life-15_area-MX_life-15`. Se colapsan
+    # solo cuando la repeticion es EXACTA y consecutiva; `_session-XXX` (que
+    # debe ser unica por proxy) queda intacta porque no forma parte del grupo.
+    _RE_SEGMENTOS_REPETIDOS = (
+        re.compile(
+            r"(_area-[A-Za-z]{2}(?:_life-[A-Za-z0-9]+)?)\1(?=_|:|@|$)", re.IGNORECASE
+        ),
+        re.compile(
+            r"(_country-[A-Za-z]{2}(?:_lifetime-[A-Za-z0-9]+m?)?)\1(?=_|:|@|$)",
+            re.IGNORECASE,
+        ),
+        re.compile(
+            r"(-country-[A-Za-z]{2}(?:-session-[A-Za-z0-9]+)?)\1(?=-|:|@|$)",
+            re.IGNORECASE,
+        ),
+    )
+
     # Numero de sesiones (_session-XXX) quemadas de UN mismo gateway (misma
     # combinacion host:port:usuario_base) a partir del cual se considera que el
     # gateway completo esta flaggeado por X y se excluyen TODAS sus sesiones.
@@ -113,6 +132,34 @@ class ProxyManager:
         self._fwd_proxy = None
         # Gateways ya reportados por logger.error para no repetir el aviso.
         self._gateways_logueados = set()
+
+    def _colapsar_repeticiones(self, texto: str) -> str:
+        """Colapsa modificadores de credenciales repetidos CONSECUTIVAMENTE.
+
+        En el log real aparecio `_area-MX_life-15_area-MX_life-15` (un proxy
+        base ya modificado al que se le volvio a agregar el modificador). Se
+        colapsa solo la repeticion EXACTA de `_area-XX[_life-NN]`,
+        `_country-XX[_lifetime-NNm]` o `-country-XX[-session-XXX]`; el numero
+        de sesion (`_session-XXX`) nunca se toca. Nunca lanza.
+        """
+        original = texto or ""
+        s = original
+        try:
+            for _ in range(3):  # por si viene repetido 3+ veces
+                nuevo = s
+                for rx in self._RE_SEGMENTOS_REPETIDOS:
+                    nuevo = rx.sub(r"\1", nuevo)
+                if nuevo == s:
+                    break
+                s = nuevo
+            if s != original:
+                logger.warning(
+                    "Proxy con credenciales repetidas colapsado: "
+                    f"{original!r} -> {s!r}"
+                )
+        except Exception:
+            return original
+        return s
 
     def _archivos_por_pais(self) -> dict[str, list[str]]:
         """Devuelve un dict {pais_canonico: [rutas de archivo]} escaneando la
@@ -801,6 +848,8 @@ class ProxyManager:
             else:
                 s = f"http://{s}"
 
+        s = self._colapsar_repeticiones(s)
+
         if not self.analizar(s):
             logger.warning(f"Proxy ignorado (formato invalido): {linea}")
             return None
@@ -810,7 +859,7 @@ class ProxyManager:
     def analizar(self, proxy: str) -> Optional[dict]:
         """Devuelve {scheme, host, port, user, password} o None."""
         try:
-            s = proxy.strip()
+            s = self._colapsar_repeticiones(proxy).strip()
             scheme = "http"
             resto = s
             for prefijo in self.FORMATOS:
@@ -920,35 +969,47 @@ class ProxyManager:
 
         return ext_dir
 
-    def aplicar_a_options(self, options, proxy: str, tag: str = "perfil") -> None:
+    def aplicar_a_options(self, options, proxy: str, tag: str = "perfil"):
         """Aplica el proxy a un objeto ChromeOptions de undetected_chromedriver.
 
         Chrome 137+ ya no carga --load-extension ni acepta credenciales en
         --proxy-server, asi que se levanta un proxy local (127.0.0.1) que
         inyecta Proxy-Authorization y reenvia al proxy real.
+
+        DEVUELVE el `LocalForwardProxy` creado (o `None` si el proxy no
+        requiere auth local / es invalido). El LLAMADOR es su dueno: debe
+        guardarlo y cerrarlo al terminar el navegador (`fwd.close()`), porque
+        NO se guarda en esta instancia (`self._fwd_proxy`): asi ningun bot
+        cierra el proxy de otro por compartir un `ProxyManager`.
         """
         if not proxy:
-            return
+            return None
 
+        proxy = self._colapsar_repeticiones(proxy)
         info = self.analizar(proxy)
         if not info:
             logger.warning(f"Proxy invalido, no se aplicara: {proxy}")
-            return
+            return None
 
         if info.get("user"):
-            # Cerrar un proxy local previo antes de levantar uno nuevo.
-            self.cerrar_fwd_proxy()
             fwd = LocalForwardProxy(
                 info["host"], info["port"], info["user"], info.get("password", "")
             )
             puerto_local = fwd.start()
-            self._fwd_proxy = fwd
             options.add_argument(f"--proxy-server=127.0.0.1:{puerto_local}")
-        else:
-            options.add_argument(f"--proxy-server={info['host']}:{info['port']}")
+            logger.debug(f"Proxy local de {tag} en 127.0.0.1:{puerto_local}")
+            return fwd
+
+        options.add_argument(f"--proxy-server={info['host']}:{info['port']}")
+        return None
 
     def cerrar_fwd_proxy(self) -> None:
-        """Cierra el proxy local de autenticacion activo (si hay)."""
+        """Cierra el proxy local guardado EXPLICITAMENTE en esta instancia.
+
+        Se mantiene por compatibilidad, pero `aplicar_a_options` ya no asigna
+        `self._fwd_proxy` (devuelve el proxy al llamador), asi que esto nunca
+        cierra el proxy local de otro bot que comparta el `ProxyManager`.
+        """
         if getattr(self, "_fwd_proxy", None):
             try:
                 self._fwd_proxy.close()
