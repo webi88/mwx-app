@@ -46,6 +46,27 @@ class TwitterBot:
         self.ultimo_error = ""
         self.cuenta_suspendida = False
         self._proxy_cache = None
+        # True cuando las cookies se inyectaron por CDP sin navegar
+        # (`preparar_sesion_cdp`): los flujos van directo a la URL objetivo y,
+        # si X pide login, hacen UN fallback a `login_con_cookies()`.
+        self._sesion_cdp = False
+
+    @staticmethod
+    def _ahora() -> float:
+        """Reloj local para medir fases (perf).
+
+        Usa `time.monotonic()`; los tests parchean `selenium_bot.time` con un
+        reloj falso sin `monotonic`, por lo que se cae a `time.time()` para no
+        romperlos. Nunca lanza.
+        """
+        try:
+            return time.monotonic()
+        except Exception:
+            pass
+        try:
+            return time.time()
+        except Exception:
+            return 0.0
     
     def _obtener_proxy(self) -> str:
         try:
@@ -269,12 +290,13 @@ class TwitterBot:
             logger.warning(f"No hay cookies .pkl para {self.usuario}, intentando cookies_json")
             return self.login_con_cookies_json()
         
-        if not self.iniciar_driver():
+        if not self.driver and not self.iniciar_driver():
             return False
         
         try:
             self.driver.get(self.base_url)
-            time.sleep(2)
+            self._esperar_documento_listo()
+            time.sleep(0.3)
             
             with open(self.cookies_path, "rb") as f:
                 cookies = pickle.load(f)
@@ -286,7 +308,8 @@ class TwitterBot:
                     continue
             
             self.driver.refresh()
-            time.sleep(3)
+            self._esperar_documento_listo()
+            time.sleep(0.3)
 
             if self._detectar_cuenta_propia_suspendida():
                 self.cuenta_suspendida = True
@@ -366,7 +389,8 @@ class TwitterBot:
             # /404 en vez de home: evita las redirecciones agresivas que X hace
             # desde "/" cuando aun no hay sesion (te manda a /i/flow/login).
             self.driver.get(f"{self.base_url}/404")
-            time.sleep(2)
+            self._esperar_documento_listo()
+            time.sleep(0.3)
 
             # Normaliza TODAS las cookies (auth_token, ct0, twid, etc.) desde
             # formatos de vendedor/EditThisCookie/Selenium al que acepta Chrome.
@@ -384,12 +408,14 @@ class TwitterBot:
                     continue
 
             self.driver.refresh()
-            time.sleep(3)
+            self._esperar_documento_listo()
+            time.sleep(0.3)
 
             # Entrar a /home para que X ejecute su JS autenticado y emita ct0.
             try:
                 self.driver.get(f"{self.base_url}/home")
-                time.sleep(4)
+                self._esperar_documento_listo()
+                time.sleep(0.3)
             except Exception:
                 pass
 
@@ -445,6 +471,174 @@ class TwitterBot:
         except Exception as e:
             self.ultimo_error = f"{type(e).__name__}: {e}"
             logger.exception(f"Error en login con cookies_json {self.usuario}: {e}")
+            return False
+
+    def _esperar_documento_listo(self, timeout: int = 10) -> bool:
+        """Espera a que `document.readyState` sea `interactive`/`complete`.
+
+        Poll cada 0.25s via `execute_script`. Nunca lanza: devuelve False si el
+        driver no responde o no se alcanza el estado dentro de `timeout`s.
+        """
+        try:
+            fin = time.time() + max(0.0, float(timeout))
+        except Exception:
+            return False
+        while True:
+            try:
+                estado = self.driver.execute_script("return document.readyState")
+            except Exception:
+                estado = None
+            if estado in ("interactive", "complete"):
+                return True
+            try:
+                if time.time() >= fin:
+                    return False
+                time.sleep(0.25)
+            except Exception:
+                return False
+
+    def _cargar_cookies_normalizadas(self) -> list:
+        """Cookies de la cuenta normalizadas para CDP/Selenium (nunca lanza).
+
+        Orden: `.pkl` de la cuenta (`pickle.load`) -> `Cookie.cookies_json` de
+        la BD -> `auth_token` minimo para que X emita `ct0`. Devuelve [] si no
+        hay nada usable. Reutiliza `normalizar_cookies` sin duplicar la logica
+        de `login_con_cookies`/`login_con_cookies_json`.
+        """
+        # 1) Archivo .pkl (ruta rapida, ya en formato Selenium/navegador).
+        try:
+            if os.path.exists(self.cookies_path):
+                with open(self.cookies_path, "rb") as f:
+                    cookies_pkl = pickle.load(f)
+                normalizadas = normalizar_cookies(cookies_pkl)
+                if normalizadas:
+                    return normalizadas
+        except Exception as e:
+            logger.debug(f"No se pudo leer el .pkl de {self.usuario}: {e}")
+
+        # 2) cookies_json de la BD (formato completo: auth_token, ct0, twid...).
+        try:
+            import json
+
+            from core.database import get_db_session
+            from core.models import Cuenta
+
+            with get_db_session() as db:
+                cuenta = db.query(Cuenta).filter(Cuenta.usuario == self.usuario).first()
+                cookies_json = cuenta.cookies_json if cuenta else None
+            if isinstance(cookies_json, str):
+                try:
+                    cookies_json = json.loads(cookies_json)
+                except Exception:
+                    cookies_json = None
+            if cookies_json:
+                normalizadas = normalizar_cookies(cookies_json)
+                if normalizadas:
+                    return normalizadas
+        except Exception as e:
+            logger.debug(f"No se pudo leer cookies_json de {self.usuario}: {e}")
+
+        # 3) auth_token minimo (X emite ct0 al cargar x.com con sesion valida).
+        try:
+            minimas = self._cookies_auth_token()
+            if minimas:
+                return normalizar_cookies(minimas)
+        except Exception as e:
+            logger.debug(f"No se pudo preparar el auth_token de {self.usuario}: {e}")
+        return []
+
+    def preparar_sesion_cdp(self, cookies: Optional[list] = None) -> bool:
+        """Inyecta las cookies guardadas por CDP SIN navegar (sesion rapida).
+
+        Es la ruta principal del motor de activaciones: inicia el driver (si no
+        existe) y hace `Network.enable` + un `Network.setCookie` por cookie
+        (mapea `expiry` -> `expirationDate`; omite cookies sin name/value;
+        domain por defecto `.x.com`). No navega ni espera: los flujos
+        (`publicar_tweet`/`solo_retwittear`/`responder_tweet`) van directo a la
+        URL objetivo y, si X pide login, hacen UN fallback a
+        `login_con_cookies()`.
+
+        Devuelve True si inyecto >=1 cookie (deja `self._sesion_cdp = True`);
+        False si no hay cookies o CDP falla (el motor cae a `login_con_cookies`).
+        Nunca lanza.
+        """
+        self.ultimo_error = ""
+        self._sesion_cdp = False
+        try:
+            if not self.driver:
+                if not self.iniciar_driver():
+                    return False
+
+            cookies = cookies if cookies is not None else self._cargar_cookies_normalizadas()
+            if not cookies:
+                logger.debug(f"sesion CDP no disponible para {self.usuario}: sin cookies")
+                return False
+
+            try:
+                self.driver.execute_cdp_cmd("Network.enable", {})
+            except Exception as e:
+                logger.debug(f"CDP no disponible para {self.usuario}: {e}")
+                return False
+
+            inyectadas = 0
+            for cookie in cookies:
+                try:
+                    if not isinstance(cookie, dict):
+                        continue
+                    name = cookie.get("name")
+                    value = cookie.get("value")
+                    if not name or value is None or str(value) == "":
+                        continue
+                    payload = {
+                        "name": str(name),
+                        "value": value if isinstance(value, str) else str(value),
+                        "domain": str(cookie.get("domain") or ".x.com"),
+                        "path": str(cookie.get("path") or "/"),
+                        "secure": bool(cookie.get("secure", True)),
+                        "httpOnly": bool(cookie.get("httpOnly", False)),
+                    }
+                    expira = cookie.get("expiry", cookie.get("expirationDate"))
+                    if expira:
+                        try:
+                            payload["expirationDate"] = float(expira)
+                        except (TypeError, ValueError):
+                            pass
+                    self.driver.execute_cdp_cmd("Network.setCookie", payload)
+                    inyectadas += 1
+                except Exception as e:
+                    logger.debug(
+                        f"Cookie {cookie.get('name') if isinstance(cookie, dict) else '?'} "
+                        f"no inyectada por CDP: {e}"
+                    )
+                    continue
+
+            if inyectadas >= 1:
+                self._sesion_cdp = True
+                logger.debug(f"sesion CDP lista para {self.usuario} ({inyectadas} cookies)")
+                return True
+            return False
+        except Exception as e:
+            logger.debug(f"Preparacion de sesion CDP fallo para {self.usuario}: {e}")
+            self._sesion_cdp = False
+            return False
+
+    def _revivir_sesion_cdp(self) -> bool:
+        """Fallback UNICO tras detectar muro de login con `_sesion_cdp`.
+
+        Apaga `_sesion_cdp` y hace el login lento (`login_con_cookies`). Devuelve
+        True si la sesion quedo restablecida. Solo se llama cuando el flujo ya
+        detecto que X pidio login (no navega por si mismo).
+        """
+        if not self._sesion_cdp:
+            return False
+        logger.warning(
+            f"Sesion CDP invalida para {self.usuario}; login lento y UN reintento"
+        )
+        self._sesion_cdp = False
+        try:
+            return bool(self.login_con_cookies())
+        except Exception as e:
+            logger.warning(f"Login lento de recuperacion fallo para {self.usuario}: {e}")
             return False
 
     def _hay_challenge_seguridad(self, revisar_url: bool = True) -> bool:
@@ -956,6 +1150,7 @@ class TwitterBot:
             logger.error("Cuenta limitada, saltando publicacion")
             return None
         
+        t_inicio = self._ahora()
         try:
             # Compositor de POST NUEVO: prueba /compose/post, /compose/tweet y
             # el boton "Nuevo post" de /home, y distingue la sesion caida o
@@ -963,7 +1158,18 @@ class TwitterBot:
             # `_abrir_compositor`). El editor devuelto es SIEMPRE visible
             # (evita escribir en un composer oculto que deja el boton Post
             # deshabilitado).
-            editor = self._abrir_compositor()
+            try:
+                editor = self._abrir_compositor()
+            except Exception as e_compositor:
+                # Sesion CDP invalida: UN fallback a login lento y UN reintento.
+                if not (
+                    self._sesion_cdp
+                    and self._es_error_fatal_compositor(e_compositor)
+                    and self._revivir_sesion_cdp()
+                ):
+                    raise
+                editor = self._abrir_compositor()
+            t_compose = self._ahora()
             
             contenido = self._reorganizar_hashtags(contenido)
             contenido = self._recortar_para_x(contenido)
@@ -972,7 +1178,8 @@ class TwitterBot:
             if imagen_path and os.path.exists(imagen_path):
                 self._subir_imagen(imagen_path)
             
-            time.sleep(1)
+            time.sleep(random.uniform(0.15, 0.35))
+            t_escribir = self._ahora()
             
             # Esperar a que el boton "Post" se HABILITE: X lo mantiene
             # deshabilitado hasta que el editor registra el texto. Si en 10s no
@@ -999,8 +1206,15 @@ class TwitterBot:
                 except:
                     pass
                 return None
+            t_confirmado = self._ahora()
             
             logger.info(f"Tweet publicado por {self.usuario}")
+            logger.info(
+                f"perf @{self.usuario}: compose={t_compose - t_inicio:.1f}s "
+                f"escribir={t_escribir - t_compose:.1f}s "
+                f"publicar={t_confirmado - t_escribir:.1f}s "
+                f"total={t_confirmado - t_inicio:.1f}s"
+            )
             
             # 5 segundos de vista a la pantalla para confirmacion visual.
             # En headless (Railway) no hay pantalla que mirar: omitir la espera.
@@ -1841,7 +2055,9 @@ class TwitterBot:
                 logger.warning(
                     f"Carga lenta de {self.base_url}{ruta}; sigo con esperas explicitas"
                 )
-            time.sleep(3)
+            # Sin sleep fijo: basta con que el documento este interactivo y,
+            # sobre todo, con la espera por elemento VISIBLE (`_esperar_editor_visible`).
+            self._esperar_documento_listo(timeout=3)
 
             # Si X ya redirigio al login no hay SPA que esperar: cortar ya.
             if self._hay_muro_login():
@@ -1985,6 +2201,7 @@ class TwitterBot:
                 self.ultimo_error = self.ultimo_error or "no se pudo iniciar sesion"
                 return None
 
+        t_inicio = self._ahora()
         try:
             try:
                 self.driver.get(url)
@@ -1992,15 +2209,26 @@ class TwitterBot:
                 # Carga lenta (proxy intermitente): la pagina suele seguir
                 # cargando; las esperas explicitas de elementos deciden.
                 logger.warning(f"Carga lenta de {url}; sigo con esperas explicitas")
-            time.sleep(random.uniform(2.5, 4.0))
+            time.sleep(0.3)
 
             if self._hay_muro_login():
-                self.ultimo_error = (
-                    "sesión de X expirada o inválida: se pidió login al abrir "
-                    "el tweet ancla"
-                )
-                logger.error(self.ultimo_error)
-                return None
+                # Sesion CDP invalida: UN fallback a login lento y UN reintento
+                # de la navegacion (misma semantica que el resto de flujos).
+                if self._sesion_cdp and self._revivir_sesion_cdp():
+                    try:
+                        self.driver.get(url)
+                    except TimeoutException:
+                        logger.warning(
+                            f"Carga lenta de {url} tras login; sigo con esperas explicitas"
+                        )
+                    time.sleep(0.3)
+                if self._hay_muro_login():
+                    self.ultimo_error = (
+                        "sesión de X expirada o inválida: se pidió login al abrir "
+                        "el tweet ancla"
+                    )
+                    logger.error(self.ultimo_error)
+                    return None
 
             if self._detectar_limite_cuenta():
                 self.ultimo_error = "cuenta limitada por X"
@@ -2052,7 +2280,7 @@ class TwitterBot:
             except Exception:
                 pass
             self.driver.execute_script("arguments[0].click();", reply_btn)
-            time.sleep(random.uniform(1.0, 2.0))
+            time.sleep(random.uniform(0.5, 0.8))
 
             try:
                 # Preferir el editor del modal de respuesta y, sobre todo, que
@@ -2067,7 +2295,7 @@ class TwitterBot:
             texto = self._reorganizar_hashtags(texto)
             texto = self._recortar_para_x(texto)
             self._pegar_texto(editor, texto)
-            time.sleep(random.uniform(0.8, 1.5))
+            time.sleep(random.uniform(0.15, 0.35))
 
             if imagen_path and os.path.exists(imagen_path):
                 self._subir_imagen(imagen_path)
@@ -2109,11 +2337,17 @@ class TwitterBot:
             url_respuesta = self._obtener_url_respuesta(url)
             if url_respuesta:
                 self.ultima_url_publicada = url_respuesta
+            logger.info(
+                f"perf @{self.usuario}: total={self._ahora() - t_inicio:.1f}s (urls=1)"
+            )
             return url_respuesta or True
 
         except Exception as e:
             self.ultimo_error = f"{type(e).__name__}: {e}"
             logger.exception(f"Error respondiendo tweet para {self.usuario}: {e}")
+            logger.info(
+                f"perf @{self.usuario}: total={self._ahora() - t_inicio:.1f}s (urls=1)"
+            )
             try:
                 self.driver.save_screenshot(
                     resolver_ruta("data/temp/twitter_error_reply.png")
@@ -2544,7 +2778,8 @@ class TwitterBot:
         if not self.driver:
             if not self.login_con_cookies():
                 return resultados
-        
+
+        t_inicio = self._ahora()
         for url in targets:
             try:
                 try:
@@ -2553,7 +2788,27 @@ class TwitterBot:
                     # Carga lenta (proxy intermitente): la pagina suele seguir
                     # cargando; las esperas explicitas de elementos deciden.
                     logger.warning(f"Carga lenta de {url}; sigo con esperas explicitas")
-                time.sleep(3)
+                time.sleep(0.3)
+
+                if self._sesion_cdp and self._hay_muro_login():
+                    # Sesion CDP invalida: UN fallback a login lento y UN
+                    # reintento de la navegacion (misma semantica que el resto).
+                    if self._revivir_sesion_cdp():
+                        try:
+                            self.driver.get(url)
+                        except TimeoutException:
+                            logger.warning(
+                                f"Carga lenta de {url} tras login; sigo con esperas explicitas"
+                            )
+                        time.sleep(0.3)
+                    if self._hay_muro_login():
+                        self.ultimo_error = (
+                            "sesión de X expirada o inválida: se pidió login al "
+                            "abrir el tweet"
+                        )
+                        logger.error(self.ultimo_error)
+                        resultados["fallidos"] += 1
+                        break
                 
                 if self._detectar_limite_cuenta():
                     self.ultimo_error = "cuenta limitada por X"
@@ -2673,13 +2928,17 @@ class TwitterBot:
                     resultados["urls"].append(url_perfil)
                     self.ultima_url_publicada = url_perfil
                 
-                time.sleep(random.uniform(2.5, 6.0))
+                time.sleep(random.uniform(0.4, 1.2))
             
             except Exception as e:
                 resultados["fallidos"] += 1
                 self.ultimo_error = f"{type(e).__name__}: {e}"
                 logger.error(f"Error en RT: {e}")
         
+        logger.info(
+            f"perf @{self.usuario}: total={self._ahora() - t_inicio:.1f}s "
+            f"(urls={len(targets)})"
+        )
         return resultados
     
     def retweet(self, url: str) -> bool:

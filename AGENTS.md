@@ -665,6 +665,18 @@ python -m bot.main
 - `activaciones/motor.py`: "boton responder no encontrado"/"boton responder deshabilitado" son reintentables SEGUROS (nada se publicó); "respuestas limitadas" NO se reintenta y el detalle queda como "el tweet ancla no permite respuestas"; "sesión de X expirada" tampoco se reintenta.
 - Verificado: 33/33 responder (botón tardío, refresh, limitadas sin refresh, login, deshabilitado, motor) + 40/40 compositor + suites motor 49/20/20/23/19 + like 29.
 
+### Velocidad: sesion CDP + sleeps recortados para 10+ publicaciones/min (2026-09-18)
+- **Objetivo del usuario**: mínimo 10 publicaciones/minuto. Antes cada acción tardaba ~25-40s (login con 2-3 navegaciones y sleeps fijos de 2/3/4s, compose `sleep(3)`, pegado 1s y el motor 2-6s entre acciones) → ~3-4/min con 2 navegadores.
+- `plataformas/twitter/selenium_bot.py`:
+  - `preparar_sesion_cdp()`: inyecta las cookies (`.pkl`/`cookies_json`/`auth_token` vía `_cargar_cookies_normalizadas`) con `Network.setCookie` por CDP **sin navegar**; el motor lo usa primero y cae a `login_con_cookies()` solo si falla (DEBUG `sesion: CDP` / `sesion: login lento`).
+  - Si la URL objetivo pide login con sesión CDP, `_revivir_sesion_cdp()` hace UN login lento y reintenta UNA vez (en tweet/RT/respuesta).
+  - `_esperar_documento_listo()` reemplaza sleeps fijos en login/compose; sleeps recortados: tras pegar `1s→0.15-0.35`, `driver.get` del target `3s→0.3`, fin de cada URL en RT `2.5-6s→0.4-1.2`, clic Responder `1-2s→0.5-0.8`.
+  - Logs `perf @user: compose=… escribir=… publicar=… total=…` (y totals en RT/respuesta) para medir en Railway.
+- `activaciones/motor.py`: pausa del worker tras cada acción `2-6s→0.4-1.2s`; descanso cuando todas están en cooldown `2-5s→1-2s`. El cooldown por cuenta (`cooldown_min`) y el reintento de driver (2-4s) no cambian.
+- Medición: sleeps por acción 13-18s → ~1-5s; fast path de `publicar_tweet` 0.32s vs 5.21s (flujo viejo ≥9s). Con 6 navegadores el techo pasa a ser Chrome + carga de página (~8-15s/acción ⇒ 20-40/min teóricas; ≥10/min realista).
+- Verificado: suites nuevas 42/42 (`preparar_sesion_cdp`, sleeps, fallback) y 15/15 (RT/respuesta) + compositor 40 + responder 33 + motor 49/20/20/23/19 + like 29; **smoke real Chrome 152** de `Network.setCookie` OK.
+- ⚠ Para ≥10/min: subir "Navegadores simultáneos" en la UI o `MAX_BROWSERS=6` en Railway. Cada Chrome ~300-500MB RAM y el proxy residencial consume ~2-3MB por acción (10/min ≈ 1.2-1.8GB/h): monitorear GB de Smartproxy.
+
 ### Pendiente
 - Probar `ia/contexto_noticias.generar_contexto_desde_links` con `OPENAI_API_KEY` real (hoy verificado con IA simulada; el fallback local ya funciona)
 - Reemplazar tokens placeholder en `.env` por claves reales (Telegram, Gemini, Grizzly)

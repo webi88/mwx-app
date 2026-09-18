@@ -1222,7 +1222,7 @@ class MotorActivacion:
                     # Todas las cuentas revisadas estan en descanso: soltar el
                     # lock y reintentar sin bloquear a los demas workers.
                     if time.monotonic() < fin:
-                        time.sleep(random.uniform(2, 5))
+                        time.sleep(random.uniform(1, 2))
                     continue
                 cuenta, texto, rol = elegido
                 if time.monotonic() >= fin:
@@ -1242,7 +1242,9 @@ class MotorActivacion:
                             f"Error reportando el resultado de activacion: {e}"
                         )
                 if time.monotonic() < fin:
-                    time.sleep(random.uniform(2, 6))
+                    # Pausa corta entre acciones: el anti-spam real es el
+                    # cooldown por cuenta (`cooldown_min`), no este sleep.
+                    time.sleep(random.uniform(0.4, 1.2))
 
         if not procesables:
             return 0
@@ -1271,11 +1273,23 @@ class MotorActivacion:
             url = random.choice(urls)
 
             bot = TwitterBot(cuenta.usuario)
-            if not bot.login_con_cookies():
-                motivo = getattr(bot, "ultimo_error", "") or "login fallido"
-                logger.warning(f"Login fallido para @{cuenta.usuario}: {motivo}")
-                detalle = _detalle_con_sesion(motivo) or "login fallido"
-                return (cuenta.usuario, False, detalle[:120], "")
+            # Sesion rapida por CDP: inyecta las cookies sin navegar. Si no hay
+            # cookies o CDP falla, se cae al login lento de siempre.
+            try:
+                preparar_cdp = getattr(bot, "preparar_sesion_cdp", None)
+                sesion_cdp = bool(preparar_cdp()) if callable(preparar_cdp) else False
+            except Exception as e:
+                logger.debug(f"preparar_sesion_cdp fallo para @{cuenta.usuario}: {e}")
+                sesion_cdp = False
+            if sesion_cdp:
+                logger.debug(f"sesion: CDP para @{cuenta.usuario}")
+            else:
+                logger.debug(f"sesion: login lento para @{cuenta.usuario}")
+                if not bot.login_con_cookies():
+                    motivo = getattr(bot, "ultimo_error", "") or "login fallido"
+                    logger.warning(f"Login fallido para @{cuenta.usuario}: {motivo}")
+                    detalle = _detalle_con_sesion(motivo) or "login fallido"
+                    return (cuenta.usuario, False, detalle[:120], "")
 
             res = bot.solo_retwittear(
                 [url],
@@ -1360,11 +1374,23 @@ class MotorActivacion:
                     return (cuenta.usuario, rol, False, "sin URL objetivo", "")
 
             bot = TwitterBot(cuenta.usuario)
-            if not bot.login_con_cookies():
-                motivo = getattr(bot, "ultimo_error", "") or "login fallido"
-                logger.warning(f"Login fallido para @{cuenta.usuario}: {motivo}")
-                detalle = _detalle_con_sesion(motivo) or "login fallido"
-                return (cuenta.usuario, rol, False, detalle[:120], url_objetivo)
+            # Sesion rapida por CDP: inyecta las cookies sin navegar. Si no hay
+            # cookies o CDP falla, se cae al login lento de siempre.
+            try:
+                preparar_cdp = getattr(bot, "preparar_sesion_cdp", None)
+                sesion_cdp = bool(preparar_cdp()) if callable(preparar_cdp) else False
+            except Exception as e:
+                logger.debug(f"preparar_sesion_cdp fallo para @{cuenta.usuario}: {e}")
+                sesion_cdp = False
+            if sesion_cdp:
+                logger.debug(f"sesion: CDP para @{cuenta.usuario}")
+            else:
+                logger.debug(f"sesion: login lento para @{cuenta.usuario}")
+                if not bot.login_con_cookies():
+                    motivo = getattr(bot, "ultimo_error", "") or "login fallido"
+                    logger.warning(f"Login fallido para @{cuenta.usuario}: {motivo}")
+                    detalle = _detalle_con_sesion(motivo) or "login fallido"
+                    return (cuenta.usuario, rol, False, detalle[:120], url_objetivo)
 
             if rol == "cita":
                 res = bot.solo_retwittear(
