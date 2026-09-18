@@ -315,12 +315,15 @@ def _normalizar_rol_sorteo(valor) -> str:
 
 
 def _roles_disponibles_aleatorios(urls, hashtags="", contexto="",
-                                  texto_base="", solo_roles=None) -> list[str]:
+                                  texto_base="", solo_roles=None,
+                                  narrativa="") -> list[str]:
     """Roles que se pueden sortear con los inputs dados (modo aleatorio).
 
     - "cita", "rt" y "comentario" requieren al menos una URL objetivo (el
       comentario responde al tweet ancla).
-    - "hashtags" requiere hashtags, contexto o texto base.
+    - "hashtags" requiere hashtags, contexto, texto base o narrativa
+      (el trasfondo de noticias habilita el rol como material narrativo,
+      pero NUNCA se usa como texto publicable).
     - `solo_roles`, si viene, limita el sorteo a su interseccion con los
       disponibles; si la interseccion queda vacia se usan todos los
       disponibles. Nunca lanza: ante cualquier valor raro devuelve lo que
@@ -338,6 +341,7 @@ def _roles_disponibles_aleatorios(urls, hashtags="", contexto="",
             str(hashtags or "").strip()
             or str(contexto or "").strip()
             or str(texto_base or "").strip()
+            or str(narrativa or "").strip()
         ):
             disponibles.append("hashtags")
         if solo_roles:
@@ -359,8 +363,9 @@ def _sugerencia_roles_aleatorios() -> str:
     """Accion sugerida cuando el modo aleatorio no tiene ningun rol posible."""
     return (
         "Rol aleatorio sin roles disponibles: pega al menos una URL objetivo "
-        "(habilita cita/rt) o escribe hashtags, contexto o texto base "
-        "(habilita hashtags); no se abrió ningún navegador."
+        "(habilita cita/rt) o escribe hashtags, contexto, texto base O EL "
+        "TRASFONDO DE NOTICIAS (habilita hashtags); no se abrió ningún "
+        "navegador."
     )
 
 
@@ -734,6 +739,74 @@ class MotorActivacion:
                 grupos[rol].append(cuenta)
         return grupos
 
+    def _asignar_variaciones_cita(self, cuentas: list, texto_base: str,
+                                  narrativa: str = "",
+                                  entrenamiento: str = "",
+                                  tags: list = None) -> dict:
+        """Asigna a cada cuenta una variacion de cita segun su registro/perfil.
+
+        Agrupa `cuentas` por (registro, perfil) -- "politica"/"activista"/
+        "ciudadana" + "formal"/"ciudadano"/"popular", normalizados -- y pide un
+        pool a `generar_pool_variaciones_openai` POR GRUPO, para que el texto
+        de la cita hable como la cuenta que lo publica.
+
+        `narrativa` es SOLO TRASFONDO: viaja al prompt como referencia interna
+        (el propio generador ya lo refuerza) y NUNCA se usa como texto
+        publicable ni como base del fallback local. La transformacion por ronda
+        (`_narrativa_con_ronda`) la hace el llamador, para no duplicarla.
+
+        Aplica `_garantizar_hashtags_texto` con `tags` y reparte cada pool
+        barajado entre las cuentas de su grupo; las cuentas que no alcancen
+        texto reciben el fallback `_garantizar_hashtags_texto(texto_base,
+        tags)` (comportamiento previo). Nunca lanza: si el pool de un grupo
+        falla, sus cuentas usan el fallback. Devuelve {usuario: texto}.
+        """
+        asignaciones: dict = {}
+        tags = list(tags or [])
+        grupos: dict = {}
+        for cuenta in (cuentas or []):
+            try:
+                clave = (
+                    normalizar_tipo_cuenta(getattr(cuenta, "tipo_cuenta", "")),
+                    normalizar_perfil(
+                        getattr(cuenta, "perfil_personalidad", "")
+                    ),
+                )
+            except Exception:
+                clave = ("", "")
+            grupos.setdefault(clave, []).append(cuenta)
+
+        for (registro, perfil), grupo in grupos.items():
+            try:
+                pool = generar_pool_variaciones_openai(
+                    texto_base,
+                    cantidad=len(grupo),
+                    narrativa=narrativa,
+                    entrenamiento=entrenamiento,
+                    registro=registro,
+                    perfil=perfil,
+                )
+            except Exception as e:
+                logger.error(
+                    f"Activacion: pool de citas fallo para "
+                    f"({registro or 'libre'}/{perfil or 'libre'}) "
+                    f"({type(e).__name__}: {e}); se usa el texto base"
+                )
+                pool = []
+            if not isinstance(pool, list):
+                pool = []
+            if tags:
+                pool = [_garantizar_hashtags_texto(t, tags) for t in pool]
+            random.shuffle(pool)
+            for i, cuenta in enumerate(grupo):
+                if i < len(pool):
+                    asignaciones[cuenta.usuario] = pool[i]
+                else:
+                    asignaciones[cuenta.usuario] = (
+                        _garantizar_hashtags_texto(texto_base, tags)
+                    )
+        return asignaciones
+
     def _generar_textos_por_rol(self, grupos_ejec: dict, texto_base: str,
                                 hashtags: str = "", menciones: str = "",
                                 narrativa: str = "",
@@ -760,27 +833,22 @@ class MotorActivacion:
 
         citas = list(grupos_ejec.get("cita") or [])
         if citas:
-            pool_cita = generar_pool_variaciones_openai(
+            # Cada grupo (registro, perfil) recibe SU propio pool de variaciones
+            # para que el texto de la cita hable como la cuenta que lo publica.
+            asignaciones.update(self._asignar_variaciones_cita(
+                citas,
                 texto_base,
-                cantidad=len(citas),
                 narrativa=narrativa,
                 entrenamiento=entrenamiento,
-            )
-            if tags:
-                pool_cita = [
-                    _garantizar_hashtags_texto(t, tags) for t in pool_cita
-                ]
-            random.shuffle(pool_cita)
-            for i, cuenta in enumerate(citas):
-                if i < len(pool_cita):
-                    asignaciones[cuenta.usuario] = pool_cita[i]
-                else:
-                    asignaciones[cuenta.usuario] = _garantizar_hashtags_texto(
-                        texto_base, tags
-                    )
+                tags=tags,
+            ))
 
         cuentas_hashtags = list(grupos_ejec.get("hashtags") or [])
         if cuentas_hashtags:
+            # Campanas sin tweet ancla: el contexto de noticias raspadas por
+            # la IA hace de "texto base" para el fallback local (posts reales
+            # en vez de textos vacios cuando no hay texto_base).
+            base_hashtags = (texto_base or "").strip() or str(contexto or "").strip()
             textos_ia: dict = {}
             try:
                 from ia.generador_contenido import (
@@ -835,12 +903,13 @@ class MotorActivacion:
             respaldo = []
             if faltantes:
                 respaldo = self._pool_hashtags(
-                    texto_base, hashtags, menciones, len(faltantes)
+                    base_hashtags, hashtags, menciones, len(faltantes)
                 )
                 random.shuffle(respaldo)
             for i, cuenta in enumerate(faltantes):
                 asignaciones[cuenta.usuario] = (
-                    respaldo[i] if i < len(respaldo) else texto_base
+                    respaldo[i] if i < len(respaldo)
+                    else (base_hashtags or texto_base)
                 )
             for cuenta in cuentas_hashtags:
                 if cuenta.usuario in textos_ia:
@@ -853,12 +922,16 @@ class MotorActivacion:
             material = (
                 str(contexto or "").strip() or str(texto_base or "").strip()
             )
-            narrativa_com = narrativa
-            if material:
-                instruccion = f"Comenta el tweet ancla sobre: {material}"
-                narrativa_com = (
-                    f"{instruccion}\n{narrativa}" if narrativa else instruccion
-                )
+            instruccion = (
+                f"Comenta el tweet ancla sobre: {material}" if material else ""
+            )
+            trasfondo = (
+                "TRASFONDO (solo referencia interna; PROHIBIDO mencionarlo "
+                f"o copiarlo): {narrativa}"
+            ) if narrativa else ""
+            narrativa_com = "\n".join(
+                x for x in [instruccion, trasfondo] if x
+            )
             textos_ia_com: dict = {}
             try:
                 from ia.generador_contenido import generar_textos_comentario
@@ -1475,27 +1548,13 @@ class MotorActivacion:
                     except TypeError:
                         deseados = set()
                     base = [c for c in con_sesion if c.usuario in deseados]
-                nuevo = generar_pool_variaciones_openai(
+                asignaciones_ronda = self._asignar_variaciones_cita(
+                    base,
                     texto_base,
-                    cantidad=len(base),
                     narrativa=_narrativa_con_ronda(narrativa, _ronda),
                     entrenamiento=entrenamiento,
+                    tags=tags_pedidos,
                 )
-                if tags_pedidos:
-                    nuevo = [
-                        _garantizar_hashtags_texto(t, tags_pedidos)
-                        for t in nuevo
-                    ]
-                random.shuffle(nuevo)
-                asignaciones_ronda = {
-                    cuenta.usuario: (
-                        nuevo[i] if i < len(nuevo)
-                        else _garantizar_hashtags_texto(
-                            texto_base, tags_pedidos
-                        )
-                    )
-                    for i, cuenta in enumerate(base)
-                }
                 return _aplicar_anti_repeticion(asignaciones_ronda, usados)
 
             def _ejecutar_una_cuenta(cuenta, texto, rol=""):
@@ -1564,20 +1623,15 @@ class MotorActivacion:
             )
             return resumen
 
-        pool = generar_pool_variaciones_openai(
-            texto_base, cantidad=len(con_sesion), narrativa=narrativa, entrenamiento=entrenamiento
+        # Un pool por grupo (registro, perfil): cada cuenta publica una cita con
+        # su propio estilo. La narrativa viaja solo como trasfondo.
+        asignaciones = self._asignar_variaciones_cita(
+            con_sesion,
+            texto_base,
+            narrativa=narrativa,
+            entrenamiento=entrenamiento,
+            tags=tags_pedidos,
         )
-        if tags_pedidos:
-            pool = [_garantizar_hashtags_texto(t, tags_pedidos) for t in pool]
-        # Garantizar un texto unico por cuenta (ninguna cuenta comparte el mismo).
-        random.shuffle(pool)
-        asignaciones = {
-            cuenta.usuario: (
-                pool[i] if i < len(pool)
-                else _garantizar_hashtags_texto(texto_base, tags_pedidos)
-            )
-            for i, cuenta in enumerate(con_sesion)
-        }
         bloques = self._distribuir_cohortes(con_sesion, duracion_min, cohortes)
 
         logger.info(
@@ -1722,7 +1776,8 @@ class MotorActivacion:
             cooldown_val = 0.0
         roles_sortear = (
             _roles_disponibles_aleatorios(
-                urls, hashtags, contexto, texto_base, solo_roles
+                urls, hashtags, contexto, texto_base, solo_roles,
+                narrativa=narrativa,
             )
             if roles_aleatorios else []
         )

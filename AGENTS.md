@@ -611,7 +611,30 @@ python -m bot.main
 - Verificado: compileall global OK; motor 49/49 (k∈[7,13] con n=15 en 17 rondas, rotación 200 iteraciones sin repetir, comentario + fallbacks, URLs múltiples, no regresión con `repetir=False`); like 29/29 (0 clics a `unlike` con like ya dado); AppTest 3/3 pestañas de Activación Masiva y 15/15 de Cuentas con 0 excepciones, con los kwargs `secciones`/`porcentaje_min_ronda`/`porcentaje_max_ronda` capturados.
 - ⚠ Selectores nuevos de like y de comentario (`responder_tweet`) pendientes de probar con Chrome real; los flujos de campaña siguen necesitando proxy con GB y `MAX_BROWSERS` acorde.
 
+### Contexto desde links de noticias + campanas sin tweet ancla (2026-09-18)
+- **Nuevo `ia/contexto_noticias.py`** (sin dependencias nuevas):
+  - `normalizar_links(links)`: quita numeración ("1- ", "2) "), valida http(s) y deduplica por URL normalizada (minúsculas esquema/host, sin `#`, sin `utm_*`/`fbclid`, sin `/` final). Lista real de 10 líneas → 8 únicas (pares 1-2 y 8-9).
+  - `extraer_noticia(url, timeout=20)` / `extraer_noticias(links, timeout=20, max_workers=4)`: descarga con `curl_cffi` (impersonate chrome; fallback httpx/requests), extrae `og:title` → `<title>` → `<h1>` y párrafos `<p>` con `html.parser` (ignora script/style/nav/header/footer/aside, párrafos <40 chars y repetidos; fallback a `meta description`); límites ~1.5MB por página y 4000 chars por noticia; nunca lanza. **Prueba real: 8/8 noticias de la lista del usuario extraídas.**
+  - `generar_contexto_desde_links(links, texto_extra="", max_caracteres=1800, narrativa="")` → `{"ok","contexto","fuentes","errores","links_usados","links_duplicados","resumen_ia","ultimo_error"}`: briefing 900-1500 chars con `gpt-4o-mini` (temperature 0.4, patrón openai 0.28/>=1.0) y **fallback local** (títulos + extractos) si la IA falla (`resumen_ia=False`).
+- `web/operaciones/activacion_masiva.py`: panel **"📰 Contexto desde noticias"** en Cita masiva y Por roles (links una por línea + texto/contexto adicional opcional, botón extraer con spinner, preview de fuentes/contexto persistido en `session_state`, botón limpiar). `narrativa=contexto` en ambas pestañas; en Por roles se combina con el contexto manual (`contexto_final`).
+- **Modo sin tweet ancla**: checkbox "📝 Campaña solo de posts (sin tweet ancla)" en Por roles: deshabilita las URLs y fuerza `solo_roles=["hashtags"]` (también en modo aleatorio). Si no hay hashtags/texto base/contexto → warning y no lanza.
+- `activaciones/motor.py`: el fallback local del grupo hashtags usa `texto_base or contexto` (con el contexto de noticias genera posts aunque OpenAI falle); `urls=[] + solo_roles=["hashtags"]` nunca sortea cita/rt/comentario (100 iteraciones).
+- Verificado: compileall global OK; motor 49/49 + 20/20 (E2E sin ancla: 15 acciones, 5 rondas, todas `hashtags`, bots cerrados); scraper real 8/8 y dedup 10→8; AppTest noticias E2E (kwargs `urls=[]`, `solo_roles=["hashtags"]`, `contexto` combinado, `narrativa`) y regresión 15/15 pestañas de Cuentas con 0 excepciones.
+
+### Noticias solo como trasfondo invisible + citas por registro/perfil (2026-09-18)
+- **Regla del usuario**: de los links de noticias NO debe salir nada literal ni reconocible; son SOLO trasfondo. Todo texto (post, comentario y RT con cita) se escribe según el registro (politica/activista/ciudadana) y perfil (formal/ciudadano/popular) de CADA cuenta.
+- `ia/prompts.py`: nuevo bloque `_reglas_trasfondo()` ("MATERIAL DE REFERENCIA INTERNO... PROHIBIDO mencionarlo/citarlo/parafrasearlo; nada de medios, links, cifras, fechas, nombres propios ni frases; prohibido 'según la noticia/se informó/este hecho/en el contexto actual'"). Se inyecta en `get_prompt_hashtags`, `get_prompt_comentario` y en `generar_variaciones_masivas`; `_prompt_lote_mantenimiento()` (ruta real de comentarios/posts de campaña) también lo agrega.
+- **Fallbacks locales limpios**: `_PLANTILLAS_HASHTAGS`/`_construir_texto_local` solo usan `{contexto}` (tema manual; con vacío → "lo que tenemos") y ninguna plantilla local lee `narrativa`. Auditado todo `ia/generador_contenido.py`: la narrativa solo entra en prompts, nunca en texto publicable.
+- `activaciones/motor.py`:
+  - Nuevo helper `_asignar_variaciones_cita(cuentas, texto_base, narrativa, entrenamiento, tags)`: agrupa por (registro, perfil) y genera variaciones con `registro`/`perfil` de cada grupo. Se usa en el grupo "cita" de `ejecutar_por_roles` y en el flujo CLÁSICO de `ejecutar` (rondas y una pasada) — antes las citas se generaban genéricas.
+  - `activaciones/variaciones.py::generar_pool_variaciones_openai(..., registro="", perfil="")` pasa ambos a `generar_variaciones_masivas`.
+  - Comentarios: la noticia viaja como `narrativa_com` = "TRASFONDO (solo referencia interna; PROHIBIDO mencionarlo o copiarlo): ..."; el tema manual sigue como "Comenta el tweet ancla sobre: ...".
+  - `_roles_disponibles_aleatorios(..., narrativa="")`: la narrativa cuenta como material para habilitar posts con hashtag (campañas solo-noticias sin contexto manual).
+- **UI** (`web/operaciones/activacion_masiva.py`): se separaron los canales — `contexto` = tema manual (opinable), `narrativa` = noticias (trasfondo invisible). El panel ahora dice "solo trasfondo"; con solo noticias se puede lanzar en "solo posts" (`contexto=""`, `narrativa=noticias`).
+- Verificado: compileall global OK; suites motor 49/49 + 20/20 + 20/20 + 23/23 + 19/19; en pruebas con `narrativa="NOTICIA aviario Durango Toño Ochoa…"` los textos publicados (IA caída y local) NO contienen "aviario/Durango/Toño/Ochoa/zoológico" y respetan el registro de cada cuenta; AppTest de separación y regresión 15/15 pestañas con 0 excepciones.
+
 ### Pendiente
+- Probar `ia/contexto_noticias.generar_contexto_desde_links` con `OPENAI_API_KEY` real (hoy verificado con IA simulada; el fallback local ya funciona)
 - Reemplazar tokens placeholder en `.env` por claves reales (Telegram, Gemini, Grizzly)
 - Probar acciones Selenium en VPS (requiere Chrome; local sin Chrome)
 - `web_users.json`: cambiar usuario/clave admin por defecto antes de exponer el dashboard

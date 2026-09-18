@@ -97,20 +97,31 @@ def generar_pool_variaciones_openai(
     cantidad: int,
     narrativa: str = "",
     entrenamiento: str = "",
+    registro: str = "",
+    perfil: str = "",
 ) -> list[str]:
     """Genera 'cantidad' variaciones unicas de una cita usando OpenAI.
+
+    Las variaciones respetan el REGISTRO (politica/activista/ciudadana) y el
+    PERFIL (formal/ciudadano/popular) de la cuenta para la que se generan, de
+    modo que cada grupo de cuentas recibe textos con su propio estilo.
+
+    `narrativa` es SOLO TRASFONDO: viaja al prompt como referencia interna
+    (el prompt de `ia.generador_contenido` ya lo refuerza) y NUNCA se usa como
+    texto publicable ni como base del fallback local (que solo varia `base`).
 
     Si OpenAI no devuelve suficiente variedad, rellena el faltante con el
     fallback basado en sinonimos. Si aun asi falta, agrega variantes con
     sufijo numerado. Devuelve exactamente 'cantidad' strings (o tantos como
-    sea humanamente posible)."""
+    sea humanamente posible). Retrocompatible: con registro/perfil vacios se
+    comporta como antes."""
     from ia.generador_contenido import GeneradorContenido
 
     pool = []
     vistos = set()
 
     textos_openai = GeneradorContenido().generar_variaciones_masivas(
-        base, cantidad, narrativa, entrenamiento
+        base, cantidad, narrativa, entrenamiento, registro, perfil
     )
     for t in textos_openai:
         if t and t not in vistos:

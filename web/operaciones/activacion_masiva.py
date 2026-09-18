@@ -1,10 +1,22 @@
 """Operacion ACTIVACION MASIVA: cita masiva clasica + campana por roles + 3+3+3.
 
+Ambas pestanas de activacion incluyen el panel "📰 Contexto desde noticias
+(solo trasfondo)": ahi se pegan links de prensa (uno por linea, con o sin
+numeracion) y un texto de trasfondo adicional opcional; al pulsar "Extraer
+contexto" el modulo `ia.contexto_noticias` scrapea las noticias, las resume
+con IA (o fallback local) y muestra el preview y las fuentes usadas. Ese
+resultado es TRASFONDO INVISIBLE: viaja al motor como `narrativa` (en ambas
+pestanas) para orientar internamente los textos, y los prompts garantizan
+que la IA NUNCA mencione la noticia, sus medios, cifras ni nombres; cada
+texto se escribe con el registro y perfil de la cuenta. El TEMA que la IA SI
+puede tratar (sin copiarlo) es el campo manual "Contexto de los posts con
+hashtag", que en la pestana B viaja como `contexto` (la pestana A no lo usa).
+
 Pestana A ("🎯 Cita masiva"): quote-RTs aleatorizados sobre N cuentas con
 `MotorActivacion.ejecutar` (mismo formulario de siempre). Permite elegir la
 SECCION (CI/IP/Libertad/Justicia o Todas: solo publican sus cuentas) y, con
 "🔁 Repetir", el % minimo/maximo de cuentas que entra en cada ronda
-(subconjunto aleatorio).
+(subconjunto aleatorio). Requiere URLs (tweet ancla).
 
 Pestana B ("🗂️ Por roles (subcuentas)"): divide las cuentas twitter activas en
 SUBCUENTAS por rol (`Cuenta.rol_activacion`, ver `core/roles.py`):
@@ -16,6 +28,13 @@ Permite asignar el rol a la seleccion (selector masivo de `web.operaciones.
 cuentas`), repartir automaticamente entre los 4 roles, ver conteos/ejemplos y
 lanzar `MotorActivacion.ejecutar_por_roles` limitado a una seccion opcional.
 
+Modo "📝 Campaña solo de posts (sin tweet ancla)": checkbox de la pestana B
+para campanas donde NO hay tweet ancla. Deshabilita las URLs y limita las
+acciones a posts con hashtag/contexto (`solo_roles=["hashtags"]` tanto en
+modo rol aleatorio como en rol fijo); requiere material para que la IA genere
+los posts: hashtags, texto base, el contexto manual (tema) o el trasfondo de
+noticias (que NUNCA se menciona).
+
 Con "🎲 Rol aleatorio por cuenta en cada ronda" (default) el rol guardado NO
 se usa como filtro: en cada ronda el motor sortea cita/hashtags/comentario/rt
 por cuenta (`roles_aleatorios=True`) y cada cuenta CAMBIA de accion respecto
@@ -26,8 +45,9 @@ Las cuentas sin registro siguen saltandose.
 
 Con "🔁 Repetir hasta agotar el tiempo" (+ porcentajes) cada ronda usa un
 SUBCONJUNTO ALEATORIO de cuentas: mas del minimo% y menos del maximo%, la
-primera ronda tambien. Sin URLs no hay cita/rt/comentario; sin hashtags ni
-contexto no hay posts con hashtag.
+primera ronda tambien. Sin URLs no hay cita/rt/comentario; sin hashtags,
+contexto manual, texto base ni trasfondo de noticias no hay posts con
+hashtag.
 
 Pestana C ("📋 Campaña 3+3+3"): por cuenta 3 posts + 3 comentarios + 3 RTs
 del tweet principal (9 acciones). Genera los 9 textos con
@@ -549,6 +569,164 @@ def _mostrar_resultados_roles(resultados: dict):
                 st.caption(", ".join(f"@{u}" for u in sin_registro_usuarios))
 
 
+# ============================ UI: CONTEXTO DE NOTICIAS ============================
+
+def _panel_contexto_noticias(prefix: str) -> dict:
+    """Panel "📰 Contexto desde noticias (solo trasfondo)" de una pestana.
+
+    El resultado es TRASFONDO INVISIBLE: se pasa al motor como `narrativa`
+    (y NO como `contexto`), de modo que la IA lo usa solo como referencia
+    interna y NUNCA debe mencionar la noticia, sus medios, cifras ni nombres;
+    cada texto se escribe con el registro y perfil de la cuenta. El widget de
+    preview si muestra el contexto extraido, pero es para revision humana.
+
+    Renderiza:
+      - text_area de links (una por linea, con o sin numeracion) y text_area
+        de texto/trasfondo adicional opcional.
+      - boton "📰 Extraer contexto de las noticias": llama (bajo spinner y SOLO
+        al pulsarlo) a `ia.contexto_noticias.generar_contexto_desde_links` con
+        `max_caracteres=1800` y guarda el dict completo en
+        `st.session_state[f"{prefix}_noticias_resultado"]`.
+      - boton "🗑️ Limpiar contexto": borra el resultado y hace `st.rerun()`.
+      - si ya hay resultado, lo muestra en cada rerun (sin volver a raspar):
+        links usados/duplicados, si fue "Resumen IA" o "Resumen local (sin IA)",
+        los errores (max. 3) y un expander "Ver fuentes y contexto".
+
+    Devuelve `{"contexto", "links", "ok", "fuentes", "texto_extra"}` con
+    valores vacios si todavia no hay resultado. Nunca raspa fuera del boton.
+    """
+    from ia.contexto_noticias import generar_contexto_desde_links, normalizar_links
+
+    st.markdown("#### 📰 Contexto desde noticias (solo trasfondo)")
+    st.caption(
+        "Los links son solo trasfondo: la IA los usa como referencia interna "
+        "y NO debe mencionar la noticia, medios, cifras ni nombres; cada texto "
+        "se escribe con el registro y perfil de la cuenta."
+    )
+    links_raw = st.text_area(
+        "Links de noticias (una por línea)",
+        height=120,
+        key=f"{prefix}_noticias_links",
+        help=(
+            "Los links son solo trasfondo: la IA los usa como referencia "
+            "interna y NO debe mencionar la noticia, medios, cifras ni "
+            "nombres; cada texto se escribe con el registro y perfil de la "
+            "cuenta."
+        ),
+    )
+    texto_extra = st.text_area(
+        "Texto/contexto adicional (opcional)",
+        height=80,
+        key=f"{prefix}_noticias_texto",
+        help=(
+            "Se suma como trasfondo interno para orientar los textos; la IA "
+            "no debe mencionarlo literalmente. El tema que la IA sí puede "
+            "tratar es el campo 'Contexto de los posts con hashtag'."
+        ),
+    )
+
+    col_extraer, col_limpiar = st.columns(2)
+    with col_extraer:
+        extraer = st.button(
+            "📰 Extraer contexto de las noticias",
+            key=f"{prefix}_noticias_btn",
+        )
+    with col_limpiar:
+        limpiar = st.button(
+            "🗑️ Limpiar contexto",
+            key=f"{prefix}_noticias_clear",
+        )
+
+    clave_resultado = f"{prefix}_noticias_resultado"
+    if limpiar:
+        st.session_state.pop(clave_resultado, None)
+        st.rerun()
+
+    if extraer:
+        with st.spinner("Leyendo las noticias y resumiendo el contexto…"):
+            resultado = generar_contexto_desde_links(
+                links_raw,
+                texto_extra=texto_extra,
+                max_caracteres=1800,
+            )
+        st.session_state[clave_resultado] = resultado
+
+    resultado = st.session_state.get(clave_resultado) or {}
+    if not resultado:
+        return {
+            "contexto": "",
+            "links": [],
+            "ok": False,
+            "fuentes": [],
+            "texto_extra": "",
+        }
+
+    try:
+        links_usados = int(resultado.get("links_usados") or 0)
+    except (TypeError, ValueError):
+        links_usados = 0
+    try:
+        links_duplicados = int(resultado.get("links_duplicados") or 0)
+    except (TypeError, ValueError):
+        links_duplicados = 0
+    detalle = f"{links_usados} fuente(s)"
+    if links_duplicados:
+        detalle += f" · {links_duplicados} link(s) duplicado(s)"
+    detalle += (
+        " · Resumen IA" if resultado.get("resumen_ia")
+        else " · Resumen local (sin IA)"
+    )
+    if resultado.get("ok"):
+        st.success(f"📰 Contexto extraído: {detalle}.")
+    else:
+        motivo = str(resultado.get("ultimo_error") or "").strip()
+        st.warning(
+            f"📰 No se pudo construir el contexto: {detalle}."
+            + (f" {motivo}" if motivo else "")
+        )
+
+    errores = [
+        str(x).strip() for x in (resultado.get("errores") or []) if str(x).strip()
+    ]
+    if errores:
+        st.warning("⚠️ Fuentes con error: " + " · ".join(errores[:3]))
+
+    with st.expander("Ver fuentes y contexto", expanded=False):
+        fuentes = resultado.get("fuentes") or []
+        if fuentes:
+            for fuente in fuentes:
+                titulo = str(fuente.get("titulo") or "").strip() or "(sin título)"
+                url = str(fuente.get("url") or "").strip()
+                st.markdown(f"- [{titulo}]({url})" if url else f"- {titulo}")
+        else:
+            st.caption("No hay fuentes extraídas.")
+        contexto_guardado = str(resultado.get("contexto") or "").strip()
+        if contexto_guardado:
+            clave_ver = f"{prefix}_noticias_contexto_ver"
+            # Se fija el estado ANTES de crear el widget para que el preview
+            # muestre siempre el ultimo contexto (widget de solo lectura).
+            st.session_state[clave_ver] = contexto_guardado
+            st.text_area(
+                "Contexto",
+                height=200,
+                disabled=True,
+                key=clave_ver,
+            )
+        else:
+            st.caption("Sin contexto.")
+        ultimo_error = str(resultado.get("ultimo_error") or "").strip()
+        if ultimo_error:
+            st.caption(f"Último error: {ultimo_error}")
+
+    return {
+        "contexto": str(resultado.get("contexto") or "").strip(),
+        "links": normalizar_links(links_raw),
+        "ok": bool(resultado.get("ok")),
+        "fuentes": list(resultado.get("fuentes") or []),
+        "texto_extra": str(texto_extra or "").strip(),
+    }
+
+
 # ============================ PESTANAS ============================
 
 def _cita_masiva():
@@ -567,6 +745,8 @@ def _cita_masiva():
         key="act_hashtags",
         help="Se agregan a los retweets con cita (con '#' garantizado).",
     )
+
+    panel_noticias = _panel_contexto_noticias("act")
 
     col1, col2, col3, col4 = st.columns(4)
     with col1:
@@ -686,6 +866,10 @@ def _cita_masiva():
         urls = [u.strip() for u in urls_text.splitlines() if u.strip()]
         if not urls:
             st.warning("Pega al menos una URL objetivo.")
+            st.info(
+                "Para campañas sin tweet ancla usa la pestaña «🗂️ Por roles "
+                "(subcuentas)» con «Campaña solo de posts»."
+            )
             return
         if not texto_base:
             st.warning("Escribe el texto base de la cita.")
@@ -704,6 +888,7 @@ def _cita_masiva():
             lambda cb: motor.ejecutar(
                 urls=urls,
                 texto_base=texto_base,
+                narrativa=panel_noticias["contexto"],
                 cantidad_cuentas=(
                     None if todas_cuentas else (int(cantidad) if cantidad > 0 else None)
                 ),
@@ -900,11 +1085,21 @@ def _por_roles():
             f"🚦 La campaña usará todas las cuentas activas: {len(cuentas)}."
         )
 
+    # El checkbox "📝 Campaña solo de posts" se renderiza mas abajo (junto a
+    # "Rol aleatorio"); leemos su valor de session_state para poder deshabilitar
+    # las URLs en el mismo rerun en que se marca.
+    sin_ancla = bool(st.session_state.get("act_roles_sin_ancla", False))
     urls_text = st.text_area(
         "URLs objetivo (una por línea; las usan 'cita', 'comentario' y 'rt')",
         height=100,
         key="act_roles_urls",
+        disabled=sin_ancla,
     )
+    if sin_ancla:
+        st.caption(
+            "🚫 Sin tweet ancla: las URLs están deshabilitadas y no se usan; "
+            "todas las acciones serán posts con hashtag/contexto."
+        )
     texto_base = st.text_area(
         "Texto base de la cita / contexto por defecto de los posts con hashtag",
         height=80,
@@ -936,6 +1131,8 @@ def _por_roles():
             "Menciones (ej. @cuenta1 @cuenta2)",
             key="act_roles_menciones",
         )
+
+    panel_noticias = _panel_contexto_noticias("act_roles")
 
     col_dur, col_coh, col_nav, col_cool = st.columns(4)
     with col_dur:
@@ -991,6 +1188,22 @@ def _por_roles():
             "guardado y se desactiva el filtro «Solo cuentas con rol»."
         ),
     )
+
+    sin_ancla = st.checkbox(
+        "📝 Campaña solo de posts (sin tweet ancla)",
+        value=False,
+        key="act_roles_sin_ancla",
+        help=(
+            "No hay tweet que retwittear/citar/comentar: todas las cuentas "
+            "publican posts con el contexto manual (tema), hashtags, texto "
+            "base o el trasfondo de noticias (que la IA no menciona)."
+        ),
+    )
+    if sin_ancla:
+        st.caption(
+            "🚫📌 Campaña solo de posts: no se usan URLs; todas las acciones "
+            "serán posts con hashtag/contexto."
+        )
 
     col_like, col_solo, col_rep = st.columns(3)
     with col_like:
@@ -1078,18 +1291,32 @@ def _por_roles():
             "subcuenta."
         ),
     ):
-        urls = [u.strip() for u in urls_text.splitlines() if u.strip()]
+        urls = (
+            []
+            if sin_ancla
+            else [u.strip() for u in urls_text.splitlines() if u.strip()]
+        )
+        # Separacion estricta: el campo manual es el TEMA (`contexto`, la IA
+        # SI puede opinar de el) y las noticias raspadas son TRASFONDO
+        # INVISIBLE (`narrativa`, la IA NUNCA debe mencionarlas ni copiarlas).
+        contexto_manual = str(contexto or "").strip()
+        narrativa_noticias = str(panel_noticias["contexto"] or "").strip()
         if repetir and not (1 <= int(pct_min) < int(pct_max) <= 99):
             st.warning(
                 "Revisa los porcentajes por ronda: el mínimo debe ser menor "
                 "que el máximo y el máximo no puede pasar de 99%."
             )
             return
-        solo_roles_param = (
-            None
-            if roles_aleatorios
-            else (list(ORDEN_ROLES) if solo_con_rol else None)
-        )
+        if sin_ancla:
+            # Campaña sin tweet ancla: SOLO posts con hashtag/contexto, tanto
+            # en modo rol aleatorio como en modo rol fijo.
+            solo_roles_param = ["hashtags"]
+        else:
+            solo_roles_param = (
+                None
+                if roles_aleatorios
+                else (list(ORDEN_ROLES) if solo_con_rol else None)
+            )
         usuarios_param = None if todas_cuentas else (usuarios_sel or None)
         base_objetivo = (
             [f for f in cuentas if f.get("tipo_cuenta")]
@@ -1102,18 +1329,52 @@ def _por_roles():
                 if f.get("seccion") == secciones_param[0]
             ]
 
-        if roles_aleatorios:
+        material_posts = (
+            str(hashtags or "").strip()
+            or contexto_manual
+            or str(texto_base or "").strip()
+            or narrativa_noticias
+        )
+
+        if sin_ancla:
+            if roles_aleatorios:
+                if not _cuentas_objetivo(base_objetivo, usuarios_param):
+                    st.warning(
+                        "No hay cuentas que cumplan la selección (sección, "
+                        "selector o registro). Revisa los filtros."
+                    )
+                    return
+            else:
+                roles_objetivo = _roles_objetivo(
+                    base_objetivo, usuarios_param, solo_roles_param
+                )
+                if "hashtags" not in roles_objetivo:
+                    st.warning(
+                        "No hay cuentas con rol 'Hashtags y menciones' que "
+                        "cumplan la selección. Asigna ese rol o activa «🎲 Rol "
+                        "aleatorio por cuenta en cada ronda»."
+                    )
+                    return
+            if not material_posts:
+                st.warning(
+                    "Sin tweet ancla necesitas al menos hashtags, texto base, "
+                    "el contexto de los posts o links de noticias (trasfondo) "
+                    "para que la IA genere los posts."
+                )
+                return
+        elif roles_aleatorios:
             if not _cuentas_objetivo(base_objetivo, usuarios_param):
                 st.warning(
                     "No hay cuentas que cumplan la selección (sección, "
                     "selector o registro). Revisa los filtros."
                 )
                 return
-            if not urls and not str(hashtags or "").strip():
+            if not urls and not material_posts:
                 st.warning(
-                    "Pega al menos una URL objetivo o hashtags: sin URLs el "
-                    "rol aleatorio no puede hacer cita/rt/comentario y solo "
-                    "quedan posts con hashtag."
+                    "Pega al menos una URL objetivo, escribe hashtags, texto "
+                    "base o el contexto de los posts, o extrae las noticias "
+                    "de trasfondo: sin URLs el rol aleatorio no puede hacer "
+                    "cita/rt/comentario y solo quedan posts con hashtag."
                 )
                 return
         else:
@@ -1149,7 +1410,8 @@ def _por_roles():
                 usuarios=usuarios_param,
                 solo_roles=solo_roles_param,
                 callback=cb,
-                contexto=contexto,
+                contexto=contexto_manual,
+                narrativa=narrativa_noticias,
                 repetir=bool(repetir),
                 solo_con_registro=bool(todas_cuentas),
                 roles_aleatorios=bool(roles_aleatorios),

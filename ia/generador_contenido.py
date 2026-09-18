@@ -23,6 +23,7 @@ from ia.prompts import (
     instrucciones_tema,
     _normalizar_tema,
     _reglas_registro,
+    _reglas_trasfondo,
 )
 from loguru import logger
 
@@ -238,13 +239,22 @@ class GeneradorContenido:
             )
             prompt += _reglas_registro(registro)
             prompt += bloque_estilo_perfil(perfil_norm)
+            prompt += _reglas_trasfondo()
+            prompt += (
+                "\nLas variaciones conservan el SENTIDO de la CITA BASE y el "
+                "REGISTRO/PERFIL de la cuenta; PROHIBIDO incorporar datos, "
+                "nombres propios, cifras, fechas o frases de la "
+                "NARRATIVA/TRASFONDO.\n"
+            )
             if perfil_norm:
                 prompt += (
                     "\nEl texto DEBE incluir al menos un hashtag integrado EN MEDIO "
                     "del texto; NUNCA lo pongas al final.\n"
                 )
             if narrativa:
-                prompt += f"\n\nNARRATIVA GENERAL:\n{narrativa}"
+                prompt += (
+                    f"\n\nNARRATIVA GENERAL (TRASFONDO INVISIBLE):\n{narrativa}"
+                )
             if entrenamiento:
                 prompt += f"\n\nENTRENAMIENTO DEL CLIENTE:\n{entrenamiento}"
             prompt += (
@@ -1186,7 +1196,8 @@ def _prompt_lote_mantenimiento(
         ),
     ]
     if narrativa:
-        partes.append(f"NARRATIVA GENERAL:\n{narrativa}")
+        partes.append(f"NARRATIVA GENERAL (TRASFONDO INVISIBLE):\n{narrativa}")
+        partes.append(_reglas_trasfondo().strip())
     if entrenamiento:
         partes.append(f"ENTRENAMIENTO GENERAL:\n{entrenamiento}")
 

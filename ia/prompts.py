@@ -105,6 +105,35 @@ def _reglas_registro(registro: str = "") -> str:
 
 
 # --------------------------------------------------------------------------- #
+# Narrativa/noticias como TRASFONDO INVISIBLE: el texto final opina con la voz
+# de la cuenta, NUNCA menciona ni alude al material de referencia.
+# --------------------------------------------------------------------------- #
+_REGLAS_TRASFONDO = (
+    "NARRATIVA/TRASFONDO = MATERIAL DE REFERENCIA INTERNO (puede venir de "
+    "noticias). PROHIBIDO mencionarlo, citarlo, parafrasearlo o aludir a él: "
+    "nada de medios, links, cifras, fechas, nombres propios, cargos ni frases "
+    "del trasfondo. PROHIBIDO usar fórmulas como 'según la noticia', 'se "
+    "informó', 'este hecho', 'ante esta situación' o 'en el contexto actual'. "
+    "El texto debe leerse como una OPINIÓN/EXPERIENCIA ESPONTÁNEA de la "
+    "cuenta; quien lo lea NO debe poder deducir de qué noticia salió. El "
+    "CONTEXTO (si se indica) es un tema legítimo del que SÍ se opina, siempre "
+    "con palabras propias y sin copiarlo literal."
+)
+
+
+def _reglas_trasfondo() -> str:
+    """Bloque de reglas para tratar la narrativa/noticias como trasfondo invisible.
+
+    Se agrega a los prompts que reciben ``narrativa`` (puede traer material de
+    noticias) para que el texto final se lea como una opinion/experiencia
+    espontanea de la cuenta y NUNCA mencione la noticia, el medio, links,
+    cifras, fechas, nombres propios, cargos ni frases del trasfondo.
+    Devuelve el bloque listo para concatenar (con salto de linea inicial).
+    """
+    return f"\n{_REGLAS_TRASFONDO}\n"
+
+
+# --------------------------------------------------------------------------- #
 # Perfiles de redaccion (core.perfiles) -> formato OBLIGATORIO por cuenta.
 # --------------------------------------------------------------------------- #
 _BLOQUES_ESTILO_PERFIL = {
@@ -559,6 +588,7 @@ def get_prompt_comentario(
     """
     return (
         _base_narrativa(narrativa, entrenamiento)
+        + (_reglas_trasfondo() if narrativa else "")
         + _reglas_registro(registro)
         + "\nTIPO DE CONTENIDO: COMENTARIO/RESPUESTA BREVE.\n"
         "TAREA: comentar o responder una publicacion de forma breve y natural.\n"
@@ -595,6 +625,7 @@ def get_prompt_hashtags(
     """
     prompt = (
         _base_narrativa(narrativa, entrenamiento)
+        + (_reglas_trasfondo() if narrativa else "")
         + _reglas_registro(registro)
         + "\nTIPO DE CONTENIDO: POST ORIGINAL CON HASHTAG.\n"
         "TAREA: redactar publicaciones ORIGINALES con opinion propia sobre el "
@@ -633,7 +664,9 @@ def get_prompt_hashtags(
         )
     if contexto:
         prompt += (
-            "\nCONTEXTO (tema sobre el que debes opinar; NO copies su redacción):\n"
+            "\nCONTEXTO (tema legítimo sobre el que SÍ debes opinar con tus "
+            "propias palabras; es distinto del trasfondo de noticias y NO "
+            "debes copiar su redacción):\n"
             f"{contexto}"
         )
     prompt += _reglas_formato(cantidad)
