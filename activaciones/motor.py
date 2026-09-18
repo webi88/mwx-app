@@ -113,6 +113,10 @@ _SENALES_ERROR_PUBLICACION_SEGURA = (
     "boton de retweet no encontrado",
     "botón de retweet no encontrado",
     "compositor de x no cargo",
+    "no se encontro el boton responder",
+    "no se encontró el botón responder",
+    "boton responder deshabilitado",
+    "botón responder deshabilitado",
 )
 
 
@@ -155,6 +159,26 @@ def _detalle_con_sesion(motivo) -> str:
         return "" if motivo is None else str(motivo)
     except Exception:
         return ""
+
+
+def _detalle_comentario(motivo) -> str:
+    """Detalle legible del fallo de un comentario/respuesta.
+
+    Normaliza la sesion caida (`_detalle_con_sesion`) y deja claro cuando el
+    tweet ancla no acepta respuestas (respuestas limitadas): no es un fallo de
+    la cuenta y no se reintenta. Nunca lanza.
+    """
+    try:
+        texto = "" if motivo is None else str(motivo)
+    except Exception:
+        texto = ""
+    texto_lower = texto.lower()
+    if (
+        "respuestas limitadas" in texto_lower
+        or "no permite respuestas" in texto_lower
+    ):
+        return "el tweet ancla no permite respuestas"
+    return _detalle_con_sesion(f"comentario: {texto}")
 
 
 def _es_error_driver_transitorio(detalle) -> bool:
@@ -1387,8 +1411,9 @@ class MotorActivacion:
                 else:
                     motivo = getattr(bot, "ultimo_error", "") or "sin exito"
                     # La sesion caida se reporta sin prefijo, con la accion
-                    # concreta (renovar cookies/login); no es suspension.
-                    detalle = _detalle_con_sesion(f"comentario: {motivo}")
+                    # concreta (renovar cookies/login); no es suspension. Las
+                    # respuestas limitadas del tweet ancla se reportan claras.
+                    detalle = _detalle_comentario(motivo)
                 return (cuenta.usuario, rol, ok, detalle[:120], url_objetivo)
 
             # rol == "hashtags"

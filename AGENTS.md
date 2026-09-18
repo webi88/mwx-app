@@ -659,6 +659,12 @@ python -m bot.main
 - Verificado: 45/45 red de seguridad + suites ia (43/23/55/29) y motor (49/20/20/23/19).
 - ⚠ **Railway debe redeployarse**: la instancia que publicó el texto con la noticia literal corría una versión anterior a los cambios de trasfondo/registros; tras redeploy los posts se generan con las reglas nuevas y la red anti-fuga.
 
+### Rol comentario confiable: respuestas limitadas, refresh y diagnóstico (2026-09-18)
+- **Bug en Railway (rol "comentario")**: `responder_tweet: no se encontro el boton Responder del tweet`. Buscaba el botón solo 12s, sin refrescar ni distinguir "respuestas limitadas"/tweet eliminado/sesión caída.
+- `plataformas/twitter/selenium_bot.py`: `_buscar_boton_responder(timeout=25)` + variantes (aria-label Reply/Responder, `data-testid='reply'` anidado); `_motivo_no_respondible()` detecta "Who can reply?"/"respuestas limitadas" (EN/ES, sin acentos) y tweet no disponible; `_esperar_article_tweet(20)` espera a que monte el tweet; `responder_tweet` corta con "sesión de X expirada o inválida" si hay muro de login, hace UN refresh + reintento cuando no hay motivo, y si sigue sin botón reporta `no se encontro el boton Responder del tweet (url=… title=…)`; antes de clicar espera `_esperar_boton_post_habilitado(10)` (evita el falso "X no confirmó").
+- `activaciones/motor.py`: "boton responder no encontrado"/"boton responder deshabilitado" son reintentables SEGUROS (nada se publicó); "respuestas limitadas" NO se reintenta y el detalle queda como "el tweet ancla no permite respuestas"; "sesión de X expirada" tampoco se reintenta.
+- Verificado: 33/33 responder (botón tardío, refresh, limitadas sin refresh, login, deshabilitado, motor) + 40/40 compositor + suites motor 49/20/20/23/19 + like 29.
+
 ### Pendiente
 - Probar `ia/contexto_noticias.generar_contexto_desde_links` con `OPENAI_API_KEY` real (hoy verificado con IA simulada; el fallback local ya funciona)
 - Reemplazar tokens placeholder en `.env` por claves reales (Telegram, Gemini, Grizzly)

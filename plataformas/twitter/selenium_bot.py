@@ -18,6 +18,7 @@ import random
 import os
 import re
 import hashlib
+import unicodedata
 from typing import Optional
 from datetime import datetime, timedelta
 from loguru import logger
@@ -1380,15 +1381,19 @@ class TwitterBot:
     # usan varios selectores de respaldo (data-testid / rol textbox / texto
     # visible) y verifican la publicacion real antes de reportar exito.
 
-    def _buscar_boton_responder(self, timeout: int = 12):
+    def _buscar_boton_responder(self, timeout: int = 25):
         """Devuelve el boton Responder del tweet (o un fallback).
 
-        Selectores (con fallback): `[data-testid='reply']`, `button[...]`,
-        aria-label "Responder"/"Reply" y botones con ese texto visible.
+        Selectores (con fallback): `[data-testid='reply']` (y variantes con
+        `div[role='button']`), `button[...]`, aria-label "Responder"/"Reply"
+        (incluida la coincidencia lateral '...eply'/'...espond' por si X cambia
+        el prefijo del aria-label) y botones con ese texto visible.
         Devuelve None si no aparece un boton visible/habilitado en `timeout`s.
         """
         selectores = [
             "[data-testid='reply']",
+            "div[role='button'][data-testid='reply']",
+            "[data-testid='reply'] [role='button']",
             "button[data-testid='reply']",
         ]
         xpaths = [
@@ -1397,6 +1402,12 @@ class TwitterBot:
             "'abcdefghijklmnopqrstuvwxyz'), 'responder')]",
             "//*[contains(translate(@aria-label, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', "
             "'abcdefghijklmnopqrstuvwxyz'), 'reply')]",
+            "//*[@role='button'][@aria-label='Reply' or @aria-label='Responder']",
+            "//*[@role='button'][.//*[local-name()='path'] and "
+            "(contains(translate(@aria-label,'ABCDEFGHIJKLMNOPQRSTUVWXYZ',"
+            "'abcdefghijklmnopqrstuvwxyz'),'eply') or "
+            "contains(translate(@aria-label,'ABCDEFGHIJKLMNOPQRSTUVWXYZ',"
+            "'abcdefghijklmnopqrstuvwxyz'),'espond'))]",
             "//div[@role='button'][.//span[text()='Responder']]",
             "//div[@role='button'][.//span[text()='Reply']]",
         ]
@@ -1420,6 +1431,53 @@ class TwitterBot:
                     continue
             time.sleep(0.5)
         return None
+
+    # Frases visibles de X cuando el tweet ancla NO acepta respuestas (el
+    # boton Responder no esta disponible). Se comparan en minusculas y sin
+    # acentos contra el texto visible de la pagina (ver
+    # `_motivo_no_respondible`).
+    _FRASES_RESPUESTAS_LIMITADAS = (
+        "who can reply",
+        "quien puede responder",
+        "quienes pueden responder",
+        "respuestas limitadas",
+        "replies are limited",
+        "only some people can reply",
+        "solo algunas personas pueden responder",
+    )
+
+    def _motivo_no_respondible(self) -> str:
+        """Motivo por el que el tweet ancla NO se puede responder ('' si si).
+
+        Detecta, en el texto visible de la pagina (o su `page_source`):
+        - respuestas limitadas ("Who can reply?", "Las respuestas estan
+          limitadas", "Only some people can reply", ...);
+        - tweet eliminado/no existe/cuenta suspendida
+          (`_detectar_tweet_no_disponible`).
+
+        Compara en minusculas y sin acentos. Nunca lanza.
+        """
+        texto = ""
+        try:
+            texto = self.driver.find_element(By.TAG_NAME, "body").text or ""
+        except Exception:
+            texto = ""
+        if not texto:
+            try:
+                texto = self.driver.page_source or ""
+            except Exception:
+                texto = ""
+        try:
+            normalizado = unicodedata.normalize("NFKD", (texto or "").lower())
+            normalizado = "".join(
+                c for c in normalizado if not unicodedata.combining(c)
+            )
+        except Exception:
+            normalizado = (texto or "").lower()
+        for frase in self._FRASES_RESPUESTAS_LIMITADAS:
+            if frase in normalizado:
+                return "el tweet ancla tiene las respuestas limitadas"
+        return self._detectar_tweet_no_disponible()
 
     def _buscar_editor_respuesta(self, timeout: int = 12):
         """Devuelve el textbox de composicion visible de la respuesta.
@@ -1461,6 +1519,27 @@ class TwitterBot:
                             return editor
                 except Exception:
                     continue
+            time.sleep(0.5)
+        return None
+
+    def _esperar_article_tweet(self, timeout: int = 20):
+        """Espera hasta `timeout`s a que exista `article[data-testid='tweet']`.
+
+        La pagina del tweet ancla puede tardar con proxy lento; los timeouts
+        transitorios del renderer se toleran. Devuelve el articulo o None si no
+        aparecio en el plazo (el llamador sigue con el flujo normal, sin
+        abortar). Nunca lanza.
+        """
+        fin = time.time() + max(0.2, float(timeout))
+        while time.time() < fin:
+            try:
+                articulos = self.driver.find_elements(
+                    By.CSS_SELECTOR, "article[data-testid='tweet']"
+                )
+                if articulos:
+                    return articulos[0]
+            except Exception:
+                pass
             time.sleep(0.5)
         return None
 
@@ -1915,16 +1994,56 @@ class TwitterBot:
                 logger.warning(f"Carga lenta de {url}; sigo con esperas explicitas")
             time.sleep(random.uniform(2.5, 4.0))
 
+            if self._hay_muro_login():
+                self.ultimo_error = (
+                    "sesión de X expirada o inválida: se pidió login al abrir "
+                    "el tweet ancla"
+                )
+                logger.error(self.ultimo_error)
+                return None
+
             if self._detectar_limite_cuenta():
                 self.ultimo_error = "cuenta limitada por X"
                 logger.error("Cuenta limitada, saltando respuesta")
                 return None
 
-            reply_btn = self._buscar_boton_responder()
+            # La pagina del tweet puede tardar con proxy lento: esperar a que
+            # exista el articulo (si no aparece, se sigue con el flujo actual).
+            self._esperar_article_tweet(timeout=20)
+
+            reply_btn = self._buscar_boton_responder(timeout=25)
             if reply_btn is None:
-                self.ultimo_error = "no se encontro el boton Responder del tweet"
-                logger.warning(self.ultimo_error)
-                return None
+                # Distinguir un tweet NO respondible (respuestas limitadas,
+                # eliminado...) de una simple carga lenta: con motivo no se
+                # refresca ni se insiste (no cambiaria nada).
+                motivo = self._motivo_no_respondible()
+                if motivo:
+                    self.ultimo_error = motivo
+                    logger.warning(f"Tweet ancla no respondible: {motivo}")
+                    return None
+
+                # La SPA de X puede montar el boton tarde: UN refresh
+                # (tolerando la carga lenta) y un segundo intento mas corto.
+                logger.warning(
+                    "Boton Responder no aparecio; refrescando la pagina del tweet"
+                )
+                try:
+                    self.driver.refresh()
+                except TimeoutException:
+                    logger.warning("Refresh lento del tweet ancla; sigo con esperas")
+                except Exception as e:
+                    logger.warning(
+                        f"Refresh del tweet ancla fallo ({type(e).__name__}: {e})"
+                    )
+                self._esperar_article_tweet(timeout=20)
+                reply_btn = self._buscar_boton_responder(timeout=20)
+                if reply_btn is None:
+                    self.ultimo_error = (
+                        "no se encontro el boton Responder del tweet "
+                        f"({self._diagnostico_pagina()})"
+                    )
+                    logger.warning(self.ultimo_error)
+                    return None
             try:
                 self.driver.execute_script(
                     "arguments[0].scrollIntoView({block: 'center'});", reply_btn
@@ -1954,7 +2073,18 @@ class TwitterBot:
                 self._subir_imagen(imagen_path)
                 time.sleep(1)
 
-            publicar_btn = self._buscar_boton_post()
+            # No clicar a ciegas: X mantiene el boton Responder deshabilitado
+            # hasta que el editor registra el texto. Si no se habilita, el
+            # reply NO se publico y hay que cortar aqui (el motor lo reintenta
+            # sin riesgo de duplicar).
+            publicar_btn = self._esperar_boton_post_habilitado(10, texto=texto)
+            if publicar_btn is None:
+                self.ultimo_error = (
+                    "boton Responder deshabilitado: el texto no quedo en el "
+                    "editor (el reply NO se publico)"
+                )
+                logger.warning(self.ultimo_error)
+                return None
             self.driver.execute_script("arguments[0].click();", publicar_btn)
 
             # Verificacion real: no basta con hacer clic.
