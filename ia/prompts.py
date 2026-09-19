@@ -592,8 +592,9 @@ def get_prompt_comentario(
 
     Mismos bloques que mantenimiento (narrativa, registro, tema, personalidad
     y formato por perfil) pero los textos son aptos para responder: mas
-    breves, directos y conversacionales. Todos llevan hashtag EN MEDIO y el
-    perfil formal conserva Titulo/Descripcion/Conclusion en version corta.
+    breves, directos y conversacionales, SIN hashtags, links ni @menciones
+    (X marca las respuestas con esos elementos como probable spam). El perfil
+    formal conserva Titulo/Descripcion/Conclusion en version corta.
     """
     return (
         _base_narrativa(narrativa, entrenamiento)
@@ -603,6 +604,10 @@ def get_prompt_comentario(
         "TAREA: comentar o responder una publicacion de forma breve y natural.\n"
         "- Los textos son para responder: directos, conversacionales y con "
         "reaccion u opinion propia.\n"
+        "- NO uses hashtags, ni links, ni @menciones (X marca las respuestas "
+        "con esos elementos como probable spam).\n"
+        "- Evita frases de relleno repetidas; aporta un angulo distinto y "
+        "conversacional.\n"
         "- NO repitas la publicacion original ni empieces con 'En respuesta a'.\n"
         "- Cada texto debe aportar un angulo distinto y sonar humano.\n"
         "- Son mas breves que un post normal: 1-2 frases (el perfil formal "
@@ -665,7 +670,11 @@ def get_prompt_hashtags(
     if hashtags:
         prompt += (
             "\nHASHTAGS OBLIGATORIOS:\n"
-            f"- Usa EXACTAMENTE estos hashtags (bien escritos): {hashtags}\n"
+            f"- Usa SOLO hashtags de esta lista (bien escritos): {hashtags}\n"
+            "- PROHIBIDO inventar o agregar cualquier otro hashtag distinto.\n"
+            "- Puedes usar UNO, DOS o TODOS los de la lista (elige la cantidad "
+            "segun el texto); lo importante es que todos los que uses salgan "
+            "de esa lista.\n"
             "- Integrados EN MEDIO del texto, de forma NATURAL: al final de "
             "una frase o despues de una coma/punto cercano a la mitad; nunca "
             "entre un articulo y su sustantivo, nunca partiendo la frase y "

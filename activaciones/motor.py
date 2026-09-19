@@ -445,28 +445,93 @@ def _sugerencia_roles_aleatorios() -> str:
     )
 
 
-def _garantizar_hashtags_texto(texto: str, tags: list[str]) -> str:
-    """Garantiza que el texto traiga al menos un hashtag de `tags`.
+def _garantizar_hashtags_texto_local(texto: str, tags: list) -> str:
+    """Fallback local de `_garantizar_hashtags_texto` (sin IA).
 
-    Si no trae ninguno, agrega al final 1-2 tags elegidos al azar (los que
-    quepan de la lista). Con `tags` vacio devuelve el texto intacto.
-    Nunca lanza.
+    Normaliza los tags pedidos, elimina los hashtags que no esten entre ellos
+    y reinserta en el MEDIO un subconjunto aleatorio (los que ya estuvieran
+    presentes o, si no hay ninguno, 1..len(tags) elegidos al azar) respetando
+    la grafia exacta pedida. Nunca lanza.
+    """
+    try:
+        pedidos, claves = [], set()
+        for tag in (tags or []):
+            limpio = str(tag or "").strip()
+            if not limpio:
+                continue
+            if not limpio.startswith("#"):
+                limpio = "#" + limpio.lstrip("@")
+            clave = limpio.lower()
+            if clave not in claves:
+                claves.add(clave)
+                pedidos.append(limpio)
+        if not pedidos:
+            return texto
+
+        presentes = {}
+        for hallado in re.findall(_RE_HASHTAG, texto):
+            clave = hallado.lower()
+            if clave in claves:
+                presentes.setdefault(clave, hallado)
+        sin_tags = re.sub(_RE_HASHTAG, " ", texto)
+        sin_tags = re.sub(r"\s+([,.;:!?])", r"\1", sin_tags)
+        sin_tags = re.sub(r"[ \t]{2,}", " ", sin_tags)
+        sin_tags = re.sub(r"\n{3,}", "\n\n", sin_tags).strip()
+        if not sin_tags:
+            return " ".join(pedidos)
+        if presentes:
+            elegidos = [
+                presentes[p.lower()] for p in pedidos
+                if p.lower() in presentes
+            ]
+        else:
+            k = random.randint(1, len(pedidos))
+            elegidos = random.sample(pedidos, k)
+        if not elegidos:
+            return sin_tags
+        colocado = colocar_hashtag_en_medio(sin_tags, hashtag=elegidos[0])
+        hallado = re.search(_RE_HASHTAG, colocado)
+        if hallado and hallado.group(0).lower() == elegidos[0].lower():
+            colocado = (
+                colocado[:hallado.start()]
+                + " ".join(elegidos)
+                + colocado[hallado.end():]
+            )
+        return colocado
+    except Exception:
+        return texto
+
+
+def _garantizar_hashtags_texto(texto: str, tags: list[str]) -> str:
+    """Deja en el texto SOLO hashtags de `tags` (subconjunto aleatorio).
+
+    Con `tags` no vacio delega en `ia.generador_contenido
+    .solo_hashtags_pedidos` (import perezoso), que conserva un subconjunto
+    aleatorio de 1..len(tags), elimina cualquier otro hashtag y lo integra en
+    MEDIO (nunca al final). Si ese import no esta disponible, usa el fallback
+    local `_garantizar_hashtags_texto_local` (mismo criterio, con
+    `core.perfiles.colocar_hashtag_en_medio`). Con `tags` vacio devuelve el
+    texto tal cual. Nunca lanza.
     """
     t = str(texto or "").strip()
     if not t or not tags:
         return t
     try:
-        presentes = {
-            h.lower()
-            for h in re.findall(r"#[A-Za-z0-9ÁÉÍÓÚÜÑáéíóúüñ_]+", t)
-        }
-        if any(str(tag).lower() in presentes for tag in tags):
-            return t
-        cantidad = min(len(tags), random.randint(1, 2))
-        elegidos = random.sample(list(tags), cantidad)
-        return (t + " " + " ".join(elegidos)).strip()
+        from ia.generador_contenido import solo_hashtags_pedidos
     except Exception:
-        return t
+        solo_hashtags_pedidos = None
+    if callable(solo_hashtags_pedidos):
+        try:
+            # Semilla aleatoria por texto: el subconjunto 1..len(tags) varia
+            # entre textos (con la semilla 0 seria siempre el mismo).
+            resultado = solo_hashtags_pedidos(
+                t, list(tags), semilla=random.randint(0, 10**9)
+            )
+            if resultado is not None:
+                return str(resultado)
+        except Exception:
+            pass
+    return _garantizar_hashtags_texto_local(t, tags)
 
 
 def _agregar_menciones(texto: str, menciones_norm: list[str]) -> str:
@@ -481,6 +546,37 @@ def _agregar_menciones(texto: str, menciones_norm: list[str]) -> str:
         return f"{t}\n\n{' '.join(seleccion)}".strip()
     except Exception:
         return t
+
+
+def _limpiar_comentario_spam(texto) -> str:
+    """Quita hashtags, URLs y @menciones de un comentario (anti-spam de X).
+
+    Usa `ia.generador_contenido.limpiar_comentario_spam` (import perezoso);
+    si no esta disponible aplica un fallback local equivalente. Nunca lanza:
+    ante cualquier fallo devuelve el texto original sin espacios sobrantes.
+    """
+    try:
+        from ia.generador_contenido import limpiar_comentario_spam
+    except Exception:
+        limpiar_comentario_spam = None
+    if callable(limpiar_comentario_spam):
+        try:
+            limpio = limpiar_comentario_spam(texto)
+            if limpio is not None:
+                return str(limpio)
+        except Exception:
+            pass
+    try:
+        t = str(texto or "")
+        t = re.sub(r"(?:https?://|www\.)\S+", " ", t, flags=re.IGNORECASE)
+        t = re.sub(_RE_HASHTAG, " ", t)
+        t = re.sub(r"@[A-Za-z0-9_]+", " ", t)
+        t = re.sub(r"\s+([,.;:!?])", r"\1", t)
+        t = re.sub(r"[ \t]{2,}", " ", t)
+        t = re.sub(r"\n{3,}", "\n\n", t)
+        return t.strip()
+    except Exception:
+        return str(texto or "").strip()
 
 
 _RE_HASHTAG = r"#[A-Za-z0-9ÁÉÍÓÚÜÑáéíóúüñ_]+"
@@ -761,6 +857,10 @@ class MotorActivacion:
                 random.shuffle(seleccion)
                 partes.append(" ".join(seleccion))
             texto = "\n\n".join(p for p in partes if p).strip()
+            if texto:
+                # Deja SOLO un subconjunto aleatorio de los hashtags pedidos
+                # (quita los ajenos que vengan en el texto base).
+                texto = _garantizar_hashtags_texto(texto, tags)
             if texto and texto not in vistos:
                 vistos.add(texto)
                 pool.append(texto)
@@ -861,6 +961,7 @@ class MotorActivacion:
                     entrenamiento=entrenamiento,
                     registro=registro,
                     perfil=perfil,
+                    hashtags=tags,
                 )
             except Exception as e:
                 logger.error(
@@ -1075,6 +1176,7 @@ class MotorActivacion:
                             cantidad=len(faltantes),
                             narrativa=narrativa,
                             entrenamiento=entrenamiento,
+                            hashtags=[],
                         )
                     except Exception:
                         respaldo = []
@@ -1086,10 +1188,13 @@ class MotorActivacion:
                         str(respaldo[i] or "").strip()
                         if i < len(respaldo) else ""
                     )
-                    if not texto and tags:
-                        semilla = base_respaldo or " ".join(tags)
-                        texto = _garantizar_hashtags_texto(semilla, tags)
-                    textos_ia_com[cuenta.usuario] = texto
+                    if not texto:
+                        texto = base_respaldo or " ".join(tags)
+                    # Los comentarios/respuestas NUNCA llevan hashtags, links
+                    # ni @menciones (senales de "Probable spam" para X).
+                    textos_ia_com[cuenta.usuario] = _limpiar_comentario_spam(
+                        texto
+                    )
             for cuenta in cuentas_comentario:
                 asignaciones[cuenta.usuario] = textos_ia_com.get(
                     cuenta.usuario, ""

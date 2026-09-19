@@ -944,6 +944,45 @@ def _con_hashtag_en_medio(texto: str) -> str:
         return t
 
 
+# Cierre conversacional de ultimo recurso para comentarios: X marca las
+# respuestas con hashtags, links o @menciones como "probable spam".
+_CIERRE_COMENTARIO_SPAM = "Buen punto, vale la pena conversarlo."
+
+
+def _limpiar_espacios_y_saltos(texto: str) -> str:
+    """Limpia espacios antes de puntuacion, dobles y saltos 3+; nunca lanza."""
+    t = str(texto or "")
+    t = re.sub(r"[ \t]+([.,;:!?])", r"\1", t)
+    t = re.sub(r"[ \t]{2,}", " ", t)
+    t = re.sub(r"\n{3,}", "\n\n", t)
+    t = "\n".join(linea.strip() for linea in t.splitlines())
+    return re.sub(r"\n{3,}", "\n\n", t).strip()
+
+
+def limpiar_comentario_spam(texto: str) -> str:
+    """Deja un comentario/respuesta apto para X (spam-safe).
+
+    X marca como "probable spam" las respuestas que llevan hashtags, links o
+    @menciones. Este helper los elimina SIEMPRE, limpia los espacios huerfanos
+    (``" ,"`` -> ``,``; dobles espacios; saltos 3+) y garantiza un texto
+    conversacional no vacio: si tras limpiar quedan menos de 8 caracteres
+    utiles, devuelve un cierre generico corto. Nunca lanza.
+    """
+    try:
+        t = str(texto or "")
+        t = re.sub(r"https?://\S+", " ", t, flags=re.IGNORECASE)
+        t = re.sub(r"www\.\S+", " ", t, flags=re.IGNORECASE)
+        t = re.sub(r"#[A-Za-z0-9ÁÉÍÓÚÜÑáéíóúüñ_]+", " ", t)
+        t = re.sub(r"@[A-Za-z0-9_]+", " ", t)
+        t = _limpiar_espacios_y_saltos(t)
+    except Exception as e:
+        logger.error(f"Error limpiando comentario spam-safe: {e}")
+        t = ""
+    if len(re.sub(r"\s+", "", t)) < 8:
+        return _CIERRE_COMENTARIO_SPAM
+    return t
+
+
 # ===================================================================== #
 # Estilos locales por REGISTRO (fallback sin OpenAI):
 # - ciudadana: persona real "sin estudios" -> malos signos de puntuacion
@@ -1799,7 +1838,9 @@ def _prompt_lote_mantenimiento(
     Cada item del lote es ``(indice_cuenta, numero_texto, tema)`` y la info de
     la cuenta puede traer ``"perfil"`` (formal/ciudadano/popular) y
     ``"tipo_accion"`` ("post" o "comentario"). El prompt respeta formato,
-    registro, personalidad y tema de cada cuenta, y exige hashtag en MEDIO.
+    registro, personalidad y tema de cada cuenta; los POSTS exigen hashtag en
+    MEDIO y los COMENTARIOS/RESPUESTAS van SIN hashtags, links ni @menciones
+    (X marca las respuestas con esos elementos como probable spam).
     """
     n_textos = len(lote)
     infos = [_info_cuenta(cuentas_info, item[0]) for item in lote]
@@ -1867,10 +1908,35 @@ def _prompt_lote_mantenimiento(
         if accion == "comentario":
             linea += (
                 "\nACCION COMENTARIO/RESPUESTA: texto apto para responder una "
-                "publicacion; breve y conversacional (1-2 frases)."
+                "publicacion; breve y conversacional (1-2 frases) y SIN "
+                "hashtags, links ni @menciones."
             )
         lineas.append(linea)
     partes.append("\n".join(lineas))
+
+    if solo_comentarios:
+        reglas_hashtag = (
+            "- Los textos de COMENTARIO/RESPUESTA NO deben llevar hashtags, NI "
+            "links, NI @menciones (X marca las respuestas con esos elementos "
+            "como probable spam): texto conversacional limpio.\n"
+            "- No repitas frases de relleno; aporta un angulo distinto y "
+            "conversacional en cada texto.\n"
+        )
+    elif hay_comentarios:
+        reglas_hashtag = (
+            "- Los textos de POST DEBEN incluir al menos un hashtag INTEGRADO "
+            "EN MEDIO del texto; NUNCA lo pongas al final (bien escrito, sin "
+            "deformar).\n"
+            "- Los textos de COMENTARIO/RESPUESTA NO deben llevar hashtags, NI "
+            "links, NI @menciones (X marca las respuestas con esos elementos "
+            "como probable spam): texto conversacional limpio.\n"
+        )
+    else:
+        reglas_hashtag = (
+            "- TODOS los textos DEBEN incluir al menos un hashtag INTEGRADO EN "
+            "MEDIO del texto; NUNCA lo pongas al final (bien escrito, sin "
+            "deformar).\n"
+        )
 
     partes.append(
         "REGLAS DEL LOTE:\n"
@@ -1891,9 +1957,8 @@ def _prompt_lote_mantenimiento(
         "error leve opcional (p. ej. una tilde omitida) y ninguna abreviatura.\n"
         "- Los textos de COMENTARIO/RESPUESTA deben ser breves y conversacionales "
         "(1-2 frases; el perfil formal con sus 3 bloques pero cortos).\n"
-        "- TODOS los textos DEBEN incluir al menos un hashtag INTEGRADO EN MEDIO "
-        "del texto; NUNCA lo pongas al final (bien escrito, sin deformar).\n"
-        "- Maximo 240 caracteres por texto.\n"
+        + reglas_hashtag
+        + "- Maximo 240 caracteres por texto.\n"
         "- NO numeres, NO uses etiquetas ni corchetes.\n"
         "- Responde SOLO con los textos separados por '---'."
     )
@@ -1903,9 +1968,11 @@ def _prompt_lote_mantenimiento(
 def _fallback_estructura_mantenimiento(cuentas_info, n_por_cuenta) -> list[list[str]]:
     """Ultimo recurso: estructura valida con textos no vacios (nunca lanza).
 
-    Respeta el perfil/tipo_accion/registro de cada cuenta y garantiza hashtag
-    en medio. Aplica el estilo local de cada registro (ciudadana: malos signos
-    + 4-7 errores; activista: 2-3 errores sin abrir "¿"/"¡"; politica intacta).
+    Respeta el perfil/tipo_accion/registro de cada cuenta; los POSTS llevan
+    hashtag en medio y los COMENTARIOS se limpian para no llevar hashtags,
+    links ni @menciones (spam-safe). Aplica el estilo local de cada registro
+    (ciudadana: malos signos + 4-7 errores; activista: 2-3 errores sin abrir
+    "¿"/"¡"; politica intacta).
     """
     try:
         lista = list(cuentas_info or [])
@@ -1928,17 +1995,25 @@ def _fallback_estructura_mantenimiento(cuentas_info, n_por_cuenta) -> list[list[
             plantillas = _plantillas_comentario(perfil)
         else:
             plantillas = _PLANTILLAS_MANTENIMIENTO["gustos"]["generico"]
+        es_comentario = accion == "comentario"
         fila = []
         vistos: set = set()
         for j in range(n):
             t = plantillas[(i + j) % len(plantillas)]
             # Estilo local por registro ANTES del hashtag (no deforma el tag).
             t = _humanizar_por_registro(t, registro, semilla=i * 100 + j)
-            t = _con_hashtag_en_medio(t)
+            if es_comentario:
+                # Comentarios spam-safe: sin hashtags, links ni @menciones.
+                t = limpiar_comentario_spam(t)
+            else:
+                t = _con_hashtag_en_medio(t)
             if t in vistos:
                 t = _variar_hasta_unico(t, vistos)
                 t = _humanizar_por_registro(t, registro, semilla=i * 100 + j + 997)
-                t = _con_hashtag_en_medio(t)
+                if es_comentario:
+                    t = limpiar_comentario_spam(t)
+                else:
+                    t = _con_hashtag_en_medio(t)
             vistos.add(t)
             fila.append(t)
         resultado.append(fila)
@@ -2043,7 +2118,8 @@ def _generar_textos_mantenimiento_impl(
             _reportar()
 
     # 3) Relleno local + normalizacion final: exactamente n textos por cuenta,
-    #    unicos en lo posible, NUNCA vacios y con hashtag integrado EN MEDIO.
+    #    unicos en lo posible y NUNCA vacios; los POSTS con hashtag integrado
+    #    EN MEDIO y los COMENTARIOS sin hashtags/links/@menciones (spam-safe).
     for i in range(total_cuentas):
         info = _info_cuenta(lista, i)
         nombre = str(info.get("nombre") or info.get("usuario") or "").strip()
@@ -2051,6 +2127,7 @@ def _generar_textos_mantenimiento_impl(
         perfil = str(info.get("perfil") or "").strip()
         registro = str(info.get("registro") or "").strip()
         accion = _normalizar_accion(info.get("tipo_accion"))
+        es_comentario = accion == "comentario"
 
         fila: list[str] = []
         vistos: set = set()
@@ -2091,16 +2168,29 @@ def _generar_textos_mantenimiento_impl(
             # hashtag para no deformar el tag; con semilla por (cuenta, texto)
             # para que cada texto varie.
             t = _humanizar_por_registro(t, registro, semilla=i * 100 + j)
-            t = _con_hashtag_en_medio(t)
+            if es_comentario:
+                # COMENTARIOS spam-safe: estilo y signos ANTES de limpiar; X
+                # castiga las respuestas con hashtags, links o @menciones.
+                t = _quitar_signos_por_registro(t, registro)
+                t = limpiar_comentario_spam(t)
+            else:
+                t = _con_hashtag_en_medio(t)
             if t in vistos:
                 t = _variar_hasta_unico(t, vistos)
                 t = _humanizar_por_registro(
                     t, registro, semilla=i * 100 + j + 997
                 )
-                t = _con_hashtag_en_medio(t)
+                if es_comentario:
+                    t = _quitar_signos_por_registro(t, registro)
+                    t = limpiar_comentario_spam(t)
+                else:
+                    t = _con_hashtag_en_medio(t)
             # Signos de apertura: activista/ciudadana NUNCA abren "¿"/"¡"
             # (aplica tambien a los textos de la IA); politica intacta.
             t = _quitar_signos_por_registro(t, registro)
+            if es_comentario and not t:
+                # Red de seguridad: jamas un comentario vacio.
+                t = limpiar_comentario_spam(_plantilla_local(j))
             vistos.add(t)
             fila.append(t)
         resultado[i] = fila
@@ -2133,8 +2223,9 @@ def generar_textos_mantenimiento(
     - Si OpenAI falla o devuelve menos, rellena con plantillas locales
       (>=3 por perfil en cada tema, mas comentarios por perfil) + variaciones +
       el nombre/personalidad, garantizando n_por_cuenta textos NO VACIOS.
-    - TODOS los textos finales llevan un hashtag INTEGRADO EN MEDIO
-      (`core.perfiles.colocar_hashtag_en_medio`), nunca al final.
+    - Los textos de POST llevan un hashtag INTEGRADO EN MEDIO
+      (`core.perfiles.colocar_hashtag_en_medio`), nunca al final; los de
+      COMENTARIO/RESPUESTA van SIN hashtags, links ni @menciones (spam-safe).
     - callback(hechas, total) opcional para progreso.
     - Devuelve len(cuentas_info) listas de exactamente n_por_cuenta textos
       (unicos dentro de la medida de lo posible; nunca vacios). Nunca lanza.
@@ -2168,9 +2259,10 @@ def generar_textos_comentario(
     Misma firma/contrato que `generar_textos_mantenimiento`: nunca lanza,
     devuelve len(cuentas_info) listas de exactamente n_por_cuenta textos no
     vacios (o el fallback estructural). Cada texto usa el PERFIL de su cuenta
-    (formal/ciudadano/popular), es apto para responder (breve y conversacional,
-    el perfil formal con Titulo/Descripcion/Conclusion cortos) y lleva un
-    hashtag INTEGRADO EN MEDIO del texto.
+    (formal/ciudadano/popular) y es apto para responder (breve y
+    conversacional, el perfil formal con Titulo/Descripcion/Conclusion
+    cortos). Son SPAM-SAFE: no llevan hashtags, links ni @menciones (X marca
+    las respuestas con esos elementos como probable spam).
     """
     try:
         base = list(cuentas_info or [])
@@ -2360,14 +2452,15 @@ def generar_pool_campana_por_cuenta(
         {"posts": [...3], "comentarios": [...3], "citas": [...3]}
 
     - ``posts``: textos de post (formato por perfil de cada cuenta).
-    - ``comentarios``: textos breves aptos para responder.
+    - ``comentarios``: textos breves aptos para responder, SIN hashtags, links
+      ni @menciones (spam-safe para X).
     - ``citas``: textos para citas/RTs del tweet principal; si hay
       ``base_cita`` son variaciones de esa cita, si no son posts alternos.
     - Los 9 textos de cada cuenta son DISTINTOS entre si (sin duplicados en lo
       posible), respetan registro (ciudadano con errores humanos legibles;
-      politico/activista sin errores fuertes), perfil y pasan TODOS por
-      ``colocar_hashtag_en_medio`` (hashtag obligatorio EN MEDIO, nunca al
-      final, bien escrito).
+      politico/activista sin errores fuertes) y perfil; posts y citas pasan
+      por ``colocar_hashtag_en_medio`` (hashtag obligatorio EN MEDIO, nunca al
+      final, bien escrito) y los comentarios por ``limpiar_comentario_spam``.
     - Nunca lanza: en el peor caso devuelve estructura valida con fallbacks
       locales. ``callback(hechas, total)`` opcional para progreso.
     """
@@ -2446,15 +2539,27 @@ def generar_pool_campana_por_cuenta(
     for i in range(total):
         vistos: set = set()
 
-        def _unico(texto: str, registro, semilla: int) -> str:
+        def _unico(
+            texto: str, registro, semilla: int, es_comentario: bool = False
+        ) -> str:
             t = (texto or "").strip()
             if not t:
-                t = "Buen dia a todos."
-            t = _con_hashtag_en_medio(t)
+                t = (
+                    _CIERRE_COMENTARIO_SPAM
+                    if es_comentario
+                    else "Buen dia a todos."
+                )
+            if es_comentario:
+                t = limpiar_comentario_spam(t)
+            else:
+                t = _con_hashtag_en_medio(t)
             if t in vistos:
                 t = _variar_hasta_unico(t, vistos)
                 t = _humanizar_por_registro(t, registro, semilla=semilla)
-                t = _con_hashtag_en_medio(t)
+                if es_comentario:
+                    t = limpiar_comentario_spam(t)
+                else:
+                    t = _con_hashtag_en_medio(t)
             vistos.add(t)
             return t
 
@@ -2466,7 +2571,11 @@ def generar_pool_campana_por_cuenta(
         for j, t in enumerate(list(posts[i]) if i < len(posts) else []):
             fila_posts.append(_unico(t, registro, semilla=i * 1000 + j))
         for j, t in enumerate(list(comentarios[i]) if i < len(comentarios) else []):
-            fila_coms.append(_unico(t, registro, semilla=i * 1000 + 100 + j))
+            fila_coms.append(
+                _unico(
+                    t, registro, semilla=i * 1000 + 100 + j, es_comentario=True
+                )
+            )
         for j, t in enumerate(list(citas[i]) if i < len(citas) else []):
             fila_citas.append(_unico(t, registro, semilla=i * 1000 + 200 + j))
         # Garantiza longitudes exactas aunque algo fallara arriba.
@@ -2477,8 +2586,11 @@ def generar_pool_campana_por_cuenta(
             )
         while len(fila_coms) < n_comentarios:
             fila_coms.append(
-                _unico(f"Comentario extra {len(fila_coms) + 1}", registro,
-                       semilla=i * 1000 + 400 + len(fila_coms))
+                _unico(
+                    f"Comentario extra {len(fila_coms) + 1}", registro,
+                    semilla=i * 1000 + 400 + len(fila_coms),
+                    es_comentario=True,
+                )
             )
         while len(fila_citas) < n_citas:
             fila_citas.append(
@@ -2530,85 +2642,197 @@ _MAX_CUENTAS_HASHTAGS_POR_LLAMADA = 15
 _MAX_LARGO_HASHTAG = 240
 
 
+def _reemplazar_tag_exacto(texto: str, tag_pedido: str, reemplazo: str) -> str:
+    """Sustituye la primera aparicion del tag por ``reemplazo`` (grupo exacto).
+
+    ``colocar_hashtag_en_medio`` normaliza la grafia del hashtag (p. ej.
+    ``#mexico`` -> ``#Mexico``); este helper restaura la grafia EXACTA pedida
+    y permite insertar un grupo de tags juntos. Nunca lanza.
+    """
+    t = str(texto or "")
+    pedido = str(tag_pedido or "").strip()
+    nuevo = str(reemplazo or "").strip()
+    if not t or not pedido or not nuevo:
+        return t
+    try:
+        patron = re.compile(re.escape(pedido), re.IGNORECASE)
+        return patron.sub(lambda _m: nuevo, t, count=1)
+    except Exception:
+        return t
+
+
+def _insertar_grupo_tras_tag(texto: str, tag_ancla: str, extras) -> str:
+    """Inserta ``extras`` justo despues del primer ``tag_ancla`` encontrado.
+
+    Asi el grupo de hashtags pedidos queda unido (``... #mexico #futbol ...``)
+    en el punto medio donde ya estaba el ancla. Nunca lanza.
+    """
+    t = str(texto or "")
+    ancla = str(tag_ancla or "").strip()
+    try:
+        resto = [str(x or "").strip() for x in (extras or []) if str(x or "").strip()]
+    except Exception:
+        resto = []
+    if not t or not ancla or not resto:
+        return t
+    try:
+        m = re.search(re.escape(ancla), t, re.IGNORECASE)
+        if not m:
+            return t
+        grupo = " ".join(resto)
+        return f"{t[:m.end()]} {grupo}{t[m.end():]}"
+    except Exception:
+        return t
+
+
+def _cortar_texto_a_limite(texto: str, limite: int) -> str:
+    """Corta ``texto`` a ``limite`` (frase completa si puede); nunca lanza."""
+    t = str(texto or "").strip()
+    try:
+        limite = max(1, int(limite))
+    except (TypeError, ValueError):
+        return t
+    if len(t) <= limite:
+        return t
+    corte = None
+    for signo in (".", "!", "?"):
+        pos = t.rfind(signo, 0, limite)
+        if pos >= limite // 2 and (corte is None or pos > corte):
+            corte = pos
+    if corte is not None:
+        return t[: corte + 1].strip()
+    pos = t.rfind(" ", 0, limite)
+    if pos <= 0:
+        pos = limite
+    return t[:pos].rstrip()
+
+
 def _recortar_limite_hashtag(
     texto, tags=None, limite: int = _MAX_LARGO_HASHTAG
 ) -> str:
     """Recorta un texto a ``limite`` caracteres sin dejarlo a medias si puede.
 
-    - Si ya cabe, se devuelve tal cual.
+    - Si ya cabe, se devuelve tal cual (salvo que termine en hashtag: se
+      reubica el grupo en el medio).
     - Busca el ultimo cierre de frase (``.``, ``!`` o ``?``) dentro del limite
       y a partir del 50% del limite; si existe, corta ahi (conservando el
       signo y la frase completa, sin ``…``).
     - Si no hay cierre, corta en el ultimo espacio antes del limite y agrega
       ``…`` SOLO en ese caso (corte de palabra).
-    - Preserva los ``tags`` pedidos: si el recorte se llevo el hashtag (quedo
-      mas alla del corte), lo reinserta EN MEDIO del texto recortado sin
-      volver a pasarse del limite.
+    - Preserva los ``tags`` pedidos: si el recorte se llevo alguno, reinserta
+      el grupo COMPLETO (los faltantes) EN MEDIO del texto recortado, sin
+      volver a pasarse del limite. Garantiza que el texto nunca termine en
+      hashtag.
     Nunca lanza: ante cualquier error devuelve el texto original.
     """
     try:
         t = str(texto or "").strip()
-        if len(t) <= limite:
-            return t
         limite = max(40, int(limite))
-
-        # 1) Ultimo cierre de frase dentro del limite y desde la mitad.
-        corte = None
-        for signo in (".", "!", "?"):
-            pos = t.rfind(signo, 0, limite)
-            if pos >= limite // 2 and (corte is None or pos > corte):
-                corte = pos
-        if corte is not None:
-            rec = t[: corte + 1].strip()
+        if len(t) <= limite:
+            rec = t
         else:
-            # 2) Corte en el ultimo espacio (frontera de palabra).
-            pos = t.rfind(" ", 0, limite)
-            if pos <= 0:
-                pos = limite
-            rec = t[:pos].rstrip() + "…"
+            # 1) Ultimo cierre de frase dentro del limite y desde la mitad.
+            corte = None
+            for signo in (".", "!", "?"):
+                pos = t.rfind(signo, 0, limite)
+                if pos >= limite // 2 and (corte is None or pos > corte):
+                    corte = pos
+            if corte is not None:
+                rec = t[: corte + 1].strip()
+            else:
+                # 2) Corte en el ultimo espacio (frontera de palabra).
+                pos = t.rfind(" ", 0, limite)
+                if pos <= 0:
+                    pos = limite
+                rec = t[:pos].rstrip() + "…"
 
-        # 3) Seguridad: si el recorte se llevo el hashtag pedido, se reinserta
-        #    en medio dejando margen para no exceder de nuevo el limite.
-        if tags and not _contiene_algun_hashtag(rec, tags):
-            tag = str(tags[0] or "").strip()
-            margen = len(tag) + 2
-            if tag and margen < limite:
-                cola = "…" if rec.endswith("…") else ""
-                base = rec.rstrip("…").strip()
-                if len(base) > limite - margen:
-                    recorte = base[: limite - margen]
-                    espacio = recorte.rfind(" ")
-                    if espacio >= limite // 3:
-                        recorte = recorte[:espacio]
-                    base = recorte.rstrip()
-                try:
-                    con_tag = (
-                        colocar_hashtag_en_medio(base, hashtag=tag) + cola
-                    ).strip()
-                    if (
-                        con_tag
-                        and _contiene_algun_hashtag(con_tag, tags)
-                        and len(con_tag) <= limite
-                    ):
-                        rec = con_tag
-                except Exception:
-                    pass
+        if tags:
+            etiquetas = [
+                str(tag or "").strip()
+                for tag in tags
+                if str(tag or "").strip()
+            ]
+            # 3) Seguridad: si el recorte se llevo parte del grupo pedido, se
+            #    reinsertan los faltantes EN MEDIO, dejando margen para no
+            #    exceder otra vez el limite.
+            faltantes = [
+                tag for tag in etiquetas if tag.lower() not in rec.lower()
+            ]
+            if faltantes:
+                grupo = " ".join(faltantes)
+                margen = len(grupo) + 2
+                if margen < limite:
+                    # Abre espacio recortando mas el texto si hace falta.
+                    disponible = limite - margen
+                    if len(rec) > disponible:
+                        rec = _cortar_texto_a_limite(rec, disponible)
+                    ancla = next(
+                        (tag for tag in etiquetas if tag.lower() in rec.lower()),
+                        "",
+                    )
+                    if ancla:
+                        rec = _limpiar_espacios_y_saltos(
+                            _insertar_grupo_tras_tag(rec, ancla, faltantes)
+                        )
+                    else:
+                        base = re.sub(
+                            r"#[A-Za-z0-9ÁÉÍÓÚÜÑáéíóúüñ_]+", " ", rec
+                        )
+                        base = _limpiar_espacios_y_saltos(base) or rec
+                        try:
+                            con_tag = colocar_hashtag_en_medio(
+                                base, hashtag=faltantes[0]
+                            )
+                            # Grafia EXACTA + grupo completo tras el primer tag.
+                            con_tag = _reemplazar_tag_exacto(
+                                con_tag, faltantes[0], grupo
+                            )
+                            if (
+                                con_tag
+                                and all(
+                                    tag.lower() in con_tag.lower()
+                                    for tag in etiquetas
+                                )
+                                and len(con_tag) <= limite
+                            ):
+                                rec = con_tag
+                        except Exception:
+                            pass
 
-        # 4) Regla del proyecto: el texto NUNCA termina en hashtag. Si el corte
-        #    dejo el tag al final (aunque sea antes del punto), se mueve al
-        #    medio del texto recortado.
-        if _hashtag_al_final(rec):
-            tag_presente = ""
-            for tg in (tags or []):
-                if str(tg or "").strip().lower() in rec.lower():
-                    tag_presente = str(tg).strip()
-                    break
-            try:
-                movido = colocar_hashtag_en_medio(rec, hashtag=tag_presente)
-                if movido and len(movido) <= limite:
-                    rec = re.sub(r"[ \t]+([.,;:!?])", r"\1", movido).strip()
-            except Exception:
-                pass
+        # 4) Regla del proyecto: el texto NUNCA termina en hashtag. Si quedo el
+        #    grupo al final (aunque sea antes del punto), se mueve al medio.
+        if _hashtag_al_final(rec) and tags:
+            grupo_exacto = [
+                str(tag or "").strip()
+                for tag in tags
+                if str(tag or "").strip()
+                and str(tag).strip().lower() in rec.lower()
+            ]
+            if grupo_exacto:
+                grupo = " ".join(grupo_exacto)
+                base = re.sub(r"#[A-Za-z0-9ÁÉÍÓÚÜÑáéíóúüñ_]+", " ", rec)
+                base = _limpiar_espacios_y_saltos(base)
+                if base:
+                    try:
+                        margen = len(grupo) + 2
+                        if margen < limite and len(base) > limite - margen:
+                            base = _cortar_texto_a_limite(
+                                base, limite - margen
+                            )
+                        movido = colocar_hashtag_en_medio(
+                            base, hashtag=grupo_exacto[0]
+                        )
+                        movido = _reemplazar_tag_exacto(
+                            movido, grupo_exacto[0], grupo
+                        )
+                        if (
+                            movido
+                            and len(movido) <= limite
+                            and not _hashtag_al_final(movido)
+                        ):
+                            rec = _limpiar_espacios_y_saltos(movido)
+                    except Exception:
+                        pass
         return rec
     except Exception as e:
         logger.error(f"Error recortando texto de hashtag: {e}")
@@ -2787,6 +3011,112 @@ def _normalizar_hashtags_pedidos(hashtags) -> list[str]:
     return resultado
 
 
+def _subconjunto_hashtags_pedidos(tags, rng=None) -> list[str]:
+    """Subconjunto aleatorio NO vacio de ``tags`` (1..len), en orden original.
+
+    Con ``tags`` vacio devuelve ``[]``. Nunca lanza.
+    """
+    try:
+        lista = []
+        for tag in (tags or []):
+            limpio = str(tag or "").strip()
+            if limpio:
+                lista.append(limpio)
+    except Exception:
+        return []
+    if not lista:
+        return []
+    if rng is None:
+        rng = random.Random()
+    try:
+        k = rng.randint(1, len(lista))
+        indices = sorted(rng.sample(range(len(lista)), k))
+    except Exception:
+        return list(lista)
+    return [lista[i] for i in indices]
+
+
+def solo_hashtags_pedidos(texto: str, tags, semilla: int = 0) -> str:
+    """Deja en ``texto`` SOLO un subconjunto aleatorio de los ``tags`` pedidos.
+
+    - Normaliza ``tags`` con `_normalizar_hashtags_pedidos`; sin tags devuelve
+      el texto intacto (NUNCA inventa hashtags).
+    - Elige 1..len(tags) hashtags con ``random.Random(semilla)`` y elimina del
+      texto CUALQUIER otro hashtag (case-insensitive). La grafia del hashtag
+      pedido se conserva exacta (no se capitaliza a la fuerza).
+    - Garantiza que el subconjunto elegido quede presente, integrado EN MEDIO
+      (nunca al final): el primero con `colocar_hashtag_en_medio` y el resto
+      justo despues de el, separados por un espacio (``... #mexico #futbol
+      ...``).
+    - Limpia espacios huerfanos (``" ,"``, dobles, saltos 3+). Si el texto
+      queda vacio devuelve el original. Nunca lanza.
+    """
+    original = str(texto or "")
+    t = original.strip()
+    if not t:
+        return original
+    tags_norm = _normalizar_hashtags_pedidos(tags)
+    if not tags_norm:
+        return original
+    try:
+        rng = random.Random(int(semilla))
+    except Exception:
+        rng = random.Random(0)
+    subset = _subconjunto_hashtags_pedidos(tags_norm, rng)
+    if not subset:
+        return original
+    mapa_exacto = {tag.lower(): tag for tag in subset}
+
+    def _conservar(m):
+        # Conserva (con su grafia exacta pedida) solo los tags del subset.
+        return mapa_exacto.get(m.group(0).lower(), " ")
+
+    try:
+        # 1) Fuera los hashtags que no fueron elegidos (y grafia exacta).
+        limpio = re.sub(r"#[A-Za-z0-9ÁÉÍÓÚÜÑáéíóúüñ_]+", _conservar, t)
+        limpio = _limpiar_espacios_y_saltos(limpio)
+        if not limpio:
+            return original
+
+        # 2) Garantiza TODO el subconjunto elegido, en medio del texto.
+        if not all(tag.lower() in limpio.lower() for tag in subset):
+            base = re.sub(r"#[A-Za-z0-9ÁÉÍÓÚÜÑáéíóúüñ_]+", " ", limpio)
+            base = _limpiar_espacios_y_saltos(base) or limpio
+            primero = subset[0]
+            grupo = " ".join(subset)
+            try:
+                colocado = colocar_hashtag_en_medio(base, hashtag=primero)
+            except Exception:
+                colocado = f"{base} {primero}".strip()
+            if not colocado:
+                return original
+            colocado = _reemplazar_tag_exacto(colocado, primero, grupo)
+            limpio = _limpiar_espacios_y_saltos(colocado)
+
+        # 3) Regla del proyecto: nunca terminar en hashtag.
+        if _hashtag_al_final(limpio):
+            base = re.sub(r"#[A-Za-z0-9ÁÉÍÓÚÜÑáéíóúüñ_]+", " ", limpio)
+            base = _limpiar_espacios_y_saltos(base)
+            if not base:
+                return original
+            primero = subset[0]
+            grupo = " ".join(subset)
+            try:
+                movido = colocar_hashtag_en_medio(base, hashtag=primero)
+            except Exception:
+                movido = f"{primero} {base}".strip()
+            if movido:
+                movido = _reemplazar_tag_exacto(movido, primero, grupo)
+                limpio = _limpiar_espacios_y_saltos(movido)
+
+        if not limpio:
+            return original
+        return limpio
+    except Exception as e:
+        logger.error(f"Error aplicando solo_hashtags_pedidos: {e}")
+        return original
+
+
 def _plantillas_hashtags(registro: str = "", perfil: str = "") -> tuple:
     """Plantillas locales del rol hashtags para el (registro, perfil) dado.
 
@@ -2877,13 +3207,14 @@ def _personalidad_del_lote(cuentas_info, indices) -> str:
 def _texto_hashtag_local(
     info, contexto: str, tags, indice, j, rng, inicio: int | None = None
 ) -> str:
-    """Construye un post ORIGINAL local con el contexto y el tag en medio.
+    """Construye un post ORIGINAL local con el contexto y tags en medio.
 
     Elige una plantilla por (registro, perfil), sustituye `{contexto}` y
-    `{tag}` de forma natural y rota las plantillas con aleatoriedad para que
-    los textos varíen entre cuentas y entre llamadas. ``inicio`` permite fijar
-    el punto de rotacion por cuenta para que dos textos consecutivos de la
-    misma cuenta NO repitan plantilla. Nunca lanza.
+    `{tag}` (un subconjunto aleatorio de 1..len(tags) de los hashtags pedidos,
+    unido por espacios) de forma natural y rota las plantillas con
+    aleatoriedad para que los textos varíen entre cuentas y entre llamadas.
+    ``inicio`` permite fijar el punto de rotacion por cuenta para que dos
+    textos consecutivos de la misma cuenta NO repitan plantilla. Nunca lanza.
     """
     try:
         registro = _registro_normalizado(info)
@@ -2893,15 +3224,16 @@ def _texto_hashtag_local(
         )
         ctx = " ".join(str(contexto or "").split()) or "lo que tenemos"
         if tags:
-            try:
-                tag = tags[int(indice + j) % len(tags)]
-            except Exception:
-                tag = tags[0]
+            subset = _subconjunto_hashtags_pedidos(tags, rng)
+            if not subset:
+                subset = [str(tags[0] or "").strip()]
+            tag_grupo = " ".join(subset)
         else:
             try:
-                tag = elegir_hashtag("", rng=rng)
+                tag_grupo = elegir_hashtag("", rng=rng)
             except Exception:
-                tag = "#Mexico"
+                tag_grupo = "#Mexico"
+            subset = [tag_grupo]
         k = int(indice) + int(j)
         if inicio is None:
             try:
@@ -2912,11 +3244,11 @@ def _texto_hashtag_local(
         texto = (
             str(plantilla)
             .replace("{contexto}", ctx)
-            .replace("{tag}", str(tag or ""))
+            .replace("{tag}", str(tag_grupo or ""))
             .strip()
         )
         # Contrato de largo tambien para el fallback local.
-        return _recortar_limite_hashtag(texto, [str(tag or "").strip()])
+        return _recortar_limite_hashtag(texto, subset)
     except Exception as e:
         logger.error(f"Error construyendo texto local de hashtag: {e}")
         ctx = " ".join(str(contexto or "").split()) or "lo que tenemos"
@@ -2928,10 +3260,12 @@ def _texto_hashtag_local(
 
 
 def _garantizar_hashtag_pedido(texto: str, tags, semilla: int = 0) -> str:
-    """Garantiza un hashtag pedido (y EN MEDIO) en el texto; nunca lanza.
+    """Garantiza los hashtags pedidos (en medio) en el texto; nunca lanza.
 
-    Sin tags pedidos igual aplica la regla del proyecto: todo texto lleva al
-    menos un hashtag integrado en medio (nunca al final).
+    Con ``tags`` no vacio delega en `solo_hashtags_pedidos`: solo sobreviven
+    hashtags pedidos (subconjunto aleatorio del texto) y el grupo queda en
+    medio, nunca al final. Sin tags pedidos se conserva el comportamiento
+    clasico: todo texto lleva al menos un hashtag integrado en medio.
     """
     t = str(texto or "").strip()
     if not t:
@@ -2940,22 +3274,7 @@ def _garantizar_hashtag_pedido(texto: str, tags, semilla: int = 0) -> str:
         if not tiene_hashtag(t):
             return _con_hashtag_en_medio(t)
         return t
-    try:
-        rng = random.Random(int(semilla))
-    except Exception:
-        rng = random.Random(0)
-    try:
-        tag = tags[rng.randrange(len(tags))]
-    except Exception:
-        tag = tags[0]
-    if not _contiene_algun_hashtag(t, tags) or _hashtag_al_final(t):
-        try:
-            movido = colocar_hashtag_en_medio(t, hashtag=tag)
-            if movido and _contiene_algun_hashtag(movido, tags):
-                return movido
-        except Exception as e:
-            logger.error(f"Error asegurando hashtag pedido: {e}")
-    return t
+    return solo_hashtags_pedidos(t, tags, semilla)
 
 
 def generar_textos_hashtags_por_cuenta(
@@ -2977,8 +3296,9 @@ def generar_textos_hashtags_por_cuenta(
     Devuelve ``{usuario: [textos]}`` con EXACTAMENTE ``n_por_cuenta`` textos
     por cuenta. Cada texto es una publicacion ORIGINAL sobre ``contexto``
     (NUNCA el contexto copiado ni "contexto + hashtag"), respeta el registro y
-    el perfil de la cuenta y lleva los ``hashtags`` pedidos bien escritos e
-    integrados EN MEDIO del texto (nunca al final).
+    el perfil de la cuenta y lleva UN SUBCONJUNTO ALEATORIO (1..len) de los
+    ``hashtags`` pedidos, bien escritos, integrados EN MEDIO del texto (nunca
+    al final) y SIN ningun otro hashtag inventado.
 
     Agrupa por (registro, perfil) y pide a OpenAI en lotes de <=15 cuentas
     (``get_prompt_hashtags`` + temperature 0.9). Si OpenAI falla o devuelve
@@ -3078,7 +3398,8 @@ def generar_textos_hashtags_por_cuenta(
                     _reportar()
 
     # 2) Normalizacion final por cuenta: relleno local, estilo del registro,
-    #    contexto siempre original, hashtag pedido EN MEDIO y unicidad global.
+    #    contexto siempre original, subconjunto aleatorio de hashtags pedidos
+    #    EN MEDIO (nunca otros) y unicidad global.
     for i in range(total):
         info = _info_cuenta(lista, i)
         registro = _registro_normalizado(info)
@@ -3094,6 +3415,19 @@ def generar_textos_hashtags_por_cuenta(
             return _humanizar_por_registro(texto, registro, semilla=semilla)
 
         for j in range(n):
+            # Un subconjunto aleatorio POR TEXTO (1..len(tags)): es el UNICO
+            # conjunto de hashtags valido para este texto. Sin tags pedidos se
+            # conserva el comportamiento previo (hashtag en medio).
+            subset = _subconjunto_hashtags_pedidos(tags, rng) if tags else []
+
+            def _ajustar(texto: str, semilla: int) -> str:
+                if subset:
+                    return solo_hashtags_pedidos(texto, subset, semilla)
+                return _garantizar_hashtag_pedido(texto, tags, semilla)
+
+            def _acotar(texto: str) -> str:
+                return _recortar_limite_hashtag(texto, subset or tags)
+
             t = str(resultado[i][j] or "").strip()
             if not t:
                 t = _texto_hashtag_local(
@@ -3115,7 +3449,7 @@ def generar_textos_hashtags_por_cuenta(
                         info, contexto, tags, i, j, rng, inicio=inicio_cuenta
                     )
             t = _estilizar(t, rng.randint(1, 10 ** 9))
-            t = _garantizar_hashtag_pedido(t, tags, i * 1000 + j)
+            t = _ajustar(t, i * 1000 + j)
 
             # Prohibido: contexto pelado o simple concatenacion contexto+tag.
             if _es_copia_contexto(t, contexto):
@@ -3124,7 +3458,7 @@ def generar_textos_hashtags_por_cuenta(
                     inicio=inicio_cuenta + 7919,
                 )
                 t = _estilizar(t, rng.randint(1, 10 ** 9))
-                t = _garantizar_hashtag_pedido(t, tags, i * 1000 + j + 17)
+                t = _ajustar(t, i * 1000 + j + 17)
 
             # Unicidad global (y por cuenta, que es subconjunto).
             if t in vistos:
@@ -3133,9 +3467,7 @@ def generar_textos_hashtags_por_cuenta(
                     inicio=inicio_cuenta + 104729,
                 )
                 alterno = _estilizar(alterno, rng.randint(1, 10 ** 9))
-                alterno = _garantizar_hashtag_pedido(
-                    alterno, tags, i * 1000 + j + 997
-                )
+                alterno = _ajustar(alterno, i * 1000 + j + 997)
                 if (
                     alterno
                     and alterno not in vistos
@@ -3144,22 +3476,19 @@ def generar_textos_hashtags_por_cuenta(
                     t = alterno
                 else:
                     t = _variar_hasta_unico(t, vistos)
-                    t = _garantizar_hashtag_pedido(
-                        t, tags, i * 1000 + j + 1999
-                    )
+                    t = _ajustar(t, i * 1000 + j + 1999)
 
             # Signos de apertura: activista/ciudadana nunca "¿"/"¡" (IA
             # incluida); politica conserva los signos correctos.
             t = _quitar_signos_por_registro(t, registro)
-            # Contrato de largo: ningun texto sale > _MAX_LARGO_HASHTAG.
-            t = _recortar_limite_hashtag(t, tags)
+            # Ultima pasada: solo el subset pedido, en medio, y <= 240 chars.
+            t = _ajustar(t, i * 1000 + j + 313)
+            t = _acotar(t)
             if t in vistos:
                 # El recorte pudo colisionar: se varía y se vuelve a acotar.
                 alterno = _variar_hasta_unico(t, vistos)
-                alterno = _garantizar_hashtag_pedido(
-                    alterno, tags, i * 1000 + j + 4919
-                )
-                alterno = _recortar_limite_hashtag(alterno, tags)
+                alterno = _ajustar(alterno, i * 1000 + j + 4919)
+                alterno = _acotar(alterno)
                 if alterno and alterno not in vistos:
                     t = alterno
             vistos.add(t)

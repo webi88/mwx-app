@@ -57,18 +57,25 @@ def marcar_cuenta_suspendida(usuario: str) -> None:
         logger.warning(f"Error marcando cuenta suspendida ({usuario}): {e}")
 
 
-def obtener_acciones(limit: int = 100) -> list:
+def obtener_acciones(limit: int = 100, solo_exitosas: bool = False) -> list:
     """Devuelve las ultimas 'limit' acciones ordenadas por fecha descendente.
+
+    Args:
+        limit: maximo de acciones a devolver (default 100).
+        solo_exitosas: si es True, filtra solo las acciones con estado exitoso
+            ("exito", "exitoso" u "ok"); si es False (default) devuelve todas.
 
     Ante cualquier error devuelve una lista vacia.
     """
     try:
         with get_db_session() as db:
+            query = db.query(RegistroAccion)
+            if solo_exitosas:
+                query = query.filter(
+                    RegistroAccion.estado.in_(("exito", "exitoso", "ok"))
+                )
             acciones = (
-                db.query(RegistroAccion)
-                .order_by(RegistroAccion.fecha.desc())
-                .limit(limit)
-                .all()
+                query.order_by(RegistroAccion.fecha.desc()).limit(limit).all()
             )
             return list(acciones)
     except Exception as e:

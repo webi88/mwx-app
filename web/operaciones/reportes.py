@@ -68,7 +68,15 @@ def render(usuario: dict):
     divider()
 
     st.markdown("## Historial de acciones (mantenimientos / activaciones)")
-    acciones = obtener_acciones(limit=50)
+    try:
+        acciones = obtener_acciones(limit=50, solo_exitosas=True)
+    except TypeError:
+        # Compatibilidad mientras core/registro.py no tenga el parámetro:
+        estados_ok = {"exito", "exitoso", "ok"}
+        acciones = [
+            a for a in obtener_acciones(limit=200)
+            if (a.estado or "").strip().lower() in estados_ok
+        ][:50]
     if acciones:
         filas = []
         for a in acciones:
@@ -76,9 +84,9 @@ def render(usuario: dict):
                 "Fecha": a.fecha.strftime("%Y-%m-%d %H:%M") if a.fecha else "",
                 "Usuario": a.usuario,
                 "Tipo": a.tipo,
-                "Estado": a.estado,
                 "URL publicación": a.url_publicacion or "",
             })
+        st.caption("✅ Solo se muestran las acciones exitosas; las fallidas no se incluyen.")
         st.dataframe(filas, use_container_width=True)
         # además muestra los enlaces clicables de las acciones exitosas con URL
         for a in acciones:

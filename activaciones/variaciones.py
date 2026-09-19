@@ -5,6 +5,7 @@ distintos entre si para no disparar el anti-spam de X (evita el patron
 de contenido identico en masa).
 """
 import random
+import re
 from loguru import logger
 
 
@@ -50,9 +51,57 @@ CIERRES = [
 ]
 
 
-def variar_texto(base: str, n_hashtags: int = 2) -> str:
+_RE_HASHTAG = r"#[A-Za-z0-9ÁÉÍÓÚÜÑáéíóúüñ_]+"
+
+
+def _quitar_hashtags(texto: str) -> str:
+    """Quita los hashtags del texto y normaliza los espacios resultantes."""
+    limpio = re.sub(_RE_HASHTAG, " ", str(texto or ""))
+    limpio = re.sub(r"[ \t]{2,}", " ", limpio)
+    limpio = re.sub(r" +([,.;:!?])", r"\1", limpio)
+    return re.sub(r"\n{3,}", "\n\n", limpio).strip()
+
+
+def _normalizar_hashtags(hashtags) -> list[str]:
+    """Normaliza hashtags (lista o string con comas/espacios, con o sin '#').
+
+    Devuelve la grafia tal como la pidio el usuario (solo le antepone '#'),
+    sin duplicados case-insensitive ni vacios. Nunca lanza.
+    """
+    if hashtags is None:
+        return []
+    if isinstance(hashtags, str):
+        crudos = [hashtags]
+    else:
+        try:
+            crudos = list(hashtags)
+        except TypeError:
+            return []
+    tags, vistos = [], set()
+    for crudo in crudos:
+        for token in str(crudo or "").replace(",", " ").split():
+            token = token.strip()
+            if not token:
+                continue
+            if not token.startswith("#"):
+                token = "#" + token.lstrip("@")
+            clave = token.lower()
+            if clave not in vistos:
+                vistos.add(clave)
+                tags.append(token)
+    return tags
+
+
+def variar_texto(base: str, n_hashtags: int = 2, hashtags=None) -> str:
     """Aplica variaciones leves a un texto base: apertura, sinonimos,
-    hashtags aleatorios y cierre. Devuelve un texto distinto cada vez."""
+    hashtags aleatorios y cierre. Devuelve un texto distinto cada vez.
+
+    `hashtags` (lista o string con comas/espacios, con o sin '#'): si NO es
+    None se usan ESTRICTAMENTE esos hashtags y se agrega al final un
+    subconjunto aleatorio de tamano 1..len (con lista vacia no agrega nada).
+    Si es None se conserva el comportamiento clasico (global `HASHTAGS` con
+    `n_hashtags`).
+    """
     texto = base.strip()
 
     for original, opciones in SINONIMOS.items():
@@ -70,20 +119,35 @@ def variar_texto(base: str, n_hashtags: int = 2) -> str:
         if cierre:
             texto = f"{texto}\n\n{cierre}"
 
-    if n_hashtags > 0:
+    if hashtags is not None:
+        pedidos = _normalizar_hashtags(hashtags)
+        if pedidos:
+            # Quita cualquier hashtag previo (p.ej. #Ajeno del base) para que
+            # SOLO queden los pedidos, en un subconjunto aleatorio.
+            texto = _quitar_hashtags(texto)
+            k = random.randint(1, len(pedidos))
+            seleccion = random.sample(pedidos, k)
+            texto = f"{texto}\n\n{' '.join(seleccion)}"
+    elif n_hashtags > 0:
         tags = random.sample(HASHTAGS, k=min(n_hashtags, len(HASHTAGS)))
         texto = f"{texto}\n\n{' '.join(tags)}"
 
     return texto
 
 
-def generar_pool_variaciones(base: str, cantidad: int, n_hashtags: int = 2) -> list[str]:
-    """Genera 'cantidad' variaciones distintas de un texto base."""
+def generar_pool_variaciones(base: str, cantidad: int, n_hashtags: int = 2,
+                             hashtags=None) -> list[str]:
+    """Genera 'cantidad' variaciones distintas de un texto base.
+
+    `hashtags` se propaga a `variar_texto`: si no es None, cada variacion usa
+    SOLO un subconjunto aleatorio de esos hashtags (nunca los globales); con
+    lista vacia no agrega hashtags.
+    """
     pool = []
     vistos = set()
     intentos = 0
     while len(pool) < cantidad and intentos < cantidad * 5:
-        v = variar_texto(base, n_hashtags)
+        v = variar_texto(base, n_hashtags, hashtags=hashtags)
         intentos += 1
         if v not in vistos:
             vistos.add(v)
@@ -99,6 +163,7 @@ def generar_pool_variaciones_openai(
     entrenamiento: str = "",
     registro: str = "",
     perfil: str = "",
+    hashtags=None,
 ) -> list[str]:
     """Genera 'cantidad' variaciones unicas de una cita usando OpenAI.
 
@@ -109,6 +174,11 @@ def generar_pool_variaciones_openai(
     `narrativa` es SOLO TRASFONDO: viaja al prompt como referencia interna
     (el prompt de `ia.generador_contenido` ya lo refuerza) y NUNCA se usa como
     texto publicable ni como base del fallback local (que solo varia `base`).
+
+    `hashtags` (lista o string, con o sin '#') solo afecta al FALLBACK local:
+    si no es None, el fallback usa ESTRICTAMENTE esos hashtags (subconjunto
+    aleatorio) en vez de los globales; con [] no agrega ninguno. Los textos
+    que devuelve OpenAI no se modifican aqui.
 
     Si OpenAI no devuelve suficiente variedad, rellena el faltante con el
     fallback basado en sinonimos. Si aun asi falta, agrega variantes con
@@ -130,7 +200,9 @@ def generar_pool_variaciones_openai(
 
     if len(pool) < cantidad:
         faltante = cantidad - len(pool)
-        fallback = generar_pool_variaciones(base, cantidad=faltante, n_hashtags=2)
+        fallback = generar_pool_variaciones(
+            base, cantidad=faltante, n_hashtags=2, hashtags=hashtags
+        )
         for t in fallback:
             if t and t not in vistos:
                 vistos.add(t)
