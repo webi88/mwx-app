@@ -45,14 +45,27 @@ def obtener_chromedriver(version_mayor: Optional[int] = None) -> str:
 def _headless_por_defecto() -> bool:
     """Decide el modo de Chrome por defecto segun el entorno.
 
-    En un servidor Linux sin pantalla (Railway/Docker) Chrome visible no puede
-    arrancar salvo que exista Xvfb + DISPLAY. Si NO hay DISPLAY y no estamos en
-    Windows, forzamos headless para que Selenium funcione aunque el usuario
-    olvide definir HEADLESS=true. Si hay DISPLAY (Xvfb), se puede usar Chrome
-    visible, que es mas fiable/stealth con undetected-chromedriver.
+    Regla (solo aplica si el usuario NO definio HEADLESS explicitamente; el
+    campo Settings.headless con env="HEADLESS" siempre manda):
+
+    1. Windows de escritorio => Chrome visible (False), como siempre.
+    2. Dentro de un contenedor (Railway/Docker/Kubernetes: RAILWAY_ENVIRONMENT,
+       /.dockerenv o KUBERNETES_SERVICE_HOST) => headless (True), AUNQUE exista
+       DISPLAY: el Xvfb de supervisord no es necesario para las campanas y
+       headless rinde mas y consume menos CPU/RAM.
+    3. Linux/macOS sin DISPLAY (servidor sin pantalla) => headless (True).
+    4. Cualquier otro caso (Linux de escritorio con DISPLAY) => visible (False).
+
+    Para forzar Chrome visible bajo Xvfb define HEADLESS=false en el entorno.
     """
     if os.name == "nt":
         return False
+    if (
+        os.environ.get("RAILWAY_ENVIRONMENT")
+        or os.path.exists("/.dockerenv")
+        or os.environ.get("KUBERNETES_SERVICE_HOST")
+    ):
+        return True
     return not os.environ.get("DISPLAY")
 
 

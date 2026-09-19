@@ -2404,8 +2404,10 @@ class TwitterBot:
             logger.info(f"Respuesta publicada por {self.usuario}")
 
             # 3s de vista a la pantalla para confirmacion visual (patron del bot).
-            logger.info("Dejando 3s la pantalla visible para confirmacion visual...")
-            time.sleep(3)
+            # En headless (Railway) no hay pantalla que mirar: omitir la espera.
+            if not settings.headless:
+                logger.info("Dejando 3s la pantalla visible para confirmacion visual...")
+                time.sleep(3)
 
             url_respuesta = self._obtener_url_respuesta(url)
             if url_respuesta:
@@ -2644,10 +2646,15 @@ class TwitterBot:
 
         Metodos en orden, cada uno verificado leyendo el contenido del editor:
           1. Portapapeles (`pyperclip.copy` + Ctrl/Cmd+V).
-          2. `send_keys(texto)` en UNA sola llamada (nada de bucle char por
-             char: miles de comandos al renderer son los que provocan los
-             `Timed out receiving message from renderer` en el contenedor).
-          3. `document.execCommand('insertText')` via JS sobre el elemento.
+          2. `document.execCommand('insertText')` via JS: NO necesita clic ni
+             foco por Selenium (hace `arguments[0].focus()` en JS), asi que
+             funciona aunque el modal de X aun tenga un `data-testid="mask"`
+             encima que intercepta el clic
+             (`ElementClickInterceptedException` en Railway).
+          3. `send_keys(texto)` en UNA sola llamada como ULTIMO recurso (nada de
+             bucle char por char: miles de comandos al renderer son los que
+             provocan los `Timed out receiving message from renderer` en el
+             contenedor).
         Si ninguno deja el texto en el editor lanza una excepcion explicita para
         que el fallo se reporte como tal, en vez de publicar en vacio y terminar
         en un falso "X no confirmo la publicacion".
@@ -2669,35 +2676,24 @@ class TwitterBot:
             ActionChains(self.driver).key_down(modifier).send_keys("v").key_up(modifier).perform()
             if self._verificar_texto_en_editor(elemento, texto):
                 return
-            logger.warning("El portapapeles no dejo el texto en el editor; probando send_keys")
+            logger.warning("El portapapeles no dejo el texto en el editor; probando execCommand")
         except Exception as e:
             # PyperclipException = el contenedor no tiene mecanismo de
             # portapapeles (sin xclip/xsel en Railway): es ESPERADO, no un
-            # problema del bot; se registra en debug y se sigue con send_keys.
+            # problema del bot; se registra en debug y se sigue con el JS.
             if any(cls.__name__ == "PyperclipException" for cls in type(e).__mro__):
                 logger.debug(
                     f"Sin portapapeles disponible ({type(e).__name__}: {e}); "
-                    f"usando send_keys"
+                    f"usando execCommand"
                 )
             else:
                 logger.warning(
                     f"No se pudo pegar por portapapeles ({type(e).__name__}: {e}); "
-                    f"probando send_keys"
+                    f"probando execCommand"
                 )
 
-        # 2) send_keys en UNA sola llamada.
-        try:
-            elemento.click()
-            elemento.send_keys(texto)
-            if self._verificar_texto_en_editor(elemento, texto):
-                return
-            logger.warning("send_keys no dejo el texto en el editor; probando execCommand")
-        except Exception as e:
-            logger.warning(
-                f"send_keys fallo ({type(e).__name__}: {e}); probando execCommand"
-            )
-
-        # 3) Fallback JS: insertText sobre el elemento enfocado.
+        # 2) JS: insertText sobre el elemento (focus en JS, sin clic de Selenium:
+        #    el `mask` del modal de X intercepta el clic y tiraba el intento).
         try:
             self.driver.execute_script(
                 "arguments[0].focus(); document.execCommand('insertText', false, arguments[1]);",
@@ -2706,8 +2702,20 @@ class TwitterBot:
             )
             if self._verificar_texto_en_editor(elemento, texto):
                 return
+            logger.warning("execCommand no dejo el texto en el editor; probando send_keys")
         except Exception as e:
-            logger.warning(f"execCommand fallo ({type(e).__name__}: {e})")
+            logger.warning(
+                f"execCommand fallo ({type(e).__name__}: {e}); probando send_keys"
+            )
+
+        # 3) Ultimo recurso: send_keys en UNA sola llamada.
+        try:
+            elemento.click()
+            elemento.send_keys(texto)
+            if self._verificar_texto_en_editor(elemento, texto):
+                return
+        except Exception as e:
+            logger.warning(f"send_keys fallo ({type(e).__name__}: {e})")
 
         raise Exception("no se pudo escribir el texto en el editor de X")
     
@@ -3713,8 +3721,11 @@ class TwitterBot:
                 self.ultimo_error = "X no confirmo el cambio de nombre"
                 logger.warning(self.ultimo_error)
 
-            logger.info("Dejando 3s la pantalla visible para confirmacion visual...")
-            time.sleep(3)
+            # 3s de vista a la pantalla para confirmacion visual.
+            # En headless (Railway) no hay pantalla que mirar: omitir la espera.
+            if not settings.headless:
+                logger.info("Dejando 3s la pantalla visible para confirmacion visual...")
+                time.sleep(3)
             return ok
 
         except Exception as e:
@@ -3831,8 +3842,11 @@ class TwitterBot:
                 self.ultimo_error = "X no confirmo el cambio de @"
                 logger.warning(self.ultimo_error)
 
-            logger.info("Dejando 3s la pantalla visible para confirmacion visual...")
-            time.sleep(3)
+            # 3s de vista a la pantalla para confirmacion visual.
+            # En headless (Railway) no hay pantalla que mirar: omitir la espera.
+            if not settings.headless:
+                logger.info("Dejando 3s la pantalla visible para confirmacion visual...")
+                time.sleep(3)
             return ok
 
         except Exception as e:
@@ -4275,8 +4289,11 @@ class TwitterBot:
                 )
                 logger.warning(self.ultimo_error)
 
-            logger.info("Dejando 3s la pantalla visible para confirmacion visual...")
-            time.sleep(3)
+            # 3s de vista a la pantalla para confirmacion visual.
+            # En headless (Railway) no hay pantalla que mirar: omitir la espera.
+            if not settings.headless:
+                logger.info("Dejando 3s la pantalla visible para confirmacion visual...")
+                time.sleep(3)
             return ok
 
         except Exception as e:

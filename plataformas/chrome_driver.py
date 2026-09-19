@@ -89,7 +89,18 @@ FLAGS_ESTABILIDAD = [
 # sitio) reduce los forks sin afectar a X/Facebook/Instagram/TikTok. El
 # `--disable-features` extra se fusiona con el de FLAGS_AHORRO en UNA sola
 # bandera (ver `_fusionar_disable_features`).
+#
+# `--disable-dev-shm-usage`: Railway/Docker montan /dev/shm pequeno (64MB por
+# defecto en Docker) y Chrome lo revienta con `tab crashed`; este flag hace que
+# use /tmp en su lugar (motivo principal de los crashes de renderer).
+# `--disable-extensions` / `--disable-component-extensions-with-background-pages`
+# evitan procesos de extensiones que no se usan en automatizacion, y
+# `--mute-audio` quita trabajo de audio innecesario en el contenedor.
 FLAGS_CONTENEDOR = [
+    "--disable-dev-shm-usage",
+    "--disable-extensions",
+    "--disable-component-extensions-with-background-pages",
+    "--mute-audio",
     "--renderer-process-limit=2",
     "--js-flags=--max-old-space-size=256",
 ]
@@ -549,8 +560,11 @@ def crear_chrome(options, version_main=None, intentos=3):
     """Devuelve un driver uc.Chrome listo (driver compartido pre-parcheado, sin carreras).
 
     - Aplica los flags de ahorro de datos, de estabilidad del renderer y de
-      contenedor (renderer-process-limit, heap capado, site-per-process off y
-      ``--disable-features`` fusionado en UNA sola bandera).
+      contenedor (``--disable-dev-shm-usage`` porque /dev/shm es pequeno en
+      Docker/Railway y provoca ``tab crashed``, ``--disable-extensions``,
+      ``--disable-component-extensions-with-background-pages``,
+      ``--mute-audio``, renderer-process-limit, heap capado, site-per-process
+      off y ``--disable-features`` fusionado en UNA sola bandera).
     - Usa SIEMPRE el chromedriver pre-parcheado de ``data/bin/`` (se prepara una
       sola vez bajo lock de archivo entre procesos).
     - Limita los lanzamientos concurrentes (``CHROME_LAUNCH_MAX``, default 2)

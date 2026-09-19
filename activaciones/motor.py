@@ -695,6 +695,8 @@ class MotorActivacion:
             "ronda_actual": 1,
             "eventos": [],
         }
+        self._ultimo_comentario_url: dict = {}
+        self.pausa_comentario_url_seg: float = 0.0
 
     def _registrar_evento_locked(self, usuario, ok, detalle, ronda=1, rol="",
                                  url="") -> None:
@@ -1459,6 +1461,37 @@ class MotorActivacion:
             resultado = self._intentar_quote_rt(cuenta, urls, texto, dar_like)
         return resultado
 
+    def _esperar_turno_comentario(self, url: str) -> float:
+        """Espera el turno de ESTE worker para comentar `url` (anti-spam).
+
+        Reserva un hueco temporal por URL ancla: dos comentarios dirigidos al
+        MISMO tweet no salen a la vez, aunque haya varios workers en paralelo.
+        No frena otros roles ni comentarios a URLs distintas. Devuelve los
+        segundos esperados (0.0 si no hubo espera) y nunca lanza; el tope por
+        worker es de 60s para evitar bloqueos eternos si la cola se acumula.
+        """
+        try:
+            try:
+                pausa = float(self.pausa_comentario_url_seg or 0)
+            except (TypeError, ValueError):
+                pausa = 0.0
+            if pausa <= 0 or not str(url or "").strip():
+                return 0.0
+            url = str(url)
+            ahora = time.monotonic()
+            with self._lock:
+                siguiente = self._ultimo_comentario_url.get(url, 0.0)
+                espera = max(0.0, siguiente - ahora)
+                base = max(ahora, siguiente)
+                self._ultimo_comentario_url[url] = base + pausa
+            if espera > 0:
+                dormido = min(espera, 60.0)
+                time.sleep(dormido)
+                return dormido
+            return 0.0
+        except Exception:
+            return 0.0
+
     def _intentar_accion_rol(self, cuenta: Cuenta, rol: str, urls: list[str],
                              texto: str, dar_like: bool) -> tuple:
         """Un intento de UNA accion segun el rol de activacion de la cuenta.
@@ -1484,6 +1517,14 @@ class MotorActivacion:
                 url_objetivo = random.choice(urls) if urls else ""
                 if not url_objetivo:
                     return (cuenta.usuario, rol, False, "sin URL objetivo", "")
+
+            if rol == "comentario":
+                espero = self._esperar_turno_comentario(url_objetivo)
+                if espero > 0:
+                    logger.debug(
+                        f"comentario: pausa anti-spam {espero:.1f}s para "
+                        f"{url_objetivo}"
+                    )
 
             bot = TwitterBot(cuenta.usuario)
             # Sesion rapida por CDP: inyecta las cookies sin navegar. Si no hay
@@ -1946,6 +1987,7 @@ class MotorActivacion:
         secciones=None,
         porcentaje_min_ronda=40,
         porcentaje_max_ronda=90,
+        pausa_comentario_url_seg: float = 15.0,
     ) -> dict:
         """Campaña masiva dividida en subcuentas por rol.
 
@@ -1985,6 +2027,10 @@ class MotorActivacion:
         - `porcentaje_min_ronda`/`porcentaje_max_ronda`: con `repetir=True`,
           rango de cuentas por ronda (estricto: mas del minimo, menos que
           todas).
+        - `pausa_comentario_url_seg`: segundos minimos entre dos comentarios
+          dirigidos a la MISMA URL ancla (0 = sin pausa); el hueco se reserva
+          antes de abrir el navegador y solo afecta al rol "comentario" (no
+          frena citas/RTs/hashtags ni comentarios a otras URLs).
         - Cohortes temporales + delay aleatorio y concurrencia limitada,
           igual que `ejecutar()`.
         - Nunca lanza: cada cuenta fallida se reporta en `detalles`.
@@ -1994,6 +2040,13 @@ class MotorActivacion:
             cooldown_val = max(0.0, float(cooldown_min or 0))
         except (TypeError, ValueError):
             cooldown_val = 0.0
+        try:
+            pausa_comentario_val = max(
+                0.0, float(pausa_comentario_url_seg or 0)
+            )
+        except (TypeError, ValueError):
+            pausa_comentario_val = 0.0
+        self.pausa_comentario_url_seg = pausa_comentario_val
         roles_sortear = (
             _roles_disponibles_aleatorios(
                 urls, hashtags, contexto, texto_base, solo_roles,
@@ -2026,6 +2079,7 @@ class MotorActivacion:
                 "rondas": 0 if repetir else 1,
                 "roles_aleatorios": True,
                 "cooldown_min": cooldown_val,
+                "pausa_comentario_url_seg": pausa_comentario_val,
                 "sugerencia_roles": sugerencia_roles,
             }
         cuentas = self._obtener_cuentas_por_rol(
@@ -2111,6 +2165,7 @@ class MotorActivacion:
             "rondas": 0 if repetir else 1,
             "roles_aleatorios": bool(roles_aleatorios),
             "cooldown_min": cooldown_val,
+            "pausa_comentario_url_seg": pausa_comentario_val,
         }
         for cuenta in sin_sesion:
             rol = rol_de.get(cuenta.usuario, "")

@@ -83,8 +83,13 @@ class LocalForwardProxy:
     mantiene keep-alive y con muchos navegadores concurrentes los hilos por
     conexion agotaban el contenedor (`RuntimeError: can't start new thread`).
     `_accept_loop` solo acepta y encola; los N workers (env
-    `FORWARD_PROXY_WORKERS`, default 16) atienden la cola. Si la cola esta
+    `FORWARD_PROXY_WORKERS`, default 6) atienden la cola. Si la cola esta
     llena, la conexion se cierra sin crear nada.
+
+    Cada navegador crea su PROPIO `LocalForwardProxy`: con default 16 y 7
+    navegadores eran 112 hilos solo de proxys (parte del agotamiento de
+    hilos/PIDs). Chrome usa ~6 conexiones por host a la vez, por lo que 6
+    workers por navegador alcanzan.
     """
 
     # Tamano maximo de la cola de conexiones pendientes: si se llena, la
@@ -102,7 +107,7 @@ class LocalForwardProxy:
         self.port_local = 0
         # Pool acotado de workers (tope real de hilos, independiente del
         # numero de conexiones de Chrome).
-        self._num_workers = _env_int("FORWARD_PROXY_WORKERS", 16)
+        self._num_workers = _env_int("FORWARD_PROXY_WORKERS", 6)
         self._queue = None
         self._workers = []
         # Modo defensivo si el SO no deja crear NI UN worker (contenedor

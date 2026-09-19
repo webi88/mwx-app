@@ -55,7 +55,17 @@ del tweet principal (9 acciones). Genera los 9 textos con
 `generar_textos_campana_3_3_3`), muestra el preview por cuenta y programa
 las 9 acciones en el scheduler con `scheduler.distribucion_horaria`
 (igual que "⏰ Reparto por Hora").
+
+Anti-atasco del contexto: el panel de noticias guarda la foto de los links
+(`links_crudos`) y, si los links cambian o se borran sin volver a extraer, el
+contexto se IGNORA con aviso (no se borra solo). Al terminar una campana se
+puede limpiar el contexto con el checkbox "🧹 Limpiar el contexto" (default
+activo; aplica en el siguiente rerun y nunca toca URLs, hashtags, menciones,
+cuentas ni resultados). La pestana B incluye ademas una "Pausa entre
+comentarios al MISMO tweet" (anti-spam) y un aviso cuando solo hay 1 URL ancla.
 """
+import threading
+
 import streamlit as st
 
 from web.ui import cabecera
@@ -75,6 +85,18 @@ ICONOS_ROL = {
     "comentario": "🗨️",
     "rt": "🔁",
 }
+
+# Guard de campana unica a nivel PROCESO: impide que el boton de otra pestana
+# (u otra sesion del dashboard) lance una segunda campana mientras hay una
+# corriendo; dos campanas simultaneas saturan Chrome/contenedor (`tab crashed`,
+# `BlockingIOError`) y hacen mas lenta la que ya corre. Se libera SIEMPRE al
+# terminar (o fallar) el lanzamiento.
+_CAMPANA_ACTIVA = threading.Event()
+
+
+def _campana_en_curso() -> bool:
+    """True si hay una campana de activacion ejecutandose en este proceso."""
+    return _CAMPANA_ACTIVA.is_set()
 
 
 def _navegadores_default() -> int:
@@ -301,9 +323,23 @@ def _lanzar_con_progreso(lanzar, motor, duracion_min: int, repetir: bool) -> dic
 
     Si `lanzar()` lanza, la excepcion se re-lanza aqui tras cerrar la barra.
     Devuelve el resumen del motor.
+
+    Guard de campana unica: si otra campana ya esta en curso en este proceso,
+    muestra `st.error` y devuelve `{}` sin lanzar hilo ni barra. El guard se
+    libera SIEMPRE: en el `finally` del hilo runner (exito, error del motor o
+    excepcion inesperada) y tambien si falla el arranque del hilo.
     """
-    import threading
     import time
+
+    if _campana_en_curso():
+        st.error(
+            "⚠️ Ya hay una campaña de activación en curso. Espera a que "
+            "termine antes de lanzar otra: dos campañas simultáneas saturan "
+            "Chrome (tab crashed) y hacen más lenta la que ya corre."
+        )
+        return {}
+
+    _CAMPANA_ACTIVA.set()
 
     resultado: dict = {}
     estado: dict = {"total": 0}
@@ -319,10 +355,19 @@ def _lanzar_con_progreso(lanzar, motor, duracion_min: int, repetir: bool) -> dic
             resultado["resumen"] = _invocar_lanzar(lanzar, _cb_total)
         except BaseException as e:  # re-lanzada en el hilo principal
             resultado["error"] = e
+        finally:
+            # El guard se libera SIEMPRE (exito, error del motor o excepcion
+            # inesperada) antes de que el hilo principal re-lance el error.
+            _CAMPANA_ACTIVA.clear()
 
-    hilo = threading.Thread(target=_runner, daemon=True)
-    inicio = time.monotonic()
-    hilo.start()
+    try:
+        hilo = threading.Thread(target=_runner, daemon=True)
+        inicio = time.monotonic()
+        hilo.start()
+    except BaseException:
+        # Si el hilo no llego a arrancar, nadie mas liberaria el guard.
+        _CAMPANA_ACTIVA.clear()
+        raise
 
     barra = st.progress(0.0)
     metricas = st.empty()
@@ -399,6 +444,48 @@ def _lanzar_con_progreso(lanzar, motor, duracion_min: int, repetir: bool) -> dic
     lineas.append(f"**{linea_final}**")
     feed.markdown("  \n".join(lineas))
     return resumen
+
+
+def _soporta_kwarg(func, nombre: str) -> bool:
+    """True si `func` acepta el kwarg `nombre` (backend viejo -> False).
+
+    Se inspecciona la firma UNA vez antes de llamar: asi la pagina no falla si
+    el motor todavia no tiene un parametro nuevo (p. ej.
+    `pausa_comentario_url_seg`) sin riesgo de capturar un `TypeError` interno.
+    Tambien acepta funciones que reciben `**kwargs`.
+    """
+    import inspect
+
+    try:
+        parametros = inspect.signature(func).parameters
+    except (TypeError, ValueError):
+        return False
+    if nombre in parametros:
+        return True
+    return any(
+        p.kind == inspect.Parameter.VAR_KEYWORD for p in parametros.values()
+    )
+
+
+def _lanzar_con_progreso_o_limpiar(lanzar, motor, duracion_min: int, repetir: bool,
+                                   prefix: str, limpiar: bool) -> dict:
+    """`_lanzar_con_progreso` + limpieza diferida del contexto al volver.
+
+    Si `limpiar` y la campana llego a lanzarse (exito) o fallo, programa la
+    limpieza del contexto de `prefix`; se aplicara en el siguiente rerun, sin
+    borrar la pantalla de resultados actual. Si el guard de campana unica
+    rechazo el lanzamiento (`_lanzar_con_progreso` devuelve `{}`), no limpia
+    nada. La excepcion, si la hay, se re-lanza tal cual.
+    """
+    try:
+        resultados = _lanzar_con_progreso(lanzar, motor, duracion_min, repetir)
+    except BaseException:
+        if limpiar:
+            _programar_limpieza_contexto(prefix)
+        raise
+    if limpiar and resultados:
+        _programar_limpieza_contexto(prefix)
+    return resultados
 
 
 # ============================ ACCESO A DATOS ============================
@@ -571,6 +658,84 @@ def _mostrar_resultados_roles(resultados: dict):
 
 # ============================ UI: CONTEXTO DE NOTICIAS ============================
 
+# Claves de los campos de contexto MANUAL (tema/trasfondo escrito a mano) por
+# pestana. La limpieza post-campana los vacia, pero NUNCA toca URLs, hashtags,
+# menciones, cuentas ni resultados de la campana.
+_CLAVES_CONTEXTO_MANUAL = {
+    # Pestana A ("act"): hoy no tiene campo manual (solo el texto base de la
+    # cita y el panel de noticias); `pop` defensivo si algun dia se agrega.
+    "act": ("act_contexto",),
+    # Pestana B: "Contexto de los posts con hashtag" (tema que la IA si opina).
+    "act_roles": ("act_roles_contexto",),
+}
+
+
+def _programar_limpieza_contexto(prefix: str) -> None:
+    """Programa (diferido) la limpieza del contexto de la pestana `prefix`.
+
+    Se llama al terminar una campana (con el checkbox "🧹 Limpiar el contexto"
+    marcado). NO borra nada en este run (los widgets ya estan instanciados): la
+    limpieza se aplica en el siguiente rerun desde
+    `_aplicar_limpieza_contexto_pendiente`.
+    """
+    st.session_state[f"{prefix}_noticias_limpiar_pendiente"] = True
+    st.session_state[f"{prefix}_contexto_manual_limpiar_pendiente"] = True
+
+
+def _aplicar_limpieza_contexto_pendiente(prefix: str) -> None:
+    """Aplica la limpieza programada ANTES de crear los widgets de la pestana.
+
+    Consume los flags (una sola vez por run) y hace `pop` de:
+      - noticias: resultado extraido, links, texto extra y preview;
+      - contexto manual: las keys de `_CLAVES_CONTEXTO_MANUAL[prefix]`.
+
+    Nunca modifica el estado de un widget ya instanciado (se llama al inicio del
+    tab/panel) y nunca toca URLs, hashtags, menciones, cuentas ni resultados.
+    """
+    limpiar_noticias = bool(
+        st.session_state.pop(f"{prefix}_noticias_limpiar_pendiente", False)
+    )
+    limpiar_manual = bool(
+        st.session_state.pop(f"{prefix}_contexto_manual_limpiar_pendiente", False)
+    )
+    if limpiar_noticias:
+        for sufijo in (
+            "noticias_resultado",
+            "noticias_links",
+            "noticias_texto",
+            "noticias_contexto_ver",
+        ):
+            st.session_state.pop(f"{prefix}_{sufijo}", None)
+    if limpiar_manual:
+        for clave in _CLAVES_CONTEXTO_MANUAL.get(prefix, ()):
+            st.session_state.pop(clave, None)
+
+
+def _links_desactualizados(resultado: dict, links_raw: str,
+                           links_actuales: list) -> bool:
+    """True si el contexto guardado NO corresponde a los links actuales.
+
+    Reglas (nunca lanza):
+      - Campo de links vacio o sin URLs validas -> el contexto se ignora.
+      - Con `links_crudos` (foto del text_area al extraer): se comparan las
+        listas normalizadas (`normalizar_links`); si difieren, el contexto quedo
+        atrasado respecto de lo que el usuario tiene ahora.
+      - Resultados viejos sin `links_crudos`: se cae a `resultado["links"]` y,
+        si tampoco existe, se considera desactualizado (no se puede verificar).
+    """
+    from ia.contexto_noticias import normalizar_links
+
+    if not links_actuales:
+        return True
+    crudos_guardados = resultado.get("links_crudos")
+    if crudos_guardados is None:
+        guardados = resultado.get("links")
+        if not guardados:
+            return True
+        return [str(x) for x in guardados] != [str(x) for x in links_actuales]
+    return normalizar_links(crudos_guardados) != [str(x) for x in links_actuales]
+
+
 def _panel_contexto_noticias(prefix: str) -> dict:
     """Panel "📰 Contexto desde noticias (solo trasfondo)" de una pestana.
 
@@ -587,15 +752,25 @@ def _panel_contexto_noticias(prefix: str) -> dict:
         al pulsarlo) a `ia.contexto_noticias.generar_contexto_desde_links` con
         `max_caracteres=1800` y guarda el dict completo en
         `st.session_state[f"{prefix}_noticias_resultado"]`.
-      - boton "🗑️ Limpiar contexto": borra el resultado y hace `st.rerun()`.
+      - boton "🗑️ Limpiar contexto": programa la limpieza diferida (resultado,
+        links, texto extra y preview) y hace `st.rerun()`.
       - si ya hay resultado, lo muestra en cada rerun (sin volver a raspar):
         links usados/duplicados, si fue "Resumen IA" o "Resumen local (sin IA)",
         los errores (max. 3) y un expander "Ver fuentes y contexto".
+      - ANTI-ATASCO: el resultado guarda `links_crudos` (foto exacta del
+        text_area al extraer); si los links actuales (normalizados) ya no
+        coinciden —o el campo quedo vacio— el contexto se IGNORA con un aviso
+        (sin borrarlo) hasta que se vuelva a extraer o limpiar.
 
     Devuelve `{"contexto", "links", "ok", "fuentes", "texto_extra"}` con
-    valores vacios si todavia no hay resultado. Nunca raspa fuera del boton.
+    valores vacios si todavia no hay resultado o si quedo desactualizado.
+    Nunca raspa fuera del boton.
     """
     from ia.contexto_noticias import generar_contexto_desde_links, normalizar_links
+
+    # Limpieza diferida (boton "Limpiar contexto" o fin de campana): SIEMPRE
+    # antes de crear los widgets del panel.
+    _aplicar_limpieza_contexto_pendiente(prefix)
 
     st.markdown("#### 📰 Contexto desde noticias (solo trasfondo)")
     st.caption(
@@ -639,7 +814,10 @@ def _panel_contexto_noticias(prefix: str) -> dict:
 
     clave_resultado = f"{prefix}_noticias_resultado"
     if limpiar:
+        # Limpieza diferida: los text_area ya estan instanciados en este run,
+        # asi que se programan para el siguiente (ver inicio del panel).
         st.session_state.pop(clave_resultado, None)
+        st.session_state[f"{prefix}_noticias_limpiar_pendiente"] = True
         st.rerun()
 
     if extraer:
@@ -649,13 +827,35 @@ def _panel_contexto_noticias(prefix: str) -> dict:
                 texto_extra=texto_extra,
                 max_caracteres=1800,
             )
+        if not isinstance(resultado, dict):
+            resultado = {"ok": False, "contexto": ""}
+        # Foto EXACTA del text_area: permite detectar despues si el contexto
+        # quedo atrasado (links cambiados o borrados sin volver a extraer).
+        resultado["links_crudos"] = str(links_raw or "")
         st.session_state[clave_resultado] = resultado
 
+    links_actuales = normalizar_links(links_raw)
     resultado = st.session_state.get(clave_resultado) or {}
     if not resultado:
         return {
             "contexto": "",
-            "links": [],
+            "links": links_actuales,
+            "ok": False,
+            "fuentes": [],
+            "texto_extra": "",
+        }
+
+    if _links_desactualizados(resultado, links_raw, links_actuales):
+        # El contexto guardado pertenece a otros links (o ya no hay links): se
+        # ignora SIN borrarlo, para que el usuario decida re-extraer o limpiar.
+        st.warning(
+            "⚠️ El contexto extraído ya no corresponde a los links actuales "
+            "(o borraste los links). Se ignora hasta que vuelvas a pulsar "
+            "'📰 Extraer contexto de las noticias' o '🗑️ Limpiar contexto'."
+        )
+        return {
+            "contexto": "",
+            "links": links_actuales,
             "ok": False,
             "fuentes": [],
             "texto_extra": "",
@@ -720,7 +920,7 @@ def _panel_contexto_noticias(prefix: str) -> dict:
 
     return {
         "contexto": str(resultado.get("contexto") or "").strip(),
-        "links": normalizar_links(links_raw),
+        "links": links_actuales,
         "ok": bool(resultado.get("ok")),
         "fuentes": list(resultado.get("fuentes") or []),
         "texto_extra": str(texto_extra or "").strip(),
@@ -731,6 +931,9 @@ def _panel_contexto_noticias(prefix: str) -> dict:
 
 def _cita_masiva():
     """Pestana A: quote-RTs masivos con variaciones (formulario original)."""
+    # Limpieza diferida del contexto (fin de campana / "Limpiar contexto"):
+    # SIEMPRE antes de crear cualquier widget de la pestana.
+    _aplicar_limpieza_contexto_pendiente("act")
     st.markdown("Pega una URL de tweet por línea (objetivos a citar):")
     urls_text = st.text_area("URLs objetivo", height=100, key="act_urls")
 
@@ -768,10 +971,16 @@ def _cita_masiva():
             min_value=1, max_value=30, value=_navegadores_default(), step=1,
             key="act_nav",
             help=(
-                "Cada navegador ejecuta una cuenta a la vez. En Railway "
-                "conviene 3 (configurable con la variable MAX_BROWSERS)."
+                "Cada navegador ejecuta una cuenta a la vez. Recomendado: "
+                "4-6 en Railway (configurable con la variable MAX_BROWSERS)."
             ),
         )
+
+    st.caption(
+        "🖥️ Recomendado: 4-6 navegadores en Railway (cada Chrome ~300-500 MB). "
+        "Más navegadores solo con RAM/GB de sobra; subirlo de más provoca "
+        "`tab crashed` y la campaña va más lento. No lances dos campañas a la vez."
+    )
 
     opciones_seccion = [OPCION_TODAS_SECCIONES] + [
         etiqueta_seccion(clave) for clave in SECCIONES
@@ -862,6 +1071,17 @@ def _cita_masiva():
                 help=ayuda_pct,
             )
 
+    limpiar_contexto_al_terminar = st.checkbox(
+        "🧹 Limpiar el contexto (noticias/tema) al terminar",
+        value=True,
+        key="act_limpiar_contexto",
+        help=(
+            "Al terminar la campaña borra el resultado/links/texto de noticias "
+            "y el tema manual; no toca URLs, hashtags, menciones, cuentas ni "
+            "resultados de la campaña."
+        ),
+    )
+
     if st.button("🎯 Lanzar activación", type="primary", key="btn_act"):
         urls = [u.strip() for u in urls_text.splitlines() if u.strip()]
         if not urls:
@@ -884,7 +1104,7 @@ def _cita_masiva():
         from activaciones.motor import MotorActivacion
 
         motor = MotorActivacion(max_concurrente=int(navegadores))
-        resultados = _lanzar_con_progreso(
+        resultados = _lanzar_con_progreso_o_limpiar(
             lambda cb: motor.ejecutar(
                 urls=urls,
                 texto_base=texto_base,
@@ -907,6 +1127,8 @@ def _cita_masiva():
             motor,
             duracion_min=int(duracion_min),
             repetir=bool(repetir),
+            prefix="act",
+            limpiar=bool(limpiar_contexto_al_terminar),
         )
 
         st.markdown("---")
@@ -956,6 +1178,11 @@ def _por_roles():
     # Import perezoso: cuentas.py importa Streamlit y compania y solo se
     # necesita al abrir esta pestana (evita acoplar el arranque del dashboard).
     from web.operaciones.cuentas import _selector_masivo
+
+    # Limpieza diferida del contexto (fin de campana / "Limpiar contexto"):
+    # SIEMPRE antes de crear cualquier widget de la pestana (incluido
+    # `act_roles_contexto`).
+    _aplicar_limpieza_contexto_pendiente("act_roles")
 
     cuentas = _cargar_cuentas_con_roles()
     st.caption(f"Cuentas twitter activas: **{len(cuentas)}**")
@@ -1151,8 +1378,8 @@ def _por_roles():
             min_value=1, max_value=30, value=_navegadores_default(), step=1,
             key="act_roles_nav",
             help=(
-                "Cada navegador ejecuta una cuenta a la vez. En Railway "
-                "conviene 3 (configurable con la variable MAX_BROWSERS)."
+                "Cada navegador ejecuta una cuenta a la vez. Recomendado: "
+                "4-6 en Railway (configurable con la variable MAX_BROWSERS)."
             ),
         )
     with col_cool:
@@ -1167,10 +1394,27 @@ def _por_roles():
             ),
         )
 
+    pausa_comentario = st.number_input(
+        "Pausa entre comentarios al MISMO tweet (s)",
+        min_value=0,
+        max_value=300,
+        value=15,
+        step=5,
+        key="act_roles_pausa_comentario",
+        help=(
+            "X marca como probable spam los comentarios masivos al mismo "
+            "tweet. Esta pausa espacia las respuestas a la MISMA URL; con "
+            "varias URLs ancla casi no afecta la velocidad."
+        ),
+    )
+
     st.caption(
-        "⚡ Rendimiento estimado: con **3 navegadores** y ~45-60s por acción "
-        "se logran **~200-260 publicaciones/hora**; ajusta navegadores y "
-        "descanso según tus proxies."
+        "⚡ Rendimiento estimado: con ~45-60s por acción, 4-6 navegadores "
+        "logran **~200-260 publicaciones/hora**; ajusta navegadores y "
+        "descanso según tus proxies. 🖥️ Recomendado: 4-6 navegadores en "
+        "Railway (cada Chrome ~300-500 MB). Más navegadores solo con RAM/GB "
+        "de sobra; subirlo de más provoca `tab crashed` y la campaña va más "
+        "lento. No lances dos campañas a la vez."
     )
 
     roles_aleatorios = st.checkbox(
@@ -1280,6 +1524,52 @@ def _por_roles():
             "registro no hacen nada."
         )
 
+    # Filtros efectivos de la campana: los comparten el aviso anti-spam y el
+    # boton de lanzamiento.
+    usuarios_param = None if todas_cuentas else (usuarios_sel or None)
+    base_objetivo = (
+        [f for f in cuentas if f.get("tipo_cuenta")]
+        if todas_cuentas
+        else cuentas
+    )
+    if secciones_param:
+        base_objetivo = [
+            f for f in base_objetivo if f.get("seccion") == secciones_param[0]
+        ]
+
+    # Anti-spam: con UNA sola URL ancla y comentarios en juego, TODOS los
+    # comentarios caen en el mismo tweet y X los agrupa como spam.
+    urls_previas = (
+        [] if sin_ancla else [u.strip() for u in urls_text.splitlines() if u.strip()]
+    )
+    comentario_posible = False
+    if not sin_ancla:
+        if roles_aleatorios:
+            comentario_posible = True
+        else:
+            comentario_posible = "comentario" in _roles_objetivo(
+                base_objetivo,
+                usuarios_param,
+                list(ORDEN_ROLES) if solo_con_rol else None,
+            )
+    if len(urls_previas) == 1 and comentario_posible:
+        st.warning(
+            "⚠️ Con una sola URL ancla todos los comentarios van al mismo "
+            "tweet y X los agrupa como 'Probable spam'. Pega 2-5 URLs o sube "
+            "la pausa."
+        )
+
+    limpiar_contexto_al_terminar = st.checkbox(
+        "🧹 Limpiar el contexto (noticias/tema) al terminar",
+        value=True,
+        key="act_roles_limpiar_contexto",
+        help=(
+            "Al terminar la campaña borra el resultado/links/texto de noticias "
+            "y el contexto manual de los posts; no toca URLs, hashtags, "
+            "menciones, cuentas ni resultados de la campaña."
+        ),
+    )
+
     if st.button(
         "🗂️ Lanzar campaña por roles",
         type="primary",
@@ -1317,17 +1607,6 @@ def _por_roles():
                 if roles_aleatorios
                 else (list(ORDEN_ROLES) if solo_con_rol else None)
             )
-        usuarios_param = None if todas_cuentas else (usuarios_sel or None)
-        base_objetivo = (
-            [f for f in cuentas if f.get("tipo_cuenta")]
-            if todas_cuentas
-            else cuentas
-        )
-        if secciones_param:
-            base_objetivo = [
-                f for f in base_objetivo
-                if f.get("seccion") == secciones_param[0]
-            ]
 
         material_posts = (
             str(hashtags or "").strip()
@@ -1398,7 +1677,12 @@ def _por_roles():
         from activaciones.motor import MotorActivacion
 
         motor = MotorActivacion(max_concurrente=int(navegadores))
-        resultados = _lanzar_con_progreso(
+        # El motor viejo no acepta `pausa_comentario_url_seg`: se comprueba la
+        # firma para pasar el kwarg solo si existe (la pagina nunca falla).
+        pausa_kwargs = {}
+        if _soporta_kwarg(motor.ejecutar_por_roles, "pausa_comentario_url_seg"):
+            pausa_kwargs["pausa_comentario_url_seg"] = int(pausa_comentario)
+        resultados = _lanzar_con_progreso_o_limpiar(
             lambda cb: motor.ejecutar_por_roles(
                 urls=urls,
                 texto_base=texto_base,
@@ -1419,10 +1703,13 @@ def _por_roles():
                 secciones=secciones_param,
                 porcentaje_min_ronda=int(pct_min),
                 porcentaje_max_ronda=int(pct_max),
+                **pausa_kwargs,
             ),
             motor,
             duracion_min=int(duracion_min),
             repetir=bool(repetir),
+            prefix="act_roles",
+            limpiar=bool(limpiar_contexto_al_terminar),
         )
         _mostrar_resultados_roles(resultados)
 
