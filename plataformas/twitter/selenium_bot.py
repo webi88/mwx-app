@@ -1869,12 +1869,13 @@ class TwitterBot:
     )
 
     # Presupuesto TOTAL (segundos) para abrir el compositor. Los timeouts por
-    # ruta (18+10 en /compose/post y 10/10 en cada alterna) pueden sumar mas
-    # que esto en el peor caso; cuando se agota, las esperas de las rutas
+    # ruta (10+5 en /compose/post y 8+4 en cada alterna) pueden sumar mas que
+    # esto en el peor caso; cuando se agota, las esperas de las rutas
     # siguientes se recortan para cortar hacia el error final (el motor
-    # reintenta con otro navegador). Las esperas nunca bajan del minimo del
-    # helper (0.2s) para alcanzar a ver un editor que ya este montado.
-    _PRESUPUESTO_COMPOSITOR = 43.0
+    # reintenta con otro navegador). Una PAGINA DE ERROR de X ("something went
+    # wrong") aborta antes de recorrer las otras rutas (ver
+    # `_abrir_compositor`): antes se quemaban ~44s de proxy sin cambiar nada.
+    _PRESUPUESTO_COMPOSITOR = 20.0
 
     def _hay_muro_login(self) -> bool:
         """True si X pidio login en la pagina actual (sesion caida).
@@ -1943,6 +1944,70 @@ class TwitterBot:
         except Exception:
             error = ""
         return f"url={url} title={title} login={bool(login)} error={error}"
+
+    def _url_en_x(self) -> bool:
+        """True si la ventana actual esta navegando en x.com/twitter.com.
+
+        Un driver recien creado vive en `chrome://new-tab-page`/`about:blank`:
+        mientras siga ahi NO tiene sentido esperar elementos de X. Nunca lanza.
+        """
+        try:
+            actual = (self.driver.current_url or "").lower()
+        except Exception:
+            return False
+        return ("x.com" in actual) or ("twitter.com" in actual)
+
+    def _enfocar_ventana_x(self) -> bool:
+        """Si hay varias ventanas, cambia a la primera que este en X.
+
+        Devuelve True si la ventana activa quedo en X; False si ninguna lo
+        esta (o no se pudo leer la lista). Nunca lanza.
+        """
+        try:
+            handles = list(self.driver.window_handles or [])
+        except Exception:
+            return False
+        if self._url_en_x():
+            return True
+        for handle in handles:
+            try:
+                self.driver.switch_to.window(handle)
+                if self._url_en_x():
+                    logger.info(f"x.com encontrado en otra ventana ({handle[:8]}...)")
+                    return True
+            except Exception:
+                continue
+        return False
+
+    def _asegurar_pagina_tweet(self, url: str) -> None:
+        """Garantiza que el driver este en la pagina del tweet o lanza RAPIDO.
+
+        Bug real: con el driver en `chrome://new-tab-page`/`about:blank` (tab
+        crashed o `get` que nunca navego) `responder_tweet` esperaba 12s+8s un
+        boton que jamas iba a aparecer. Aqui:
+        1. Si ya hay una ventana en X, se usa esa.
+        2. Si no, se reintenta UNA navegacion a `url`.
+        3. Si sigue sin estar en X, lanza "tab crashed/navegador sin navegar"
+           (el motor lo trata como error reintentable) de inmediato.
+        Nunca lanza otro tipo de error.
+        """
+        if self._url_en_x():
+            return
+        if self._enfocar_ventana_x():
+            return
+        try:
+            self.driver.get(url)
+        except TimeoutException:
+            logger.warning(
+                f"Carga lenta de {url} (reintento de navegacion); sigo con "
+                f"esperas explicitas"
+            )
+        time.sleep(0.3)
+        if not self._url_en_x():
+            raise Exception(
+                "tab crashed/navegador sin navegar: la ventana de X no cargo "
+                f"({self._diagnostico_pagina()})"
+            )
 
     @classmethod
     def _es_error_fatal_compositor(cls, error) -> bool:
@@ -2280,10 +2345,11 @@ class TwitterBot:
         def abrir_con_espera(ruta, espera, reintento):
             """Abre `ruta`; devuelve el editor visible o lanza fallo controlado.
 
-            Si la ruta cae en la pagina de error de X (o el editor no aparece),
-            hace UN `driver.refresh()` corto y UN segundo intento de la MISMA
-            ruta; si vuelve a fallar, lanza un error controlado para que el
-            bucle pruebe la siguiente.
+            Si la ruta cae en la pagina de error de X, hace UN `driver.refresh()`
+            corto y UN segundo intento de la MISMA ruta; si la pagina de error
+            PERSISTE, lanza "compositor no disponible (pagina de error de X)"
+            para que `_abrir_compositor` aborte YA (recorrer las otras rutas
+            quemaba ~40s de proxy sin cambiar el resultado).
             """
             try:
                 self.driver.get(f"{self.base_url}{ruta}")
@@ -2309,6 +2375,19 @@ class TwitterBot:
                         f"segundo intento"
                     )
                     self._refresh_corto()
+                # Deteccion temprana de la pagina de error de X: no tiene
+                # sentido agotar el timeout del editor si X ya sirvio
+                # "something went wrong" y no hay ningun editor visible.
+                if (
+                    self._frase_error_pagina()
+                    and self._primer_editor_visible() is None
+                ):
+                    if intento == 1 and restante() > 1.0:
+                        continue
+                    raise Exception(
+                        "compositor no disponible (pagina de error de X) "
+                        f"({self._diagnostico_pagina()})"
+                    )
                 espera_efectiva = min(float(espera), restante())
                 reintento_efectivo = min(
                     float(reintento), max(0.0, restante() - espera_efectiva)
@@ -2329,15 +2408,12 @@ class TwitterBot:
                         # Sesion caida: probar otra ruta no ayuda.
                         raise
                     logger.warning(f"Compositor no disponible en {ruta}: {e}")
-                    # La pagina de error SI se reintenta en la misma ruta; un
-                    # timeout sin editor ya hizo su refresh interno, se pasa a
-                    # la siguiente ruta sin gastar el presupuesto.
-                    if (
-                        intento == 1
-                        and self._es_fallo_pagina_error(e)
-                        and restante() > 1.0
-                    ):
-                        continue
+                    if self._es_fallo_pagina_error(e):
+                        if intento == 1 and restante() > 1.0:
+                            continue
+                        # El segundo intento (refresh) TAMPOCO arreglo la
+                        # pagina de error: fallo rapido y reintentable.
+                        raise
                     raise
                 if editor is not None:
                     return editor
@@ -2351,14 +2427,19 @@ class TwitterBot:
                     continue
                 break
 
+            if self._frase_error_pagina() and self._primer_editor_visible() is None:
+                raise Exception(
+                    "compositor no disponible (pagina de error de X) "
+                    f"({self._diagnostico_pagina()})"
+                )
             raise Exception(
                 f"editor visible de X no apareció en {ruta} "
                 f"({self._diagnostico_pagina()})"
             )
 
         for ruta, espera, reintento in (
-            ("/compose/post", 18, 10),
-            ("/compose/tweet", 10, 10),
+            ("/compose/post", 10, 5),
+            ("/compose/tweet", 8, 4),
         ):
             if restante() <= 0.5:
                 # Presupuesto agotado: seguir con la siguiente ruta solo
@@ -2377,6 +2458,12 @@ class TwitterBot:
             except Exception as e:
                 if self._es_error_fatal_compositor(e):
                     # Sesion caida: probar otra ruta no ayuda.
+                    raise
+                if self._es_fallo_pagina_error(e):
+                    # La pagina de error de X ya se reintento UNA vez en la
+                    # MISMA ruta: recorrer las otras 2 quemaba ~40s sin
+                    # cambiar el resultado. Fallo rapido y reintentable.
+                    logger.warning(f"Compositor no disponible en {ruta}: {e}")
                     raise
                 logger.warning(f"Compositor no disponible en {ruta}: {e}")
                 continue
@@ -2408,9 +2495,9 @@ class TwitterBot:
                     "segundo intento"
                 )
                 self._refresh_corto()
-            espera_efectiva = min(10.0, restante())
-            reintento_efectivo = min(10.0, max(0.0, restante() - espera_efectiva))
-            if espera_efectiva < 10.0 or reintento_efectivo < 10.0:
+            espera_efectiva = min(8.0, restante())
+            reintento_efectivo = min(4.0, max(0.0, restante() - espera_efectiva))
+            if espera_efectiva < 8.0 or reintento_efectivo < 4.0:
                 logger.warning(
                     "timeout esperando editor visible en /home: presupuesto "
                     f"ajustado a {espera_efectiva:.0f}s + {reintento_efectivo:.0f}s"
@@ -2437,6 +2524,11 @@ class TwitterBot:
                 continue
             break
 
+        if self._frase_error_pagina() and self._primer_editor_visible() is None:
+            raise Exception(
+                "compositor no disponible (pagina de error de X) "
+                f"({self._diagnostico_pagina()})"
+            )
         raise Exception(
             "compositor de X no cargo: el editor visible no aparecio "
             f"({self._diagnostico_pagina()})"
@@ -2471,7 +2563,8 @@ class TwitterBot:
 
         try:
             self.driver.get(f"{self.base_url}/{self.usuario}/with_replies")
-            time.sleep(4)
+            self._esperar_article_tweet(timeout=2)
+            time.sleep(0.5)
             tweets = self.driver.find_elements(By.CSS_SELECTOR, "article[data-testid='tweet']")
             for tweet in tweets[:5]:
                 try:
@@ -2550,6 +2643,13 @@ class TwitterBot:
                     logger.error(self.ultimo_error)
                     return None
 
+            # La ventana DEBE estar en la pagina del tweet: con el driver en
+            # `chrome://new-tab-page`/`about:blank` (tab crashed o navegacion
+            # que nunca ocurrio) se esperaban 12s+8s un boton inexistente.
+            # Aqui se reintenta UNA navegacion y, si sigue sin X, se corta de
+            # inmediato con un error reintentable por el motor.
+            self._asegurar_pagina_tweet(url)
+
             if self._detectar_limite_cuenta():
                 self.ultimo_error = "cuenta limitada por X"
                 logger.error("Cuenta limitada, saltando respuesta")
@@ -2623,7 +2723,7 @@ class TwitterBot:
 
             if imagen_path and os.path.exists(imagen_path):
                 self._subir_imagen(imagen_path)
-                time.sleep(1)
+                time.sleep(0.5)
 
             # No clicar a ciegas: X mantiene el boton Responder deshabilitado
             # hasta que el editor registra el texto. Si no se habilita, el
@@ -3046,7 +3146,9 @@ class TwitterBot:
         try:
             input_file = self.driver.find_element(By.CSS_SELECTOR, "input[type='file'][accept*='image']")
             input_file.send_keys(os.path.abspath(imagen_path))
-            time.sleep(3)
+            # La espera del boton Post habilitado (o la verificacion real)
+            # absorbe el tiempo de subida; 3s fijos eran de mas.
+            time.sleep(1.5)
         except Exception as e:
             logger.error(f"Error subiendo imagen: {e}")
     
@@ -3140,7 +3242,7 @@ class TwitterBot:
                     self.driver.execute_script("arguments[0].click();", btn)
                 except Exception as e:
                     logger.warning(f"Fallo el clic de like (intento {intento + 1}): {e}")
-                time.sleep(random.uniform(1.0, 2.0))
+                time.sleep(random.uniform(0.4, 0.8))
                 if self._tweet_ya_tiene_like():
                     logger.info("Like registrado en el tweet")
                     return True
@@ -3237,7 +3339,7 @@ class TwitterBot:
                             url_perfil = f"https://twitter.com/{usuario}"
                             resultados["urls"].append(url_perfil)
                             self.ultima_url_publicada = url_perfil
-                            time.sleep(random.uniform(1.0, 2.5))
+                            time.sleep(random.uniform(0.2, 0.5))
                             continue
                     except Exception:
                         pass
@@ -3278,22 +3380,24 @@ class TwitterBot:
                             motivo or "boton de retweet no encontrado (carga lenta o cambio de interfaz)"
                         )
                 rt_btn.click()
-                time.sleep(1)
+                time.sleep(0.3)
                 
                 if mensaje_cita:
                     # Elegir la opcion "Quote" del menu (NO "Retweet") para citar
                     quote_btn = self._buscar_opcion_quote()
                     self.driver.execute_script("arguments[0].click();", quote_btn)
-                    time.sleep(2)
+                    # `_buscar_opcion_quote` espera a que el modal monte su
+                    # editor; la pausa fija de 2s era innecesaria.
+                    time.sleep(random.uniform(0.5, 0.9))
                     
                     editor = self._esperar_editor_visible()
                     mensaje = self._recortar_para_x(mensaje_cita)
                     self._pegar_texto(editor, mensaje)
-                    time.sleep(1)
+                    time.sleep(0.3)
                     
                     if imagen_path and os.path.exists(imagen_path):
                         self._subir_imagen(imagen_path)
-                        time.sleep(1)
+                        time.sleep(0.5)
                     
                     publicar_btn = self._buscar_boton_post()
                     self.driver.execute_script("arguments[0].click();", publicar_btn)
@@ -3312,7 +3416,9 @@ class TwitterBot:
                     if not self._esperar_rt_confirmado():
                         raise Exception("X no confirmo el RT (sin estado 'unretweet')")
                 
-                time.sleep(2)
+                # El resultado ya esta verificado (unretweet/toast): no hace
+                # falta dormir 2s antes de cerrar la accion.
+                time.sleep(0.3)
                 
                 if dar_like:
                     # Idempotente: si la cuenta ya tiene like en este tweet NO

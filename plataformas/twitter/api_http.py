@@ -1,6 +1,10 @@
 import curl_cffi.requests as requests
 import hashlib
+import html as _html
+import json
 import pickle
+import re
+import threading
 import time
 import random
 import os
@@ -21,6 +25,158 @@ def _env_activo(nombre: str, por_defecto: bool = False) -> bool:
     if valor is None or not valor.strip():
         return por_defecto
     return valor.strip().lower() not in ("0", "false", "no", "off")
+
+
+# --------------------------------------------------------------------------- #
+# Descubrimiento/cache de queryIds GraphQL
+# --------------------------------------------------------------------------- #
+# Los queryId de la API interna de X cambian sin aviso (el viejo
+# `ojPdsZsimiJrUGLR1sjUtA` de CreateRetweet ya devuelve 422). En vez de
+# hardcodear uno vencido, `TwitterAPI._queryid` los DESCUBRE de los bundles JS
+# de x.com, los cachea por proceso + archivo TTL 6h y los redescubre cuando X
+# responde 400/422. El fallback conocido solo se usa si el descubrimiento
+# falla (RT/like) o devuelve "" (CreateTweet/TweetResultByRestId: sin
+# candidato fiable => el llamador debe usar descubrimiento).
+_QUERYIDS_FALLBACK = {
+    "CreateRetweet": "ojPdsZsimiJrUGLR1sjUtA",
+    "FavoriteTweet": "lZ0GCEojmtQfiUQa5oJSEw",
+}
+_QUERYIDS_TTL_SEG = 6 * 3600
+_QUERYIDS_PRESUPUESTO_SEG = 8.0
+_QUERYIDS_MAX_BUNDLES = 3
+_QUERYIDS_MEM: dict = {}
+_QUERYIDS_LOCK = threading.Lock()
+_QUERYIDS_DESCUBRIMIENTO_LOCK = threading.Lock()
+_QUERYIDS_ARCHIVO = "data/twitter_queryids.json"
+
+# Features estandar del cliente web. X tolera campos de mas; incluir el set
+# completo evita que GraphQL rechace CreateTweet por "features" incompletas.
+_FEATURES_CREATE_TWEET = {
+    "rweb_tipjar_consumption_enabled": True,
+    "responsive_web_graphql_exclude_directive_enabled": True,
+    "verified_phone_label_enabled": False,
+    "creator_subscriptions_tweet_preview_api_enabled": True,
+    "responsive_web_graphql_timeline_navigation_enabled": True,
+    "responsive_web_graphql_skip_user_profile_image_extensions_enabled": False,
+    "communities_web_enable_tweet_community_results_fetch": True,
+    "c9s_tweet_anatomy_moderator_badge_enabled": True,
+    "articles_preview_enabled": True,
+    "responsive_web_edit_tweet_api_enabled": True,
+    "graphql_is_translatable_rweb_tweet_is_translatable_enabled": True,
+    "view_counts_everywhere_api_enabled": True,
+    "longform_notetweets_consumption_enabled": True,
+    "responsive_web_twitter_article_tweet_consumption_enabled": True,
+    "tweet_awards_web_tipping_enabled": False,
+    "creator_subscriptions_quote_tweet_preview_enabled": False,
+    "freedom_of_speech_not_reach_fetch_enabled": True,
+    "standardized_nudges_misinfo": True,
+    "tweet_with_visibility_results_prefer_gql_limited_actions_policy_enabled": True,
+    "longform_notetweets_rich_text_read_enabled": True,
+    "longform_notetweets_inline_media_enabled": True,
+    "responsive_web_enhance_cards_enabled": False,
+}
+
+# Features minimas que aceptan CreateRetweet/FavoriteTweet (los endpoints de
+# accion no usan el set completo de CreateTweet).
+_FEATURES_BASICAS = {
+    "rweb_tipjar_consumption_enabled": True,
+    "responsive_web_graphql_exclude_directive_enabled": True,
+    "verified_phone_label_enabled": False,
+}
+
+# --------------------------------------------------------------------------- #
+# Texto REAL de un tweet (sin cuenta) para el contexto de los comentarios
+# --------------------------------------------------------------------------- #
+_TEXTO_TWEET_CACHE: dict = {}
+_TEXTO_TWEET_LOCK = threading.Lock()
+_TEXTO_TWEET_MAX = 500
+_TEXTO_TWEET_CACHE_MAX = 2000
+
+
+def _tweet_id_de_url(url: str) -> str:
+    """Id numerico de un enlace `/status/<id>` ('' si no hay). Nunca lanza."""
+    try:
+        match = re.search(r"/status(?:es)?/(\d+)", str(url or ""))
+        return match.group(1) if match else ""
+    except Exception:
+        return ""
+
+
+def _texto_plano(valor, limite: int = _TEXTO_TWEET_MAX) -> str:
+    """HTML/JSON de un tweet -> texto plano (sin links ni etiquetas)."""
+    try:
+        texto = _html.unescape(str(valor or ""))
+        texto = re.sub(r"<[^>]+>", " ", texto)
+        texto = re.sub(r"https?://\S+", "", texto)
+        texto = re.sub(r"\s+", " ", texto).strip()
+        return texto[:limite]
+    except Exception:
+        return ""
+
+
+def obtener_texto_tweet(url: str) -> str:
+    """Texto REAL del tweet ancla (sin cuenta) para dar contexto a los comentarios.
+
+    1. CDN de sindicacion de X:
+       `cdn.syndication.twimg.com/tweet-result?id=<id>&lang=es` (JSON con `text`).
+    2. Fallback oEmbed de `publish.twitter.com` (HTML embebido del tweet).
+
+    Cache en memoria por id (una sola descarga por tweet en todo el proceso),
+    timeout de 8s y NUNCA lanza: devuelve "" si no se pudo obtener.
+    """
+    tweet_id = _tweet_id_de_url(url)
+    if not tweet_id:
+        return ""
+    with _TEXTO_TWEET_LOCK:
+        cacheado = _TEXTO_TWEET_CACHE.get(tweet_id)
+    if cacheado is not None:
+        return cacheado
+
+    texto = ""
+    try:
+        resp = requests.get(
+            "https://cdn.syndication.twimg.com/tweet-result"
+            f"?id={tweet_id}&lang=es",
+            timeout=8,
+        )
+        if getattr(resp, "status_code", 0) == 200:
+            try:
+                data = resp.json()
+            except Exception:
+                data = None
+            if isinstance(data, dict):
+                texto = _texto_plano(
+                    data.get("text") or data.get("full_text") or ""
+                )
+    except Exception as e:
+        logger.debug(
+            f"obtener_texto_tweet: syndication fallo para {tweet_id} "
+            f"({type(e).__name__}: {e})"
+        )
+
+    if not texto:
+        try:
+            resp = requests.get(
+                "https://publish.twitter.com/oembed",
+                params={"url": url, "omit_script": 1},
+                timeout=8,
+            )
+            if getattr(resp, "status_code", 0) == 200:
+                data = resp.json()
+                if isinstance(data, dict):
+                    texto = _texto_plano(data.get("html") or "")
+        except Exception as e:
+            logger.debug(
+                f"obtener_texto_tweet: oembed fallo para {tweet_id} "
+                f"({type(e).__name__}: {e})"
+            )
+
+    with _TEXTO_TWEET_LOCK:
+        _TEXTO_TWEET_CACHE[tweet_id] = texto
+        if len(_TEXTO_TWEET_CACHE) > _TEXTO_TWEET_CACHE_MAX:
+            for clave in list(_TEXTO_TWEET_CACHE)[: _TEXTO_TWEET_CACHE_MAX // 2]:
+                _TEXTO_TWEET_CACHE.pop(clave, None)
+    return texto
 
 
 class TwitterAPI:
@@ -60,6 +216,12 @@ class TwitterAPI:
                 cookies_list = cookies_json
 
         cookies_norm = normalizar_cookies(cookies_list)
+        if not cookies_norm:
+            # Cuentas importadas SOLO con `Cuenta.auth_token` (sin .pkl ni
+            # cookies_json): la cookie minima de auth_token basta para que X
+            # emita ct0 al cargar x.com (`asegurar_ct0`). Antes se descartaban
+            # con "No hay cookies" y caian directo a Selenium.
+            cookies_norm = self._cookies_auth_token(cuenta)
         if not cookies_norm:
             logger.warning(f"No hay cookies para {self.usuario}")
             return False
@@ -118,6 +280,39 @@ class TwitterAPI:
             logger.error(f"Error cargando cookies: {e}")
             return False
 
+    def _cookies_auth_token(self, cuenta) -> list:
+        """Cookie minima de `auth_token` normalizada ([] si no hay token).
+
+        X emite `ct0` al cargar x.com con una sesion valida, asi que con el
+        `auth_token` de la BD la API HTTP puede operar aunque la cuenta no
+        tenga `.pkl` ni `cookies_json`. Acepta `Cuenta` o dict. Nunca lanza.
+        """
+        try:
+            if isinstance(cuenta, dict):
+                token = cuenta.get("auth_token")
+            else:
+                token = getattr(cuenta, "auth_token", "")
+            if not isinstance(token, str):
+                token = str(token or "")
+            token = token.strip()
+            if not token:
+                return []
+            logger.info(
+                f"{self.usuario} solo con auth_token; se usa la cookie minima "
+                f"(asegurar_ct0 obtendra el ct0)"
+            )
+            return normalizar_cookies([{
+                "name": "auth_token",
+                "value": token,
+                "domain": ".x.com",
+                "path": "/",
+                "secure": True,
+                "httpOnly": True,
+            }])
+        except Exception as e:
+            logger.debug(f"No se pudo armar la cookie auth_token: {e}")
+            return []
+
     def _proxy_para_api(self, cuenta=None) -> str:
         """Proxy para la sesion HTTP ('' = sin proxy).
 
@@ -163,20 +358,11 @@ class TwitterAPI:
                 return True
 
             logger.info(f"Sin ct0 para {self.usuario}; obteniendo de x.com")
-            headers = {
-                "accept": (
-                    "text/html,application/xhtml+xml,application/xml;q=0.9,"
-                    "image/avif,image/webp,*/*;q=0.8"
-                ),
-                "accept-language": "es-MX,es;q=0.9,en;q=0.8",
-                "referer": "https://x.com/",
-                "x-twitter-active-user": "yes",
-            }
-            try:
-                resp = self.session.get("https://x.com/", headers=headers, timeout=20)
-            except TypeError:
-                # Sesiones fake/stubs que no aceptan kwargs.
-                resp = self.session.get("https://x.com/")
+            # Con los headers de API (Bearer) x.com responde 401 al HTML y no
+            # emite ct0: `_get_web` los quita solo para este GET.
+            resp = self._get_web(
+                "https://x.com/", 20, extra_headers={"x-twitter-active-user": "yes"}
+            )
 
             ct0 = self._ct0_de_respuesta(resp)
             if not ct0:
@@ -286,8 +472,6 @@ class TwitterAPI:
         if not cookies:
             return []
         if isinstance(cookies, str):
-            import json
-
             try:
                 cookies = json.loads(cookies)
             except Exception:
@@ -297,44 +481,426 @@ class TwitterAPI:
         if not isinstance(cookies, list):
             return []
         return [c for c in cookies if isinstance(c, dict)]
-    
+
+    # ------------------------------------------------------------------ #
+    # queryIds GraphQL: cache por proceso/archivo + descubrimiento
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _queryid_memoria(operacion: str) -> str:
+        """queryId cacheado por proceso y vigente ('' si no hay). Nunca lanza."""
+        try:
+            with _QUERYIDS_LOCK:
+                entrada = _QUERYIDS_MEM.get(operacion)
+            if not entrada:
+                return ""
+            queryid, expira = entrada
+            if expira > time.time() and queryid:
+                return str(queryid)
+            return ""
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _guardar_queryid_memoria(operacion: str, queryid: str) -> None:
+        try:
+            with _QUERYIDS_LOCK:
+                _QUERYIDS_MEM[operacion] = (str(queryid), time.time() + _QUERYIDS_TTL_SEG)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _leer_queryids_archivo() -> dict:
+        """Contenido del archivo de cache ({} si no existe/ilegible)."""
+        try:
+            ruta = resolver_ruta(_QUERYIDS_ARCHIVO)
+            if not os.path.exists(ruta):
+                return {}
+            with open(ruta, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    def _queryid_archivo(self, operacion: str) -> str:
+        """queryId del archivo compartido si sigue vigente (TTL 6h)."""
+        try:
+            entrada = self._leer_queryids_archivo().get(operacion)
+            if isinstance(entrada, dict):
+                queryid = str(entrada.get("id") or "")
+                timestamp = float(entrada.get("ts") or 0)
+                if queryid and (time.time() - timestamp) < _QUERYIDS_TTL_SEG:
+                    return queryid
+            elif isinstance(entrada, str) and entrada:
+                # Formato viejo/comodo: {operacion: "queryId"} (sin TTL).
+                return entrada
+        except Exception:
+            pass
+        return ""
+
+    @staticmethod
+    def _guardar_queryid_archivo(operacion: str, queryid: str) -> None:
+        """Escribe el cache compartido; best-effort, nunca lanza."""
+        try:
+            ruta = resolver_ruta(_QUERYIDS_ARCHIVO)
+            carpeta = os.path.dirname(ruta)
+            if carpeta:
+                os.makedirs(carpeta, exist_ok=True)
+            data = {}
+            if os.path.exists(ruta):
+                try:
+                    with open(ruta, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                    if not isinstance(data, dict):
+                        data = {}
+                except Exception:
+                    data = {}
+            data[operacion] = {"id": str(queryid), "ts": time.time()}
+            with open(ruta, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.debug(f"No se pudo guardar el cache de queryIds: {e}")
+
+    def _guardar_queryid(self, operacion: str, queryid: str) -> None:
+        """Guarda el queryId en memoria y en el archivo compartido."""
+        self._guardar_queryid_memoria(operacion, queryid)
+        self._guardar_queryid_archivo(operacion, queryid)
+
+    def _invalidar_queryid(self, operacion: str) -> None:
+        """Invalida el queryId (memoria + archivo) tras un 400/422 de X."""
+        try:
+            with _QUERYIDS_LOCK:
+                _QUERYIDS_MEM.pop(operacion, None)
+        except Exception:
+            pass
+        try:
+            ruta = resolver_ruta(_QUERYIDS_ARCHIVO)
+            if not os.path.exists(ruta):
+                return
+            with open(ruta, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict) and operacion in data:
+                data.pop(operacion, None)
+                with open(ruta, "w", encoding="utf-8") as f:
+                    json.dump(data, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.debug(f"No se pudo invalidar el queryId de {operacion}: {e}")
+
+    @staticmethod
+    def _bundles_de_html(html: str) -> list:
+        """URLs de bundles JS del cliente web de X (deduplicadas, en orden)."""
+        urls, vistos = [], set()
+        try:
+            for match in re.findall(
+                r"https://abs\.twimg\.com/responsive-web/client-web[^\"'\\\s>]+\.js",
+                str(html or ""),
+            ):
+                if match not in vistos:
+                    vistos.add(match)
+                    urls.append(match)
+        except Exception:
+            pass
+        return urls
+
+    @staticmethod
+    def _buscar_queryid_en_js(js: str, operacion: str) -> str:
+        """queryId de `operacion` dentro de un bundle JS ('' si no aparece)."""
+        if not js:
+            return ""
+        op = re.escape(str(operacion))
+        patrones = (
+            re.compile(r'queryId:"([A-Za-z0-9_-]+)",operationName:"' + op + r'"'),
+            re.compile(
+                r'operationName:"' + op + r'"[^{}]{0,200}?queryId:"([A-Za-z0-9_-]+)"'
+            ),
+            re.compile(
+                r'queryId:"([A-Za-z0-9_-]+)"[^{}]{0,200}?operationName:"' + op + r'"'
+            ),
+        )
+        for patron in patrones:
+            try:
+                match = patron.search(js)
+                if match:
+                    return match.group(1)
+            except Exception:
+                continue
+        return ""
+
+    def _get_web(self, url: str, timeout: float, extra_headers: dict = None):
+        """GET de una pagina/bundle HTML con headers de NAVEGADOR.
+
+        El `authorization: Bearer` + `x-twitter-auth-type` de la API hacen que
+        x.com responda 401 al HTML (comprobado con una sesion real: con esos
+        headers 401, con headers de navegador 200 y la SPA completa). Se quitan
+        SOLO para este GET y se restauran SIEMPRE. Tolera sesiones fake sin
+        kwargs. Nunca lanza por los headers.
+        """
+        web_headers = {
+            "accept": (
+                "text/html,application/xhtml+xml,application/xml;q=0.9,"
+                "image/avif,image/webp,*/*;q=0.8"
+            ),
+            "accept-language": "es-MX,es;q=0.9,en;q=0.8",
+            "referer": "https://x.com/",
+        }
+        if extra_headers:
+            web_headers.update(extra_headers)
+        quitados = {}
+        for header in ("authorization", "x-twitter-auth-type", "x-csrf-token"):
+            try:
+                if header in self.session.headers:
+                    quitados[header] = self.session.headers.pop(header)
+            except Exception:
+                pass
+        try:
+            try:
+                return self.session.get(
+                    url, headers=web_headers, timeout=max(0.5, float(timeout))
+                )
+            except TypeError:
+                return self.session.get(url, headers=web_headers)
+        finally:
+            for header, valor in quitados.items():
+                try:
+                    self.session.headers[header] = valor
+                except Exception:
+                    pass
+
+    def _descubrir_queryid(self, operacion: str) -> str:
+        """Busca el queryId en los bundles JS de x.com (presupuesto ~8s).
+
+        Un lock de proceso evita que N workers descarguen los bundles a la vez:
+        el primero descubre y los demas leen el cache. Nunca lanza.
+        """
+        with _QUERYIDS_DESCUBRIMIENTO_LOCK:
+            # Doble verificacion: otro worker pudo descubrirlo mientras esperaba.
+            queryid = self._queryid_memoria(operacion)
+            if queryid:
+                return queryid
+            if self.session is None:
+                return ""
+            fin = time.time() + _QUERYIDS_PRESUPUESTO_SEG
+            try:
+                resp = self._get_web(
+                    "https://x.com/", min(6.0, max(1.0, fin - time.time()))
+                )
+                html = getattr(resp, "text", "") or ""
+            except Exception as e:
+                logger.debug(f"Descubrimiento de queryId: x.com fallo ({e})")
+                return ""
+            for bundle in self._bundles_de_html(html)[:_QUERYIDS_MAX_BUNDLES]:
+                restante = fin - time.time()
+                if restante <= 0.5:
+                    break
+                try:
+                    resp_js = self._get_web(bundle, min(4.0, restante))
+                    texto_js = getattr(resp_js, "text", "") or ""
+                except Exception:
+                    continue
+                queryid = self._buscar_queryid_en_js(texto_js, operacion)
+                if queryid:
+                    logger.info(f"queryId descubierto para {operacion}: {queryid}")
+                    return queryid
+            return ""
+
+    def _queryid(self, operacion: str) -> str:
+        """queryId vigente de una operacion GraphQL (cache -> descubrimiento).
+
+        Orden: cache por proceso -> archivo `data/twitter_queryids.json`
+        (TTL 6h) -> descubrimiento en los bundles de x.com (~8s) -> fallback
+        conocido (solo CreateRetweet/FavoriteTweet; CreateTweet y
+        TweetResultByRestId devuelven "" si no hay candidato fiable). Nunca
+        lanza.
+        """
+        operacion = str(operacion or "").strip()
+        if not operacion:
+            return ""
+        try:
+            queryid = self._queryid_memoria(operacion)
+            if queryid:
+                return queryid
+            queryid = self._queryid_archivo(operacion)
+            if queryid:
+                self._guardar_queryid_memoria(operacion, queryid)
+                return queryid
+            queryid = self._descubrir_queryid(operacion)
+            if queryid:
+                self._guardar_queryid(operacion, queryid)
+                return queryid
+            queryid = _QUERYIDS_FALLBACK.get(operacion, "")
+            if queryid:
+                logger.info(
+                    f"queryId de {operacion} no descubierto; usando fallback "
+                    f"conocido para {self.usuario}"
+                )
+                self._guardar_queryid_memoria(operacion, queryid)
+            return queryid
+        except Exception as e:
+            logger.debug(f"_queryid({operacion}) fallo: {type(e).__name__}: {e}")
+            return _QUERYIDS_FALLBACK.get(operacion, "")
+
+    # ------------------------------------------------------------------ #
+    # POST GraphQL con reintento por queryId vencido
+    # ------------------------------------------------------------------ #
+
+    def _post_json(self, url: str, payload: dict):
+        """POST JSON con timeout de 15s (tolerante a sesiones fake)."""
+        try:
+            return self.session.post(url, json=payload, timeout=15)
+        except TypeError:
+            # Sesion fake/stub que no acepta kwargs.
+            try:
+                return self.session.post(url, json=payload)
+            except Exception:
+                return None
+        except Exception as e:
+            logger.debug(
+                f"POST {url} fallo para {self.usuario}: {type(e).__name__}: {e}"
+            )
+            return None
+
+    def _graphql(self, operacion: str, variables: dict, features: dict = None):
+        """POST GraphQL con `_queryid` y UN reintento si X lo rechaza (400/422).
+
+        En 400/422 invalida el cache y redescubre el queryId UNA vez (el viejo
+        `ojPdsZsimiJrUGLR1sjUtA` de CreateRetweet ya devuelve 422). Devuelve
+        `(status, data)`; `(0, None)` si no se pudo enviar. Nunca lanza.
+        """
+        status, data = 0, None
+        for intento in (1, 2):
+            queryid = self._queryid(operacion)
+            if not queryid:
+                return 0, None
+            payload = {"variables": variables}
+            if features:
+                payload["features"] = features
+            url = f"https://x.com/i/api/graphql/{queryid}/{operacion}"
+            resp = self._post_json(url, payload)
+            if resp is None:
+                return 0, None
+            status = getattr(resp, "status_code", 0)
+            try:
+                data = resp.json()
+            except Exception:
+                data = None
+            if status in (400, 422) and intento == 1:
+                logger.info(
+                    f"queryId de {operacion} rechazado por X ({status}); "
+                    f"redescubriendo y reintentando para {self.usuario}"
+                )
+                self._invalidar_queryid(operacion)
+                continue
+            return status, data
+        return status, data
+
+    @staticmethod
+    def _mensajes_error(data) -> str:
+        """Texto normalizado de `errors` de GraphQL ('' si no hay)."""
+        try:
+            errores = data.get("errors") if isinstance(data, dict) else None
+            if not errores:
+                return ""
+            partes = []
+            for err in errores:
+                if not isinstance(err, dict):
+                    continue
+                partes.append(str(err.get("message") or ""))
+                codigo = err.get("code")
+                if codigo is None:
+                    extensiones = err.get("extensions")
+                    if isinstance(extensiones, dict):
+                        codigo = extensiones.get("code")
+                if codigo is not None:
+                    partes.append(str(codigo))
+            return " ".join(partes).lower()
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _respuesta_ok(data) -> bool:
+        """True si la respuesta 200 no trae errores de GraphQL."""
+        try:
+            return isinstance(data, dict) and not data.get("errors")
+        except Exception:
+            return False
+
+    @classmethod
+    def _retweet_ya_hecho(cls, data) -> bool:
+        """True si X reporta que el tweet YA estaba retwitteado (code 327)."""
+        texto = cls._mensajes_error(data)
+        return (
+            "327" in texto
+            or "already retweeted" in texto
+            or "already retweet" in texto
+            or "ya retwitteaste" in texto
+            or "reposteaste" in texto
+        )
+
+    @classmethod
+    def _like_ya_hecho(cls, data) -> bool:
+        """True si X reporta que el like YA estaba dado (code 139)."""
+        texto = cls._mensajes_error(data)
+        return (
+            "139" in texto
+            or "already favorited" in texto
+            or "already liked" in texto
+            or "ya te gusta" in texto
+            or "ya lo marcaste" in texto
+        )
+
+    @staticmethod
+    def _crear_tweet_ok(data) -> bool:
+        """True si CreateTweet devolvio el id del tweet creado."""
+        try:
+            if not isinstance(data, dict) or data.get("errors"):
+                return False
+            resultado = (
+                data.get("data", {})
+                .get("create_tweet", {})
+                .get("tweet_results", {})
+                .get("result", {})
+            )
+            return bool(resultado.get("rest_id") or resultado.get("tweet"))
+        except Exception:
+            return False
+
     def retweet(self, tweet_url: str, dar_like: bool = False) -> bool:
         """Retweetea por API HTTP (firma compatible con `retweet(url)`).
 
-        Con `dar_like=True` da like al mismo tweet UNA vez (se ignora su
-        resultado): el motor usa esto para reemplazar el flujo Selenium de
-        RT+like por ~1-2s en vez de ~10-35s.
+        Usa el `queryId` de CreateRetweet (descubierto/cacheado; UN reintento
+        con redescubrimiento si X responde 400/422). Si X contesta "already
+        retweeted" (code 327) se cuenta como EXITO: la campana es idempotente y
+        no duplica nada. Con `dar_like=True` da like al mismo tweet UNA vez (se
+        ignora su resultado): reemplaza el flujo Selenium de RT+like por ~1-2s.
+        Nunca lanza.
         """
         if not self.session and not self._cargar_cookies():
             return False
 
+        t0 = time.time()
         resultado = False
         try:
             tweet_id = self._extraer_tweet_id(tweet_url)
             if not tweet_id:
                 return False
 
-            variables = {"source_tweet_id": tweet_id}
-            features = {
-                "rweb_tipjar_consumption_enabled": True,
-                "responsive_web_graphql_exclude_directive_enabled": True,
-                "verified_phone_label_enabled": False,
-            }
-
-            response = self.session.post(
-                "https://x.com/i/api/graphql/ojPdsZsimiJrUGLR1sjUtA/CreateRetweet",
-                json={"variables": variables, "features": features}
+            status, data = self._graphql(
+                "CreateRetweet",
+                {"source_tweet_id": tweet_id},
+                features=_FEATURES_BASICAS,
             )
-
-            if response.status_code == 200:
-                data = response.json()
-                if "errors" not in data:
-                    logger.info(f"RT por API para {self.usuario}")
-                    resultado = True
-
-            if not resultado:
+            if self._respuesta_ok(data):
+                logger.info(f"RT por API para {self.usuario}")
+                resultado = True
+            elif self._retweet_ya_hecho(data):
+                logger.info(
+                    f"{self.usuario} ya habia retwitteado; se cuenta como exito"
+                )
+                resultado = True
+            else:
                 logger.warning(
-                    f"RT API fallo ({response.status_code}) para {self.usuario}"
+                    f"RT API fallo ({status}) para {self.usuario}: "
+                    f"{self._mensajes_error(data)[:120]}"
                 )
 
         except Exception as e:
@@ -347,60 +913,157 @@ class TwitterAPI:
             except Exception as e:
                 logger.debug(f"Like del RT fallo para {self.usuario}: {e}")
 
+        logger.debug(
+            f"perf API @{self.usuario}: RT {time.time() - t0:.2f}s ok={resultado}"
+        )
         return resultado
-    
+
     def like(self, tweet_url: str) -> bool:
+        """Da like por API HTTP (queryId de FavoriteTweet).
+
+        Si X contesta "already favorited" (code 139) se cuenta como EXITO
+        (idempotente). Nunca lanza.
+        """
         if not self.session and not self._cargar_cookies():
             return False
-        
+
+        t0 = time.time()
         try:
             tweet_id = self._extraer_tweet_id(tweet_url)
             if not tweet_id:
                 return False
-            
-            variables = {"source_tweet_id": tweet_id}
-            features = {
-                "rweb_tipjar_consumption_enabled": True,
-                "responsive_web_graphql_exclude_directive_enabled": True,
-                "verified_phone_label_enabled": False,
-            }
-            
-            response = self.session.post(
-                "https://x.com/i/api/graphql/lZ0GCEojmtQfiUQa5oJSEw/FavoriteTweet",
-                json={"variables": variables, "features": features}
+
+            status, data = self._graphql(
+                "FavoriteTweet",
+                {"source_tweet_id": tweet_id},
+                features=_FEATURES_BASICAS,
             )
-            
-            if response.status_code == 200:
-                data = response.json()
-                if "errors" not in data:
-                    logger.info(f"Like exitoso para {self.usuario}")
-                    return True
-            
-            logger.warning(f"Like fallido para {self.usuario}: {response.status_code}")
-            return False
-        
+            if self._respuesta_ok(data):
+                logger.info(f"Like exitoso para {self.usuario}")
+                resultado = True
+            elif self._like_ya_hecho(data):
+                logger.info(f"{self.usuario} ya tenia like; se cuenta como exito")
+                resultado = True
+            else:
+                logger.warning(
+                    f"Like fallido para {self.usuario} ({status}): "
+                    f"{self._mensajes_error(data)[:120]}"
+                )
+                resultado = False
         except Exception as e:
             logger.error(f"Error en like: {e}")
+            resultado = False
+
+        logger.debug(
+            f"perf API @{self.usuario}: like {time.time() - t0:.2f}s ok={resultado}"
+        )
+        return resultado
+
+    def crear_tweet(self, texto: str, reply_to_url: str = "",
+                    quote_url: str = "") -> bool:
+        """Publica un tweet nuevo (o respuesta/cita) por GraphQL CreateTweet.
+
+        - `reply_to_url`: crea una RESPUESTA a ese tweet (variables `reply.
+          in_reply_to_tweet_id`).
+        - `quote_url`: crea un POST QUE CITA ese tweet (variable
+          `attachment_url`).
+        - Si vienen ambos, gana la respuesta.
+
+        Devuelve True/False y NUNCA lanza (403/429/422 y cualquier error de X
+        => False: el motor cae a Selenium).
+        """
+        texto = (texto or "").strip()
+        if not texto:
+            return False
+        if not self.session and not self._cargar_cookies():
             return False
 
-    def accion_rapida(self, rol: str, url: str, dar_like: bool = False) -> bool:
-        """Ejecuta por HTTP una accion soportada (punto de entrada del motor).
+        t0 = time.time()
+        try:
+            variables = {
+                "tweet_text": texto,
+                "dark_request": False,
+                "media": {"media_entities": [], "possibly_sensitive": False},
+                "semantic_annotation_ids": [],
+            }
+            if reply_to_url:
+                reply_id = self._extraer_tweet_id(reply_to_url)
+                if not reply_id:
+                    return False
+                variables["reply"] = {
+                    "in_reply_to_tweet_id": reply_id,
+                    "exclude_reply_user_ids": [],
+                }
+            elif quote_url:
+                if not self._extraer_tweet_id(quote_url):
+                    return False
+                variables["attachment_url"] = quote_url
+
+            status, data = self._graphql(
+                "CreateTweet", variables, features=_FEATURES_CREATE_TWEET
+            )
+            ok = self._crear_tweet_ok(data)
+            if not ok:
+                logger.warning(
+                    f"CreateTweet fallo ({status}) para {self.usuario}: "
+                    f"{self._mensajes_error(data)[:140]}"
+                )
+            else:
+                logger.info(f"Tweet por API para {self.usuario}")
+            logger.debug(
+                f"perf API @{self.usuario}: crear_tweet {time.time() - t0:.2f}s "
+                f"ok={ok}"
+            )
+            return ok
+        except Exception as e:
+            logger.error(f"Error en crear_tweet: {e}")
+            return False
+
+    def accion_rapida(self, rol: str, url: str = "", dar_like: bool = False,
+                      texto: str = "") -> bool:
+        """Ejecuta por HTTP una accion segun el rol (punto de entrada del motor).
 
         - `rt`: retweet (+ like si `dar_like=True`).
         - `like`: like.
-        - Cualquier otro rol devuelve False (sin soporte HTTP: el motor debe
-          usar Selenium).
+        - `comentario`: respuesta a `url` con `texto` (CreateTweet reply).
+        - `hashtags` / `post`: post nuevo con `texto` (CreateTweet).
+        - `cita`: post que cita `url` con `texto` (CreateTweet quote).
+        - Cualquier otro rol => False (sin soporte HTTP: el motor usa Selenium).
+
+        Firma retrocompatible: `url` ahora tiene default y `texto` se agrego al
+        final. Loguea la duracion de cada accion (para medir en campana).
+        Nunca lanza.
         """
         rol = (rol or "").strip().lower()
-        if rol == "rt":
-            return self.retweet(url, dar_like=dar_like)
-        if rol == "like":
-            return self.like(url)
-        return False
+        t0 = time.time()
+        try:
+            if rol == "rt":
+                ok = self.retweet(url, dar_like=dar_like)
+            elif rol == "like":
+                ok = self.like(url)
+            elif rol == "comentario":
+                ok = self.crear_tweet(texto, reply_to_url=url)
+            elif rol in ("hashtags", "post"):
+                ok = self.crear_tweet(texto)
+            elif rol == "cita":
+                ok = self.crear_tweet(texto, quote_url=url)
+            else:
+                ok = False
+        except Exception as e:
+            logger.debug(
+                f"accion_rapida({rol}) fallo para {self.usuario}: "
+                f"{type(e).__name__}: {e}"
+            )
+            ok = False
+        logger.debug(
+            f"perf API @{self.usuario}: accion_rapida({rol or '?'}) "
+            f"{time.time() - t0:.2f}s ok={ok}"
+        )
+        return bool(ok)
 
     def _extraer_tweet_id(self, url: str) -> Optional[str]:
-        import re
-        match = re.search(r"/status/(\d+)", url)
+        """Id numerico de `/status/<id>` (None si no hay)."""
+        match = re.search(r"/status(?:es)?/(\d+)", url or "")
         return match.group(1) if match else None
     
     def verificar_sesion(self) -> bool:

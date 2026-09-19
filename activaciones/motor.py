@@ -120,6 +120,7 @@ _SENALES_ERROR_PUBLICACION_SEGURA = (
     "boton de retweet no encontrado",
     "botón de retweet no encontrado",
     "compositor de x no cargo",
+    "compositor no disponible",
     "no se encontro el boton responder",
     "no se encontró el botón responder",
     "boton responder deshabilitado",
@@ -139,6 +140,32 @@ _SENALES_SESION_INVALIDA = (
 )
 
 MENSAJE_SESION_INVALIDA = "sesión de X expirada: renueva cookies/login"
+
+
+# Detalles que indican que la SESION de la cuenta ya no sirve dentro de la
+# campana (cookies vencidas, sin credenciales, login fallido): esas cuentas se
+# sacan del orden de las rondas siguientes para no quemar intentos ni abrir
+# navegadores inutiles.
+_SENALES_SESION_CAIDA_POOL = (
+    "sesión de x expirada",
+    "sesion de x expirada",
+    "login fallido",
+    "sin cookies",
+    "sin sesion",
+    "sin sesión",
+)
+
+
+def _es_sesion_caida_detalle(detalle) -> bool:
+    """True si el detalle indica que la sesion de la cuenta ya no sirve.
+
+    Tolera None y tipos raros; nunca lanza.
+    """
+    try:
+        texto = "" if detalle is None else str(detalle).lower()
+    except Exception:
+        return False
+    return any(senal in texto for senal in _SENALES_SESION_CAIDA_POOL)
 
 
 def _es_error_sesion_invalida(detalle) -> bool:
@@ -234,6 +261,22 @@ def _rt_por_api_activo() -> bool:
     except Exception:
         return True
     return valor not in ("0", "false", "no", "off")
+
+
+def _api_primero_activo() -> bool:
+    """True si TODOS los roles deben intentar la API HTTP antes de Selenium.
+
+    Lee `API_PRIMERO` (la UI escribe `API_PRIMERO` y `RT_POR_API` juntas); si
+    la variable no existe o esta vacia se hereda el comportamiento historico
+    de `RT_POR_API` (alias/compatibilidad). Default True. Nunca lanza.
+    """
+    try:
+        valor = os.environ.get("API_PRIMERO")
+    except Exception:
+        return True
+    if valor is None or not str(valor).strip():
+        return _rt_por_api_activo()
+    return str(valor).strip().lower() not in ("0", "false", "no", "off")
 
 
 def _tiene_credencial_sesion(cuenta) -> bool:
@@ -710,6 +753,66 @@ class MotorActivacion:
         }
         self._ultimo_comentario_url: dict = {}
         self.pausa_comentario_url_seg: float = 0.0
+        # Semaforo de NAVEGADORES: las acciones HTTP (API primero) no lo usan;
+        # solo los fallbacks a Selenium, que se limitan a `max_browsers` a la
+        # vez aunque haya muchos mas trabajadores en paralelo.
+        try:
+            self._sem_browser = threading.Semaphore(
+                max(1, int(self.max_concurrente or 1))
+            )
+        except Exception:
+            self._sem_browser = threading.Semaphore(1)
+        # Cuentas con la sesion caida DENTRO de esta campana: se descartan del
+        # orden de las rondas siguientes (no cuentan como fallo por ronda).
+        self._sesiones_caidas: set = set()
+        # Ancla asignada a cada cuenta de comentario al generar su texto: la
+        # ejecucion usa ESA misma URL para que el comentario corresponda al
+        # tweet que describe.
+        self._ancla_por_cuenta: dict = {}
+
+    def _n_workers(self) -> int:
+        """Trabajadores del pool de rondas: env `MAX_WORKERS`.
+
+        Default `max(6, max_browsers)`: las acciones API corren en paralelo sin
+        Chrome y los fallbacks quedan limitados por `_sem_browser`. Un valor
+        raro en la env se ignora (nunca lanza).
+        """
+        try:
+            valor = os.environ.get("MAX_WORKERS")
+            if valor is not None and str(valor).strip():
+                return max(1, int(float(str(valor).strip())))
+        except Exception:
+            pass
+        try:
+            return max(6, int(self.max_concurrente or 1))
+        except Exception:
+            return 6
+
+    def _marcar_sesion_caida(self, usuario) -> None:
+        """Anota la cuenta como 'sesion caida' para las rondas siguientes."""
+        try:
+            with self._lock:
+                self._sesiones_caidas.add(str(usuario))
+        except Exception:
+            pass
+
+    def _sesion_caida(self, usuario) -> bool:
+        """True si la cuenta ya se marco como sesion caida en esta campana."""
+        try:
+            with self._lock:
+                return str(usuario) in self._sesiones_caidas
+        except Exception:
+            return False
+
+    def _registrar_sesion_caida(self, usuario, detalle) -> None:
+        """Marca la cuenta si `detalle` indica sesion caida (nunca lanza)."""
+        if not _es_sesion_caida_detalle(detalle):
+            return
+        self._marcar_sesion_caida(usuario)
+        logger.debug(
+            f"sesion caida registrada para @{usuario}; se omite en las "
+            f"siguientes rondas"
+        )
 
     def _registrar_evento_locked(self, usuario, ok, detalle, ronda=1, rol="",
                                  url="") -> None:
@@ -930,6 +1033,70 @@ class MotorActivacion:
                 grupos[rol].append(cuenta)
         return grupos
 
+    def _repartir_anclas(self, cuentas: list, ancla_textos) -> dict:
+        """Asigna a cada cuenta de comentario el texto de UN tweet ancla.
+
+        Reparte las URLs CON texto de `ancla_textos` ({url: texto}) entre las
+        cuentas (round-robin tras barajar) y devuelve `{usuario: texto del
+        ancla}`. Tambien guarda en `self._ancla_por_cuenta` la URL elegida para
+        que la ejecucion use ESA misma ancla (el comentario corresponde al
+        tweet que su texto describe). Sin anclas con texto devuelve {}.
+        Nunca lanza.
+        """
+        asignadas: dict = {}
+        try:
+            items = [
+                (str(url), str(texto))
+                for url, texto in (ancla_textos or {}).items()
+                if str(texto or "").strip()
+            ]
+        except Exception:
+            items = []
+        if not items:
+            return asignadas
+        random.shuffle(items)
+        try:
+            with self._lock:
+                for i, cuenta in enumerate(cuentas or []):
+                    url, texto = items[i % len(items)]
+                    asignadas[cuenta.usuario] = texto
+                    self._ancla_por_cuenta[cuenta.usuario] = url
+        except Exception:
+            pass
+        return asignadas
+
+    def _obtener_anclas(self, urls) -> dict:
+        """Texto REAL de cada tweet ancla (una descarga por URL, con cache).
+
+        Usa `plataformas.twitter.api_http.obtener_texto_tweet` (sin cuenta; su
+        cache en memoria evita repetir la descarga del mismo tweet). Nunca
+        lanza: las URLs sin texto quedan como "" y los comentarios caen al
+        comportamiento previo (contexto/texto_base).
+        """
+        anclas: dict = {}
+        try:
+            from plataformas.twitter.api_http import obtener_texto_tweet
+        except Exception as e:
+            logger.debug(f"ancla: no se pudo importar obtener_texto_tweet: {e}")
+            return anclas
+        unicas = []
+        for url in urls or []:
+            url = str(url or "").strip()
+            if url and url not in anclas and url not in unicas:
+                unicas.append(url)
+        for url in unicas:
+            try:
+                anclas[url] = str(obtener_texto_tweet(url) or "")
+            except Exception:
+                anclas[url] = ""
+        con_texto = sum(1 for texto in anclas.values() if texto.strip())
+        if anclas:
+            logger.info(
+                f"ancla: {con_texto}/{len(anclas)} tweet(s) ancla con texto "
+                f"real para los comentarios"
+            )
+        return anclas
+
     def _asignar_variaciones_cita(self, cuentas: list, texto_base: str,
                                   narrativa: str = "",
                                   entrenamiento: str = "",
@@ -1004,7 +1171,8 @@ class MotorActivacion:
                                 narrativa: str = "",
                                 entrenamiento: str = "",
                                 contexto: str = "",
-                                ronda: int = 1) -> dict:
+                                ronda: int = 1,
+                                ancla_textos: dict = None) -> dict:
         """Arma {usuario: texto} para una ronda de la campana por roles.
 
         - "cita": variaciones OpenAI/fallback del texto base con los hashtags
@@ -1013,9 +1181,12 @@ class MotorActivacion:
           si la IA falla o no devuelve texto, rellena con `_pool_hashtags`
           (comportamiento anterior) y agrega las menciones al final.
         - "comentario": respuestas ORIGINALES por cuenta con IA
-          (`generar_textos_comentario`, registro/perfil) sobre el tweet ancla
-          (contexto/texto base); si la IA falla, cae al pool de variaciones y,
-          en ultimo caso, a un texto local con los hashtags pedidos.
+          (`generar_textos_comentario`, registro/perfil) sobre el tweet ancla.
+          Con `ancla_textos` (URL -> texto real del tweet) el comentario se
+          genera SOLO con el contenido del ancla al que responde, sin
+          narrativa/contexto de campana; sin ancla se mantiene el
+          comportamiento previo (contexto/texto_base). Si la IA falla, cae al
+          pool de variaciones y, en ultimo caso, a un texto local.
         - "rt": sin texto ("").
         Nunca lanza por la IA: ante cualquier fallo usa el pool de respaldo.
         """
@@ -1111,105 +1282,158 @@ class MotorActivacion:
 
         cuentas_comentario = list(grupos_ejec.get("comentario") or [])
         if cuentas_comentario:
-            material = (
+            # Material general de la campana (contexto manual o texto base).
+            material_general = (
                 str(contexto or "").strip() or str(texto_base or "").strip()
             )
-            instruccion = (
-                f"Comenta el tweet ancla sobre: {material}" if material else ""
-            )
-            trasfondo = (
-                "TRASFONDO (solo referencia interna; PROHIBIDO mencionarlo "
-                f"o copiarlo): {narrativa}"
-            ) if narrativa else ""
-            narrativa_com = "\n".join(
-                x for x in [instruccion, trasfondo] if x
-            )
+            # Ancla REAL por cuenta (`ancla_textos`: texto del tweet ancla
+            # descargado UNA vez por URL): con texto de ancla el comentario
+            # habla SOLO de ese tweet, sin narrativa/contexto de campana.
+            anclas = self._repartir_anclas(cuentas_comentario, ancla_textos)
+            # Se agrupa por material para no multiplicar las llamadas a la IA.
+            grupos_material: dict = {}
+            for cuenta in cuentas_comentario:
+                texto_ancla = anclas.get(cuenta.usuario, "")
+                clave = (bool(texto_ancla), texto_ancla or material_general)
+                grupos_material.setdefault(clave, []).append(cuenta)
+
             textos_ia_com: dict = {}
             try:
                 from ia.generador_contenido import generar_textos_comentario
-
-                cuentas_info = []
-                for cuenta in cuentas_comentario:
-                    cuentas_info.append({
-                        "usuario": cuenta.usuario,
-                        "registro": normalizar_tipo_cuenta(
-                            getattr(cuenta, "tipo_cuenta", "")
-                        ),
-                        "personalidad": (
-                            getattr(cuenta, "personalidad", "") or ""
-                        ),
-                        "seccion": getattr(cuenta, "seccion", "") or "",
-                        "nombre": (
-                            getattr(cuenta, "nombre_mostrado", "")
-                            or cuenta.usuario
-                        ),
-                        "perfil": normalizar_perfil(
-                            getattr(cuenta, "perfil_personalidad", "")
-                        ),
-                    })
-                resultado_ia = generar_textos_comentario(
-                    cuentas_info,
-                    n_por_cuenta=1,
-                    narrativa=narrativa_com,
-                    entrenamiento=entrenamiento,
-                )
-                for i, cuenta in enumerate(cuentas_comentario):
-                    lista = None
-                    if isinstance(resultado_ia, dict):
-                        lista = resultado_ia.get(cuenta.usuario)
-                    elif (
-                        isinstance(resultado_ia, (list, tuple))
-                        and i < len(resultado_ia)
-                    ):
-                        lista = resultado_ia[i]
-                    if isinstance(lista, str):
-                        lista = [lista]
-                    if lista:
-                        texto_ia = str(lista[0] or "").strip()
-                        if texto_ia:
-                            textos_ia_com[cuenta.usuario] = texto_ia
             except Exception as e:
+                generar_textos_comentario = None
                 logger.error(
-                    f"Activacion por roles: IA de comentarios fallo "
-                    f"({type(e).__name__}: {e}); se usa el pool de respaldo"
+                    f"Activacion por roles: no se pudo importar la IA de "
+                    f"comentarios ({type(e).__name__}: {e})"
                 )
+
+            if generar_textos_comentario is not None:
+                for (es_ancla, material), grupo in grupos_material.items():
+                    cuentas_info = []
+                    for cuenta in grupo:
+                        cuentas_info.append({
+                            "usuario": cuenta.usuario,
+                            "registro": normalizar_tipo_cuenta(
+                                getattr(cuenta, "tipo_cuenta", "")
+                            ),
+                            "personalidad": (
+                                getattr(cuenta, "personalidad", "") or ""
+                            ),
+                            "seccion": getattr(cuenta, "seccion", "") or "",
+                            "nombre": (
+                                getattr(cuenta, "nombre_mostrado", "")
+                                or cuenta.usuario
+                            ),
+                            "perfil": normalizar_perfil(
+                                getattr(cuenta, "perfil_personalidad", "")
+                            ),
+                        })
+                    try:
+                        if es_ancla:
+                            # SOLO el tweet ancla: se pasa su texto real y NO la
+                            # narrativa/contexto de campana. `tweet_ancla_texto`
+                            # es kwarg de la version nueva de `ia`; con la vieja
+                            # (TypeError) el ancla viaja como narrativa.
+                            try:
+                                resultado_ia = generar_textos_comentario(
+                                    cuentas_info,
+                                    n_por_cuenta=1,
+                                    tweet_ancla_texto=material,
+                                    entrenamiento=entrenamiento,
+                                )
+                            except TypeError:
+                                # Version vieja de `ia` sin el kwarg: el texto
+                                # del ancla viaja como instruccion (mismo
+                                # contrato que usaba el motor antes), sin
+                                # narrativa de campana.
+                                resultado_ia = generar_textos_comentario(
+                                    cuentas_info,
+                                    n_por_cuenta=1,
+                                    narrativa=(
+                                        f"Comenta el tweet ancla sobre: {material}"
+                                    ),
+                                    entrenamiento=entrenamiento,
+                                )
+                        else:
+                            instruccion = (
+                                f"Comenta el tweet ancla sobre: {material}"
+                                if material else ""
+                            )
+                            trasfondo = (
+                                "TRASFONDO (solo referencia interna; PROHIBIDO "
+                                f"mencionarlo o copiarlo): {narrativa}"
+                            ) if narrativa else ""
+                            narrativa_com = "\n".join(
+                                x for x in [instruccion, trasfondo] if x
+                            )
+                            resultado_ia = generar_textos_comentario(
+                                cuentas_info,
+                                n_por_cuenta=1,
+                                narrativa=narrativa_com,
+                                entrenamiento=entrenamiento,
+                            )
+                        for i, cuenta in enumerate(grupo):
+                            lista = None
+                            if isinstance(resultado_ia, dict):
+                                lista = resultado_ia.get(cuenta.usuario)
+                            elif (
+                                isinstance(resultado_ia, (list, tuple))
+                                and i < len(resultado_ia)
+                            ):
+                                lista = resultado_ia[i]
+                            if isinstance(lista, str):
+                                lista = [lista]
+                            if lista:
+                                texto_ia = str(lista[0] or "").strip()
+                                if texto_ia:
+                                    textos_ia_com[cuenta.usuario] = texto_ia
+                    except Exception as e:
+                        logger.error(
+                            f"Activacion por roles: IA de comentarios fallo "
+                            f"({type(e).__name__}: {e}); se usa el pool de respaldo"
+                        )
 
             faltantes = [
                 c for c in cuentas_comentario
                 if c.usuario not in textos_ia_com
             ]
             if faltantes:
-                base_respaldo = (
-                    str(texto_base or "").strip()
-                    or str(contexto or "").strip()
-                )
-                respaldo = []
-                if base_respaldo:
-                    try:
-                        respaldo = generar_pool_variaciones_openai(
-                            base_respaldo,
-                            cantidad=len(faltantes),
-                            narrativa=narrativa,
-                            entrenamiento=entrenamiento,
-                            hashtags=[],
-                        )
-                    except Exception:
-                        respaldo = []
-                if not isinstance(respaldo, list):
+                # Pool de respaldo POR MATERIAL: con ancla real se basa en el
+                # tweet ancla (sin narrativa de campana); sin ancla se mantiene
+                # el comportamiento previo (texto_base/contexto + narrativa).
+                grupos_respaldo: dict = {}
+                for cuenta in faltantes:
+                    texto_ancla = anclas.get(cuenta.usuario, "")
+                    clave = (bool(texto_ancla), texto_ancla or material_general)
+                    grupos_respaldo.setdefault(clave, []).append(cuenta)
+                for (es_ancla, material), grupo in grupos_respaldo.items():
                     respaldo = []
-                random.shuffle(respaldo)
-                for i, cuenta in enumerate(faltantes):
-                    texto = (
-                        str(respaldo[i] or "").strip()
-                        if i < len(respaldo) else ""
-                    )
-                    if not texto:
-                        texto = base_respaldo or " ".join(tags)
-                    # Los comentarios/respuestas NUNCA llevan hashtags, links
-                    # ni @menciones (senales de "Probable spam" para X).
-                    textos_ia_com[cuenta.usuario] = _limpiar_comentario_spam(
-                        texto
-                    )
+                    if material:
+                        try:
+                            respaldo = generar_pool_variaciones_openai(
+                                material,
+                                cantidad=len(grupo),
+                                narrativa="" if es_ancla else narrativa,
+                                entrenamiento=entrenamiento,
+                                hashtags=[],
+                            )
+                        except Exception:
+                            respaldo = []
+                    if not isinstance(respaldo, list):
+                        respaldo = []
+                    random.shuffle(respaldo)
+                    for i, cuenta in enumerate(grupo):
+                        texto = (
+                            str(respaldo[i] or "").strip()
+                            if i < len(respaldo) else ""
+                        )
+                        if not texto:
+                            texto = material or " ".join(tags)
+                        # Los comentarios/respuestas NUNCA llevan hashtags,
+                        # links ni @menciones (senales de "Probable spam").
+                        textos_ia_com[cuenta.usuario] = _limpiar_comentario_spam(
+                            texto
+                        )
             for cuenta in cuentas_comentario:
                 asignaciones[cuenta.usuario] = textos_ia_com.get(
                     cuenta.usuario, ""
@@ -1226,8 +1450,9 @@ class MotorActivacion:
                       porcentaje_max_ronda=90) -> int:
         """Ejecuta acciones en rondas hasta agotar `duracion_min`.
 
-        Worker-pool con cola compartida: `self.max_concurrente` workers toman
-        cuentas de un orden barajado; al agotarlo, regeneran los textos de la
+        Worker-pool con cola compartida: `self._n_workers()` trabajadores
+        (`MAX_WORKERS`, default `max(6, max_browsers)`) toman cuentas de un
+        orden barajado; al agotarlo, regeneran los textos de la
         siguiente ronda, vuelven a barajar y reinician el cursor. Las cuentas
         que no alcanzan a ejecutar antes del deadline se omiten sin abrir
         navegador. Devuelve el numero de rondas iniciadas. Nunca lanza.
@@ -1264,7 +1489,7 @@ class MotorActivacion:
         if min_pct > max_pct:
             min_pct, max_pct = max_pct, min_pct
         fin = time.monotonic() + minutos * 60
-        n_workers = max(1, int(self.max_concurrente or 1))
+        n_workers = self._n_workers()
         estado = {
             "cursor": 0, "ronda": 0, "orden": [],
             "textos": {}, "roles": {},
@@ -1292,6 +1517,13 @@ class MotorActivacion:
                     subset = random.sample(procesables, k)
                 except Exception:
                     subset = list(procesables)
+            # Las cuentas con la sesion caida NO vuelven a entrar en ninguna
+            # ronda: sus cookies no reviven solas y solo quemarian intentos.
+            subset = [c for c in subset if not self._sesion_caida(c.usuario)]
+            if not subset:
+                subset = [
+                    c for c in procesables if not self._sesion_caida(c.usuario)
+                ]
             random.shuffle(subset)
             estado["orden"] = subset
             estado["cursor"] = 0
@@ -1326,6 +1558,12 @@ class MotorActivacion:
                 if estado["cursor"] >= len(orden):
                     return None
                 candidata = orden[estado["cursor"]]
+                if self._sesion_caida(candidata.usuario):
+                    # Sesion caida en esta campana: se saca del orden sin
+                    # contar un fallo nuevo ni abrir navegador por ella.
+                    orden.pop(estado["cursor"])
+                    revisados += 1
+                    continue
                 if _en_descanso(candidata.usuario):
                     orden.pop(estado["cursor"])
                     orden.append(candidata)
@@ -1371,7 +1609,7 @@ class MotorActivacion:
                 if time.monotonic() < fin:
                     # Pausa corta entre acciones: el anti-spam real es el
                     # cooldown por cuenta (`cooldown_min`), no este sleep.
-                    time.sleep(random.uniform(0.4, 1.2))
+                    time.sleep(random.uniform(0.1, 0.4))
 
         if not procesables:
             return 0
@@ -1390,6 +1628,10 @@ class MotorActivacion:
                            texto: str, dar_like: bool) -> tuple:
         """Un intento de quote-RT para UNA cuenta; cierra el bot siempre.
 
+        API PRIMERO (mismo criterio que `_intentar_accion_rol`): la cita se
+        intenta por HTTP (`accion_rapida("cita", ...)`) antes de abrir Chrome;
+        si la API no puede/falla, se usa Selenium.
+
         Devuelve una tupla de 4 elementos:
         (usuario, exito, detalle, url_publicada).
         """
@@ -1398,6 +1640,12 @@ class MotorActivacion:
             from plataformas.twitter.selenium_bot import TwitterBot
 
             url = random.choice(urls)
+
+            # --- API PRIMERO: sin navegador. ---
+            resultado_api = self._probar_api_rol(cuenta, "cita", url, texto, dar_like)
+            if resultado_api is not None:
+                return (resultado_api[0], resultado_api[2],
+                        resultado_api[3], resultado_api[4])
 
             bot = TwitterBot(cuenta.usuario)
             # Sesion rapida por CDP: inyecta las cookies sin navegar. Si no hay
@@ -1472,6 +1720,8 @@ class MotorActivacion:
             )
             time.sleep(pausa)
             resultado = self._intentar_quote_rt(cuenta, urls, texto, dar_like)
+        if not resultado[1]:
+            self._registrar_sesion_caida(resultado[0], resultado[2])
         return resultado
 
     def _esperar_turno_comentario(self, url: str) -> float:
@@ -1505,6 +1755,99 @@ class MotorActivacion:
         except Exception:
             return 0.0
 
+    # Roles que la API HTTP puede ejecutar (el resto solo Selenium).
+    _ROLES_API = ("rt", "like", "hashtags", "comentario", "cita")
+
+    def _url_objetivo_rol(self, cuenta, rol: str, urls) -> str:
+        """URL objetivo del rol ('' si no hay ninguna).
+
+        Los comentarios usan SU ancla asignada al generar el texto
+        (`_generar_textos_por_rol`), para que el comentario viaje al tweet que
+        su texto describe; el resto de roles sortea entre las URLs.
+        """
+        opciones = [u for u in (urls or []) if str(u or "").strip()]
+        if not opciones:
+            return ""
+        if rol == "comentario":
+            try:
+                with self._lock:
+                    asignada = self._ancla_por_cuenta.get(cuenta.usuario, "")
+            except Exception:
+                asignada = ""
+            if asignada in opciones:
+                return asignada
+        return random.choice(opciones)
+
+    def _probar_api_rol(self, cuenta, rol: str, url_objetivo: str,
+                        texto: str, dar_like: bool):
+        """Intenta LA accion por HTTP; devuelve la tupla de resultado o None.
+
+        - None = rol no soportado / API desactivada (`API_PRIMERO`,
+          `RT_POR_API`) / fallo: el llamador usa Selenium.
+        - Tupla = exito por API, con detalle "... via API".
+
+        Tolerante a firmas viejas (getattr/callable): si `accion_rapida` no
+        acepta `texto` (versiones anteriores) el TypeError cae al except y se
+        usa Selenium. Nunca lanza.
+        """
+        if rol not in self._ROLES_API:
+            return None
+        if not _api_primero_activo():
+            return None
+        try:
+            from plataformas.twitter.api_http import TwitterAPI
+
+            accion_rapida = getattr(TwitterAPI(cuenta.usuario), "accion_rapida", None)
+            if not callable(accion_rapida):
+                return None
+            try:
+                ok = accion_rapida(
+                    rol, url=url_objetivo, dar_like=dar_like, texto=texto
+                )
+            except TypeError:
+                # Firma vieja de `accion_rapida` (sin `texto`): rt/like no
+                # necesitan texto y siguen por API; los roles que SI publican
+                # texto (hashtags/comentario/cita) caen a Selenium para no
+                # publicar un texto vacio.
+                if rol not in ("rt", "like"):
+                    raise
+                ok = accion_rapida(rol, url=url_objetivo, dar_like=dar_like)
+            if not ok:
+                return None
+            logger.debug(f"{rol}: API para @{cuenta.usuario}")
+            if rol == "rt":
+                url_publicada = f"https://twitter.com/{cuenta.usuario}"
+            elif rol in ("like", "cita", "comentario"):
+                url_publicada = url_objetivo
+            else:
+                url_publicada = ""
+            return (cuenta.usuario, rol, True, f"{rol} via API", url_publicada)
+        except Exception as e:
+            logger.debug(
+                f"{rol}: API fallo para @{cuenta.usuario} "
+                f"({type(e).__name__}: {e}); se usa Selenium"
+            )
+            return None
+
+    def _cerrar_bot(self, cuenta, bot) -> None:
+        """Cierra el navegador del bot y marca suspendidas; nunca lanza."""
+        if bot is None:
+            return
+        try:
+            if getattr(bot, "cuenta_suspendida", False):
+                marcar_cuenta_suspendida(cuenta.usuario)
+                logger.warning(
+                    f"@{cuenta.usuario} marcada como suspendida (desactivada)"
+                )
+        except Exception:
+            pass
+        try:
+            bot.cerrar()
+        except Exception as e:
+            logger.warning(
+                f"No se pudo cerrar el navegador de @{cuenta.usuario}: {e}"
+            )
+
     def _intentar_accion_rol(self, cuenta: Cuenta, rol: str, urls: list[str],
                              texto: str, dar_like: bool) -> tuple:
         """Un intento de UNA accion segun el rol de activacion de la cuenta.
@@ -1513,6 +1856,11 @@ class MotorActivacion:
         - "hashtags": publica el texto con hashtags/menciones ("post" es alias).
         - "comentario": respuesta a un tweet (url + texto distintos por slot).
         - "rt": retweet simple (sin cita); puede dar like.
+
+        API PRIMERO: rt/like/hashtags/comentario/cita se intentan por HTTP
+        (`TwitterAPI.accion_rapida`) SIN abrir navegador ni consumir el
+        semaforo; solo si la API no puede/falla se usa Selenium, limitado por
+        `self._sem_browser` a `max_browsers` a la vez.
 
         Devuelve una tupla de 5 elementos:
         (usuario, rol, exito, detalle, url).
@@ -1526,8 +1874,8 @@ class MotorActivacion:
         try:
             from plataformas.twitter.selenium_bot import TwitterBot
 
-            if rol in ("cita", "rt", "comentario"):
-                url_objetivo = random.choice(urls) if urls else ""
+            if rol in ("cita", "rt", "comentario", "like"):
+                url_objetivo = self._url_objetivo_rol(cuenta, rol, urls)
                 if not url_objetivo:
                     return (cuenta.usuario, rol, False, "sin URL objetivo", "")
 
@@ -1539,110 +1887,113 @@ class MotorActivacion:
                         f"{url_objetivo}"
                     )
 
-            if rol == "rt" and _rt_por_api_activo():
+            # --- API PRIMERO (sin navegador ni semaforo). ---
+            resultado_api = self._probar_api_rol(
+                cuenta, rol, url_objetivo, texto, dar_like
+            )
+            if resultado_api is not None:
+                return resultado_api
+            if rol == "like":
+                # "like" solo tiene ruta HTTP: sin soporte Selenium aqui, jamas
+                # debe caer al flujo de hashtags (publicaria un post).
+                return (
+                    cuenta.usuario, rol, False,
+                    "like sin soporte por API en este momento", url_objetivo,
+                )
+
+            # --- Selenium (fallback): solo `max_browsers` a la vez. ---
+            self._sem_browser.acquire()
+            try:
+                bot = TwitterBot(cuenta.usuario)
+                # Sesion rapida por CDP: inyecta las cookies sin navegar. Si no
+                # hay cookies o CDP falla, se cae al login lento de siempre.
                 try:
-                    from plataformas.twitter.api_http import TwitterAPI
-                    accion_rapida = getattr(
-                        TwitterAPI(cuenta.usuario), "accion_rapida", None
-                    )
-                    if callable(accion_rapida) and accion_rapida(
-                        "rt", url_objetivo, dar_like=dar_like
-                    ):
-                        logger.debug(f"rt: API para @{cuenta.usuario}")
-                        return (
-                            cuenta.usuario, "rt", True, "rt por API",
-                            f"https://twitter.com/{cuenta.usuario}",
-                        )
+                    preparar_cdp = getattr(bot, "preparar_sesion_cdp", None)
+                    sesion_cdp = bool(preparar_cdp()) if callable(preparar_cdp) else False
                 except Exception as e:
                     logger.debug(
-                        f"rt: API fallo para @{cuenta.usuario} "
-                        f"({type(e).__name__}); se usa Selenium"
+                        f"preparar_sesion_cdp fallo para @{cuenta.usuario}: {e}"
                     )
+                    sesion_cdp = False
+                if sesion_cdp:
+                    logger.debug(f"sesion: CDP para @{cuenta.usuario}")
+                else:
+                    logger.debug(f"sesion: login lento para @{cuenta.usuario}")
+                    if not bot.login_con_cookies():
+                        motivo = getattr(bot, "ultimo_error", "") or "login fallido"
+                        logger.warning(f"Login fallido para @{cuenta.usuario}: {motivo}")
+                        detalle = _detalle_con_sesion(motivo) or "login fallido"
+                        return (cuenta.usuario, rol, False, detalle[:120], url_objetivo)
 
-            bot = TwitterBot(cuenta.usuario)
-            # Sesion rapida por CDP: inyecta las cookies sin navegar. Si no hay
-            # cookies o CDP falla, se cae al login lento de siempre.
-            try:
-                preparar_cdp = getattr(bot, "preparar_sesion_cdp", None)
-                sesion_cdp = bool(preparar_cdp()) if callable(preparar_cdp) else False
-            except Exception as e:
-                logger.debug(f"preparar_sesion_cdp fallo para @{cuenta.usuario}: {e}")
-                sesion_cdp = False
-            if sesion_cdp:
-                logger.debug(f"sesion: CDP para @{cuenta.usuario}")
-            else:
-                logger.debug(f"sesion: login lento para @{cuenta.usuario}")
-                if not bot.login_con_cookies():
-                    motivo = getattr(bot, "ultimo_error", "") or "login fallido"
-                    logger.warning(f"Login fallido para @{cuenta.usuario}: {motivo}")
-                    detalle = _detalle_con_sesion(motivo) or "login fallido"
-                    return (cuenta.usuario, rol, False, detalle[:120], url_objetivo)
+                if rol == "cita":
+                    res = bot.solo_retwittear(
+                        [url_objetivo],
+                        cuenta.usuario,
+                        mensaje_cita=texto,
+                        dar_like=dar_like,
+                    )
+                    ok = res.get("exitos", 0) > 0
+                    urls_pub = res.get("urls") or []
+                    url_publicada = urls_pub[0] if urls_pub else url_objetivo
+                    detalle = "ok" if ok else (
+                        _detalle_con_sesion(getattr(bot, "ultimo_error", ""))
+                        or "sin exito"
+                    )
+                    return (cuenta.usuario, rol, ok, detalle[:120], url_publicada)
 
-            if rol == "cita":
-                res = bot.solo_retwittear(
-                    [url_objetivo],
-                    cuenta.usuario,
-                    mensaje_cita=texto,
-                    dar_like=dar_like,
-                )
-                ok = res.get("exitos", 0) > 0
-                urls_pub = res.get("urls") or []
-                url_publicada = urls_pub[0] if urls_pub else url_objetivo
-                detalle = "ok" if ok else (
-                    _detalle_con_sesion(getattr(bot, "ultimo_error", ""))
-                    or "sin exito"
-                )
-                return (cuenta.usuario, rol, ok, detalle[:120], url_publicada)
+                if rol == "rt":
+                    res = bot.solo_retwittear(
+                        [url_objetivo],
+                        cuenta.usuario,
+                        dar_like=dar_like,
+                    )
+                    ok = res.get("exitos", 0) > 0
+                    urls_pub = res.get("urls") or []
+                    # El RT simple no genera un post propio: `solo_retwittear`
+                    # ya devuelve el perfil de quien retwittea, no el tweet original.
+                    url_publicada = urls_pub[0] if urls_pub else f"https://twitter.com/{cuenta.usuario}"
+                    detalle = "ok" if ok else (
+                        _detalle_con_sesion(getattr(bot, "ultimo_error", ""))
+                        or "sin exito"
+                    )
+                    return (cuenta.usuario, rol, ok, detalle[:120], url_publicada)
 
-            if rol == "rt":
-                res = bot.solo_retwittear(
-                    [url_objetivo],
-                    cuenta.usuario,
-                    dar_like=dar_like,
-                )
-                ok = res.get("exitos", 0) > 0
-                urls_pub = res.get("urls") or []
-                # El RT simple no genera un post propio: `solo_retwittear`
-                # ya devuelve el perfil de quien retwittea, no el tweet original.
-                url_publicada = urls_pub[0] if urls_pub else f"https://twitter.com/{cuenta.usuario}"
-                detalle = "ok" if ok else (
-                    _detalle_con_sesion(getattr(bot, "ultimo_error", ""))
-                    or "sin exito"
-                )
-                return (cuenta.usuario, rol, ok, detalle[:120], url_publicada)
+                if rol == "comentario":
+                    if not (texto or "").strip():
+                        return (cuenta.usuario, rol, False, "sin texto asignado", url_objetivo)
+                    responder = getattr(bot, "responder_tweet", None)
+                    if responder is None:
+                        return (cuenta.usuario, rol, False, "sin soporte de respuesta", url_objetivo)
+                    ok = bool(responder(url_objetivo, texto))
+                    if ok:
+                        detalle = "comentario publicado"
+                    else:
+                        motivo = getattr(bot, "ultimo_error", "") or "sin exito"
+                        # La sesion caida se reporta sin prefijo, con la accion
+                        # concreta (renovar cookies/login); no es suspension. Las
+                        # respuestas limitadas del tweet ancla se reportan claras.
+                        detalle = _detalle_comentario(motivo)
+                    return (cuenta.usuario, rol, ok, detalle[:120], url_objetivo)
 
-            if rol == "comentario":
-                if not (texto or "").strip():
-                    return (cuenta.usuario, rol, False, "sin texto asignado", url_objetivo)
-                responder = getattr(bot, "responder_tweet", None)
-                if responder is None:
-                    return (cuenta.usuario, rol, False, "sin soporte de respuesta", url_objetivo)
-                ok = bool(responder(url_objetivo, texto))
+                # rol == "hashtags"
+                res = bot.publicar_tweet(texto, buscar_url=False)
+                ok = bool(res)
+                if isinstance(res, str):
+                    url_publicada = res
+                elif ok:
+                    url_publicada = getattr(bot, "ultima_url_publicada", "") or ""
+                else:
+                    url_publicada = ""
                 if ok:
-                    detalle = "comentario publicado"
+                    detalle = "hashtags publicados"
                 else:
                     motivo = getattr(bot, "ultimo_error", "") or "sin exito"
-                    # La sesion caida se reporta sin prefijo, con la accion
-                    # concreta (renovar cookies/login); no es suspension. Las
-                    # respuestas limitadas del tweet ancla se reportan claras.
-                    detalle = _detalle_comentario(motivo)
-                return (cuenta.usuario, rol, ok, detalle[:120], url_objetivo)
+                    detalle = _detalle_con_sesion(f"hashtags: {motivo}")
+                return (cuenta.usuario, rol, ok, detalle[:120], url_publicada)
 
-            # rol == "hashtags"
-            res = bot.publicar_tweet(texto, buscar_url=False)
-            ok = bool(res)
-            if isinstance(res, str):
-                url_publicada = res
-            elif ok:
-                url_publicada = getattr(bot, "ultima_url_publicada", "") or ""
-            else:
-                url_publicada = ""
-            if ok:
-                detalle = "hashtags publicados"
-            else:
-                motivo = getattr(bot, "ultimo_error", "") or "sin exito"
-                detalle = _detalle_con_sesion(f"hashtags: {motivo}")
-            return (cuenta.usuario, rol, ok, detalle[:120], url_publicada)
+            finally:
+                self._cerrar_bot(cuenta, bot)
+                self._sem_browser.release()
 
         except Exception as e:
             logger.error(f"Error en @{cuenta.usuario} (rol {rol}): {e}")
@@ -1651,19 +2002,6 @@ class MotorActivacion:
                 cuenta.usuario, rol, False,
                 detalle[:120], url_objetivo,
             )
-        finally:
-            if bot is not None:
-                if getattr(bot, "cuenta_suspendida", False):
-                    marcar_cuenta_suspendida(cuenta.usuario)
-                    logger.warning(
-                        f"@{cuenta.usuario} marcada como suspendida (desactivada)"
-                    )
-                try:
-                    bot.cerrar()
-                except Exception as e:
-                    logger.warning(
-                        f"No se pudo cerrar el navegador de @{cuenta.usuario}: {e}"
-                    )
 
     def _ejecutar_accion_rol(self, cuenta: Cuenta, rol: str, urls: list[str],
                              texto: str, dar_like: bool, retardo: float = 0) -> tuple:
@@ -1690,6 +2028,10 @@ class MotorActivacion:
             )
             time.sleep(pausa)
             resultado = self._intentar_accion_rol(cuenta, rol, urls, texto, dar_like)
+        if not resultado[2]:
+            # Sesion caida (cookies vencidas/sin credenciales): se omite en las
+            # rondas siguientes de la campana (conteo unico, sin abrir Chrome).
+            self._registrar_sesion_caida(resultado[0], resultado[3])
         return resultado
 
     def ejecutar(
@@ -2246,7 +2588,7 @@ class MotorActivacion:
             f"rt={len(grupos_ejec['rt'])}, sin_rol={len(sin_rol_usuarios)}, "
             f"sin_sesion={len(sin_sesion)}), "
             f"{len(urls)} urls, {cohortes} cohortes, {duracion_min} min, "
-            f"concurrencia {self.max_concurrente}"
+            f"navegadores {self.max_concurrente}, trabajadores {self._n_workers()}"
         )
 
         with self._lock:
@@ -2273,6 +2615,18 @@ class MotorActivacion:
                     cuenta.usuario, False,
                 )
         intervalo_cohorte = max(1, (duracion_min * 60) // max(cohortes, 1))
+
+        # Contexto REAL del comentario: se descarga el texto de cada tweet
+        # ancla UNA vez por URL (con cache) ANTES de las rondas, para que los
+        # comentarios hablen del tweet al que responden y no de la campana.
+        hay_comentarios = (
+            ("comentario" in roles_sortear)
+            if roles_aleatorios
+            else bool(grupos_ejec.get("comentario"))
+        )
+        ancla_textos: dict = {}
+        if urls and hay_comentarios:
+            ancla_textos = self._obtener_anclas(urls)
 
         if repetir:
             usados: dict = {}
@@ -2304,6 +2658,7 @@ class MotorActivacion:
                         entrenamiento=entrenamiento,
                         contexto=contexto,
                         ronda=_ronda,
+                        ancla_textos=ancla_textos,
                     )
                     return (
                         _aplicar_anti_repeticion(textos, usados),
@@ -2325,6 +2680,7 @@ class MotorActivacion:
                     entrenamiento=entrenamiento,
                     contexto=contexto,
                     ronda=_ronda,
+                    ancla_textos=ancla_textos,
                 )
                 return _aplicar_anti_repeticion(textos, usados)
 
@@ -2412,6 +2768,7 @@ class MotorActivacion:
             narrativa=narrativa,
             entrenamiento=entrenamiento,
             contexto=contexto,
+            ancla_textos=ancla_textos,
         )
 
         bloques = self._distribuir_cohortes(ejecutables, duracion_min, cohortes)

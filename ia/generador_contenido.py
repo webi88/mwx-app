@@ -15,6 +15,7 @@ from core.perfiles import (
 from core.registros import normalizar_tipo_cuenta
 from ia.prompts import (
     bloque_estilo_perfil,
+    bloque_tweet_ancla,
     get_prompt_generico,
     get_prompt_hashtags,
     get_prompt_verificado_ambiental,
@@ -966,11 +967,13 @@ def limpiar_comentario_spam(texto: str) -> str:
     @menciones. Este helper los elimina SIEMPRE, limpia los espacios huerfanos
     (``" ,"`` -> ``,``; dobles espacios; saltos 3+) y garantiza un texto
     conversacional no vacio: si tras limpiar quedan menos de 8 caracteres
-    utiles, devuelve un cierre generico corto. Nunca lanza.
+    utiles, devuelve un cierre generico corto. Tras esta funcion el texto NO
+    contiene ``#``, ``http``, ``www.`` ni ``@``. Nunca lanza.
     """
     try:
         t = str(texto or "")
         t = re.sub(r"https?://\S+", " ", t, flags=re.IGNORECASE)
+        t = re.sub(r"\bhttps?\b[^\s]*", " ", t, flags=re.IGNORECASE)
         t = re.sub(r"www\.\S+", " ", t, flags=re.IGNORECASE)
         t = re.sub(r"#[A-Za-z0-9ÁÉÍÓÚÜÑáéíóúüñ_]+", " ", t)
         t = re.sub(r"@[A-Za-z0-9_]+", " ", t)
@@ -1507,13 +1510,18 @@ def _normalizar_para_fuga(texto) -> str:
         return ""
 
 
-def _fuga_narrativa(texto, narrativa) -> bool:
+def _fuga_narrativa(texto, narrativa, exentos: str = "") -> bool:
     """True si ``texto`` filtra material reconocible de ``narrativa``.
 
     Compara palabras completas tras normalizar (minusculas, sin acentos ni
     signos). Cuenta como fuga cuando aparecen **>=2 tokens distintos** de la
     narrativa (palabras de >=7 letras, sin la stoplist de genericos) o **UN
     token de >=10 letras** (suficientemente distintivo, p. ej. "descuentazo").
+
+    ``exentos`` (kwarg nuevo AL FINAL, opcional): material que SI es tema
+    legitimo del texto (p. ej. el TEXTO REAL del tweet ancla al que se
+    responde). Sus palabras NO cuentan como fuga aunque coincidan con la
+    narrativa. Vacio = comportamiento anterior intacto.
     Nunca lanza: ante cualquier error/entrada rara devuelve False.
     """
     try:
@@ -1527,6 +1535,10 @@ def _fuga_narrativa(texto, narrativa) -> bool:
             tok for tok in re.findall(r"[a-záéíóúüñ]{7,}", narrativa_norm)
             if tok not in _FUGA_STOPLIST
         }
+        if exentos:
+            # El ancla es el TEMA de la respuesta: sus palabras son legitimas.
+            exentos_norm = _normalizar_para_fuga(exentos)
+            tokens -= set(re.findall(r"[a-záéíóúüñ]{7,}", exentos_norm))
         apariciones = 0
         for tok in tokens:
             if re.search(r"\b" + re.escape(tok) + r"\b", texto_norm):
@@ -1540,16 +1552,20 @@ def _fuga_narrativa(texto, narrativa) -> bool:
         return False
 
 
-def _reemplazo_sin_fuga(texto, narrativa, reemplazo_fn):
+def _reemplazo_sin_fuga(texto, narrativa, reemplazo_fn, exentos: str = ""):
     """Devuelve ``texto`` intacto o el fallback local si hay fuga (nunca lanza).
 
-    Si ``_fuga_narrativa(texto, narrativa)`` es True, loguea WARNING y
+    Si ``_fuga_narrativa(texto, narrativa, exentos)`` es True, loguea WARNING y
     devuelve el resultado de ``reemplazo_fn()`` (texto local que no lee la
     narrativa). Si no hay fuga, devuelve el texto tal cual. Ante error en el
     reemplazo devuelve "" para que el llamador use su propio fallback.
+
+    ``exentos`` (kwarg nuevo AL FINAL, opcional) se pasa a `_fuga_narrativa`:
+    permite marcar como legitimo el material que SI es tema del texto (p. ej.
+    el tweet ancla). Vacio = comportamiento anterior intacto.
     """
     try:
-        if not _fuga_narrativa(texto, narrativa):
+        if not _fuga_narrativa(texto, narrativa, exentos):
             return texto
         logger.warning(
             "Se detecto fuga de la narrativa; se reemplaza el texto por "
@@ -1832,6 +1848,7 @@ def _prompt_lote_mantenimiento(
     cuentas_info: list,
     narrativa: str = "",
     entrenamiento: str = "",
+    tweet_ancla_texto: str = "",
 ) -> str:
     """Prompt para pedir UN texto por PERFIL (lote <=15), separados por '---'.
 
@@ -1841,6 +1858,11 @@ def _prompt_lote_mantenimiento(
     registro, personalidad y tema de cada cuenta; los POSTS exigen hashtag en
     MEDIO y los COMENTARIOS/RESPUESTAS van SIN hashtags, links ni @menciones
     (X marca las respuestas con esos elementos como probable spam).
+
+    ``tweet_ancla_texto`` (kwarg nuevo AL FINAL, opcional): TEXTO REAL del
+    tweet al que responden los comentarios. Si viene, se agrega como TEMA
+    PRINCIPAL de los COMENTARIOS/RESPUESTAS (manda sobre la narrativa/contexto
+    de campana) sin copiarlo ni parafrasearlo. Vacio = comportamiento previo.
     """
     n_textos = len(lote)
     infos = [_info_cuenta(cuentas_info, item[0]) for item in lote]
@@ -1867,6 +1889,14 @@ def _prompt_lote_mantenimiento(
     if narrativa:
         partes.append(f"NARRATIVA GENERAL (TRASFONDO INVISIBLE):\n{narrativa}")
         partes.append(_reglas_trasfondo().strip())
+    # El tweet ancla real es el TEMA PRINCIPAL de las respuestas: por encima
+    # de la narrativa/contexto de campana y sin material copiable.
+    ancla_prompt = bloque_tweet_ancla(tweet_ancla_texto).strip()
+    if hay_comentarios and ancla_prompt:
+        partes.append(
+            "TEMA PRINCIPAL DE LOS COMENTARIOS/RESPUESTAS (por encima de "
+            "la narrativa/contexto de campana):\n" + ancla_prompt
+        )
     if entrenamiento:
         partes.append(f"ENTRENAMIENTO GENERAL:\n{entrenamiento}")
 
@@ -1936,6 +1966,12 @@ def _prompt_lote_mantenimiento(
             "- TODOS los textos DEBEN incluir al menos un hashtag INTEGRADO EN "
             "MEDIO del texto; NUNCA lo pongas al final (bien escrito, sin "
             "deformar).\n"
+        )
+    if hay_comentarios and ancla_prompt:
+        reglas_hashtag += (
+            "- Los COMENTARIOS/RESPUESTA deben reaccionar al TEMA PRINCIPAL "
+            "(el tweet ancla indicado arriba), NO a la narrativa/contexto de "
+            "campana, y sin copiarlo ni parafrasearlo.\n"
         )
 
     partes.append(
@@ -2027,6 +2063,7 @@ def _generar_textos_mantenimiento_impl(
     entrenamiento: str = "",
     temas: list | None = None,
     callback=None,
+    tweet_ancla_texto: str = "",
 ) -> list[list[str]]:
     try:
         lista = list(cuentas_info or [])
@@ -2100,7 +2137,11 @@ def _generar_textos_mantenimiento_impl(
             textos_lote = []
             try:
                 prompt = _prompt_lote_mantenimiento(
-                    lote, lista, narrativa, entrenamiento
+                    lote,
+                    lista,
+                    narrativa,
+                    entrenamiento,
+                    tweet_ancla_texto,
                 )
                 contenido = generador._chat(prompt, temperature=0.8)
                 textos_lote = generador._parsear_textos(contenido, len(lote))
@@ -2157,8 +2198,13 @@ def _generar_textos_mantenimiento_impl(
                 # Red de seguridad: si el texto de la IA filtra la narrativa,
                 # se cambia por la plantilla local del mismo tema/perfil (que
                 # NO lee la narrativa) y conserva registro/perfil de la cuenta.
+                # En COMENTARIOS, las palabras del tweet ancla (tema legitimo)
+                # quedan exentas: hablar del ancla NO es filtrar la narrativa.
                 t = _reemplazo_sin_fuga(
-                    t, narrativa, lambda j=j: _plantilla_local(j)
+                    t,
+                    narrativa,
+                    lambda j=j: _plantilla_local(j),
+                    exentos=(tweet_ancla_texto if es_comentario else ""),
                 )
                 if not t:
                     t = _plantilla_local(j)
@@ -2188,9 +2234,11 @@ def _generar_textos_mantenimiento_impl(
             # Signos de apertura: activista/ciudadana NUNCA abren "¿"/"¡"
             # (aplica tambien a los textos de la IA); politica intacta.
             t = _quitar_signos_por_registro(t, registro)
-            if es_comentario and not t:
-                # Red de seguridad: jamas un comentario vacio.
-                t = limpiar_comentario_spam(_plantilla_local(j))
+            if es_comentario:
+                # Garantia final: TODO comentario (IA o fallback) sale por
+                # `limpiar_comentario_spam` (NUNCA con #, links ni @) y jamas
+                # vacio: si queda muy corto, devuelve un cierre conversacional.
+                t = limpiar_comentario_spam(t)
             vistos.add(t)
             fila.append(t)
         resultado[i] = fila
@@ -2253,6 +2301,7 @@ def generar_textos_comentario(
     narrativa: str = "",
     entrenamiento: str = "",
     callback=None,
+    tweet_ancla_texto: str = "",
 ) -> list[list[str]]:
     """Genera n_por_cuenta COMENTARIOS/RESPUESTAS por cuenta (alineados).
 
@@ -2263,6 +2312,14 @@ def generar_textos_comentario(
     conversacional, el perfil formal con Titulo/Descripcion/Conclusion
     cortos). Son SPAM-SAFE: no llevan hashtags, links ni @menciones (X marca
     las respuestas con esos elementos como probable spam).
+
+    ``tweet_ancla_texto`` (kwarg nuevo AL FINAL, retrocompatible): TEXTO REAL
+    del tweet al que se responde. Cuando viene, ese contenido es el TEMA
+    PRINCIPAL del comentario (por encima de la narrativa/contexto de campana):
+    se pasa al prompt de los lotes de comentarios para que la respuesta
+    reaccione a ESE tema sin copiarlo ni parafrasearlo. NUNCA se mete en
+    ``narrativa`` (la red anti-fuga `_fuga_narrativa` lo reemplazaria) y el
+    fallback local tampoco lo copia. Vacio = comportamiento anterior intacto.
     """
     try:
         base = list(cuentas_info or [])
@@ -2286,6 +2343,7 @@ def generar_textos_comentario(
             narrativa=narrativa,
             entrenamiento=entrenamiento,
             callback=callback,
+            tweet_ancla_texto=tweet_ancla_texto,
         )
     except Exception as e:
         logger.error(f"Error inesperado generando textos de comentario: {e}")

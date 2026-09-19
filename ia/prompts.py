@@ -11,6 +11,8 @@ Los perfiles de redaccion (formal/ciudadano/popular) viven en
 ``core.perfiles``; ``bloque_estilo_perfil()`` traduce cada perfil al bloque de
 formato obligatorio que se agrega al prompt.
 """
+import re
+
 from core.perfiles import normalizar_perfil
 
 
@@ -197,18 +199,31 @@ _BLOQUES_ESTILO_PERFIL = {
 }
 
 
-def bloque_estilo_perfil(perfil: str) -> str:
+def bloque_estilo_perfil(perfil: str, comentario: bool = False) -> str:
     """Bloque de instrucciones de formato segun el perfil de la cuenta.
 
     Acepta variantes via ``core.perfiles.normalizar_perfil`` ("Formal",
     "Popular/Orgánico", etc.). Devuelve el bloque listo para concatenar (con
     salto de linea inicial) o "" si el perfil no se reconoce.
+
+    ``comentario`` (kwarg nuevo AL FINAL, opcional): para COMENTARIOS/
+    RESPUESTAS el bloque cambia la regla de "hashtag obligatorio en medio" por
+    su prohibicion (X marca como spam las respuestas con hashtags, links o
+    @menciones); el resto del formato del perfil se conserva intacto. Default
+    False = comportamiento anterior identico para posts/citas.
     """
     try:
         clave = normalizar_perfil(perfil)
     except Exception:
         return ""
-    return _BLOQUES_ESTILO_PERFIL.get(clave, "")
+    bloque = _BLOQUES_ESTILO_PERFIL.get(clave, "")
+    if not bloque or not comentario:
+        return bloque
+    return re.sub(
+        r"- El texto DEBE incluir al menos un hashtag[^.]*\.",
+        "- NUNCA uses hashtags, links ni @menciones: es una respuesta breve.",
+        bloque,
+    )
 
 
 # Instrucciones por tema para el mantenimiento organico de cuentas.
@@ -579,6 +594,62 @@ def get_prompt_mantenimiento(
     )
 
 
+# --------------------------------------------------------------------------- #
+# Tweet ancla real: el TEMA PRINCIPAL de la respuesta. El motor pasa el texto
+# del tweet al que responde cada comentario y se usa como tema (nunca como
+# material copiable, y NUNCA via `narrativa`: la red anti-fuga lo reemplazaria).
+# --------------------------------------------------------------------------- #
+_MAX_TWEET_ANCLA = 400
+
+
+def texto_tweet_ancla(
+    tweet_ancla_texto: str = "", max_chars: int = _MAX_TWEET_ANCLA
+) -> str:
+    """Normaliza (espacios) y trunca el texto del tweet ancla; nunca lanza.
+
+    Devuelve "" si no hay texto util. Reutilizable por otros modulos (p. ej.
+    ``ia/generador_contenido.py``) para no duplicar la normalizacion.
+    """
+    try:
+        t = " ".join(str(tweet_ancla_texto or "").split())
+    except Exception:
+        return ""
+    if not t:
+        return ""
+    try:
+        limite = max(1, int(max_chars))
+    except (TypeError, ValueError):
+        limite = _MAX_TWEET_ANCLA
+    if len(t) > limite:
+        t = t[:limite].rstrip()
+    return t
+
+
+def bloque_tweet_ancla(
+    tweet_ancla_texto: str = "", max_chars: int = _MAX_TWEET_ANCLA
+) -> str:
+    """Bloque de prompt que fija el TEMA PRINCIPAL: el tweet real al que responde.
+
+    Devuelve "" si no hay texto. El ancla es SOLO tema: prohibe repetirla
+    literalmente, parafrasearla plano, mencionar "el tweet" y citar medios o
+    fuentes; ademas declara que ese tema manda sobre la narrativa/contexto de
+    campana. Se usa en ``get_prompt_comentario`` y en el prompt de lotes de
+    comentarios de ``ia/generador_contenido.py``.
+    """
+    ancla = texto_tweet_ancla(tweet_ancla_texto, max_chars)
+    if not ancla:
+        return ""
+    return (
+        "\nEL TWEET AL QUE RESPONDES DICE: «{ancla}».\n"
+        "TAREA: responde A ESE CONTENIDO (opina, reacciona, coincide o "
+        "discrepa) usando ese tema como base; NO lo repitas literalmente, NO "
+        "lo parafrasees plano, NO menciones \"el tweet\", NO cites medios ni "
+        "fuentes.\n"
+        "IMPORTANTE: este es el TEMA PRINCIPAL de la respuesta y MANDA sobre "
+        "cualquier narrativa o contexto de campaña.\n"
+    ).format(ancla=ancla)
+
+
 def get_prompt_comentario(
     narrativa: str,
     entrenamiento: str = "",
@@ -587,6 +658,7 @@ def get_prompt_comentario(
     perfil: str = "",
     tema: str = "",
     personalidad: str = "",
+    tweet_ancla_texto: str = "",
 ) -> str:
     """Prompt para COMENTARIOS/RESPUESTAS breves y conversacionales.
 
@@ -595,6 +667,12 @@ def get_prompt_comentario(
     breves, directos y conversacionales, SIN hashtags, links ni @menciones
     (X marca las respuestas con esos elementos como probable spam). El perfil
     formal conserva Titulo/Descripcion/Conclusion en version corta.
+
+    ``tweet_ancla_texto`` (kwarg nuevo AL FINAL, retrocompatible): TEXTO REAL
+    del tweet al que se responde. Si viene no vacio se agrega como TEMA
+    PRINCIPAL (truncado a 400 chars) al que debe reaccionar el comentario,
+    por encima de la narrativa/contexto de campana, sin copiarlo ni
+    parafrasearlo y sin mencionar "el tweet" ni citar medios/fuentes.
     """
     return (
         _base_narrativa(narrativa, entrenamiento)
@@ -612,9 +690,10 @@ def get_prompt_comentario(
         "- Cada texto debe aportar un angulo distinto y sonar humano.\n"
         "- Son mas breves que un post normal: 1-2 frases (el perfil formal "
         "mantiene Titulo/Descripcion/Conclusion pero MUY cortos).\n"
+        + bloque_tweet_ancla(tweet_ancla_texto)
         + _bloque_tema_personalidad(tema, personalidad)
-        + _reglas_formato(cantidad, max_chars=200, estructura=False)
-        + bloque_estilo_perfil(perfil)
+        + _reglas_formato(cantidad, max_chars=200, estructura=False, hashtags=False)
+        + bloque_estilo_perfil(perfil, comentario=True)
     )
 
 

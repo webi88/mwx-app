@@ -733,8 +733,28 @@ python -m bot.main
 - Ahorro adicional de GB/CPU con las opciones de la UI: `CHROME_SIN_IMAGENES` (default ON) + `--autoplay-policy` + RT/likes por API (no cargan paginas).
 - Verificado: cache 8/8 (3 acciones = 1 sondeo; TTL vencido re-sondea; `PROXY_X_CACHE_SEG=0` sondea siempre; proxy invalido rota y el rotado no se re-sondea; `TWITTER_SIN_PROXY` intacto) + compileall OK.
 
+### Velocidad masiva: API-first para TODOS los roles + fail-fast + comentarios con el tweet ancla (2026-09-19)
+- **Diagnostico del log (4.2/min, 19/40 fallos)**: RT por API fallaba 422 por `queryId` vencido y caia a Selenium (10-35s); `responder_tweet` recibio `chrome://new-tab-page` (el driver nunca navego) y quemo ~20s; el compositor de X con pagina de error ("something went wrong") quemaba hasta 44s; las cuentas con solo `auth_token` no tenian cookies para la API; cada accion abria/cerraba Chrome; y los comentarios se generaban con el contexto de campana en vez del contenido real del tweet ancla.
+- `plataformas/twitter/api_http.py`:
+  - `_cargar_cookies` construye la cookie minima desde `Cuenta.auth_token` cuando no hay `.pkl`/`cookies_json`.
+  - Bug de headers corregido: mandar `authorization: Bearer` al HTML de x.com devolvia **401**; `_get_web` usa headers de navegador para `asegurar_ct0`/descubrimiento.
+  - **Descubrimiento/cache de queryIds**: memoria + `data/twitter_queryids.json` (TTL 6h), busca `queryId/operationName` en hasta 3 bundles (~8s, primera vez ~1.5s), fallback `CreateRetweet`/`FavoriteTweet`, y **reintento unico en 422/400** invalidando cache.
+  - `already retweeted` (327) / `already favorited` (139) => exito idempotente.
+  - `crear_tweet(texto, reply_to_url, quote_url)` (GraphQL CreateTweet) y `accion_rapida(rol, url="", dar_like=False, texto="")` para **rt/like/hashtags/post/comentario/cita**; `obtener_texto_tweet(url)` (syndication -> oembed, cache, sin cuenta) y logs `perf API`.
+- `plataformas/twitter/selenium_bot.py`: `_asegurar_pagina_tweet` (si el driver quedo en `chrome://`/`about:` reintenta UN `get` y lanza "tab crashed/navegador sin navegar" en <1s; cambio de ventana a la de x.com); presupuesto del compositor 43→20s con UN refresh y aborto claro "compositor no disponible (pagina de error de X)" (no recorre 3 rutas); sleeps fijos recortados.
+- `activaciones/motor.py`:
+  - **API primero para TODOS los roles**: `_api_primero_activo()` (`API_PRIMERO`; alias `RT_POR_API`; default ON) intenta `accion_rapida` antes de crear `TwitterBot`; tolerante a firma vieja (rt/like reintentan sin `texto`; los roles que publican texto caen a Selenium para no publicar vacio).
+  - **Navegadores solo si se usan**: `_sem_browser` limita SOLO el bloque Selenium a `max_browsers`; los workers del pool usan `MAX_WORKERS` (default `max(6, navegadores)`), asi las acciones API corren en paralelo sin Chrome.
+  - **Sesiones caidas se omiten** en las rondas siguientes del mismo run (no se reintentan 20-40s por ronda).
+  - **Comentarios con el tweet ancla real**: `_obtener_anclas` (1 fetch por URL, cache) + `_repartir_anclas` (URL<->texto por cuenta); a la IA se le pasa `tweet_ancla_texto` y **sin narrativa de campana**; fallback con pool solo del ancla. Pausa entre acciones del worker 0.4-1.2s → 0.1-0.4s.
+- `ia/`: `generar_textos_comentario(..., tweet_ancla_texto="")`, `get_prompt_comentario(..., tweet_ancla_texto="")` + `bloque_tweet_ancla` (el ancla MANDA como tema, sin copiarla) y `bloque_estilo_perfil(..., comentario=True)` (no exige hashtag en respuestas); `_fuga_narrativa(..., exentos=)` exime las palabras del ancla; `limpiar_comentario_spam` reforzado (tambien `http` pelado) y aplicado en TODOS los caminos de comentario.
+- **UI** (`web/operaciones/activacion_masiva.py`, ambas pestañas): checkbox "⚡ Publicar por API (RT, likes, posts, comentarios y citas)" (exporta `API_PRIMERO` + `RT_POR_API`; default ON) e input "Trabajadores simultáneos (acciones en paralelo)" ("`MAX_WORKERS`", 6-30, default 8); ambos se restauran SIEMPRE al terminar.
+- Verificado: compileall global OK; 66/66 plataformas (API sin Chrome, 422->redescubrimiento, responder en 0.61s, semaforo 1 navegador, sesiones caidas omitidas, 1 fetch de ancla/URL); 51/51 + 11/11 ia (ancla como tema, retrocompatibilidad byte-identica sin ancla, comentarios spam-safe); 22/22 + AppTest 32/32 UI (envs aplicadas/restauradas); 24/24 interfaces cruzadas; regresion: rt_api 11/11, responder 33/33, like 29/29, timeouts 26/26, contexto 61/61, pool de proxy 42/42, compositor 39/40 (solo el acento del mensaje), sesion_cdp 41/42 (solo el sleep viejo 0.4-1.2 esperado). Las suites viejas de fallback con hashtag contiguo (`"Texto base"`) ya fallaban igual en HEAD (verificado con worktree): son expectativas previas al hashtag en medio y al comentario spam-safe.
+- ⚠ **Railway debe redeployarse**. La primera accion API por proceso paga ~1.5s de descubrimiento de queryIds (despues cache 6h); con 8+ trabajadores el techo supera las 20/min, pero los comentarios al MISMO tweet siguen limitados por la pausa anti-spam (15s/URL: usar 2-5 tweets ancla). Los fallbacks Selenium quedan limitados por "Navegadores simultáneos".
+
 ### Pendiente
 - Probar `ia/contexto_noticias.generar_contexto_desde_links` con `OPENAI_API_KEY` real (hoy verificado con IA simulada; el fallback local ya funciona)
 - Reemplazar tokens placeholder en `.env` por claves reales (Telegram, Gemini, Grizzly)
 - Probar acciones Selenium en VPS (requiere Chrome; local sin Chrome)
 - `web_users.json`: cambiar usuario/clave admin por defecto antes de exponer el dashboard
+- Redeploy en Railway para aplicar la capa API-first/`MAX_WORKERS` y probar velocidad real (objetivo ≥20 acciones/min con 8 trabajadores)

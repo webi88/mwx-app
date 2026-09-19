@@ -494,21 +494,49 @@ def _lanzar_con_progreso_o_limpiar(lanzar, motor, duracion_min: int, repetir: bo
 # Variables de entorno que leen los modulos del bot/motor al construir cada
 # navegador o peticion (nunca se editan esos modulos: solo se cambian aqui
 # antes de lanzar la campana y se restauran al terminar).
-_VARS_VELOCIDAD = ("TWITTER_SIN_PROXY", "CHROME_SIN_IMAGENES", "RT_POR_API")
+#   - `RT_POR_API` se mantiene como alias/compat de `API_PRIMERO` (maestro).
+#   - `MAX_WORKERS` es numerico: trabajadores en paralelo del motor.
+_VARS_VELOCIDAD = (
+    "TWITTER_SIN_PROXY",
+    "CHROME_SIN_IMAGENES",
+    "RT_POR_API",
+    "API_PRIMERO",
+    "MAX_WORKERS",
+)
 
 
 def _aplicar_opciones_velocidad(sin_proxy: bool, sin_imagenes: bool,
-                                rt_api: bool) -> dict:
+                                rt_api: bool, api_primero: bool = None,
+                                max_workers: int = 8) -> dict:
     """Escribe las env de velocidad y devuelve sus valores PREVIOS.
 
-    Convencion "1"/"0". Los valores previos (o `None` si la variable no
-    existia) se devuelven para poder restaurarlos con
-    `_restaurar_opciones_velocidad` al terminar la campana, de modo que el
-    resto del dashboard no herede las opciones de una campana.
+    Convencion "1"/"0" para los interruptores; `MAX_WORKERS` se escribe como
+    entero. `RT_POR_API` y `API_PRIMERO` son el MISMO interruptor (alias/
+    compatibilidad): si cualquiera de los dos esta activo, ambos van a "1".
+    Si no se pasa `api_primero`, se usa el valor de `rt_api` (llamadas viejas).
+
+    Los valores previos (o `None` si la variable no existia) se devuelven para
+    poder restaurarlos con `_restaurar_opciones_velocidad` al terminar la
+    campana, de modo que el resto del dashboard no herede las opciones de una
+    campana.
     """
+    if api_primero is None:
+        api_primero = rt_api
+    api_activa = "1" if (bool(rt_api) or bool(api_primero)) else "0"
+    try:
+        workers = str(int(max_workers))
+    except (TypeError, ValueError):
+        workers = "8"
+    valores = {
+        "TWITTER_SIN_PROXY": "1" if sin_proxy else "0",
+        "CHROME_SIN_IMAGENES": "1" if sin_imagenes else "0",
+        "RT_POR_API": api_activa,
+        "API_PRIMERO": api_activa,
+        "MAX_WORKERS": workers,
+    }
     previos = {clave: os.environ.get(clave) for clave in _VARS_VELOCIDAD}
-    for clave, valor in zip(_VARS_VELOCIDAD, (sin_proxy, sin_imagenes, rt_api)):
-        os.environ[clave] = "1" if valor else "0"
+    for clave, valor in valores.items():
+        os.environ[clave] = valor
     return previos
 
 
@@ -531,15 +559,21 @@ def _restaurar_opciones_velocidad(previos: dict) -> None:
 def _lanzar_con_opciones_velocidad(lanzar, motor, duracion_min: int,
                                    repetir: bool, prefix: str, limpiar: bool,
                                    sin_proxy: bool, sin_imagenes: bool,
-                                   rt_api: bool) -> dict:
+                                   rt_api: bool, api_primero: bool = None,
+                                   max_workers: int = 8) -> dict:
     """`_lanzar_con_progreso_o_limpiar` aplicando y restaurando la velocidad.
 
-    Las tres env se escriben ANTES de lanzar (el motor las lee al abrir cada
-    navegador/hacer cada peticion) y se restauran a sus valores previos
-    SIEMPRE al volver: exito, guard de campana unica que devuelve `{}` o
-    excepcion (el `finally` re-lanza el error original tal cual).
+    Las env (`TWITTER_SIN_PROXY`, `CHROME_SIN_IMAGENES`, `RT_POR_API`,
+    `API_PRIMERO` y `MAX_WORKERS`) se escriben ANTES de lanzar (el motor las
+    lee al abrir cada navegador/hacer cada peticion) y se restauran a sus
+    valores previos SIEMPRE al volver: exito, guard de campana unica que
+    devuelve `{}` o excepcion (el `finally` re-lanza el error original tal
+    cual). `api_primero=None` usa el valor de `rt_api` (alias/compat).
     """
-    previos = _aplicar_opciones_velocidad(sin_proxy, sin_imagenes, rt_api)
+    previos = _aplicar_opciones_velocidad(
+        sin_proxy, sin_imagenes, rt_api,
+        api_primero=api_primero, max_workers=max_workers,
+    )
     try:
         return _lanzar_con_progreso_o_limpiar(
             lanzar, motor, duracion_min, repetir, prefix=prefix, limpiar=limpiar
@@ -1011,7 +1045,7 @@ def _cita_masiva():
 
     panel_noticias = _panel_contexto_noticias("act")
 
-    col1, col2, col3, col4 = st.columns(4)
+    col1, col2, col3, col4, col5 = st.columns(5)
     with col1:
         cantidad = st.number_input(
             "Cantidad de cuentas (vacío = todas)",
@@ -1035,13 +1069,24 @@ def _cita_masiva():
                 "4-6 en Railway (configurable con la variable MAX_BROWSERS)."
             ),
         )
+    with col5:
+        max_workers = st.number_input(
+            "Trabajadores simultáneos (acciones en paralelo)",
+            min_value=6, max_value=30, value=8, step=1,
+            key="act_workers",
+            help=(
+                "Acciones que el motor ejecuta a la vez cuando la API va "
+                "primero (variable MAX_WORKERS). Los navegadores solo se "
+                "abren cuando la API falla."
+            ),
+        )
 
     st.caption(
-        "🖥️ Recomendado: 4-6 navegadores en Railway (cada Chrome ~300-500 MB). "
-        "Más navegadores solo con RAM/GB de sobra; subirlo de más provoca "
-        "`tab crashed` y la campaña va más lento. No lances dos campañas a la vez.\n\n"
-        "💡 Con RT por API + sin imágenes la campaña rinde bastante más; si "
-        "ves pocas acciones/min revisa que \"RT y likes por API\" esté activado."
+        "⚡ Los navegadores solo se abren cuando la API falla; con API primero "
+        "el techo lo marca este número (`MAX_WORKERS`).\n\n"
+        "🚀 Con API primero cada acción tarda ~1-3s; mantener «Navegadores "
+        "simultáneos» alto ya no es lo crítico. No lances dos campañas a la "
+        "vez."
     )
 
     with st.expander("⚙️ Opciones de velocidad", expanded=False):
@@ -1067,13 +1112,14 @@ def _cita_masiva():
             ),
         )
         rt_api = st.checkbox(
-            "⚡ RT y likes por API (sin abrir Chrome)",
+            "⚡ Publicar por API (RT, likes, posts, comentarios y citas)",
             value=True,
             key="act_rt_api",
             help=(
-                "Los retweets se hacen por HTTP con las cookies de la cuenta "
-                "(~1-2s vs ~20s con Chrome). Si la API falla, se reintenta "
-                "automáticamente con Chrome."
+                "Todas las acciones (RT, likes, posts, comentarios y citas) "
+                "se hacen por HTTP con las cookies de la cuenta (~1-3s vs "
+                "~20s con Chrome; variables API_PRIMERO/RT_POR_API). Si la "
+                "API falla, se reintenta automáticamente con Chrome."
             ),
         )
 
@@ -1227,6 +1273,8 @@ def _cita_masiva():
             sin_proxy=bool(sin_proxy),
             sin_imagenes=bool(sin_imagenes),
             rt_api=bool(rt_api),
+            api_primero=bool(rt_api),
+            max_workers=int(max_workers),
         )
 
         st.markdown("---")
@@ -1459,7 +1507,7 @@ def _por_roles():
 
     panel_noticias = _panel_contexto_noticias("act_roles")
 
-    col_dur, col_coh, col_nav, col_cool = st.columns(4)
+    col_dur, col_coh, col_nav, col_work, col_cool = st.columns(5)
     with col_dur:
         duracion_min = st.number_input(
             "Duración (min)", min_value=1, max_value=360, value=60, step=5,
@@ -1478,6 +1526,17 @@ def _por_roles():
             help=(
                 "Cada navegador ejecuta una cuenta a la vez. Recomendado: "
                 "4-6 en Railway (configurable con la variable MAX_BROWSERS)."
+            ),
+        )
+    with col_work:
+        max_workers = st.number_input(
+            "Trabajadores simultáneos (acciones en paralelo)",
+            min_value=6, max_value=30, value=8, step=1,
+            key="act_roles_workers",
+            help=(
+                "Acciones que el motor ejecuta a la vez cuando la API va "
+                "primero (variable MAX_WORKERS). Los navegadores solo se "
+                "abren cuando la API falla."
             ),
         )
     with col_cool:
@@ -1501,20 +1560,20 @@ def _por_roles():
         key="act_roles_pausa_comentario",
         help=(
             "X marca como probable spam los comentarios masivos al mismo "
-            "tweet. Esta pausa espacia las respuestas a la MISMA URL; con "
-            "varias URLs ancla casi no afecta la velocidad."
+            "tweet. Esta pausa espacia las respuestas a la MISMA URL; usa "
+            "2-5 tweets ancla para no frenar (con varias URLs casi no afecta "
+            "la velocidad)."
         ),
     )
 
     st.caption(
-        "⚡ Rendimiento estimado: con ~45-60s por acción, 4-6 navegadores "
-        "logran **~200-260 publicaciones/hora**; ajusta navegadores y "
-        "descanso según tus proxies. 🖥️ Recomendado: 4-6 navegadores en "
-        "Railway (cada Chrome ~300-500 MB). Más navegadores solo con RAM/GB "
-        "de sobra; subirlo de más provoca `tab crashed` y la campaña va más "
-        "lento. No lances dos campañas a la vez.\n\n"
-        "💡 Con RT por API + sin imágenes la campaña rinde bastante más; si "
-        "ves pocas acciones/min revisa que \"RT y likes por API\" esté activado."
+        "⚡ Los navegadores solo se abren cuando la API falla; con API primero "
+        "el techo lo marca «Trabajadores simultáneos» (`MAX_WORKERS`).\n\n"
+        "🚀 Con API primero cada acción tarda ~1-3s (RT, likes, posts, "
+        "comentarios y citas por HTTP); mantener «Navegadores simultáneos» "
+        "alto ya no es lo crítico. Usa 2-5 tweets ancla para no frenar la "
+        "pausa anti-spam de comentarios (15s por URL). No lances dos "
+        "campañas a la vez."
     )
 
     with st.expander("⚙️ Opciones de velocidad", expanded=False):
@@ -1540,13 +1599,14 @@ def _por_roles():
             ),
         )
         rt_api = st.checkbox(
-            "⚡ RT y likes por API (sin abrir Chrome)",
+            "⚡ Publicar por API (RT, likes, posts, comentarios y citas)",
             value=True,
             key="act_roles_rt_api",
             help=(
-                "Los retweets se hacen por HTTP con las cookies de la cuenta "
-                "(~1-2s vs ~20s con Chrome). Si la API falla, se reintenta "
-                "automáticamente con Chrome."
+                "Todas las acciones (RT, likes, posts, comentarios y citas) "
+                "se hacen por HTTP con las cookies de la cuenta (~1-3s vs "
+                "~20s con Chrome; variables API_PRIMERO/RT_POR_API). Si la "
+                "API falla, se reintenta automáticamente con Chrome."
             ),
         )
 
@@ -1688,8 +1748,8 @@ def _por_roles():
     if len(urls_previas) == 1 and comentario_posible:
         st.warning(
             "⚠️ Con una sola URL ancla todos los comentarios van al mismo "
-            "tweet y X los agrupa como 'Probable spam'. Pega 2-5 URLs o sube "
-            "la pausa."
+            "tweet y X los agrupa como 'Probable spam'. Usa 2-5 tweets ancla "
+            "para no frenar: pega 2-5 URLs o sube la pausa."
         )
 
     limpiar_contexto_al_terminar = st.checkbox(
@@ -1846,6 +1906,8 @@ def _por_roles():
             sin_proxy=bool(sin_proxy),
             sin_imagenes=bool(sin_imagenes),
             rt_api=bool(rt_api),
+            api_primero=bool(rt_api),
+            max_workers=int(max_workers),
         )
         _mostrar_resultados_roles(resultados)
 
