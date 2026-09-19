@@ -72,14 +72,36 @@ MENSAJE_SIN_SESION = (
     "brandea o carga credenciales antes de activar"
 )
 
+MENSAJE_SOLO_PASSWORD = (
+    "sin sesión: solo password; activa cookies/auth_token para "
+    "campañas rápidas"
+)
+
+
+def _mensaje_sin_sesion(cuenta) -> str:
+    """Mensaje de `sin_sesion` segun la credencial que falte.
+
+    Con `ACTIVACION_PERMITIR_PASSWORD=0` (default) una cuenta solo-password
+    recibe `MENSAJE_SOLO_PASSWORD` (accion clara); el resto conserva
+    `MENSAJE_SIN_SESION`. Nunca lanza.
+    """
+    try:
+        if _solo_password(cuenta):
+            return MENSAJE_SOLO_PASSWORD
+    except Exception:
+        pass
+    return MENSAJE_SIN_SESION
+
 
 def _sugerencia_sesion(n: int) -> str:
     """Accion sugerida para las cuentas filtradas por falta de sesion."""
     return (
         f"{n} cuenta(s) sin sesión: no tienen .pkl en "
-        "data/cookies/twitter/ ni cookies_json/auth_token/password en la BD. "
-        "Brandéalas (login manual) o importa el lote con auth_token/cookies/"
-        "password antes de activar; se saltaron sin abrir navegador."
+        "data/cookies/twitter/ ni cookies_json/auth_token en la BD (las que "
+        "solo tienen password se omiten por lentas: usa "
+        "ACTIVACION_PERMITIR_PASSWORD=1 para permitirlas). Brandéalas (login "
+        "manual) o importa el lote con auth_token/cookies antes de activar; "
+        "se saltaron sin abrir navegador."
     )
 
 
@@ -145,14 +167,40 @@ MENSAJE_SESION_INVALIDA = "sesión de X expirada: renueva cookies/login"
 # Detalles que indican que la SESION de la cuenta ya no sirve dentro de la
 # campana (cookies vencidas, sin credenciales, login fallido): esas cuentas se
 # sacan del orden de las rondas siguientes para no quemar intentos ni abrir
-# navegadores inutiles.
+# navegadores inutiles. Incluye las variantes de password/TOTP que antes no
+# entraban ("X pidio verificar identidad...", challenge sin resolver, etc.).
 _SENALES_SESION_CAIDA_POOL = (
     "sesión de x expirada",
     "sesion de x expirada",
     "login fallido",
+    "no se pudo iniciar sesion",
+    "no se pudo iniciar sesión",
+    "no se pudo iniciar sesion con password",
+    "auth_token/cookies inválidos",
+    "auth_token/cookies invalidos",
+    "auth_token inválido",
+    "auth_token invalido",
+    "verificar identidad",
+    "password/totp",
+    "no se pudo resolver",
     "sin cookies",
     "sin sesion",
     "sin sesión",
+)
+
+# Senales de AGOTAMIENTO DE RECURSOS del contenedor (hilos/RAM): si aparecen,
+# abrir MAS Chrome empeora el problema: el motor baja el limite de navegadores
+# y NO reintenta la accion.
+_SENALES_ERROR_RECURSOS = (
+    "can't start new thread",
+    "can not start new thread",
+    "resource temporarily unavailable",
+    "blockingioerror",
+    "cannot connect to chrome",
+    "chrome not reachable",
+    "session not created",
+    "tab crashed",
+    "errno 11",
 )
 
 
@@ -195,6 +243,23 @@ def _detalle_con_sesion(motivo) -> str:
         return ""
 
 
+def _detalle_login_fallido(motivo) -> str:
+    """Detalle de un login fallido con el marcador 'login fallido' garantizado.
+
+    Antes `getattr(bot, "ultimo_error", "") or "login fallido"` dejaba pasar
+    motivos de password/TOTP ("X pidio verificar identidad...") que NO estaban
+    en `_SENALES_SESION_CAIDA_POOL`: la cuenta no se sacaba del pool y gastaba
+    login lento en cada ronda. Aqui el detalle siempre lleva "login fallido"
+    (salvo sesion expirada, que se normaliza). Nunca lanza.
+    """
+    detalle = _detalle_con_sesion(motivo) or "login fallido"
+    if _es_error_sesion_invalida(detalle):
+        return detalle
+    if "login fallido" in detalle.lower():
+        return detalle
+    return f"login fallido: {detalle}"
+
+
 def _detalle_comentario(motivo) -> str:
     """Detalle legible del fallo de un comentario/respuesta.
 
@@ -228,6 +293,21 @@ def _es_error_driver_transitorio(detalle) -> bool:
     except Exception:
         return False
     return any(senal in texto for senal in _SENALES_ERROR_DRIVER_TRANSITORIO)
+
+
+def _es_error_recursos(detalle) -> bool:
+    """True si el detalle es agotamiento de recursos del contenedor.
+
+    Hilos ("can't start new thread", "resource temporarily unavailable"),
+    Chrome muerto ("cannot connect to chrome", "chrome not reachable",
+    "session not created", "tab crashed"). Con estos fallos NO se reintenta:
+    lanzar mas Chrome empeora el agotamiento. Tolera None; nunca lanza.
+    """
+    try:
+        texto = "" if detalle is None else str(detalle).lower()
+    except Exception:
+        return False
+    return any(senal in texto for senal in _SENALES_ERROR_RECURSOS)
 
 
 def _es_error_reintentable(detalle) -> bool:
@@ -279,11 +359,31 @@ def _api_primero_activo() -> bool:
     return str(valor).strip().lower() not in ("0", "false", "no", "off")
 
 
-def _tiene_credencial_sesion(cuenta) -> bool:
+def _permitir_password() -> bool:
+    """True si `ACTIVACION_PERMITIR_PASSWORD` permite cuentas solo-password.
+
+    Default 0 (desactivado): una cuenta con SOLO password (sin .pkl,
+    cookies_json ni auth_token) NO entra a campanas rapidas porque el login
+    con password/TOTP es lento y suele fallar; se reporta en `sin_sesion` sin
+    abrir navegador. Con la env en 1 se conserva el comportamiento anterior.
+    Nunca lanza.
+    """
+    try:
+        valor = os.environ.get("ACTIVACION_PERMITIR_PASSWORD")
+    except Exception:
+        return False
+    if valor is None or not str(valor).strip():
+        return False
+    return str(valor).strip().lower() not in ("0", "false", "no", "off")
+
+
+def _tiene_credencial_sesion(cuenta, permitir_password: bool = True) -> bool:
     """True si la cuenta tiene alguna credencial de sesion usable.
 
     Revisa, sin abrir ningun navegador: archivo .pkl en disco,
-    `cookies_json` con contenido y `auth_token` no vacio en la BD.
+    `cookies_json` con contenido y `auth_token` no vacio en la BD. La
+    `password` solo cuenta con `permitir_password=True` (ver
+    `_permitir_password`).
     """
     usuario = (getattr(cuenta, "usuario", "") or "").strip()
     if usuario:
@@ -306,17 +406,39 @@ def _tiene_credencial_sesion(cuenta) -> bool:
         return True
     elif auth:
         return True
+    if not permitir_password:
+        return False
     password = getattr(cuenta, "password", "")
     if isinstance(password, str):
         return bool(password.strip())
     return bool(password)
 
 
+def _solo_password(cuenta) -> bool:
+    """True si la cuenta SOLO tiene password (sin cookies/auth_token/.pkl).
+
+    Se usa para reportarle un mensaje claro en `sin_sesion`. Nunca lanza.
+    """
+    try:
+        if _tiene_credencial_sesion(cuenta, permitir_password=False):
+            return False
+        return bool(_tiene_credencial_sesion(cuenta, permitir_password=True))
+    except Exception:
+        return False
+
+
 def _partir_por_sesion(cuentas: list) -> tuple:
-    """Separa cuentas con credencial de sesion de las que no tienen ninguna."""
+    """Separa cuentas con credencial de sesion de las que no tienen ninguna.
+
+    Con `ACTIVACION_PERMITIR_PASSWORD=0` (default) las cuentas con SOLO
+    password NO cuentan como credencial: van a `sin_sesion` (login con
+    password/TOTP lento y propenso a fallar). Con la env en 1 se comporta como
+    antes. Nunca lanza.
+    """
+    permitir = _permitir_password()
     con, sin = [], []
     for cuenta in (cuentas or []):
-        (con if _tiene_credencial_sesion(cuenta) else sin).append(cuenta)
+        (con if _tiene_credencial_sesion(cuenta, permitir) else sin).append(cuenta)
     return con, sin
 
 
@@ -753,15 +875,20 @@ class MotorActivacion:
         }
         self._ultimo_comentario_url: dict = {}
         self.pausa_comentario_url_seg: float = 0.0
-        # Semaforo de NAVEGADORES: las acciones HTTP (API primero) no lo usan;
-        # solo los fallbacks a Selenium, que se limitan a `max_browsers` a la
-        # vez aunque haya muchos mas trabajadores en paralelo.
+        # GATE ADAPTATIVO de NAVEGADORES: las acciones HTTP (API primero) no lo
+        # usan; solo los fallbacks a Selenium, limitados a `_limite_navegadores`
+        # a la vez aunque haya muchos mas trabajadores en paralelo. Si el
+        # contenedor se queda sin hilos/RAM, `_reducir_navegadores` baja el
+        # limite a la mitad y no se reintenta en cascada.
         try:
-            self._sem_browser = threading.Semaphore(
-                max(1, int(self.max_concurrente or 1))
-            )
+            self._limite_navegadores = max(1, int(self.max_concurrente or 1))
         except Exception:
-            self._sem_browser = threading.Semaphore(1)
+            self._limite_navegadores = 1
+        self._navegadores_activos = 0
+        self._navegadores_cond = threading.Condition()
+        # Marca del ultimo agotamiento de recursos (None = nunca): durante
+        # `_VENTANA_RECURSOS_SEG` no se reintentan acciones.
+        self._recursos_agotados = None
         # Cuentas con la sesion caida DENTRO de esta campana: se descartan del
         # orden de las rondas siguientes (no cuentan como fallo por ronda).
         self._sesiones_caidas: set = set()
@@ -770,12 +897,74 @@ class MotorActivacion:
         # tweet que describe.
         self._ancla_por_cuenta: dict = {}
 
+    _VENTANA_RECURSOS_SEG = 30.0
+
+    def _adquirir_navegador(self) -> None:
+        """Reserva un cupo de navegador (espera si el limite esta lleno)."""
+        with self._navegadores_cond:
+            while self._navegadores_activos >= self._limite_navegadores:
+                self._navegadores_cond.wait(timeout=0.5)
+            self._navegadores_activos += 1
+
+    def _liberar_navegador(self) -> None:
+        """Devuelve un cupo de navegador (sin negativos; despierta waiters)."""
+        with self._navegadores_cond:
+            if self._navegadores_activos > 0:
+                self._navegadores_activos -= 1
+            self._navegadores_cond.notify_all()
+
+    def _reducir_navegadores(self, motivo: str = "") -> int:
+        """Reduce el limite de navegadores a la mitad (minimo 1).
+
+        Se llama con fallos de RECURSOS ("can't start new thread", "cannot
+        connect to chrome", tab crashed...): marcar `_recursos_agotados` evita
+        reintentos en cascada. Loguea WARNING. Devuelve el limite nuevo. Nunca
+        lanza.
+        """
+        try:
+            with self._navegadores_cond:
+                previo = self._limite_navegadores
+                nuevo = max(1, int(previo) // 2)
+                self._recursos_agotados = time.monotonic()
+                if nuevo < previo:
+                    self._limite_navegadores = nuevo
+                self._navegadores_cond.notify_all()
+        except Exception:
+            return 1
+        texto = str(motivo or "")[:120]
+        if nuevo < previo:
+            logger.warning(
+                f"Activacion: recursos agotados ({texto}); navegadores "
+                f"{previo} -> {nuevo} (sin reintento en cascada)"
+            )
+        else:
+            logger.warning(
+                f"Activacion: recursos agotados ({texto}); navegadores ya en "
+                f"el minimo ({previo})"
+            )
+        return self._limite_navegadores
+
+    def _recursos_recientes(self, ventana: float = None) -> bool:
+        """True si hubo agotamiento de recursos hace menos de `ventana` seg.
+
+        Mientras sea True no se reintentan acciones (mas Chrome empeoraria).
+        Nunca lanza.
+        """
+        try:
+            marca = self._recursos_agotados
+            if not marca:
+                return False
+            limite = self._VENTANA_RECURSOS_SEG if ventana is None else float(ventana)
+            return (time.monotonic() - float(marca)) < limite
+        except Exception:
+            return False
+
     def _n_workers(self) -> int:
         """Trabajadores del pool de rondas: env `MAX_WORKERS`.
 
-        Default `max(6, max_browsers)`: las acciones API corren en paralelo sin
-        Chrome y los fallbacks quedan limitados por `_sem_browser`. Un valor
-        raro en la env se ignora (nunca lanza).
+        Default `max(12, max_browsers)`: las acciones API corren en paralelo
+        sin Chrome (~1-2s) y los fallbacks quedan limitados por el gate de
+        navegadores. Un valor raro en la env se ignora (nunca lanza).
         """
         try:
             valor = os.environ.get("MAX_WORKERS")
@@ -784,9 +973,9 @@ class MotorActivacion:
         except Exception:
             pass
         try:
-            return max(6, int(self.max_concurrente or 1))
+            return max(12, int(self.max_concurrente or 1))
         except Exception:
-            return 6
+            return 12
 
     def _marcar_sesion_caida(self, usuario) -> None:
         """Anota la cuenta como 'sesion caida' para las rondas siguientes."""
@@ -1451,7 +1640,7 @@ class MotorActivacion:
         """Ejecuta acciones en rondas hasta agotar `duracion_min`.
 
         Worker-pool con cola compartida: `self._n_workers()` trabajadores
-        (`MAX_WORKERS`, default `max(6, max_browsers)`) toman cuentas de un
+        (`MAX_WORKERS`, default `max(12, max_browsers)`) toman cuentas de un
         orden barajado; al agotarlo, regeneran los textos de la
         siguiente ronda, vuelven a barajar y reinician el cursor. Las cuentas
         que no alcanzan a ejecutar antes del deadline se omiten sin abrir
@@ -1663,7 +1852,7 @@ class MotorActivacion:
                 if not bot.login_con_cookies():
                     motivo = getattr(bot, "ultimo_error", "") or "login fallido"
                     logger.warning(f"Login fallido para @{cuenta.usuario}: {motivo}")
-                    detalle = _detalle_con_sesion(motivo) or "login fallido"
+                    detalle = _detalle_login_fallido(motivo)
                     return (cuenta.usuario, False, detalle[:120], "")
 
             res = bot.solo_retwittear(
@@ -1702,24 +1891,31 @@ class MotorActivacion:
 
         Si el primer intento falla por un error transitorio de
         driver/navegador, espera 0.5-1.5s y reintenta UNA vez con un bot nuevo.
+        Si el fallo es de RECURSOS (sin hilos/RAM) reduce el limite de
+        navegadores y NO reintenta (mas Chrome empeoraria).
 
         Devuelve una tupla de 4 elementos:
         (usuario, exito, detalle, url_publicada).
         """
-        if not _tiene_credencial_sesion(cuenta):
-            return (cuenta.usuario, False, MENSAJE_SIN_SESION[:120], "")
+        if not _tiene_credencial_sesion(cuenta, _permitir_password()):
+            return (cuenta.usuario, False, _mensaje_sin_sesion(cuenta)[:120], "")
         if retardo > 0:
             time.sleep(retardo)
 
         resultado = self._intentar_quote_rt(cuenta, urls, texto, dar_like)
-        if not resultado[1] and _es_error_reintentable(resultado[2]):
-            pausa = random.uniform(0.5, 1.5)
-            logger.warning(
-                f"Reintento de quote-RT para @{cuenta.usuario} por error de "
-                f"driver/navegador ({resultado[2]}); espero {pausa:.1f}s"
-            )
-            time.sleep(pausa)
-            resultado = self._intentar_quote_rt(cuenta, urls, texto, dar_like)
+        if not resultado[1]:
+            detalle = resultado[2]
+            if _es_error_recursos(detalle):
+                # Recursos agotados: bajar el limite y NO reintentar.
+                self._reducir_navegadores(detalle)
+            elif _es_error_reintentable(detalle) and not self._recursos_recientes():
+                pausa = random.uniform(0.5, 1.5)
+                logger.warning(
+                    f"Reintento de quote-RT para @{cuenta.usuario} por error de "
+                    f"driver/navegador ({detalle}); espero {pausa:.1f}s"
+                )
+                time.sleep(pausa)
+                resultado = self._intentar_quote_rt(cuenta, urls, texto, dar_like)
         if not resultado[1]:
             self._registrar_sesion_caida(resultado[0], resultado[2])
         return resultado
@@ -1858,9 +2054,10 @@ class MotorActivacion:
         - "rt": retweet simple (sin cita); puede dar like.
 
         API PRIMERO: rt/like/hashtags/comentario/cita se intentan por HTTP
-        (`TwitterAPI.accion_rapida`) SIN abrir navegador ni consumir el
-        semaforo; solo si la API no puede/falla se usa Selenium, limitado por
-        `self._sem_browser` a `max_browsers` a la vez.
+        (`TwitterAPI.accion_rapida`) SIN abrir navegador ni consumir el gate;
+        solo si la API no puede/falla se usa Selenium, limitado por
+        `_limite_navegadores` a la vez (adaptativo: baja si hay agotamiento de
+        recursos).
 
         Devuelve una tupla de 5 elementos:
         (usuario, rol, exito, detalle, url).
@@ -1887,7 +2084,7 @@ class MotorActivacion:
                         f"{url_objetivo}"
                     )
 
-            # --- API PRIMERO (sin navegador ni semaforo). ---
+            # --- API PRIMERO (sin navegador ni gate). ---
             resultado_api = self._probar_api_rol(
                 cuenta, rol, url_objetivo, texto, dar_like
             )
@@ -1901,8 +2098,8 @@ class MotorActivacion:
                     "like sin soporte por API en este momento", url_objetivo,
                 )
 
-            # --- Selenium (fallback): solo `max_browsers` a la vez. ---
-            self._sem_browser.acquire()
+            # --- Selenium (fallback): gate de navegadores. ---
+            self._adquirir_navegador()
             try:
                 bot = TwitterBot(cuenta.usuario)
                 # Sesion rapida por CDP: inyecta las cookies sin navegar. Si no
@@ -1922,7 +2119,7 @@ class MotorActivacion:
                     if not bot.login_con_cookies():
                         motivo = getattr(bot, "ultimo_error", "") or "login fallido"
                         logger.warning(f"Login fallido para @{cuenta.usuario}: {motivo}")
-                        detalle = _detalle_con_sesion(motivo) or "login fallido"
+                        detalle = _detalle_login_fallido(motivo)
                         return (cuenta.usuario, rol, False, detalle[:120], url_objetivo)
 
                 if rol == "cita":
@@ -1993,7 +2190,7 @@ class MotorActivacion:
 
             finally:
                 self._cerrar_bot(cuenta, bot)
-                self._sem_browser.release()
+                self._liberar_navegador()
 
         except Exception as e:
             logger.error(f"Error en @{cuenta.usuario} (rol {rol}): {e}")
@@ -2009,25 +2206,34 @@ class MotorActivacion:
 
         Si el primer intento falla por un error transitorio de
         driver/navegador, espera 0.5-1.5s y reintenta UNA vez con un bot nuevo.
+        Si el fallo es de RECURSOS (sin hilos/RAM) o ya se redujo el limite
+        hace <30s (`_recursos_agotados`), NO se reintenta: mas Chrome empeora
+        el agotamiento.
 
         Devuelve una tupla de 5 elementos:
         (usuario, rol, exito, detalle, url).
         Nunca lanza: cualquier error se reporta como fallo.
         """
-        if not _tiene_credencial_sesion(cuenta):
-            return (cuenta.usuario, rol, False, MENSAJE_SIN_SESION[:120], "")
+        if not _tiene_credencial_sesion(cuenta, _permitir_password()):
+            return (cuenta.usuario, rol, False, _mensaje_sin_sesion(cuenta)[:120], "")
         if retardo > 0:
             time.sleep(retardo)
 
         resultado = self._intentar_accion_rol(cuenta, rol, urls, texto, dar_like)
-        if not resultado[2] and _es_error_reintentable(resultado[3]):
-            pausa = random.uniform(0.5, 1.5)
-            logger.warning(
-                f"Reintento de acción '{rol}' para @{cuenta.usuario} por error "
-                f"de driver/navegador ({resultado[3]}); espero {pausa:.1f}s"
-            )
-            time.sleep(pausa)
-            resultado = self._intentar_accion_rol(cuenta, rol, urls, texto, dar_like)
+        if not resultado[2]:
+            detalle = resultado[3]
+            if _es_error_recursos(detalle):
+                # Recursos del contenedor agotados: bajar el limite y NO
+                # reintentar; el worker sigue con otra cuenta.
+                self._reducir_navegadores(detalle)
+            elif _es_error_reintentable(detalle) and not self._recursos_recientes():
+                pausa = random.uniform(0.5, 1.5)
+                logger.warning(
+                    f"Reintento de acción '{rol}' para @{cuenta.usuario} por error "
+                    f"de driver/navegador ({detalle}); espero {pausa:.1f}s"
+                )
+                time.sleep(pausa)
+                resultado = self._intentar_accion_rol(cuenta, rol, urls, texto, dar_like)
         if not resultado[2]:
             # Sesion caida (cookies vencidas/sin credenciales): se omite en las
             # rondas siguientes de la campana (conteo unico, sin abrir Chrome).
@@ -2109,19 +2315,20 @@ class MotorActivacion:
 
         resultados = [
             {"usuario": c.usuario, "ok": False,
-             "detalle": MENSAJE_SIN_SESION[:120], "url": ""}
+             "detalle": _mensaje_sin_sesion(c)[:120], "url": ""}
             for c in sin_sesion
         ]
         for cuenta in sin_sesion:
+            mensaje_sin_sesion = _mensaje_sin_sesion(cuenta)[:120]
             with self._lock:
                 self.progreso["hechas"] += 1
                 self.progreso["fallidas"] += 1
                 self._registrar_evento_locked(
-                    cuenta.usuario, False, MENSAJE_SIN_SESION[:120], 1, "", ""
+                    cuenta.usuario, False, mensaje_sin_sesion, 1, "", ""
                 )
             registrar_accion(
                 cuenta.usuario, "activacion", "fallido", "",
-                MENSAJE_SIN_SESION[:120],
+                mensaje_sin_sesion,
             )
             if callback:
                 callback(
@@ -2551,7 +2758,7 @@ class MotorActivacion:
                 "usuario": cuenta.usuario,
                 "rol": rol,
                 "ok": False,
-                "detalle": MENSAJE_SIN_SESION[:120],
+                "detalle": _mensaje_sin_sesion(cuenta)[:120],
                 "url": "",
             })
 
@@ -2600,13 +2807,14 @@ class MotorActivacion:
                 "eventos": [],
             }
         for cuenta in sin_sesion:
+            mensaje_sin_sesion = _mensaje_sin_sesion(cuenta)[:120]
             registrar_accion(
                 cuenta.usuario, "activacion", "fallido", "",
-                MENSAJE_SIN_SESION[:120],
+                mensaje_sin_sesion,
             )
             with self._lock:
                 self._registrar_evento_locked(
-                    cuenta.usuario, False, MENSAJE_SIN_SESION[:120], 1,
+                    cuenta.usuario, False, mensaje_sin_sesion, 1,
                     rol_de.get(cuenta.usuario, ""), "",
                 )
             if callback:
@@ -2999,6 +3207,7 @@ class MotorActivacion:
             }
 
         for cuenta in sin_sesion:
+            mensaje_sin_sesion = _mensaje_sin_sesion(cuenta)[:120]
             for slot in range(9):
                 if slot < 3:
                     rol_slot, tipo_slot = "hashtags", "post"
@@ -3015,19 +3224,19 @@ class MotorActivacion:
                     "tipo": tipo_slot,
                     "slot": slot % 3,
                     "ok": False,
-                    "detalle": MENSAJE_SIN_SESION[:120],
+                    "detalle": mensaje_sin_sesion,
                     "url": "",
                 })
                 with self._lock:
                     self.progreso["hechas"] += 1
                     self.progreso["fallidas"] += 1
                     self._registrar_evento_locked(
-                        cuenta.usuario, False, MENSAJE_SIN_SESION[:120], 1,
+                        cuenta.usuario, False, mensaje_sin_sesion, 1,
                         rol_slot, "",
                     )
                 registrar_accion(
                     cuenta.usuario, "campana_3_3_3", "fallido", "",
-                    MENSAJE_SIN_SESION[:120],
+                    mensaje_sin_sesion,
                 )
                 if callback:
                     try:

@@ -63,6 +63,15 @@ puede limpiar el contexto con el checkbox "🧹 Limpiar el contexto" (default
 activo; aplica en el siguiente rerun y nunca toca URLs, hashtags, menciones,
 cuentas ni resultados). La pestana B incluye ademas una "Pausa entre
 comentarios al MISMO tweet" (anti-spam) y un aviso cuando solo hay 1 URL ancla.
+
+Opciones de velocidad (ambas pestanas de activacion): el expander "⚙️ Opciones
+de velocidad" expone `TWITTER_SIN_PROXY`, `CHROME_SIN_IMAGENES`,
+`API_PRIMERO`/`RT_POR_API`, `MAX_WORKERS` (trabajadores en paralelo, default
+12) y `ACTIVACION_PERMITIR_PASSWORD` (login con password/TOTP en campanas,
+default OFF, lento). Los disyuntores de la API (`API_BREAKER_FALLOS`,
+`API_BREAKER_SEG`) no se editan en la UI: se documentan en un caption y se
+ajustan por env. En Railway NO conviene pasar de 3-4 "Navegadores
+simultaneos": si Chrome crashea, la campana se frena en cascada.
 """
 import os
 import threading
@@ -496,24 +505,32 @@ def _lanzar_con_progreso_o_limpiar(lanzar, motor, duracion_min: int, repetir: bo
 # antes de lanzar la campana y se restauran al terminar).
 #   - `RT_POR_API` se mantiene como alias/compat de `API_PRIMERO` (maestro).
 #   - `MAX_WORKERS` es numerico: trabajadores en paralelo del motor.
+#   - `ACTIVACION_PERMITIR_PASSWORD`: "1" permite el login lento con
+#     password/TOTP cuando la cuenta no tiene cookies validas (default "0").
+# Los disyuntores de API (`API_BREAKER_FALLOS`/`API_BREAKER_SEG`) NO se
+# escriben desde aqui: solo se documentan en la UI y se ajustan por env.
 _VARS_VELOCIDAD = (
     "TWITTER_SIN_PROXY",
     "CHROME_SIN_IMAGENES",
     "RT_POR_API",
     "API_PRIMERO",
     "MAX_WORKERS",
+    "ACTIVACION_PERMITIR_PASSWORD",
 )
 
 
 def _aplicar_opciones_velocidad(sin_proxy: bool, sin_imagenes: bool,
                                 rt_api: bool, api_primero: bool = None,
-                                max_workers: int = 8) -> dict:
+                                max_workers: int = 8,
+                                permitir_password: bool = False) -> dict:
     """Escribe las env de velocidad y devuelve sus valores PREVIOS.
 
     Convencion "1"/"0" para los interruptores; `MAX_WORKERS` se escribe como
     entero. `RT_POR_API` y `API_PRIMERO` son el MISMO interruptor (alias/
     compatibilidad): si cualquiera de los dos esta activo, ambos van a "1".
     Si no se pasa `api_primero`, se usa el valor de `rt_api` (llamadas viejas).
+    `permitir_password` (default False = OFF) controla
+    `ACTIVACION_PERMITIR_PASSWORD`.
 
     Los valores previos (o `None` si la variable no existia) se devuelven para
     poder restaurarlos con `_restaurar_opciones_velocidad` al terminar la
@@ -533,6 +550,9 @@ def _aplicar_opciones_velocidad(sin_proxy: bool, sin_imagenes: bool,
         "RT_POR_API": api_activa,
         "API_PRIMERO": api_activa,
         "MAX_WORKERS": workers,
+        "ACTIVACION_PERMITIR_PASSWORD": (
+            "1" if permitir_password else "0"
+        ),
     }
     previos = {clave: os.environ.get(clave) for clave in _VARS_VELOCIDAD}
     for clave, valor in valores.items():
@@ -543,8 +563,9 @@ def _aplicar_opciones_velocidad(sin_proxy: bool, sin_imagenes: bool,
 def _restaurar_opciones_velocidad(previos: dict) -> None:
     """Restaura las env a `previos`; si no existian, las ELIMINA.
 
-    Nunca lanza: corre en el `finally` de la campana y no debe tapar el error
-    original si algo falla al restaurar.
+    Cubre TODAS las variables de `_VARS_VELOCIDAD` (incluida
+    `ACTIVACION_PERMITIR_PASSWORD`). Nunca lanza: corre en el `finally` de la
+    campana y no debe tapar el error original si algo falla al restaurar.
     """
     for clave, valor in (previos or {}).items():
         try:
@@ -556,23 +577,47 @@ def _restaurar_opciones_velocidad(previos: dict) -> None:
             pass
 
 
+def _caption_disyuntores_api() -> None:
+    """Caption comun (ambas pestanas) sobre el disyuntor de la API.
+
+    El motor de API usa un disyuntor: si X rechaza las peticiones (anti-bot o
+    limite), deja de intentar la API por un tiempo y pasa a Selenium solo. No
+    se expone en la UI para no complicarla; si el proceso ya trae overrides por
+    env, se muestran al final del caption como estado.
+    """
+    overrides = []
+    for var in ("API_BREAKER_FALLOS", "API_BREAKER_SEG"):
+        valor = (os.environ.get(var) or "").strip()
+        if valor:
+            overrides.append(f"`{var}={valor}`")
+    sufijo = (" Ahora por env: " + " · ".join(overrides) + ".") if overrides else ""
+    st.caption(
+        "🧯 Si X rechaza la API (anti-bot/límite), el sistema deja de "
+        "intentarla y pasa a Selenium automáticamente; puedes ajustar "
+        "`API_BREAKER_FALLOS`/`API_BREAKER_SEG` por env." + sufijo
+    )
+
+
 def _lanzar_con_opciones_velocidad(lanzar, motor, duracion_min: int,
                                    repetir: bool, prefix: str, limpiar: bool,
                                    sin_proxy: bool, sin_imagenes: bool,
                                    rt_api: bool, api_primero: bool = None,
-                                   max_workers: int = 8) -> dict:
+                                   max_workers: int = 8,
+                                   permitir_password: bool = False) -> dict:
     """`_lanzar_con_progreso_o_limpiar` aplicando y restaurando la velocidad.
 
     Las env (`TWITTER_SIN_PROXY`, `CHROME_SIN_IMAGENES`, `RT_POR_API`,
-    `API_PRIMERO` y `MAX_WORKERS`) se escriben ANTES de lanzar (el motor las
-    lee al abrir cada navegador/hacer cada peticion) y se restauran a sus
-    valores previos SIEMPRE al volver: exito, guard de campana unica que
-    devuelve `{}` o excepcion (el `finally` re-lanza el error original tal
-    cual). `api_primero=None` usa el valor de `rt_api` (alias/compat).
+    `API_PRIMERO`, `MAX_WORKERS` y `ACTIVACION_PERMITIR_PASSWORD`) se escriben
+    ANTES de lanzar (el motor las lee al abrir cada navegador/hacer cada
+    peticion) y se restauran a sus valores previos SIEMPRE al volver: exito,
+    guard de campana unica que devuelve `{}` o excepcion (el `finally` re-lanza
+    el error original tal cual). `api_primero=None` usa el valor de `rt_api`
+    (alias/compat).
     """
     previos = _aplicar_opciones_velocidad(
         sin_proxy, sin_imagenes, rt_api,
         api_primero=api_primero, max_workers=max_workers,
+        permitir_password=permitir_password,
     )
     try:
         return _lanzar_con_progreso_o_limpiar(
@@ -1065,28 +1110,32 @@ def _cita_masiva():
             min_value=1, max_value=30, value=_navegadores_default(), step=1,
             key="act_nav",
             help=(
-                "Cada navegador ejecuta una cuenta a la vez. Recomendado: "
-                "4-6 en Railway (configurable con la variable MAX_BROWSERS)."
+                "Cada navegador ejecuta una cuenta a la vez. En Railway NO "
+                "conviene pasar de 3-4: cada Chrome consume RAM/CPU/hilos y, "
+                "si uno crashea, la campaña se frena en cascada (variable "
+                "MAX_BROWSERS)."
             ),
         )
     with col5:
         max_workers = st.number_input(
             "Trabajadores simultáneos (acciones en paralelo)",
-            min_value=6, max_value=30, value=8, step=1,
+            min_value=6, max_value=30, value=12, step=1,
             key="act_workers",
             help=(
                 "Acciones que el motor ejecuta a la vez cuando la API va "
-                "primero (variable MAX_WORKERS). Los navegadores solo se "
-                "abren cuando la API falla."
+                "primero (variable MAX_WORKERS): con API primero este es el "
+                "paralelismo REAL; súbelo a 16-24 si la API responde. Los "
+                "navegadores solo se abren cuando la API falla."
             ),
         )
 
     st.caption(
-        "⚡ Los navegadores solo se abren cuando la API falla; con API primero "
-        "el techo lo marca este número (`MAX_WORKERS`).\n\n"
-        "🚀 Con API primero cada acción tarda ~1-3s; mantener «Navegadores "
-        "simultáneos» alto ya no es lo crítico. No lances dos campañas a la "
-        "vez."
+        "⚡ Con API primero este es el paralelismo real: «Trabajadores "
+        "simultáneos» (`MAX_WORKERS`, default 12) — súbelo a 16-24 si la API "
+        "responde.\n\n"
+        "🖥️ En Railway NO conviene pasar de **3-4 navegadores**: los "
+        "navegadores solo se abren cuando la API falla y, si Chrome crashea, "
+        "todo se frena en cascada. No lances dos campañas a la vez."
     )
 
     with st.expander("⚙️ Opciones de velocidad", expanded=False):
@@ -1122,6 +1171,19 @@ def _cita_masiva():
                 "API falla, se reintenta automáticamente con Chrome."
             ),
         )
+        permitir_password = st.checkbox(
+            "🔑 Permitir login con password/TOTP en campañas (lento)",
+            value=False,
+            key="act_permitir_password",
+            help=(
+                "Si una cuenta no tiene cookies válidas, permite el login con "
+                "la contraseña guardada (+TOTP) durante la campaña. Es MUY "
+                "lento (~20-40s por cuenta); déjalo apagado salvo lotes "
+                "pequeños o cuentas recién creadas (variable "
+                "ACTIVACION_PERMITIR_PASSWORD)."
+            ),
+        )
+        _caption_disyuntores_api()
 
     opciones_seccion = [OPCION_TODAS_SECCIONES] + [
         etiqueta_seccion(clave) for clave in SECCIONES
@@ -1275,6 +1337,7 @@ def _cita_masiva():
             rt_api=bool(rt_api),
             api_primero=bool(rt_api),
             max_workers=int(max_workers),
+            permitir_password=bool(permitir_password),
         )
 
         st.markdown("---")
@@ -1524,19 +1587,22 @@ def _por_roles():
             min_value=1, max_value=30, value=_navegadores_default(), step=1,
             key="act_roles_nav",
             help=(
-                "Cada navegador ejecuta una cuenta a la vez. Recomendado: "
-                "4-6 en Railway (configurable con la variable MAX_BROWSERS)."
+                "Cada navegador ejecuta una cuenta a la vez. En Railway NO "
+                "conviene pasar de 3-4: cada Chrome consume RAM/CPU/hilos y, "
+                "si uno crashea, la campaña se frena en cascada (variable "
+                "MAX_BROWSERS)."
             ),
         )
     with col_work:
         max_workers = st.number_input(
             "Trabajadores simultáneos (acciones en paralelo)",
-            min_value=6, max_value=30, value=8, step=1,
+            min_value=6, max_value=30, value=12, step=1,
             key="act_roles_workers",
             help=(
                 "Acciones que el motor ejecuta a la vez cuando la API va "
-                "primero (variable MAX_WORKERS). Los navegadores solo se "
-                "abren cuando la API falla."
+                "primero (variable MAX_WORKERS): con API primero este es el "
+                "paralelismo REAL; súbelo a 16-24 si la API responde. Los "
+                "navegadores solo se abren cuando la API falla."
             ),
         )
     with col_cool:
@@ -1551,6 +1617,15 @@ def _por_roles():
             ),
         )
 
+    st.caption(
+        "⚡ Con API primero este es el paralelismo real: «Trabajadores "
+        "simultáneos» (`MAX_WORKERS`, default 12) — súbelo a 16-24 si la API "
+        "responde.\n\n"
+        "🖥️ En Railway NO conviene pasar de **3-4 navegadores**: los "
+        "navegadores solo se abren cuando la API falla y, si Chrome crashea, "
+        "todo se frena en cascada."
+    )
+
     pausa_comentario = st.number_input(
         "Pausa entre comentarios al MISMO tweet (s)",
         min_value=0,
@@ -1560,19 +1635,19 @@ def _por_roles():
         key="act_roles_pausa_comentario",
         help=(
             "X marca como probable spam los comentarios masivos al mismo "
-            "tweet. Esta pausa espacia las respuestas a la MISMA URL; usa "
-            "2-5 tweets ancla para no frenar (con varias URLs casi no afecta "
-            "la velocidad)."
+            "tweet. Esta pausa espacia las respuestas a la MISMA URL; con 1 "
+            "sola URL los comentarios van en fila: usa 2-5 tweets ancla para "
+            "no frenar (con varias URLs casi no afecta la velocidad)."
         ),
     )
 
     st.caption(
-        "⚡ Los navegadores solo se abren cuando la API falla; con API primero "
-        "el techo lo marca «Trabajadores simultáneos» (`MAX_WORKERS`).\n\n"
+        "⚡ Con API primero el techo lo marca «Trabajadores simultáneos» "
+        "(`MAX_WORKERS`), no los navegadores (solo se abren cuando la API "
+        "falla).\n\n"
         "🚀 Con API primero cada acción tarda ~1-3s (RT, likes, posts, "
-        "comentarios y citas por HTTP); mantener «Navegadores simultáneos» "
-        "alto ya no es lo crítico. Usa 2-5 tweets ancla para no frenar la "
-        "pausa anti-spam de comentarios (15s por URL). No lances dos "
+        "comentarios y citas por HTTP). Usa 2-5 tweets ancla para no frenar "
+        "la pausa anti-spam de comentarios (15s por URL). No lances dos "
         "campañas a la vez."
     )
 
@@ -1609,6 +1684,19 @@ def _por_roles():
                 "API falla, se reintenta automáticamente con Chrome."
             ),
         )
+        permitir_password = st.checkbox(
+            "🔑 Permitir login con password/TOTP en campañas (lento)",
+            value=False,
+            key="act_roles_permitir_password",
+            help=(
+                "Si una cuenta no tiene cookies válidas, permite el login con "
+                "la contraseña guardada (+TOTP) durante la campaña. Es MUY "
+                "lento (~20-40s por cuenta); déjalo apagado salvo lotes "
+                "pequeños o cuentas recién creadas (variable "
+                "ACTIVACION_PERMITIR_PASSWORD)."
+            ),
+        )
+        _caption_disyuntores_api()
 
     roles_aleatorios = st.checkbox(
         "🎲 Rol aleatorio por cuenta en cada ronda",
@@ -1908,6 +1996,7 @@ def _por_roles():
             rt_api=bool(rt_api),
             api_primero=bool(rt_api),
             max_workers=int(max_workers),
+            permitir_password=bool(permitir_password),
         )
         _mostrar_resultados_roles(resultados)
 
@@ -1920,7 +2009,9 @@ def render(usuario: dict):
 
     st.info(
         f"Concurrencia máxima de navegadores: **{settings.max_browsers}** "
-        f"(configurable con la variable `MAX_BROWSERS`). Headless: **{settings.headless}**."
+        f"(en Railway NO conviene pasar de 3-4: si Chrome crashea, la campaña "
+        f"se frena; configurable con `MAX_BROWSERS`). "
+        f"Headless: **{settings.headless}**."
     )
 
     tabs = st.tabs(["🎯 Cita masiva", "🗂️ Por roles (subcuentas)", "📋 Campaña 3+3+3"])

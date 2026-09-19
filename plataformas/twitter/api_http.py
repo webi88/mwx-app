@@ -27,6 +27,25 @@ def _env_activo(nombre: str, por_defecto: bool = False) -> bool:
     return valor.strip().lower() not in ("0", "false", "no", "off")
 
 
+def _env_float(nombre: str, por_defecto: float) -> float:
+    """Lee un float de entorno (default ante ausencia/valor raro). Nunca lanza."""
+    try:
+        valor = os.environ.get(nombre)
+        if valor is None or not str(valor).strip():
+            return float(por_defecto)
+        return float(str(valor).strip())
+    except Exception:
+        return float(por_defecto)
+
+
+def _env_int(nombre: str, por_defecto: int) -> int:
+    """Lee un int de entorno (default ante ausencia/valor raro). Nunca lanza."""
+    try:
+        return int(_env_float(nombre, por_defecto))
+    except Exception:
+        return int(por_defecto)
+
+
 # --------------------------------------------------------------------------- #
 # Descubrimiento/cache de queryIds GraphQL
 # --------------------------------------------------------------------------- #
@@ -49,40 +68,259 @@ _QUERYIDS_LOCK = threading.Lock()
 _QUERYIDS_DESCUBRIMIENTO_LOCK = threading.Lock()
 _QUERYIDS_ARCHIVO = "data/twitter_queryids.json"
 
-# Features estandar del cliente web. X tolera campos de mas; incluir el set
-# completo evita que GraphQL rechace CreateTweet por "features" incompletas.
-_FEATURES_CREATE_TWEET = {
-    "rweb_tipjar_consumption_enabled": True,
+# Features del cliente web ACTUAL para los endpoints de ESCRITURA. X A/B
+# rechaza con 422/validation los sets incompletos: antes CreateRetweet y
+# FavoriteTweet mandaban solo `_FEATURES_BASICAS` (3 flags) y X los tumbaba
+# ("must be defined graphql_validation_failed"). Se usa el mismo set completo
+# en CreateRetweet/FavoriteTweet/CreateTweet (X tolera campos de mas).
+_FEATURES_ESCRITURA = {
     "responsive_web_graphql_exclude_directive_enabled": True,
     "verified_phone_label_enabled": False,
-    "creator_subscriptions_tweet_preview_api_enabled": True,
-    "responsive_web_graphql_timeline_navigation_enabled": True,
-    "responsive_web_graphql_skip_user_profile_image_extensions_enabled": False,
-    "communities_web_enable_tweet_community_results_fetch": True,
-    "c9s_tweet_anatomy_moderator_badge_enabled": True,
-    "articles_preview_enabled": True,
+    "rweb_tipjar_consumption_enabled": True,
+    "longform_notetweets_consumption_enabled": True,
     "responsive_web_edit_tweet_api_enabled": True,
     "graphql_is_translatable_rweb_tweet_is_translatable_enabled": True,
     "view_counts_everywhere_api_enabled": True,
-    "longform_notetweets_consumption_enabled": True,
     "responsive_web_twitter_article_tweet_consumption_enabled": True,
     "tweet_awards_web_tipping_enabled": False,
-    "creator_subscriptions_quote_tweet_preview_enabled": False,
     "freedom_of_speech_not_reach_fetch_enabled": True,
     "standardized_nudges_misinfo": True,
     "tweet_with_visibility_results_prefer_gql_limited_actions_policy_enabled": True,
     "longform_notetweets_rich_text_read_enabled": True,
     "longform_notetweets_inline_media_enabled": True,
+    "responsive_web_media_download_video_enabled": False,
+    "responsive_web_graphql_skip_user_profile_image_extensions_enabled": False,
+    "responsive_web_graphql_timeline_navigation_enabled": True,
     "responsive_web_enhance_cards_enabled": False,
+    "c9s_tweet_anatomy_moderator_badge_enabled": True,
+    # Extras que ya mandaba CreateTweet (se conservan).
+    "creator_subscriptions_tweet_preview_api_enabled": True,
+    "communities_web_enable_tweet_community_results_fetch": True,
+    "articles_preview_enabled": True,
+    "creator_subscriptions_quote_tweet_preview_enabled": False,
 }
+# Alias retrocompatibles: el codigo/tests viejos que importan las constantes
+# anteriores siguen funcionando (ahora apuntan al set completo).
+_FEATURES_CREATE_TWEET = _FEATURES_ESCRITURA
+_FEATURES_BASICAS = _FEATURES_ESCRITURA
 
-# Features minimas que aceptan CreateRetweet/FavoriteTweet (los endpoints de
-# accion no usan el set completo de CreateTweet).
-_FEATURES_BASICAS = {
-    "rweb_tipjar_consumption_enabled": True,
-    "responsive_web_graphql_exclude_directive_enabled": True,
-    "verified_phone_label_enabled": False,
-}
+
+# --------------------------------------------------------------------------- #
+# Disyuntor (circuit breaker) por grupo de rol + bloqueo por cuenta
+# --------------------------------------------------------------------------- #
+# Cuando X rechaza TODAS las acciones de un tipo (anti-bot 226, limite diario
+# 344, 403/429/404, 422 persistente), seguir intentando en CADA cuenta cuesta
+# segundos de proxy y NO arregla nada: en el log real cada cuenta pagaba el
+# queryId + redescubrimiento + 422 antes de caer a Selenium. El disyuntor corta
+# el grupo completo (`rt`, `like`, `tweet` = hashtags/post/comentario/cita)
+# tras `API_BREAKER_FALLOS` fallos DUROS consecutivos durante
+# `API_BREAKER_SEG` (default 600s). Las cuentas con 344/226 se bloquean ademas
+# por `API_CUENTA_BLOQUEO_SEG` (default 600s).
+_BREAKER_LOCK = threading.Lock()
+_BREAKER_ESTADO: dict = {}
+_API_CUENTAS_BLOQUEADAS: dict = {}
+
+
+def _grupo_rol(rol: str) -> str:
+    """Grupo de disyuntor del rol (`rt`/`like`/`tweet`; '' si no aplica)."""
+    rol = str(rol or "").strip().lower()
+    if rol in ("rt", "retweet"):
+        return "rt"
+    if rol in ("like",):
+        return "like"
+    if rol in ("hashtags", "post", "comentario", "cita"):
+        return "tweet"
+    return ""
+
+
+def _grupo_operacion(operacion: str) -> str:
+    """Grupo de disyuntor de una operacion GraphQL ('' si no aplica)."""
+    operacion = str(operacion or "").strip()
+    if operacion == "CreateRetweet":
+        return "rt"
+    if operacion == "FavoriteTweet":
+        return "like"
+    if operacion in ("CreateTweet", "TweetResultByRestId"):
+        return "tweet"
+    return ""
+
+
+def _breaker_abierto(grupo: str) -> tuple:
+    """`(abierto, motivo)` del disyuntor del grupo.
+
+    Si la ventana ya vencio, lo cierra, limpia el contador y loguea el cierre.
+    Nunca lanza: ante cualquier valor raro devuelve `(False, "")`.
+    """
+    try:
+        grupo = str(grupo or "").strip().lower()
+        if not grupo:
+            return False, ""
+        ahora = time.monotonic()
+        with _BREAKER_LOCK:
+            estado = _BREAKER_ESTADO.get(grupo)
+            if not estado:
+                return False, ""
+            if float(estado.get("abierto_hasta", 0.0)) > ahora:
+                return True, str(estado.get("motivo", ""))
+            # Ventana vencida: se cierra (NO se borran los contadores antes de
+            # tiempo; si el disyuntor nunca se abrio, los fallos consecutivos
+            # deben seguir sumando).
+            if estado.get("abierto_hasta"):
+                logger.info(
+                    f"disyuntor API '{grupo}' cerrado tras "
+                    f"{_env_float('API_BREAKER_SEG', 600.0):.0f}s"
+                )
+                _BREAKER_ESTADO.pop(grupo, None)
+        return False, ""
+    except Exception:
+        return False, ""
+
+
+def _breaker_registrar_fallo(grupo: str, motivo: str = "") -> None:
+    """Suma un fallo DURO; abre el disyuntor tras `API_BREAKER_FALLOS` seguidos.
+
+    Los fallos "blandos" (red/curl/timeouts) NO deben llamar aqui. Log INFO al
+    abrir. Nunca lanza.
+    """
+    try:
+        grupo = str(grupo or "").strip().lower()
+        if not grupo:
+            return
+        limite = max(1, _env_int("API_BREAKER_FALLOS", 3))
+        duracion = max(1.0, _env_float("API_BREAKER_SEG", 600.0))
+        motivo = str(motivo or "fallo duro")
+        ahora = time.monotonic()
+        abierto = False
+        with _BREAKER_LOCK:
+            estado = _BREAKER_ESTADO.get(grupo) or {}
+            fallos = int(estado.get("fallos", 0)) + 1
+            abierto_hasta = float(estado.get("abierto_hasta", 0.0))
+            if abierto_hasta and abierto_hasta <= ahora and fallos > 1:
+                # La ventana anterior ya vencio (p. ej. una llamada directa sin
+                # consultar el disyuntor): se empieza de cero para exigir otra
+                # vez `API_BREAKER_FALLOS` fallos consecutivos.
+                fallos = 1
+                estado["motivo"] = ""
+            if fallos >= limite and abierto_hasta <= ahora:
+                abierto_hasta = ahora + duracion
+                estado["motivo"] = motivo
+                abierto = True
+            estado["fallos"] = fallos
+            estado["abierto_hasta"] = abierto_hasta
+            _BREAKER_ESTADO[grupo] = estado
+        if abierto:
+            logger.info(
+                f"disyuntor API '{grupo}' ABIERTO {duracion:.0f}s tras "
+                f"{limite} fallos duros: {motivo}"
+            )
+    except Exception:
+        pass
+
+
+def _breaker_registrar_exito(grupo: str) -> None:
+    """Cierra el disyuntor del grupo y limpia los fallos consecutivos."""
+    try:
+        grupo = str(grupo or "").strip().lower()
+        if not grupo:
+            return
+        with _BREAKER_LOCK:
+            estado = _BREAKER_ESTADO.pop(grupo, None)
+        if estado and estado.get("abierto_hasta"):
+            logger.info(f"disyuntor API '{grupo}' cerrado por una accion exitosa")
+    except Exception:
+        pass
+
+
+def _bloquear_cuenta(usuario: str, motivo: str = "") -> None:
+    """Bloquea la cuenta `API_CUENTA_BLOQUEO_SEG` segundos (344/226)."""
+    try:
+        usuario = str(usuario or "").strip()
+        if not usuario:
+            return
+        duracion = max(1.0, _env_float("API_CUENTA_BLOQUEO_SEG", 600.0))
+        with _BREAKER_LOCK:
+            _API_CUENTAS_BLOQUEADAS[usuario] = {
+                "hasta": time.monotonic() + duracion,
+                "motivo": str(motivo or ""),
+            }
+        logger.info(
+            f"API: cuenta @{usuario} bloqueada {duracion:.0f}s por {motivo}"
+        )
+    except Exception:
+        pass
+
+
+def _cuenta_bloqueada(usuario: str) -> tuple:
+    """`(bloqueada, motivo)` de la cuenta; limpia la entrada vencida."""
+    try:
+        usuario = str(usuario or "").strip()
+        if not usuario:
+            return False, ""
+        ahora = time.monotonic()
+        with _BREAKER_LOCK:
+            estado = _API_CUENTAS_BLOQUEADAS.get(usuario)
+            if not estado:
+                return False, ""
+            if float(estado.get("hasta", 0.0)) > ahora:
+                return True, str(estado.get("motivo", ""))
+            _API_CUENTAS_BLOQUEADAS.pop(usuario, None)
+        return False, ""
+    except Exception:
+        return False, ""
+
+
+def _texto_errores(data) -> str:
+    """Texto normalizado de `errors` de GraphQL ('' si no hay). Nunca lanza."""
+    try:
+        errores = data.get("errors") if isinstance(data, dict) else None
+        if not errores:
+            return ""
+        partes = []
+        for err in errores:
+            if not isinstance(err, dict):
+                continue
+            partes.append(str(err.get("message") or ""))
+            codigo = err.get("code")
+            if codigo is None:
+                extensiones = err.get("extensions")
+                if isinstance(extensiones, dict):
+                    codigo = extensiones.get("code")
+            if codigo is not None:
+                partes.append(str(codigo))
+        return " ".join(partes).lower()
+    except Exception:
+        return ""
+
+
+def _clasificar_fallo(status, data) -> tuple:
+    """`(es_duro, motivo_corto, bloquear_cuenta)` de un fallo de la API de X.
+
+    Fallos DUROS: 226/anti-bot ("looks like it might be automated"),
+    344/limite diario, 403, 429, 404 y 422 persistente. Los de red (status 0,
+    timeouts de curl) NO son duros: son transitorios y no abren el disyuntor.
+    Nunca lanza.
+    """
+    try:
+        texto = _texto_errores(data)
+    except Exception:
+        texto = ""
+    try:
+        if status == 226 or "automated" in texto or "might be automated" in texto:
+            return True, "226/anti-bot", True
+        if "344" in texto or "daily limit" in texto or "limite diario" in texto:
+            return True, "344/limite diario", True
+        if status == 403:
+            return True, "403", False
+        if status == 429:
+            return True, "429", False
+        if status == 404:
+            return True, "404", False
+        if status == 422:
+            return True, "422", False
+    except Exception:
+        return False, "", False
+    return False, "", False
+
 
 # --------------------------------------------------------------------------- #
 # Texto REAL de un tweet (sin cuenta) para el contexto de los comentarios
@@ -185,6 +423,12 @@ class TwitterAPI:
         self.cookies_path = resolver_ruta(f"data/cookies/twitter/{usuario}.pkl")
         self.session = None
         self.bearer_token = "AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs=1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA"
+        # Presupuesto total de red de la instancia (API_TIMEOUT_SEG, default
+        # 10s): `_post_json` lo respeta por peticion para que una accion no
+        # siga esperando indefinidamente. `accion_rapida` lo reinicia por accion.
+        self._deadline = time.monotonic() + max(
+            1.0, _env_float("API_TIMEOUT_SEG", 10.0)
+        )
 
     def _leer_cuenta(self):
         """Devuelve la fila `Cuenta` de la BD (o None) para leer su UA/cookies."""
@@ -539,25 +783,38 @@ class TwitterAPI:
         return ""
 
     @staticmethod
-    def _guardar_queryid_archivo(operacion: str, queryid: str) -> None:
-        """Escribe el cache compartido; best-effort, nunca lanza."""
+    def _escribir_queryids_archivo(data: dict) -> None:
+        """Escritura ATOMICA del cache compartido (temp file + `os.replace`).
+
+        Antes `json.dump` escribia directo sobre el archivo y dos workers
+        concurrentes lo dejaban a medias ("Extra data: line 6 column 2"): el
+        queryId malo persistia y `_invalidar_queryid` no podia leerlo. Ahora el
+        lector siempre ve un JSON completo. Nunca lanza: best-effort.
+        """
         try:
+            if not isinstance(data, dict):
+                data = {}
             ruta = resolver_ruta(_QUERYIDS_ARCHIVO)
             carpeta = os.path.dirname(ruta)
             if carpeta:
                 os.makedirs(carpeta, exist_ok=True)
-            data = {}
-            if os.path.exists(ruta):
-                try:
-                    with open(ruta, "r", encoding="utf-8") as f:
-                        data = json.load(f)
-                    if not isinstance(data, dict):
-                        data = {}
-                except Exception:
-                    data = {}
-            data[operacion] = {"id": str(queryid), "ts": time.time()}
-            with open(ruta, "w", encoding="utf-8") as f:
+            tmp = f"{ruta}.tmp{os.getpid()}_{threading.get_ident()}"
+            with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, ruta)
+        except Exception as e:
+            logger.debug(f"No se pudo escribir el cache de queryIds: {e}")
+
+    @staticmethod
+    def _guardar_queryid_archivo(operacion: str, queryid: str) -> None:
+        """Escribe el cache compartido bajo lock y de forma atomica."""
+        try:
+            with _QUERYIDS_LOCK:
+                data = TwitterAPI._leer_queryids_archivo()
+                if not isinstance(data, dict):
+                    data = {}
+                data[operacion] = {"id": str(queryid), "ts": time.time()}
+                TwitterAPI._escribir_queryids_archivo(data)
         except Exception as e:
             logger.debug(f"No se pudo guardar el cache de queryIds: {e}")
 
@@ -567,22 +824,24 @@ class TwitterAPI:
         self._guardar_queryid_archivo(operacion, queryid)
 
     def _invalidar_queryid(self, operacion: str) -> None:
-        """Invalida el queryId (memoria + archivo) tras un 400/422 de X."""
+        """Invalida el queryId (memoria + archivo) tras un 400/422 de X.
+
+        Bajo `_QUERYIDS_LOCK` y con escritura atomica. Tolera el archivo
+        corrupto (`json.load` falla => `{}`): lo REESCRIBE sano y sin la
+        operacion, para que el queryId malo no persista. Nunca lanza.
+        """
         try:
             with _QUERYIDS_LOCK:
                 _QUERYIDS_MEM.pop(operacion, None)
         except Exception:
             pass
         try:
-            ruta = resolver_ruta(_QUERYIDS_ARCHIVO)
-            if not os.path.exists(ruta):
-                return
-            with open(ruta, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            if isinstance(data, dict) and operacion in data:
+            with _QUERYIDS_LOCK:
+                data = self._leer_queryids_archivo()
+                if not isinstance(data, dict):
+                    data = {}
                 data.pop(operacion, None)
-                with open(ruta, "w", encoding="utf-8") as f:
-                    json.dump(data, f, ensure_ascii=False, indent=2)
+                self._escribir_queryids_archivo(data)
         except Exception as e:
             logger.debug(f"No se pudo invalidar el queryId de {operacion}: {e}")
 
@@ -670,8 +929,18 @@ class TwitterAPI:
         """Busca el queryId en los bundles JS de x.com (presupuesto ~8s).
 
         Un lock de proceso evita que N workers descarguen los bundles a la vez:
-        el primero descubre y los demas leen el cache. Nunca lanza.
+        el primero descubre y los demas leen el cache. NO descarga nada si el
+        disyuntor del grupo esta abierto. Nunca lanza.
         """
+        grupo = _grupo_operacion(operacion)
+        if grupo:
+            abierto, motivo = _breaker_abierto(grupo)
+            if abierto:
+                logger.debug(
+                    f"descubrimiento de {operacion} omitido: disyuntor "
+                    f"'{grupo}' abierto ({motivo})"
+                )
+                return ""
         with _QUERYIDS_DESCUBRIMIENTO_LOCK:
             # Doble verificacion: otro worker pudo descubrirlo mientras esperaba.
             queryid = self._queryid_memoria(operacion)
@@ -723,7 +992,13 @@ class TwitterAPI:
             if queryid:
                 self._guardar_queryid_memoria(operacion, queryid)
                 return queryid
-            queryid = self._descubrir_queryid(operacion)
+            # Con el disyuntor abierto NO se redescubre (ahorra ~8s por cuenta);
+            # el fallback conocido sigue disponible sin tocar la red.
+            grupo = _grupo_operacion(operacion)
+            if grupo and _breaker_abierto(grupo)[0]:
+                queryid = ""
+            else:
+                queryid = self._descubrir_queryid(operacion)
             if queryid:
                 self._guardar_queryid(operacion, queryid)
                 return queryid
@@ -743,10 +1018,40 @@ class TwitterAPI:
     # POST GraphQL con reintento por queryId vencido
     # ------------------------------------------------------------------ #
 
-    def _post_json(self, url: str, payload: dict):
-        """POST JSON con timeout de 15s (tolerante a sesiones fake)."""
+    def _timeout_restante(self) -> float:
+        """Timeout del siguiente POST acotado al presupuesto de la accion.
+
+        `API_HTTP_TIMEOUT` (default 8s) es el tope por peticion;
+        `API_TIMEOUT_SEG` (default 10s) el presupuesto total de `accion_rapida`.
+        Devuelve 0.0 si el presupuesto ya se agoto (el POST se omite). Nunca
+        lanza.
+        """
         try:
-            return self.session.post(url, json=payload, timeout=15)
+            tope = max(1.0, _env_float("API_HTTP_TIMEOUT", 8.0))
+        except Exception:
+            tope = 8.0
+        try:
+            restante = float(self._deadline) - time.monotonic()
+        except Exception:
+            return tope
+        if restante <= 0:
+            return 0.0
+        return min(tope, restante)
+
+    def _post_json(self, url: str, payload: dict):
+        """POST JSON con timeout acotado (API_HTTP_TIMEOUT/presupuesto).
+
+        Tolerante a sesiones fake/stub que no aceptan kwargs o que no exponen
+        `_deadline`. Nunca lanza: devuelve None si no se pudo enviar.
+        """
+        timeout = self._timeout_restante()
+        if timeout <= 0:
+            logger.debug(
+                f"POST {url} omitido para {self.usuario}: sin presupuesto de red"
+            )
+            return None
+        try:
+            return self.session.post(url, json=payload, timeout=timeout)
         except TypeError:
             # Sesion fake/stub que no acepta kwargs.
             try:
@@ -759,12 +1064,36 @@ class TwitterAPI:
             )
             return None
 
+    @classmethod
+    def _error_queryid_vencido(cls, status, data) -> bool:
+        """True si un 400/422 sugiere queryId viejo (vale redescubrir UNA vez).
+
+        Los errores de VALIDACION del payload (`graphql_validation_failed`,
+        "must be defined") NO son queryId viejo: redescubrir y reintentar
+        repite el mismo 422 y quema ~8s de proxy por cuenta (caso real del log
+        con CreateRetweet). Los mensajes de persistedquery/not found y los 400
+        o 422 sin cuerpo si son queryId vencido.
+        """
+        try:
+            texto = cls._mensajes_error(data)
+        except Exception:
+            texto = ""
+        if (
+            "graphql_validation_failed" in texto
+            or "must be defined" in texto
+            or "validation_failed" in texto
+        ):
+            return False
+        return True
+
     def _graphql(self, operacion: str, variables: dict, features: dict = None):
         """POST GraphQL con `_queryid` y UN reintento si X lo rechaza (400/422).
 
-        En 400/422 invalida el cache y redescubre el queryId UNA vez (el viejo
-        `ojPdsZsimiJrUGLR1sjUtA` de CreateRetweet ya devuelve 422). Devuelve
-        `(status, data)`; `(0, None)` si no se pudo enviar. Nunca lanza.
+        Redescubre el queryId UNA vez SOLO si el error sugiere id vencido
+        (persistedquery/not found, 400, 422 sin cuerpo o generico). Si el 422
+        es de validacion del payload (`graphql_validation_failed`) falla rapido
+        sin redescubrir. Devuelve `(status, data)`; `(0, None)` si no se pudo
+        enviar o si el presupuesto se agoto. Nunca lanza.
         """
         status, data = 0, None
         for intento in (1, 2):
@@ -784,6 +1113,18 @@ class TwitterAPI:
             except Exception:
                 data = None
             if status in (400, 422) and intento == 1:
+                if not self._error_queryid_vencido(status, data):
+                    logger.warning(
+                        f"{operacion} rechazado por X ({status}) por validacion "
+                        f"(no es queryId viejo); sin redescubrimiento para "
+                        f"{self.usuario}"
+                    )
+                    return status, data
+                if self._timeout_restante() <= 0:
+                    logger.debug(
+                        f"{operacion}: sin presupuesto para redescubrir el queryId"
+                    )
+                    return status, data
                 logger.info(
                     f"queryId de {operacion} rechazado por X ({status}); "
                     f"redescubriendo y reintentando para {self.usuario}"
@@ -796,25 +1137,7 @@ class TwitterAPI:
     @staticmethod
     def _mensajes_error(data) -> str:
         """Texto normalizado de `errors` de GraphQL ('' si no hay)."""
-        try:
-            errores = data.get("errors") if isinstance(data, dict) else None
-            if not errores:
-                return ""
-            partes = []
-            for err in errores:
-                if not isinstance(err, dict):
-                    continue
-                partes.append(str(err.get("message") or ""))
-                codigo = err.get("code")
-                if codigo is None:
-                    extensiones = err.get("extensions")
-                    if isinstance(extensiones, dict):
-                        codigo = extensiones.get("code")
-                if codigo is not None:
-                    partes.append(str(codigo))
-            return " ".join(partes).lower()
-        except Exception:
-            return ""
+        return _texto_errores(data)
 
     @staticmethod
     def _respuesta_ok(data) -> bool:
@@ -864,15 +1187,32 @@ class TwitterAPI:
         except Exception:
             return False
 
+    def _registrar_fallo_api(self, grupo: str, status, data) -> None:
+        """Alimenta disyuntor/bloqueo por cuenta con un fallo DURO.
+
+        Clasifica `(status, data)`; si es de red (status 0) NO cuenta. Nunca
+        lanza.
+        """
+        try:
+            es_duro, motivo, bloquear = _clasificar_fallo(status, data)
+            if not es_duro:
+                return
+            if bloquear:
+                _bloquear_cuenta(self.usuario, motivo)
+            _breaker_registrar_fallo(grupo, motivo)
+        except Exception:
+            pass
+
     def retweet(self, tweet_url: str, dar_like: bool = False) -> bool:
         """Retweetea por API HTTP (firma compatible con `retweet(url)`).
 
         Usa el `queryId` de CreateRetweet (descubierto/cacheado; UN reintento
-        con redescubrimiento si X responde 400/422). Si X contesta "already
-        retweeted" (code 327) se cuenta como EXITO: la campana es idempotente y
-        no duplica nada. Con `dar_like=True` da like al mismo tweet UNA vez (se
-        ignora su resultado): reemplaza el flujo Selenium de RT+like por ~1-2s.
-        Nunca lanza.
+        con redescubrimiento si X responde 400/422 y el error sugiere id
+        vencido). Si X contesta "already retweeted" (code 327) se cuenta como
+        EXITO: la campana es idempotente y no duplica nada. Con `dar_like=True`
+        da like al mismo tweet UNA vez (se ignora su resultado); el like se
+        omite si su disyuntor esta abierto o si ya no queda presupuesto.
+        Alimenta el disyuntor del grupo "rt" con los fallos duros. Nunca lanza.
         """
         if not self.session and not self._cargar_cookies():
             return False
@@ -887,20 +1227,23 @@ class TwitterAPI:
             status, data = self._graphql(
                 "CreateRetweet",
                 {"source_tweet_id": tweet_id},
-                features=_FEATURES_BASICAS,
+                features=_FEATURES_ESCRITURA,
             )
             if self._respuesta_ok(data):
                 logger.info(f"RT por API para {self.usuario}")
+                _breaker_registrar_exito("rt")
                 resultado = True
             elif self._retweet_ya_hecho(data):
                 logger.info(
                     f"{self.usuario} ya habia retwitteado; se cuenta como exito"
                 )
+                _breaker_registrar_exito("rt")
                 resultado = True
             else:
+                motivo = self._mensajes_error(data)[:120]
+                self._registrar_fallo_api("rt", status, data)
                 logger.warning(
-                    f"RT API fallo ({status}) para {self.usuario}: "
-                    f"{self._mensajes_error(data)[:120]}"
+                    f"RT API fallo ({status}) [rt] para {self.usuario}: {motivo}"
                 )
 
         except Exception as e:
@@ -909,7 +1252,18 @@ class TwitterAPI:
 
         if dar_like:
             try:
-                self.like(tweet_url)
+                abierto_like, motivo_like = _breaker_abierto("like")
+                if abierto_like:
+                    logger.debug(
+                        f"like del RT omitido para {self.usuario}: disyuntor "
+                        f"'like' abierto ({motivo_like})"
+                    )
+                elif self._timeout_restante() <= 0:
+                    logger.debug(
+                        f"like del RT omitido para {self.usuario}: sin presupuesto"
+                    )
+                else:
+                    self.like(tweet_url)
             except Exception as e:
                 logger.debug(f"Like del RT fallo para {self.usuario}: {e}")
 
@@ -922,7 +1276,8 @@ class TwitterAPI:
         """Da like por API HTTP (queryId de FavoriteTweet).
 
         Si X contesta "already favorited" (code 139) se cuenta como EXITO
-        (idempotente). Nunca lanza.
+        (idempotente). Alimenta el disyuntor del grupo "like" con los fallos
+        duros. Nunca lanza.
         """
         if not self.session and not self._cargar_cookies():
             return False
@@ -936,18 +1291,22 @@ class TwitterAPI:
             status, data = self._graphql(
                 "FavoriteTweet",
                 {"source_tweet_id": tweet_id},
-                features=_FEATURES_BASICAS,
+                features=_FEATURES_ESCRITURA,
             )
             if self._respuesta_ok(data):
                 logger.info(f"Like exitoso para {self.usuario}")
+                _breaker_registrar_exito("like")
                 resultado = True
             elif self._like_ya_hecho(data):
                 logger.info(f"{self.usuario} ya tenia like; se cuenta como exito")
+                _breaker_registrar_exito("like")
                 resultado = True
             else:
+                motivo = self._mensajes_error(data)[:120]
+                self._registrar_fallo_api("like", status, data)
                 logger.warning(
-                    f"Like fallido para {self.usuario} ({status}): "
-                    f"{self._mensajes_error(data)[:120]}"
+                    f"Like API fallo ({status}) [like] para {self.usuario}: "
+                    f"{motivo}"
                 )
                 resultado = False
         except Exception as e:
@@ -1000,16 +1359,19 @@ class TwitterAPI:
                 variables["attachment_url"] = quote_url
 
             status, data = self._graphql(
-                "CreateTweet", variables, features=_FEATURES_CREATE_TWEET
+                "CreateTweet", variables, features=_FEATURES_ESCRITURA
             )
             ok = self._crear_tweet_ok(data)
             if not ok:
+                motivo = self._mensajes_error(data)[:140]
+                self._registrar_fallo_api("tweet", status, data)
                 logger.warning(
-                    f"CreateTweet fallo ({status}) para {self.usuario}: "
-                    f"{self._mensajes_error(data)[:140]}"
+                    f"CreateTweet fallo ({status}) [tweet] para {self.usuario}: "
+                    f"{motivo}"
                 )
             else:
                 logger.info(f"Tweet por API para {self.usuario}")
+                _breaker_registrar_exito("tweet")
             logger.debug(
                 f"perf API @{self.usuario}: crear_tweet {time.time() - t0:.2f}s "
                 f"ok={ok}"
@@ -1030,12 +1392,34 @@ class TwitterAPI:
         - `cita`: post que cita `url` con `texto` (CreateTweet quote).
         - Cualquier otro rol => False (sin soporte HTTP: el motor usa Selenium).
 
-        Firma retrocompatible: `url` ahora tiene default y `texto` se agrego al
-        final. Loguea la duracion de cada accion (para medir en campana).
-        Nunca lanza.
+        LO PRIMERO es consultar el disyuntor del grupo (`rt`/`like`/`tweet`) y
+        el bloqueo de la cuenta: si estan abiertos devuelve False SIN cargar
+        cookies ni tocar la red. Si el fallo dura `API_TIMEOUT_SEG` (default
+        10s) no sigue esperando. Firma retrocompatible: `url` ahora tiene
+        default y `texto` se agrego al final. Loguea la duracion de cada accion
+        (para medir en campana). Nunca lanza.
         """
         rol = (rol or "").strip().lower()
         t0 = time.time()
+        grupo = _grupo_rol(rol)
+        if grupo:
+            abierto, motivo = _breaker_abierto(grupo)
+            if abierto:
+                logger.debug(
+                    f"accion_rapida({rol}) omitida para {self.usuario}: "
+                    f"disyuntor '{grupo}' abierto ({motivo})"
+                )
+                return False
+            bloqueada, motivo_cuenta = _cuenta_bloqueada(self.usuario)
+            if bloqueada:
+                logger.debug(
+                    f"accion_rapida({rol}) omitida para {self.usuario}: cuenta "
+                    f"bloqueada ({motivo_cuenta})"
+                )
+                return False
+        # Presupuesto de red de ESTA accion: `_post_json` lo respeta.
+        limite = max(1.0, _env_float("API_TIMEOUT_SEG", 10.0))
+        self._deadline = time.monotonic() + limite
         try:
             if rol == "rt":
                 ok = self.retweet(url, dar_like=dar_like)
@@ -1055,9 +1439,11 @@ class TwitterAPI:
                 f"{type(e).__name__}: {e}"
             )
             ok = False
+        excedido = (time.time() - t0) > limite
         logger.debug(
             f"perf API @{self.usuario}: accion_rapida({rol or '?'}) "
             f"{time.time() - t0:.2f}s ok={ok}"
+            + (" (presupuesto excedido)" if excedido else "")
         )
         return bool(ok)
 

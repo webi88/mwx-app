@@ -3174,6 +3174,67 @@ class TwitterBot:
             time.sleep(0.5)
         return False
 
+    def _unretweet_visible(self) -> bool:
+        """True si el tweet objetivo YA quedo retwitteado (estado `unretweet`).
+
+        Se revisa SOLO el primer `article` (en una pagina de status es el tweet
+        objetivo) para no confundirlo con respuestas ya retwitteadas; si no hay
+        ningun `article` (variante A/B del DOM) se cae a la pagina completa.
+        Nunca lanza: ante cualquier error devuelve False.
+        """
+        try:
+            articulos = self.driver.find_elements(
+                By.CSS_SELECTOR, "article[data-testid='tweet']"
+            )
+            if articulos:
+                return bool(
+                    articulos[0].find_elements(
+                        By.CSS_SELECTOR, "[data-testid='unretweet']"
+                    )
+                )
+            return bool(
+                self.driver.find_elements(
+                    By.CSS_SELECTOR, "[data-testid='unretweet']"
+                )
+            )
+        except Exception as e:
+            logger.debug(f"No se pudo leer el estado del retweet: {e}")
+            return False
+
+    # Selectores del boton de retweet que X A/B alterna. `retweet` es el
+    # historico; algunas variantes usan `repost` o solo aria-label/texto.
+    _RETWEET_SELECTORES = (
+        (By.CSS_SELECTOR, "[data-testid='retweet']"),
+        (By.CSS_SELECTOR, "[data-testid='repost']"),
+        (
+            By.XPATH,
+            "//*[@role='button'][@aria-label='Repost' or @aria-label='Repostear' "
+            "or @aria-label='Retweet']",
+        ),
+        (
+            By.XPATH,
+            "//div[@role='button'][.//span[text()='Repost' or text()='Repostear' "
+            "or text()='Retweet']]",
+        ),
+    )
+
+    def _buscar_boton_retweet(self):
+        """Devuelve el boton de RT visible (o None) SIN esperar.
+
+        Prueba, en orden: `[data-testid='retweet']`, `[data-testid='repost']`,
+        el aria-label "Repost"/"Repostear"/"Retweet" y el texto visible
+        equivalente. Nunca lanza.
+        """
+        for by, sel in self._RETWEET_SELECTORES:
+            try:
+                for btn in self.driver.find_elements(by, sel):
+                    if btn.is_displayed() and btn.is_enabled():
+                        logger.info(f"Boton Retweet encontrado con selector: {sel}")
+                        return btn
+            except Exception:
+                continue
+        return None
+
     def _tweet_ya_tiene_like(self) -> bool:
         """True si el tweet de la pagina actual ya tiene like (NO navega).
 
@@ -3320,65 +3381,77 @@ class TwitterBot:
                     self.ultimo_error = "cuenta limitada por X"
                     break
 
-                # Si el tweet objetivo YA esta retwitteado (p. ej. un timeout
-                # ambiguo anterior), X reemplaza 'retweet' por 'unretweet' y el
-                # boton no aparecera nunca: se cuenta como exito sin duplicar.
-                # Solo RT simple: en cita, un RT simple existente no es la cita.
-                if not mensaje_cita:
-                    try:
-                        articulos = self.driver.find_elements(
-                            By.CSS_SELECTOR, "article[data-testid='tweet']"
-                        )
-                        if articulos and articulos[0].find_elements(
-                            By.CSS_SELECTOR, "[data-testid='unretweet']"
-                        ):
-                            logger.info(
-                                f"El tweet ya estaba retwitteado, se cuenta como exito: {url}"
-                            )
-                            resultados["exitos"] += 1
-                            url_perfil = f"https://twitter.com/{usuario}"
-                            resultados["urls"].append(url_perfil)
-                            self.ultima_url_publicada = url_perfil
-                            time.sleep(random.uniform(0.2, 0.5))
-                            continue
-                    except Exception:
-                        pass
+                # Antes de esperar el boton (12s): dar tiempo a que monte el
+                # tweet objetivo (proxy lento) y cortar de inmediato si algo es
+                # concluyente (muro de login o RT ya hecho).
+                self._esperar_article_tweet(8)
+                if self._hay_muro_login():
+                    self.ultimo_error = (
+                        "sesión de X expirada o inválida: se pidió login al "
+                        "abrir el tweet"
+                    )
+                    logger.error(self.ultimo_error)
+                    resultados["fallidos"] += 1
+                    break
+                if not mensaje_cita and self._unretweet_visible():
+                    # Si el tweet objetivo YA esta retwitteado (p. ej. un timeout
+                    # ambiguo anterior), X reemplaza 'retweet' por 'unretweet' y
+                    # el boton no aparecera nunca: se cuenta como exito sin
+                    # duplicar. Solo RT simple: en cita, un RT simple existente
+                    # no es la cita.
+                    logger.info(
+                        f"El tweet ya estaba retwitteado, se cuenta como exito: {url}"
+                    )
+                    resultados["exitos"] += 1
+                    url_perfil = f"https://twitter.com/{usuario}"
+                    resultados["urls"].append(url_perfil)
+                    self.ultima_url_publicada = url_perfil
+                    time.sleep(random.uniform(0.2, 0.5))
+                    continue
 
-                try:
-                    rt_btn = WebDriverWait(self.driver, 12).until(
-                        EC.element_to_be_clickable((By.CSS_SELECTOR, "[data-testid='retweet']"))
-                    )
-                except TimeoutException:
-                    # Un timeout no siempre significa que no se pueda
-                    # retwittear: con proxys lentos el primer render queda a
-                    # medias. UN refresh + espera explicita extra suele bastar.
-                    # Presupuesto agresivo: 12s + 8s = 20s (antes 30s + 20s),
-                    # para que un fallo no bloquee la campana.
-                    logger.warning(
-                        f"timeout esperando boton retweet (12s) en {url}; "
-                        "refrescando la pagina e intentando de nuevo"
-                    )
+                # X A/B: variantes del boton (testid/aria-label/texto) que no
+                # requieren esperar; si no esta, se usa la espera explicita.
+                rt_btn = self._buscar_boton_retweet()
+                if rt_btn is None:
                     try:
-                        self.driver.refresh()
-                    except TimeoutException:
-                        logger.warning(
-                            f"Refresh lento de {url}; sigo con esperas explicitas"
-                        )
-                    try:
-                        rt_btn = WebDriverWait(self.driver, 8).until(
+                        rt_btn = WebDriverWait(self.driver, 12).until(
                             EC.element_to_be_clickable((By.CSS_SELECTOR, "[data-testid='retweet']"))
                         )
                     except TimeoutException:
-                        if self._detectar_cuenta_propia_suspendida():
-                            self.cuenta_suspendida = True
-                            raise Exception("cuenta suspendida/bloqueada por X")
-                        motivo = self._detectar_tweet_no_disponible()
+                        # Un timeout no siempre significa que no se pueda
+                        # retwittear: con proxys lentos el primer render queda a
+                        # medias. UN refresh + espera explicita extra suele bastar.
+                        # Presupuesto agresivo: 12s + 8s = 20s (antes 30s + 20s),
+                        # para que un fallo no bloquee la campana.
                         logger.warning(
-                            f"timeout esperando boton retweet tras refresh (8s) en {url}"
+                            f"timeout esperando boton retweet (12s) en {url}; "
+                            "refrescando la pagina e intentando de nuevo"
                         )
-                        raise Exception(
-                            motivo or "boton de retweet no encontrado (carga lenta o cambio de interfaz)"
-                        )
+                        try:
+                            self.driver.refresh()
+                        except TimeoutException:
+                            logger.warning(
+                                f"Refresh lento de {url}; sigo con esperas explicitas"
+                            )
+                        rt_btn = None
+                        try:
+                            rt_btn = WebDriverWait(self.driver, 8).until(
+                                EC.element_to_be_clickable((By.CSS_SELECTOR, "[data-testid='retweet']"))
+                            )
+                        except TimeoutException:
+                            # Ultimo recurso A/B: variantes por aria-label/texto.
+                            rt_btn = self._buscar_boton_retweet()
+                            if rt_btn is None:
+                                if self._detectar_cuenta_propia_suspendida():
+                                    self.cuenta_suspendida = True
+                                    raise Exception("cuenta suspendida/bloqueada por X")
+                                motivo = self._detectar_tweet_no_disponible()
+                                logger.warning(
+                                    f"timeout esperando boton retweet tras refresh (8s) en {url}"
+                                )
+                                raise Exception(
+                                    motivo or "boton de retweet no encontrado (carga lenta o cambio de interfaz)"
+                                )
                 rt_btn.click()
                 time.sleep(0.3)
                 
