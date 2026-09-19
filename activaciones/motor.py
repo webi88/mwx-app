@@ -1333,7 +1333,7 @@ class MotorActivacion:
         """Ejecuta el quote-RT para UNA cuenta con su propio navegador/proxy.
 
         Si el primer intento falla por un error transitorio de
-        driver/navegador, espera 2-4s y reintenta UNA vez con un bot nuevo.
+        driver/navegador, espera 0.5-1.5s y reintenta UNA vez con un bot nuevo.
 
         Devuelve una tupla de 4 elementos:
         (usuario, exito, detalle, url_publicada).
@@ -1345,7 +1345,7 @@ class MotorActivacion:
 
         resultado = self._intentar_quote_rt(cuenta, urls, texto, dar_like)
         if not resultado[1] and _es_error_reintentable(resultado[2]):
-            pausa = random.uniform(2, 4)
+            pausa = random.uniform(0.5, 1.5)
             logger.warning(
                 f"Reintento de quote-RT para @{cuenta.usuario} por error de "
                 f"driver/navegador ({resultado[2]}); espero {pausa:.1f}s"
@@ -1491,7 +1491,7 @@ class MotorActivacion:
         """Ejecuta UNA accion segun el rol de activacion de la cuenta.
 
         Si el primer intento falla por un error transitorio de
-        driver/navegador, espera 2-4s y reintenta UNA vez con un bot nuevo.
+        driver/navegador, espera 0.5-1.5s y reintenta UNA vez con un bot nuevo.
 
         Devuelve una tupla de 5 elementos:
         (usuario, rol, exito, detalle, url).
@@ -1504,7 +1504,7 @@ class MotorActivacion:
 
         resultado = self._intentar_accion_rol(cuenta, rol, urls, texto, dar_like)
         if not resultado[2] and _es_error_reintentable(resultado[3]):
-            pausa = random.uniform(2, 4)
+            pausa = random.uniform(0.5, 1.5)
             logger.warning(
                 f"Reintento de acción '{rol}' para @{cuenta.usuario} por error "
                 f"de driver/navegador ({resultado[3]}); espero {pausa:.1f}s"

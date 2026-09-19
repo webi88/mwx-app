@@ -1293,7 +1293,7 @@ class TwitterBot:
                 continue
         return " ".join(partes)
 
-    def _verificar_publicacion(self, tiempo_max: int = 25) -> bool:
+    def _verificar_publicacion(self, tiempo_max: int = 15) -> bool:
         """Confirma que el tweet realmente se publico.
 
         Tras publicar, X muestra un toast ('Your post was sent' / 'Tu post fue
@@ -1607,7 +1607,7 @@ class TwitterBot:
     # usan varios selectores de respaldo (data-testid / rol textbox / texto
     # visible) y verifican la publicacion real antes de reportar exito.
 
-    def _buscar_boton_responder(self, timeout: int = 25):
+    def _buscar_boton_responder(self, timeout: int = 12):
         """Devuelve el boton Responder del tweet (o un fallback).
 
         Selectores (con fallback): `[data-testid='reply']` (y variantes con
@@ -1656,6 +1656,7 @@ class TwitterBot:
                 except Exception:
                     continue
             time.sleep(0.5)
+        logger.warning(f"timeout esperando boton Responder ({timeout}s)")
         return None
 
     # Frases visibles de X cuando el tweet ancla NO acepta respuestas (el
@@ -1748,7 +1749,7 @@ class TwitterBot:
             time.sleep(0.5)
         return None
 
-    def _esperar_article_tweet(self, timeout: int = 20):
+    def _esperar_article_tweet(self, timeout: int = 10):
         """Espera hasta `timeout`s a que exista `article[data-testid='tweet']`.
 
         La pagina del tweet ancla puede tardar con proxy lento; los timeouts
@@ -1790,6 +1791,14 @@ class TwitterBot:
         "página de error",
         "pagina de error",
     )
+
+    # Presupuesto TOTAL (segundos) para abrir el compositor. Los timeouts por
+    # ruta (18+10 en /compose/post y 10/10 en cada alterna) pueden sumar mas
+    # que esto en el peor caso; cuando se agota, las esperas de las rutas
+    # siguientes se recortan para cortar hacia el error final (el motor
+    # reintenta con otro navegador). Las esperas nunca bajan del minimo del
+    # helper (0.2s) para alcanzar a ver un editor que ya este montado.
+    _PRESUPUESTO_COMPOSITOR = 43.0
 
     def _hay_muro_login(self) -> bool:
         """True si X pidio login en la pagina actual (sesion caida).
@@ -1915,9 +1924,9 @@ class TwitterBot:
 
     def _esperar_editor_visible(
         self,
-        timeout: int = 30,
+        timeout: int = 18,
         preferir_dialogo: bool = False,
-        reintento_timeout: int = 20,
+        reintento_timeout: int = 10,
     ):
         """Espera a que monte un editor VISIBLE y lo devuelve.
 
@@ -1936,6 +1945,10 @@ class TwitterBot:
         proxy) y espera `reintento_timeout` segundos mas. Si sigue sin
         aparecer lanza `Exception("compositor de X no cargo: el editor visible
         no aparecio (<diagnostico>)")` (mensaje que el motor reconoce).
+
+        Defaults agresivos (18/10) para que un fallo de compositor no bloquee
+        la campana; el llamador puede pasar timeouts explicitos si necesita
+        tolerar una carga mas lenta.
         """
 
         def buscar_editor():
@@ -2008,6 +2021,10 @@ class TwitterBot:
             verificar_pagina()
             time.sleep(0.5)
 
+        logger.warning(
+            f"timeout esperando editor visible "
+            f"(timeout={timeout}s, reintento={reintento_timeout}s)"
+        )
         raise Exception(
             "compositor de X no cargo: el editor visible no aparecio "
             f"({self._diagnostico_pagina()})"
@@ -2046,9 +2063,16 @@ class TwitterBot:
         """Abre el compositor de un POST NUEVO y devuelve el editor visible.
 
         Prueba en orden:
-        1. `/compose/post` (ruta clasica, timeout 35/20).
+        1. `/compose/post` (ruta clasica, timeout 18/10).
         2. `/compose/tweet` (solo si no aparecio y no hay muro de login).
-        3. `/home` + boton "Nuevo post" (25/15).
+        3. `/home` + boton "Nuevo post" (10/10).
+
+        Los timeouts son agresivos a proposito: un fallo de compositor debe
+        costar <= ~45s (antes hasta ~150s sumando los 35/20 + 25/15 + 25/15).
+        Ademas hay un presupuesto total (`_PRESUPUESTO_COMPOSITOR`): si las
+        rutas anteriores ya lo agotaron, las esperas siguientes se recortan
+        para cortar hacia el error final (el motor reintenta con un navegador
+        nuevo) en vez de seguir esperando una SPA muerta.
 
         Si alguna ruta detecta sesion caida o pagina de error, el error de
         `_esperar_editor_visible` se propaga de inmediato (no se siguen
@@ -2058,6 +2082,11 @@ class TwitterBot:
         citas/respuestas: esas abren un modal y llaman directamente a
         `_esperar_editor_visible`.
         """
+        inicio = time.time()
+
+        def restante() -> float:
+            """Segundos que quedan del presupuesto total (nunca negativo)."""
+            return max(0.0, self._PRESUPUESTO_COMPOSITOR - (time.time() - inicio))
 
         def abrir_con_espera(ruta, espera, reintento):
             """Abre `ruta` y devuelve el editor visible o lanza."""
@@ -2069,7 +2098,7 @@ class TwitterBot:
                 )
             # Sin sleep fijo: basta con que el documento este interactivo y,
             # sobre todo, con la espera por elemento VISIBLE (`_esperar_editor_visible`).
-            self._esperar_documento_listo(timeout=3)
+            self._esperar_documento_listo(timeout=min(3, max(0.2, restante())))
 
             # Si X ya redirigio al login no hay SPA que esperar: cortar ya.
             if self._hay_muro_login():
@@ -2077,14 +2106,32 @@ class TwitterBot:
                     "sesión de X expirada o inválida: se pidió login al abrir "
                     f"el compositor ({self._diagnostico_pagina()})"
                 )
+            espera_efectiva = min(float(espera), restante())
+            reintento_efectivo = min(
+                float(reintento), max(0.0, restante() - espera_efectiva)
+            )
+            if espera_efectiva < float(espera) or reintento_efectivo < float(reintento):
+                logger.warning(
+                    f"timeout esperando editor visible en {ruta}: presupuesto "
+                    f"ajustado a {espera_efectiva:.0f}s + {reintento_efectivo:.0f}s"
+                )
             return self._esperar_editor_visible(
-                timeout=espera, reintento_timeout=reintento
+                timeout=max(0.2, espera_efectiva),
+                reintento_timeout=max(0.2, reintento_efectivo),
             )
 
         for ruta, espera, reintento in (
-            ("/compose/post", 35, 20),
-            ("/compose/tweet", 25, 15),
+            ("/compose/post", 18, 10),
+            ("/compose/tweet", 10, 10),
         ):
+            if restante() <= 0.5:
+                # Presupuesto agotado: seguir con la siguiente ruta solo
+                # alargaria el fallo. El motor reintenta con otro navegador.
+                logger.warning(
+                    f"timeout esperando editor visible: presupuesto de "
+                    f"{self._PRESUPUESTO_COMPOSITOR:.0f}s agotado antes de {ruta}"
+                )
+                break
             try:
                 editor = abrir_con_espera(ruta, espera, reintento)
             except (WebDriverException, MaxRetryError):
@@ -2107,7 +2154,7 @@ class TwitterBot:
             logger.warning(
                 f"Carga lenta de {self.base_url}/home; sigo con esperas explicitas"
             )
-        time.sleep(8)
+        self._esperar_documento_listo(timeout=min(3, max(0.2, restante())))
         if self._hay_muro_login():
             raise Exception(
                 "sesión de X expirada o inválida: se pidió login al abrir "
@@ -2117,8 +2164,18 @@ class TwitterBot:
             logger.info("Boton 'Nuevo post' cliqueado en /home")
         else:
             logger.warning("No se encontro el boton 'Nuevo post' en /home")
+        espera_efectiva = min(10.0, restante())
+        reintento_efectivo = min(10.0, max(0.0, restante() - espera_efectiva))
+        if espera_efectiva < 10.0 or reintento_efectivo < 10.0:
+            logger.warning(
+                "timeout esperando editor visible en /home: presupuesto "
+                f"ajustado a {espera_efectiva:.0f}s + {reintento_efectivo:.0f}s"
+            )
         try:
-            editor = self._esperar_editor_visible(timeout=25, reintento_timeout=15)
+            editor = self._esperar_editor_visible(
+                timeout=max(0.2, espera_efectiva),
+                reintento_timeout=max(0.2, reintento_efectivo),
+            )
         except (WebDriverException, MaxRetryError):
             raise
         except Exception as e:
@@ -2249,9 +2306,9 @@ class TwitterBot:
 
             # La pagina del tweet puede tardar con proxy lento: esperar a que
             # exista el articulo (si no aparece, se sigue con el flujo actual).
-            self._esperar_article_tweet(timeout=20)
+            self._esperar_article_tweet(timeout=10)
 
-            reply_btn = self._buscar_boton_responder(timeout=25)
+            reply_btn = self._buscar_boton_responder(timeout=12)
             if reply_btn is None:
                 # Distinguir un tweet NO respondible (respuestas limitadas,
                 # eliminado...) de una simple carga lenta: con motivo no se
@@ -2265,7 +2322,8 @@ class TwitterBot:
                 # La SPA de X puede montar el boton tarde: UN refresh
                 # (tolerando la carga lenta) y un segundo intento mas corto.
                 logger.warning(
-                    "Boton Responder no aparecio; refrescando la pagina del tweet"
+                    "timeout esperando boton Responder (12s); refrescando la "
+                    "pagina del tweet"
                 )
                 try:
                     self.driver.refresh()
@@ -2275,14 +2333,17 @@ class TwitterBot:
                     logger.warning(
                         f"Refresh del tweet ancla fallo ({type(e).__name__}: {e})"
                     )
-                self._esperar_article_tweet(timeout=20)
-                reply_btn = self._buscar_boton_responder(timeout=20)
+                self._esperar_article_tweet(timeout=10)
+                reply_btn = self._buscar_boton_responder(timeout=8)
                 if reply_btn is None:
                     self.ultimo_error = (
                         "no se encontro el boton Responder del tweet "
                         f"({self._diagnostico_pagina()})"
                     )
-                    logger.warning(self.ultimo_error)
+                    logger.warning(
+                        f"timeout esperando boton Responder tras refresh (8s): "
+                        f"{self.ultimo_error}"
+                    )
                     return None
             try:
                 self.driver.execute_script(
@@ -2851,15 +2912,18 @@ class TwitterBot:
                         pass
 
                 try:
-                    rt_btn = WebDriverWait(self.driver, 30).until(
+                    rt_btn = WebDriverWait(self.driver, 12).until(
                         EC.element_to_be_clickable((By.CSS_SELECTOR, "[data-testid='retweet']"))
                     )
                 except TimeoutException:
                     # Un timeout no siempre significa que no se pueda
                     # retwittear: con proxys lentos el primer render queda a
                     # medias. UN refresh + espera explicita extra suele bastar.
+                    # Presupuesto agresivo: 12s + 8s = 20s (antes 30s + 20s),
+                    # para que un fallo no bloquee la campana.
                     logger.warning(
-                        "Boton de retweet no aparecio en 30s; refrescando la pagina e intentando de nuevo"
+                        f"timeout esperando boton retweet (12s) en {url}; "
+                        "refrescando la pagina e intentando de nuevo"
                     )
                     try:
                         self.driver.refresh()
@@ -2868,7 +2932,7 @@ class TwitterBot:
                             f"Refresh lento de {url}; sigo con esperas explicitas"
                         )
                     try:
-                        rt_btn = WebDriverWait(self.driver, 20).until(
+                        rt_btn = WebDriverWait(self.driver, 8).until(
                             EC.element_to_be_clickable((By.CSS_SELECTOR, "[data-testid='retweet']"))
                         )
                     except TimeoutException:
@@ -2876,6 +2940,9 @@ class TwitterBot:
                             self.cuenta_suspendida = True
                             raise Exception("cuenta suspendida/bloqueada por X")
                         motivo = self._detectar_tweet_no_disponible()
+                        logger.warning(
+                            f"timeout esperando boton retweet tras refresh (8s) en {url}"
+                        )
                         raise Exception(
                             motivo or "boton de retweet no encontrado (carga lenta o cambio de interfaz)"
                         )

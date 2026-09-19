@@ -688,6 +688,13 @@ python -m bot.main
 - Verificado: **estrés de 300 conexiones → 10 hilos baseline / pico 27** (antes 300+), tras `close()` vuelve a 10 y rechaza conexiones; suites 42/42 (pool) + 42/42 (CDP/velocidad) + 15/15 + 40/40 (compositor) + 33/33 (responder) + motor 49/20/20/23/19 + like 29.
 - ⚠ Recomendación operativa: con el pool arreglado, 6 navegadores ya son estables; si Railway aún se queda sin RAM, bajar a 5. El log `perf` por acción sirve para verificar ≥10/min.
 
+### Fail-fast: cancelar rapido y reintentar con otra cuenta (2026-09-18)
+- **Sintoma**: la campaña subió a 2.6/min porque los ERRORES tardaban muchísimo (RT de 46-85s esperando botón 30s + refresh 20s; compositor hasta ~140s). El usuario pidió cancelar en cuanto falle y pasar a la siguiente cuenta.
+- `plataformas/twitter/selenium_bot.py`: espera del botón de RT `30→12s` (+refresh `20→8s`); responder `25→12s` (+refresh `8s`, article `10s`); `_esperar_editor_visible` `30/20→18/10`; `_abrir_compositor` rutas `(18,10)/(10,10)/(10,10)` con `_PRESUPUESTO_COMPOSITOR=43s` (recorta esperas si las rutas previas se agotan); `_verificar_publicacion` `25→15s`; logs de fase (`timeout esperando boton retweet (12s)`, etc.).
+- `activaciones/motor.py`: pausa del reintento con navegador nuevo `2-4s→0.5-1.5s` (sigue siendo 1 reintento; `_es_error_reintentable` intacto).
+- Peor caso medido (reloj falso): RT fallido 50.3→**20.3s**; responder sin botón 45.3→**20.3s**; compositor sin editor 143-149→**44s**. El camino de éxito no cambió (posts ~4.4s + arranque CDP).
+- Verificado: 26/26 timeouts agresivos + 42/42 pool de proxy + 42/42 CDP + 15/15 RT/respuesta + 40/40 compositor + 33/33 responder + motor 49/20/20/23/19 + like 29.
+
 ### Pendiente
 - Probar `ia/contexto_noticias.generar_contexto_desde_links` con `OPENAI_API_KEY` real (hoy verificado con IA simulada; el fallback local ya funciona)
 - Reemplazar tokens placeholder en `.env` por claves reales (Telegram, Gemini, Grizzly)
