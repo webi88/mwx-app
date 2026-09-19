@@ -64,6 +64,7 @@ activo; aplica en el siguiente rerun y nunca toca URLs, hashtags, menciones,
 cuentas ni resultados). La pestana B incluye ademas una "Pausa entre
 comentarios al MISMO tweet" (anti-spam) y un aviso cuando solo hay 1 URL ancla.
 """
+import os
 import threading
 
 import streamlit as st
@@ -486,6 +487,65 @@ def _lanzar_con_progreso_o_limpiar(lanzar, motor, duracion_min: int, repetir: bo
     if limpiar and resultados:
         _programar_limpieza_contexto(prefix)
     return resultados
+
+
+# ============================ OPCIONES DE VELOCIDAD ============================
+
+# Variables de entorno que leen los modulos del bot/motor al construir cada
+# navegador o peticion (nunca se editan esos modulos: solo se cambian aqui
+# antes de lanzar la campana y se restauran al terminar).
+_VARS_VELOCIDAD = ("TWITTER_SIN_PROXY", "CHROME_SIN_IMAGENES", "RT_POR_API")
+
+
+def _aplicar_opciones_velocidad(sin_proxy: bool, sin_imagenes: bool,
+                                rt_api: bool) -> dict:
+    """Escribe las env de velocidad y devuelve sus valores PREVIOS.
+
+    Convencion "1"/"0". Los valores previos (o `None` si la variable no
+    existia) se devuelven para poder restaurarlos con
+    `_restaurar_opciones_velocidad` al terminar la campana, de modo que el
+    resto del dashboard no herede las opciones de una campana.
+    """
+    previos = {clave: os.environ.get(clave) for clave in _VARS_VELOCIDAD}
+    for clave, valor in zip(_VARS_VELOCIDAD, (sin_proxy, sin_imagenes, rt_api)):
+        os.environ[clave] = "1" if valor else "0"
+    return previos
+
+
+def _restaurar_opciones_velocidad(previos: dict) -> None:
+    """Restaura las env a `previos`; si no existian, las ELIMINA.
+
+    Nunca lanza: corre en el `finally` de la campana y no debe tapar el error
+    original si algo falla al restaurar.
+    """
+    for clave, valor in (previos or {}).items():
+        try:
+            if valor is None:
+                os.environ.pop(clave, None)
+            else:
+                os.environ[clave] = str(valor)
+        except Exception:
+            pass
+
+
+def _lanzar_con_opciones_velocidad(lanzar, motor, duracion_min: int,
+                                   repetir: bool, prefix: str, limpiar: bool,
+                                   sin_proxy: bool, sin_imagenes: bool,
+                                   rt_api: bool) -> dict:
+    """`_lanzar_con_progreso_o_limpiar` aplicando y restaurando la velocidad.
+
+    Las tres env se escriben ANTES de lanzar (el motor las lee al abrir cada
+    navegador/hacer cada peticion) y se restauran a sus valores previos
+    SIEMPRE al volver: exito, guard de campana unica que devuelve `{}` o
+    excepcion (el `finally` re-lanza el error original tal cual).
+    """
+    previos = _aplicar_opciones_velocidad(sin_proxy, sin_imagenes, rt_api)
+    try:
+        return _lanzar_con_progreso_o_limpiar(
+            lanzar, motor, duracion_min, repetir, prefix=prefix, limpiar=limpiar
+        )
+    finally:
+        _restaurar_opciones_velocidad(previos)
 
 
 # ============================ ACCESO A DATOS ============================
@@ -979,8 +1039,43 @@ def _cita_masiva():
     st.caption(
         "🖥️ Recomendado: 4-6 navegadores en Railway (cada Chrome ~300-500 MB). "
         "Más navegadores solo con RAM/GB de sobra; subirlo de más provoca "
-        "`tab crashed` y la campaña va más lento. No lances dos campañas a la vez."
+        "`tab crashed` y la campaña va más lento. No lances dos campañas a la vez.\n\n"
+        "💡 Con RT por API + sin imágenes la campaña rinde bastante más; si "
+        "ves pocas acciones/min revisa que \"RT y likes por API\" esté activado."
     )
+
+    with st.expander("⚙️ Opciones de velocidad", expanded=False):
+        sin_proxy = st.checkbox(
+            "🌐 Sin proxy: usar la IP del servidor (Railway)",
+            value=False,
+            key="act_sin_proxy",
+            help=(
+                "Las peticiones salen directo desde Railway (más rápido y sin "
+                "GB de proxy). Úsalo solo en pruebas: compartir una IP de "
+                "datacenter entre muchas cuentas puede hacer que X las "
+                "bloquee o limite."
+            ),
+        )
+        sin_imagenes = st.checkbox(
+            "🖼️ No cargar imágenes ni video (más rápido)",
+            value=True,
+            key="act_sin_imagenes",
+            help=(
+                "Chrome carga las páginas sin imágenes/video; las acciones de "
+                "texto (post/RT/comentario) no las necesitan. Ahorra RAM y "
+                "datos."
+            ),
+        )
+        rt_api = st.checkbox(
+            "⚡ RT y likes por API (sin abrir Chrome)",
+            value=True,
+            key="act_rt_api",
+            help=(
+                "Los retweets se hacen por HTTP con las cookies de la cuenta "
+                "(~1-2s vs ~20s con Chrome). Si la API falla, se reintenta "
+                "automáticamente con Chrome."
+            ),
+        )
 
     opciones_seccion = [OPCION_TODAS_SECCIONES] + [
         etiqueta_seccion(clave) for clave in SECCIONES
@@ -1104,7 +1199,7 @@ def _cita_masiva():
         from activaciones.motor import MotorActivacion
 
         motor = MotorActivacion(max_concurrente=int(navegadores))
-        resultados = _lanzar_con_progreso_o_limpiar(
+        resultados = _lanzar_con_opciones_velocidad(
             lambda cb: motor.ejecutar(
                 urls=urls,
                 texto_base=texto_base,
@@ -1129,6 +1224,9 @@ def _cita_masiva():
             repetir=bool(repetir),
             prefix="act",
             limpiar=bool(limpiar_contexto_al_terminar),
+            sin_proxy=bool(sin_proxy),
+            sin_imagenes=bool(sin_imagenes),
+            rt_api=bool(rt_api),
         )
 
         st.markdown("---")
@@ -1414,8 +1512,43 @@ def _por_roles():
         "descanso según tus proxies. 🖥️ Recomendado: 4-6 navegadores en "
         "Railway (cada Chrome ~300-500 MB). Más navegadores solo con RAM/GB "
         "de sobra; subirlo de más provoca `tab crashed` y la campaña va más "
-        "lento. No lances dos campañas a la vez."
+        "lento. No lances dos campañas a la vez.\n\n"
+        "💡 Con RT por API + sin imágenes la campaña rinde bastante más; si "
+        "ves pocas acciones/min revisa que \"RT y likes por API\" esté activado."
     )
+
+    with st.expander("⚙️ Opciones de velocidad", expanded=False):
+        sin_proxy = st.checkbox(
+            "🌐 Sin proxy: usar la IP del servidor (Railway)",
+            value=False,
+            key="act_roles_sin_proxy",
+            help=(
+                "Las peticiones salen directo desde Railway (más rápido y sin "
+                "GB de proxy). Úsalo solo en pruebas: compartir una IP de "
+                "datacenter entre muchas cuentas puede hacer que X las "
+                "bloquee o limite."
+            ),
+        )
+        sin_imagenes = st.checkbox(
+            "🖼️ No cargar imágenes ni video (más rápido)",
+            value=True,
+            key="act_roles_sin_imagenes",
+            help=(
+                "Chrome carga las páginas sin imágenes/video; las acciones de "
+                "texto (post/RT/comentario) no las necesitan. Ahorra RAM y "
+                "datos."
+            ),
+        )
+        rt_api = st.checkbox(
+            "⚡ RT y likes por API (sin abrir Chrome)",
+            value=True,
+            key="act_roles_rt_api",
+            help=(
+                "Los retweets se hacen por HTTP con las cookies de la cuenta "
+                "(~1-2s vs ~20s con Chrome). Si la API falla, se reintenta "
+                "automáticamente con Chrome."
+            ),
+        )
 
     roles_aleatorios = st.checkbox(
         "🎲 Rol aleatorio por cuenta en cada ronda",
@@ -1682,7 +1815,7 @@ def _por_roles():
         pausa_kwargs = {}
         if _soporta_kwarg(motor.ejecutar_por_roles, "pausa_comentario_url_seg"):
             pausa_kwargs["pausa_comentario_url_seg"] = int(pausa_comentario)
-        resultados = _lanzar_con_progreso_o_limpiar(
+        resultados = _lanzar_con_opciones_velocidad(
             lambda cb: motor.ejecutar_por_roles(
                 urls=urls,
                 texto_base=texto_base,
@@ -1710,6 +1843,9 @@ def _por_roles():
             repetir=bool(repetir),
             prefix="act_roles",
             limpiar=bool(limpiar_contexto_al_terminar),
+            sin_proxy=bool(sin_proxy),
+            sin_imagenes=bool(sin_imagenes),
+            rt_api=bool(rt_api),
         )
         _mostrar_resultados_roles(resultados)
 

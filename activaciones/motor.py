@@ -223,6 +223,19 @@ def _es_error_reintentable(detalle) -> bool:
     return any(senal in texto for senal in _SENALES_ERROR_PUBLICACION_SEGURA)
 
 
+def _rt_por_api_activo() -> bool:
+    """True si el rol 'rt' debe intentar primero la API HTTP (env RT_POR_API).
+
+    Default activo; `0`, `false`, `no` u `off` lo desactivan (sin distinguir
+    mayusculas ni espacios). Nunca lanza.
+    """
+    try:
+        valor = str(os.environ.get("RT_POR_API", "") or "").strip().lower()
+    except Exception:
+        return True
+    return valor not in ("0", "false", "no", "off")
+
+
 def _tiene_credencial_sesion(cuenta) -> bool:
     """True si la cuenta tiene alguna credencial de sesion usable.
 
@@ -1524,6 +1537,26 @@ class MotorActivacion:
                     logger.debug(
                         f"comentario: pausa anti-spam {espero:.1f}s para "
                         f"{url_objetivo}"
+                    )
+
+            if rol == "rt" and _rt_por_api_activo():
+                try:
+                    from plataformas.twitter.api_http import TwitterAPI
+                    accion_rapida = getattr(
+                        TwitterAPI(cuenta.usuario), "accion_rapida", None
+                    )
+                    if callable(accion_rapida) and accion_rapida(
+                        "rt", url_objetivo, dar_like=dar_like
+                    ):
+                        logger.debug(f"rt: API para @{cuenta.usuario}")
+                        return (
+                            cuenta.usuario, "rt", True, "rt por API",
+                            f"https://twitter.com/{cuenta.usuario}",
+                        )
+                except Exception as e:
+                    logger.debug(
+                        f"rt: API fallo para @{cuenta.usuario} "
+                        f"({type(e).__name__}); se usa Selenium"
                     )
 
             bot = TwitterBot(cuenta.usuario)

@@ -67,6 +67,10 @@ FLAGS_AHORRO = [
     "--no-default-browser-check",
     "--disable-client-side-phishing-detection",
     "--metrics-recording-only",
+    # Evita el autoplay de videos en los tweets ancla: ahorra CPU/RAM y
+    # acelera las cargas (los videos de X son el mayor consumidor de red/CPU
+    # en las paginas de status de las campanas).
+    "--autoplay-policy=user-gesture-required",
     "--disable-features=Translate,TranslateUI,OptimizationHints,OptimizationGuideModelDownloading,MediaRouter,AutofillServerCommunication,CalculateNativeWinOcclusion",
 ]
 

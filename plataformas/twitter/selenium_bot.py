@@ -5,9 +5,11 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.common.action_chains import ActionChains
 from selenium.common.exceptions import (
+    InvalidElementStateException,
     InvalidSessionIdException,
     NoSuchDriverException,
     NoSuchWindowException,
+    StaleElementReferenceException,
     TimeoutException,
     WebDriverException,
 )
@@ -18,13 +20,14 @@ import random
 import os
 import re
 import hashlib
+import threading
 import unicodedata
 from typing import Optional
 from datetime import datetime, timedelta
 from loguru import logger
 
 from core.config import settings, resolver_ruta, detectar_chrome_version
-from plataformas.chrome_driver import crear_chrome
+from plataformas.chrome_driver import crear_chrome, _env_activo
 from utils.proxies import ProxyManager
 from utils.anti_detection import (
     aplicar_stealth,
@@ -32,6 +35,57 @@ from utils.anti_detection import (
     normalizar_cookies,
     resolver_ua_cuenta,
 )
+
+
+# --------------------------------------------------------------------------- #
+# Cache de validacion de proxies contra x.com (por proceso)
+# --------------------------------------------------------------------------- #
+# `ProxyManager.x_accesible` hace un GET a x.com a traves del proxy (hasta 12s
+# de timeout) y `_proxy_para_x` lo repetia en CADA accion: con la sesion sticky
+# ya validada en la campana no hace falta volver a sondearla, pero si el proxy
+# muere, el TTL corto hace que se vuelva a validar/rotar. Configurable con
+# `PROXY_X_CACHE_SEG` (0 = desactivar la cache).
+_PROXY_X_VALIDADOS: dict = {}
+_PROXY_X_LOCK = threading.Lock()
+_PROXY_X_CACHE_MAX = 2000
+
+
+def _proxy_x_cache_segundos() -> float:
+    """TTL en segundos de la cache de proxies validados (default 300s)."""
+    try:
+        return max(0.0, float(os.environ.get("PROXY_X_CACHE_SEG", "300")))
+    except (TypeError, ValueError):
+        return 300.0
+
+
+def _proxy_x_valido_reciente(proxy: str) -> bool:
+    """True si `proxy` se valido hace menos de `PROXY_X_CACHE_SEG` segundos."""
+    try:
+        if _proxy_x_cache_segundos() <= 0:
+            return False
+        with _PROXY_X_LOCK:
+            expira = _PROXY_X_VALIDADOS.get(proxy, 0.0)
+        return expira > time.time()
+    except Exception:
+        return False
+
+
+def _marcar_proxy_x_valido(proxy: str) -> None:
+    """Guarda que `proxy` alcanzo x.com (limpieza simple del mapa)."""
+    try:
+        ttl = _proxy_x_cache_segundos()
+        if ttl <= 0 or not proxy:
+            return
+        ahora = time.time()
+        with _PROXY_X_LOCK:
+            _PROXY_X_VALIDADOS[proxy] = ahora + ttl
+            if len(_PROXY_X_VALIDADOS) > _PROXY_X_CACHE_MAX:
+                for clave in [
+                    k for k, v in _PROXY_X_VALIDADOS.items() if v <= ahora
+                ]:
+                    _PROXY_X_VALIDADOS.pop(clave, None)
+    except Exception:
+        pass
 
 
 class TwitterBot:
@@ -74,6 +128,15 @@ class TwitterBot:
             return 0.0
     
     def _obtener_proxy(self) -> str:
+        # Modo sin proxy: usa la IP del servidor (Railway) tal cual. Se
+        # comprueba ANTES de tocar la BD/ProxyManager para no validar
+        # (`x_accesible`) ni rotar sesiones sticky.
+        if _env_activo("TWITTER_SIN_PROXY", False):
+            logger.info(
+                f"TWITTER_SIN_PROXY activo: {self.usuario} usara la IP del "
+                f"servidor (sin proxy)"
+            )
+            return ""
         try:
             from core.database import get_db_session
             from core.models import Cuenta
@@ -178,9 +241,21 @@ class TwitterBot:
             self._proxy_cache = proxy
             return proxy
 
+        # Cache por proceso: dentro de una campana la sesion sticky no cambia y
+        # re-sondear x.com en cada accion cuesta ~0.5-1.5s (hasta ~60s si el
+        # proxy esta bloqueado y rota 5 veces). Con el TTL corto el proxy se
+        # re-valida solo si pasó un rato (o si `PROXY_X_CACHE_SEG=0`).
+        if _proxy_x_valido_reciente(proxy):
+            logger.debug(
+                f"Proxy de {self.usuario} ya validado hace poco; se omite el sondeo"
+            )
+            self._proxy_cache = proxy
+            return proxy
+
         intentos = int(os.environ.get("PROXY_X_INTENTOS", "5"))
         for i in range(intentos):
             if pm.x_accesible(proxy):
+                _marcar_proxy_x_valido(proxy)
                 if i:
                     logger.info(f"Proxy de {self.usuario} OK tras {i} rotacion(es)")
                     self._guardar_proxy(proxy)
@@ -1782,14 +1857,15 @@ class TwitterBot:
     )
 
     # Errores de `_abrir_compositor` que NO deben seguir probando rutas: la
-    # sesion esta caida o X sirvio una pagina de error.
+    # sesion esta caida (login). La pagina de error generica de X ("something
+    # went wrong"/"algo salio mal") ya NO es fatal: es un fallo de RUTA, asi
+    # que se hace un refresh corto + segundo intento y, si sigue, se prueba la
+    # siguiente ruta con el presupuesto restante.
     _ERRORES_FATALES_COMPOSITOR = (
         "sesión de x expirada",
         "sesion de x expirada",
         "se pidió login",
         "se pidio login",
-        "página de error",
-        "pagina de error",
     )
 
     # Presupuesto TOTAL (segundos) para abrir el compositor. Los timeouts por
@@ -1870,12 +1946,26 @@ class TwitterBot:
 
     @classmethod
     def _es_error_fatal_compositor(cls, error) -> bool:
-        """True si el error indica sesion caida o pagina de error de X."""
+        """True si el error indica sesion caida (no seguir probando rutas)."""
         try:
             texto = str(error or "").lower()
         except Exception:
             return False
         return any(senal in texto for senal in cls._ERRORES_FATALES_COMPOSITOR)
+
+    @staticmethod
+    def _es_fallo_pagina_error(error) -> bool:
+        """True si el error es la pagina de error generica de X.
+
+        A diferencia de la sesion caida, la pagina de error es un fallo de
+        RUTA: `_abrir_compositor` hace un refresh corto y un segundo intento
+        de la misma ruta antes de pasar a la siguiente.
+        """
+        try:
+            texto = str(error or "").lower()
+        except Exception:
+            return False
+        return "página de error" in texto or "pagina de error" in texto
 
     # Selectores del compositor de X. El `data-testid` es el principal; los
     # contenteditables quedan como respaldo por si X cambia el testid.
@@ -1922,11 +2012,33 @@ class TwitterBot:
                 continue
         return None
 
+    def _buscar_editor_visible_actual(self, timeout: float = 5.0):
+        """Devuelve el PRIMER editor VISIBLE actual (None si no aparece).
+
+        X re-renderiza el DOM (React) y un `WebElement` guardado puede quedar
+        viejo (`StaleElementReferenceException`): re-localizar es barato y
+        evita perder la accion cuando el editor cambio de nodo. Sondea con
+        `_primer_editor_visible` (sin refresh ni esperas de flujo) hasta
+        `timeout` segundos. Nunca lanza: devuelve None si no hay editor.
+        """
+        fin = time.time() + max(0.0, float(timeout))
+        while True:
+            try:
+                editor = self._primer_editor_visible()
+                if editor is not None:
+                    return editor
+            except Exception as e:
+                logger.debug(f"Re-localizando editor: {type(e).__name__}: {e}")
+            if time.time() >= fin:
+                return None
+            time.sleep(0.2)
+
     def _esperar_editor_visible(
         self,
         timeout: int = 18,
         preferir_dialogo: bool = False,
         reintento_timeout: int = 10,
+        retornar_none_en_fallo: bool = False,
     ):
         """Espera a que monte un editor VISIBLE y lo devuelve.
 
@@ -1937,14 +2049,22 @@ class TwitterBot:
           `NoSuchDriverException`, `MaxRetryError`, "connection refused"):
           el motor de activaciones los reconoce como transitorios y reintenta
           con un navegador nuevo;
-        - la sesion caida (`_hay_muro_login`) o una pagina de error de X: no
-          tiene sentido esperar 30s ni refrescar, hay que renovar cookies.
+        - la sesion caida (`_hay_muro_login`): no tiene sentido esperar mas,
+          hay que renovar cookies.
+
+        Con `retornar_none_en_fallo=True` (lo usa `_abrir_compositor`) una
+        pagina de error generica de X ("something went wrong"/"algo salio
+        mal") o el agotamiento del timeout devuelven None como fallo
+        CONTROLADO, para que el compositor pruebe la siguiente ruta sin
+        abortar. En los flujos de cita/respuesta (default) el contrato no
+        cambia: pagina de error o timeout lanzan excepcion.
 
         Si en `timeout` segundos no aparece ningun editor visible, hace UN
         `driver.refresh()` (tolerando el TimeoutException de carga lenta del
         proxy) y espera `reintento_timeout` segundos mas. Si sigue sin
         aparecer lanza `Exception("compositor de X no cargo: el editor visible
-        no aparecio (<diagnostico>)")` (mensaje que el motor reconoce).
+        no aparecio (<diagnostico>)")` (mensaje que el motor reconoce) o
+        devuelve None si `retornar_none_en_fallo=True`.
 
         Defaults agresivos (18/10) para que un fallo de compositor no bloquee
         la campana; el llamador puede pasar timeouts explicitos si necesita
@@ -1983,6 +2103,11 @@ class TwitterBot:
                 return None
 
         def verificar_pagina():
+            """Devuelve "error" si X sirvio su pagina de error (fallo controlado).
+
+            El muro de login SIEMPRE se propaga (sesion caida): no tiene
+            sentido probar otra ruta con las mismas cookies.
+            """
             if self._hay_muro_login():
                 raise Exception(
                     "sesión de X expirada o inválida: se pidió login al abrir "
@@ -1990,17 +2115,25 @@ class TwitterBot:
                 )
             error = self._frase_error_pagina()
             if error:
+                if retornar_none_en_fallo:
+                    return "error"
                 raise Exception(
                     "X mostró una página de error al abrir el compositor "
                     f"({self._diagnostico_pagina()})"
                 )
+            return ""
 
         fin = time.time() + max(0.2, float(timeout))
         while time.time() < fin:
             editor = buscar_editor()
             if editor is not None:
                 return editor
-            verificar_pagina()
+            if verificar_pagina() == "error":
+                logger.warning(
+                    "X mostró una página de error; fallo controlado de la ruta "
+                    f"({self._diagnostico_pagina()})"
+                )
+                return None
             time.sleep(0.5)
 
         logger.warning(
@@ -2018,13 +2151,20 @@ class TwitterBot:
             editor = buscar_editor()
             if editor is not None:
                 return editor
-            verificar_pagina()
+            if verificar_pagina() == "error":
+                logger.warning(
+                    "X mostró una página de error; fallo controlado de la ruta "
+                    f"({self._diagnostico_pagina()})"
+                )
+                return None
             time.sleep(0.5)
 
         logger.warning(
             f"timeout esperando editor visible "
             f"(timeout={timeout}s, reintento={reintento_timeout}s)"
         )
+        if retornar_none_en_fallo:
+            return None
         raise Exception(
             "compositor de X no cargo: el editor visible no aparecio "
             f"({self._diagnostico_pagina()})"
@@ -2059,12 +2199,37 @@ class TwitterBot:
                 continue
         return False
 
+    def _refresh_corto(self, timeout: float = 5.0) -> None:
+        """Hace UN refresh tolerante con `page_load_timeout` corto (nunca lanza).
+
+        X a veces sirve su pagina de error generica; refrescar suele montar la
+        SPA. `driver.refresh()` puede bloquear hasta el page_load_timeout de
+        60s del bot, asi que se baja a ~5s para el refresh y se restaura
+        despues.
+        """
+        try:
+            self.driver.set_page_load_timeout(max(0.5, float(timeout)))
+        except Exception:
+            pass
+        try:
+            self.driver.refresh()
+        except Exception as e:
+            logger.debug(
+                f"Refresh corto del compositor fallo ({type(e).__name__}: {e})"
+            )
+        finally:
+            try:
+                self.driver.set_page_load_timeout(60)
+            except Exception:
+                pass
+
     def _abrir_compositor(self):
         """Abre el compositor de un POST NUEVO y devuelve el editor visible.
 
-        Prueba en orden:
+        Prueba en orden, con UN refresh corto + UN segundo intento de la MISMA
+        ruta cuando X sirve su pagina de error o el editor no aparece:
         1. `/compose/post` (ruta clasica, timeout 18/10).
-        2. `/compose/tweet` (solo si no aparecio y no hay muro de login).
+        2. `/compose/tweet`.
         3. `/home` + boton "Nuevo post" (10/10).
 
         Los timeouts son agresivos a proposito: un fallo de compositor debe
@@ -2074,11 +2239,13 @@ class TwitterBot:
         para cortar hacia el error final (el motor reintenta con un navegador
         nuevo) en vez de seguir esperando una SPA muerta.
 
-        Si alguna ruta detecta sesion caida o pagina de error, el error de
-        `_esperar_editor_visible` se propaga de inmediato (no se siguen
-        probando rutas, no sirve de nada con las mismas cookies). Si ninguna
-        da editor, lanza Exception con la frase "compositor de X no cargo"
-        (el motor la usa) + el diagnostico de la pagina. NO se usa para
+        La pagina de error generica de X ("something went wrong"/"algo salio
+        mal") ya NO aborta: es un fallo de RUTA y se prueba la siguiente. La
+        sesion caida ("sesión de X expirada o inválida") y los errores duros
+        de driver (InvalidSessionId/NoSuchDriver/MaxRetry/connection refused)
+        SI se propagan tal cual (el motor los reconoce). Si ninguna ruta da
+        editor, lanza Exception con la frase "compositor de X no cargo" (el
+        motor la usa) + el diagnostico de la pagina. NO se usa para
         citas/respuestas: esas abren un modal y llaman directamente a
         `_esperar_editor_visible`.
         """
@@ -2088,8 +2255,36 @@ class TwitterBot:
             """Segundos que quedan del presupuesto total (nunca negativo)."""
             return max(0.0, self._PRESUPUESTO_COMPOSITOR - (time.time() - inicio))
 
+        def esperar_compositor(espera, reintento):
+            """Llama `_esperar_editor_visible` en modo fallo controlado.
+
+            Tolera parches/mocks con la firma vieja (sin
+            `retornar_none_en_fallo`): en ese caso el fallo llega como
+            excepcion y `abrir_con_espera` la trata igual (refresh + segundo
+            intento). Nunca lanza por la sesion caida ni por driver muerto.
+            """
+            try:
+                return self._esperar_editor_visible(
+                    timeout=max(0.2, espera),
+                    reintento_timeout=max(0.2, reintento),
+                    retornar_none_en_fallo=True,
+                )
+            except TypeError as e:
+                if "retornar_none_en_fallo" not in str(e):
+                    raise
+                return self._esperar_editor_visible(
+                    timeout=max(0.2, espera),
+                    reintento_timeout=max(0.2, reintento),
+                )
+
         def abrir_con_espera(ruta, espera, reintento):
-            """Abre `ruta` y devuelve el editor visible o lanza."""
+            """Abre `ruta`; devuelve el editor visible o lanza fallo controlado.
+
+            Si la ruta cae en la pagina de error de X (o el editor no aparece),
+            hace UN `driver.refresh()` corto y UN segundo intento de la MISMA
+            ruta; si vuelve a fallar, lanza un error controlado para que el
+            bucle pruebe la siguiente.
+            """
             try:
                 self.driver.get(f"{self.base_url}{ruta}")
             except TimeoutException:
@@ -2106,18 +2301,59 @@ class TwitterBot:
                     "sesión de X expirada o inválida: se pidió login al abrir "
                     f"el compositor ({self._diagnostico_pagina()})"
                 )
-            espera_efectiva = min(float(espera), restante())
-            reintento_efectivo = min(
-                float(reintento), max(0.0, restante() - espera_efectiva)
-            )
-            if espera_efectiva < float(espera) or reintento_efectivo < float(reintento):
-                logger.warning(
-                    f"timeout esperando editor visible en {ruta}: presupuesto "
-                    f"ajustado a {espera_efectiva:.0f}s + {reintento_efectivo:.0f}s"
+
+            for intento in (1, 2):
+                if intento == 2:
+                    logger.warning(
+                        f"ruta {ruta} con pagina de error; refresh corto y "
+                        f"segundo intento"
+                    )
+                    self._refresh_corto()
+                espera_efectiva = min(float(espera), restante())
+                reintento_efectivo = min(
+                    float(reintento), max(0.0, restante() - espera_efectiva)
                 )
-            return self._esperar_editor_visible(
-                timeout=max(0.2, espera_efectiva),
-                reintento_timeout=max(0.2, reintento_efectivo),
+                if espera_efectiva < float(espera) or reintento_efectivo < float(reintento):
+                    logger.warning(
+                        f"timeout esperando editor visible en {ruta}: presupuesto "
+                        f"ajustado a {espera_efectiva:.0f}s + {reintento_efectivo:.0f}s"
+                    )
+                try:
+                    editor = esperar_compositor(espera_efectiva, reintento_efectivo)
+                except (WebDriverException, MaxRetryError):
+                    # Driver muerto (o reconexion rechazada): que el motor
+                    # reintente con un navegador nuevo.
+                    raise
+                except Exception as e:
+                    if self._es_error_fatal_compositor(e):
+                        # Sesion caida: probar otra ruta no ayuda.
+                        raise
+                    logger.warning(f"Compositor no disponible en {ruta}: {e}")
+                    # La pagina de error SI se reintenta en la misma ruta; un
+                    # timeout sin editor ya hizo su refresh interno, se pasa a
+                    # la siguiente ruta sin gastar el presupuesto.
+                    if (
+                        intento == 1
+                        and self._es_fallo_pagina_error(e)
+                        and restante() > 1.0
+                    ):
+                        continue
+                    raise
+                if editor is not None:
+                    return editor
+                # None = fallo controlado: pagina de error (reintentar la
+                # misma ruta) o timeout sin editor (pasar a la siguiente).
+                if (
+                    intento == 1
+                    and self._frase_error_pagina()
+                    and restante() > 1.0
+                ):
+                    continue
+                break
+
+            raise Exception(
+                f"editor visible de X no apareció en {ruta} "
+                f"({self._diagnostico_pagina()})"
             )
 
         for ruta, espera, reintento in (
@@ -2140,7 +2376,7 @@ class TwitterBot:
                 raise
             except Exception as e:
                 if self._es_error_fatal_compositor(e):
-                    # Sesion caida/pagina de error: probar otra ruta no ayuda.
+                    # Sesion caida: probar otra ruta no ayuda.
                     raise
                 logger.warning(f"Compositor no disponible en {ruta}: {e}")
                 continue
@@ -2164,27 +2400,42 @@ class TwitterBot:
             logger.info("Boton 'Nuevo post' cliqueado en /home")
         else:
             logger.warning("No se encontro el boton 'Nuevo post' en /home")
-        espera_efectiva = min(10.0, restante())
-        reintento_efectivo = min(10.0, max(0.0, restante() - espera_efectiva))
-        if espera_efectiva < 10.0 or reintento_efectivo < 10.0:
-            logger.warning(
-                "timeout esperando editor visible en /home: presupuesto "
-                f"ajustado a {espera_efectiva:.0f}s + {reintento_efectivo:.0f}s"
-            )
-        try:
-            editor = self._esperar_editor_visible(
-                timeout=max(0.2, espera_efectiva),
-                reintento_timeout=max(0.2, reintento_efectivo),
-            )
-        except (WebDriverException, MaxRetryError):
-            raise
-        except Exception as e:
-            if self._es_error_fatal_compositor(e):
+
+        for intento in (1, 2):
+            if intento == 2:
+                logger.warning(
+                    "timer de /home con pagina de error; refresh corto y "
+                    "segundo intento"
+                )
+                self._refresh_corto()
+            espera_efectiva = min(10.0, restante())
+            reintento_efectivo = min(10.0, max(0.0, restante() - espera_efectiva))
+            if espera_efectiva < 10.0 or reintento_efectivo < 10.0:
+                logger.warning(
+                    "timeout esperando editor visible en /home: presupuesto "
+                    f"ajustado a {espera_efectiva:.0f}s + {reintento_efectivo:.0f}s"
+                )
+            try:
+                editor = esperar_compositor(espera_efectiva, reintento_efectivo)
+            except (WebDriverException, MaxRetryError):
                 raise
-            logger.warning(f"Compositor no disponible en /home: {e}")
-        else:
-            logger.info("compositor abierto via /home + boton Nuevo post")
-            return editor
+            except Exception as e:
+                if self._es_error_fatal_compositor(e):
+                    raise
+                logger.warning(f"Compositor no disponible en /home: {e}")
+                if (
+                    intento == 1
+                    and self._es_fallo_pagina_error(e)
+                    and restante() > 1.0
+                ):
+                    continue
+                break
+            if editor is not None:
+                logger.info("compositor abierto via /home + boton Nuevo post")
+                return editor
+            if intento == 1 and self._frase_error_pagina() and restante() > 1.0:
+                continue
+            break
 
         raise Exception(
             "compositor de X no cargo: el editor visible no aparecio "
@@ -2635,7 +2886,12 @@ class TwitterBot:
         if not aguja:
             return True
         for _ in range(max(1, intentos)):
-            contenido = self._normalizar_texto_editor(self._leer_texto_editor(elemento))
+            try:
+                contenido = self._normalizar_texto_editor(self._leer_texto_editor(elemento))
+            except Exception:
+                # StaleElementReferenceException (u otra): el elemento quedo
+                # viejo; no se puede afirmar que el texto este.
+                contenido = ""
             if aguja in contenido:
                 return True
             time.sleep(espera)
@@ -2655,67 +2911,134 @@ class TwitterBot:
              bucle char por char: miles de comandos al renderer son los que
              provocan los `Timed out receiving message from renderer` en el
              contenedor).
-        Si ninguno deja el texto en el editor lanza una excepcion explicita para
-        que el fallo se reporte como tal, en vez de publicar en vacio y terminar
-        en un falso "X no confirmo la publicacion".
+
+        El DOM de X (React) se re-renderiza y el `WebElement` guardado puede
+        quedar viejo (`StaleElementReferenceException`), perdiendo el intento:
+        cada metodo tiene hasta 2 pasadas y, si el elemento queda viejo, se
+        RE-LOCALIZA el primer editor VISIBLE
+        (`_buscar_editor_visible_actual`) y se reintenta con el fresco.
+
+        Si ninguno deja el texto en el editor lanza una excepcion explicita
+        (`"no se pudo escribir el texto en el editor de X"`) para que el fallo
+        se reporte como tal, en vez de publicar en vacio y terminar en un falso
+        "X no confirmo la publicacion".
         """
         texto = texto or ""
         if not texto:
             return
 
+        estado = {"elemento": elemento}
+
+        def _es_elemento_viejo(el) -> bool:
+            """True si el elemento ya no esta en el DOM (quedo viejo)."""
+            try:
+                el.is_displayed()
+                return False
+            except StaleElementReferenceException:
+                return True
+            except Exception:
+                return False
+
+        def _relocalizar() -> bool:
+            """Re-localiza el editor visible actual; True si hay uno fresco."""
+            try:
+                fresco = self._buscar_editor_visible_actual()
+            except Exception:
+                fresco = None
+            if fresco is None:
+                return False
+            estado["elemento"] = fresco
+            return True
+
+        def _intentar(nombre, metodo) -> bool:
+            """Ejecuta `metodo(elemento)` con hasta 2 pasadas. Nunca lanza.
+
+            Si el elemento queda viejo (por la excepcion o porque el texto no
+            quedo), re-localiza el editor visible y reintenta UNA vez con el
+            elemento fresco. Devuelve True SOLO si el texto quedo en el editor.
+            """
+            for intento in (1, 2):
+                el = estado["elemento"]
+                try:
+                    metodo(el)
+                except Exception as e:
+                    if (
+                        isinstance(
+                            e,
+                            (
+                                StaleElementReferenceException,
+                                InvalidElementStateException,
+                            ),
+                        )
+                        and intento == 1
+                        and _relocalizar()
+                    ):
+                        logger.debug(
+                            f"{nombre}: editor viejo ({type(e).__name__}); "
+                            f"re-localizado, reintentando"
+                        )
+                        continue
+                    # PyperclipException = el contenedor no tiene mecanismo de
+                    # portapapeles (sin xclip/xsel en Railway): es ESPERADO, no
+                    # un problema del bot; se registra en debug.
+                    if any(cls.__name__ == "PyperclipException" for cls in type(e).__mro__):
+                        logger.debug(
+                            f"Sin portapapeles disponible ({type(e).__name__}: {e}); "
+                            f"probando el siguiente metodo"
+                        )
+                    else:
+                        logger.warning(
+                            f"{nombre} fallo ({type(e).__name__}: {e}); "
+                            f"probando el siguiente metodo"
+                        )
+                    return False
+                if self._verificar_texto_en_editor(estado["elemento"], texto):
+                    return True
+                # El metodo corrio pero el texto no quedo: si el elemento quedo
+                # viejo (X re-renderizo el editor), re-localizar y reintentar.
+                if intento == 1 and _es_elemento_viejo(el) and _relocalizar():
+                    logger.warning(
+                        f"{nombre} no dejo el texto y el editor quedo viejo; "
+                        f"re-localizando y reintentando"
+                    )
+                    continue
+                logger.warning(f"{nombre} no dejo el texto en el editor")
+                return False
+            return False
+
         # 1) Portapapeles (rapido y natural). Todo dentro del try: en Railway
         #    falta xclip y pyperclip puede fallar; si el pegado no deja el
         #    texto, se continua con los fallbacks.
-        try:
+        def _portapapeles(el):
             import pyperclip
 
             pyperclip.copy(texto)
             modifier = Keys.COMMAND if os.name == "posix" else Keys.CONTROL
-            elemento.click()
+            el.click()
             ActionChains(self.driver).key_down(modifier).send_keys("a").key_up(modifier).perform()
             ActionChains(self.driver).key_down(modifier).send_keys("v").key_up(modifier).perform()
-            if self._verificar_texto_en_editor(elemento, texto):
-                return
-            logger.warning("El portapapeles no dejo el texto en el editor; probando execCommand")
-        except Exception as e:
-            # PyperclipException = el contenedor no tiene mecanismo de
-            # portapapeles (sin xclip/xsel en Railway): es ESPERADO, no un
-            # problema del bot; se registra en debug y se sigue con el JS.
-            if any(cls.__name__ == "PyperclipException" for cls in type(e).__mro__):
-                logger.debug(
-                    f"Sin portapapeles disponible ({type(e).__name__}: {e}); "
-                    f"usando execCommand"
-                )
-            else:
-                logger.warning(
-                    f"No se pudo pegar por portapapeles ({type(e).__name__}: {e}); "
-                    f"probando execCommand"
-                )
 
         # 2) JS: insertText sobre el elemento (focus en JS, sin clic de Selenium:
         #    el `mask` del modal de X intercepta el clic y tiraba el intento).
-        try:
+        def _execcommand(el):
             self.driver.execute_script(
                 "arguments[0].focus(); document.execCommand('insertText', false, arguments[1]);",
-                elemento,
+                el,
                 texto,
-            )
-            if self._verificar_texto_en_editor(elemento, texto):
-                return
-            logger.warning("execCommand no dejo el texto en el editor; probando send_keys")
-        except Exception as e:
-            logger.warning(
-                f"execCommand fallo ({type(e).__name__}: {e}); probando send_keys"
             )
 
         # 3) Ultimo recurso: send_keys en UNA sola llamada.
-        try:
-            elemento.click()
-            elemento.send_keys(texto)
-            if self._verificar_texto_en_editor(elemento, texto):
+        def _send_keys(el):
+            el.click()
+            el.send_keys(texto)
+
+        for nombre, metodo in (
+            ("portapapeles", _portapapeles),
+            ("execCommand", _execcommand),
+            ("send_keys", _send_keys),
+        ):
+            if _intentar(nombre, metodo):
                 return
-        except Exception as e:
-            logger.warning(f"send_keys fallo ({type(e).__name__}: {e})")
 
         raise Exception("no se pudo escribir el texto en el editor de X")
     
