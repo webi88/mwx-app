@@ -79,17 +79,3 @@ class Deduplicador:
                 logger.info(f"Historial guardado: {len(menciones)} menciones")
         except Exception as e:
             logger.error(f"Error guardando historial: {e}")
-    
-    def limpiar_historial(self, dias: int = 30):
-        try:
-            fecha_limite = datetime.now() - timedelta(days=dias)
-            
-            with get_db_session() as db:
-                eliminados = db.query(AlertaHistorial).filter(
-                    AlertaHistorial.fecha_envio < fecha_limite
-                ).delete()
-                db.commit()
-                
-                logger.info(f"Historial limpiado: {eliminados} registros eliminados")
-        except Exception as e:
-            logger.error(f"Error limpiando historial: {e}")

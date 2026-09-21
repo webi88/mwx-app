@@ -6,7 +6,6 @@ import pickle
 import re
 import threading
 import time
-import random
 import os
 from typing import Optional
 from loguru import logger
@@ -1451,28 +1450,3 @@ class TwitterAPI:
         """Id numerico de `/status/<id>` (None si no hay)."""
         match = re.search(r"/status(?:es)?/(\d+)", url or "")
         return match.group(1) if match else None
-    
-    def verificar_sesion(self) -> bool:
-        if not self.session and not self._cargar_cookies():
-            return False
-        
-        try:
-            response = self.session.get("https://x.com/i/api/1.1/account/verify_credentials.json")
-            return response.status_code == 200
-        except:
-            return False
-    
-    def rt_rapido(self, urls: list[str], usuario_ids: list[str]) -> dict:
-        resultados = {"exitos": 0, "fallidos": 0}
-        
-        for url in urls:
-            for usuario_id in usuario_ids:
-                api = TwitterAPI(usuario_id)
-                if api.retweet(url):
-                    resultados["exitos"] += 1
-                else:
-                    resultados["fallidos"] += 1
-                
-                time.sleep(random.uniform(2.5, 6.0))
-        
-        return resultados

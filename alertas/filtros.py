@@ -59,19 +59,3 @@ class FiltrosTematicos:
                 return True
         
         return False
-    
-    def verificar_keywords(self, mencion: dict, keywords: list[str], num_principales: int) -> dict:
-        titulo = mencion.get("titulo", "").lower()
-        
-        kw_principales = keywords[:num_principales]
-        kw_secundarias = keywords[num_principales:]
-        
-        for kw in kw_principales:
-            if kw.lower() in titulo:
-                return {"es_principal": True, "kw_principal": kw}
-        
-        for kw in kw_secundarias:
-            if kw.lower() in titulo:
-                return {"es_principal": False, "kw_principal": kw}
-        
-        return {"es_principal": False, "kw_principal": None}

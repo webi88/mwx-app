@@ -88,6 +88,7 @@ def _publicar_texto():
     
     variar_por_cuenta = st.checkbox(
         "🔀 Generar una variación distinta por cuenta (evita texto idéntico en masa)",
+        value=True,
         key="pub_variar_por_cuenta",
     )
     if variar_por_cuenta and len(cuentas) > 1:
@@ -1020,22 +1021,22 @@ def _mantenimiento_programado(usuario: dict | None = None):
             "'Termina al día siguiente' o corrige las horas."
         )
 
-    st.markdown("#### 🧬 Narrativa y entrenamiento (opcional)")
-    manager = CelulasManager()
+    with st.expander("🧬 Narrativa y entrenamiento (opcional)", expanded=False):
+        manager = CelulasManager()
 
-    col_cel, col_cli = st.columns(2)
-    with col_cel:
-        celula_opts = {"(Sin célula)": None}
-        for c in manager.obtener_celulas():
-            celula_opts[c.nombre] = c
-        sel_cel = st.selectbox("Célula", list(celula_opts), key="mant_celula")
-        celula = celula_opts[sel_cel]
-    with col_cli:
-        cliente_opts = {"(Sin cliente)": None}
-        for c in manager.obtener_clientes():
-            cliente_opts[c.nombre] = c
-        sel_cli = st.selectbox("Cliente", list(cliente_opts), key="mant_cliente")
-        cliente = cliente_opts[sel_cli]
+        col_cel, col_cli = st.columns(2)
+        with col_cel:
+            celula_opts = {"(Sin célula)": None}
+            for c in manager.obtener_celulas():
+                celula_opts[c.nombre] = c
+            sel_cel = st.selectbox("Célula", list(celula_opts), key="mant_celula")
+            celula = celula_opts[sel_cel]
+        with col_cli:
+            cliente_opts = {"(Sin cliente)": None}
+            for c in manager.obtener_clientes():
+                cliente_opts[c.nombre] = c
+            sel_cli = st.selectbox("Cliente", list(cliente_opts), key="mant_cliente")
+            cliente = cliente_opts[sel_cli]
 
     if st.button(
         "🧠 Preparar plan (generar textos)",

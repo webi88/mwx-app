@@ -220,10 +220,3 @@ def generar_pool_variaciones_openai(
 
     logger.info(f"Pool de variaciones OpenAI generado: {len(pool)} textos unicos")
     return pool[:cantidad]
-
-
-def elegir_variacion(pool: list[str]) -> str:
-    """Elige una variacion aleatoria del pool (o la unica disponible)."""
-    if not pool:
-        return ""
-    return random.choice(pool)

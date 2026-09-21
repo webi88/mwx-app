@@ -31,14 +31,6 @@ class FacebookBot:
         except:
             pass
     
-    def _detectar_pantalla_externa(self) -> bool:
-        try:
-            import subprocess
-            result = subprocess.run(["system_profiler", "SPDisplaysDataType"], capture_output=True, text=True)
-            return "Número" in result.stdout and result.stdout.count("Tipo de pantalla") > 1
-        except:
-            return False
-    
     def _iniciar_driver(self):
         self._limpiar_procesos_chrome()
         

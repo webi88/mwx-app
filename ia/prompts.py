@@ -807,24 +807,35 @@ def get_prompt_harfuch(contexto_links: str) -> str:
     )
 
 
-def get_prompt_filtro_alerta() -> str:
-    return (
-        "Eres un clasificador de relevancia politica en Mexico.\n"
-        "Clasifica cada noticia como RELEVANTE o NO RELEVANTE.\n\n"
-        "RELEVANTE: Gobierno, funcionarios, partidos, elecciones, seguridad publica,\n"
-        "medio ambiente, infraestructura publica, MIA, emergencias atendidas por autoridades.\n\n"
-        "NO RELEVANTE: Contenido comercial, entretenimiento sin autoridades,\n"
-        "deportes sin corrupcion, turismo/gastronomia, farandula.\n\n"
-        "Responde con el formato:\n"
-        "N. resumen (si es relevante)\n"
-        "N. NO (si no es relevante)\n"
-        "N. OK (si es relevante pero sin info para resumir)"
-    )
-
-
 def get_prompt_agrupar_temas() -> str:
     return (
         "Agrupa los siguientes titulares en temas similares.\n"
         "Responde con JSON: {\"temas\": [{\"titulo\": \"...\", \"cantidad\": N}]}\n"
         "Maximo 5 temas principales."
+    )
+
+
+def get_prompt_resumen_ejecutivo() -> str:
+    """Prompt del resumen ejecutivo de titulares (5-10 lineas, sin inventar).
+
+    Se usa en ``ia.filtros_alertas.FiltrosAlertas.resumir`` con la lista de
+    titulares pegada al final. Pide texto plano en espanol, breve, que integre
+    los titulares sin copiarlos uno por uno y sin agregar datos que no esten
+    en ellos. No incluye reglas de hashtags/registro: es un resumen interno
+    para el dashboard, no un post.
+    """
+    return (
+        "Eres un analista que redacta resúmenes ejecutivos breves y objetivos.\n"
+        "TAREA: resume los titulares que se listan abajo en un texto de 5 a 10 "
+        "líneas.\n"
+        "REGLAS:\n"
+        "- Escribe en español, claro y directo.\n"
+        "- NO inventes datos, cifras, fechas, nombres, lugares ni hechos que no "
+        "aparezcan en los titulares.\n"
+        "- NO copies los titulares uno por uno: intégralos en un resumen con "
+        "sentido y destaca los temas o asuntos que más se repiten.\n"
+        "- NO uses markdown raro (nada de tablas, bloques de código, encabezados "
+        "con # ni listas numeradas): solo texto plano.\n"
+        "- Devuelve ÚNICAMENTE el resumen, sin títulos, etiquetas ni comentarios "
+        "extra."
     )

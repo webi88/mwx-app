@@ -38,7 +38,6 @@ except Exception:  # pragma: no cover - entorno sin core
 TIPO_POST = "post"
 TIPO_COMENTARIO = "comentario"
 TIPO_RETWEET = "retweet"
-TIPOS_ACCION = (TIPO_POST, TIPO_COMENTARIO, TIPO_RETWEET)
 
 
 # --------------------------------------------------------------------------- #
@@ -518,7 +517,6 @@ def construir_plan_completo(orden, posts_por_cuenta, comentarios_por_cuenta,
 N_POSTS_CAMPANA = 3
 N_COMENTARIOS_CAMPANA = 3
 N_RTS_CAMPANA = 3
-N_ACCIONES_CAMPANA = 9
 
 
 def plan_campana_3_3_3(cuentas, hora_inicio=None, urls_rt=None,

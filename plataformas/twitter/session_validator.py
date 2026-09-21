@@ -74,27 +74,6 @@ def obtener_ct0(proxy: str = None, timeout: int = 15) -> str:
         return ""
 
 
-def cookies_minimas(auth_token: str, ct0: str) -> list:
-    """Construye la lista de cookies mínimas (auth_token + ct0) para x.com."""
-    return [
-        {"name": "auth_token", "value": auth_token, "domain": ".x.com",
-         "path": "/", "secure": True, "httpOnly": True},
-        {"name": "ct0", "value": ct0, "domain": ".x.com",
-         "path": "/", "secure": True, "httpOnly": False},
-    ]
-
-
-def _guardar_cookies(usuario: str, auth_token: str, ct0: str) -> None:
-    """Persiste auth_token + ct0 en `cookies_json` para poder publicar luego."""
-    try:
-        with get_db_session() as db:
-            reg = db.query(Cuenta).filter(Cuenta.usuario == usuario).first()
-            if reg is not None:
-                reg.cookies_json = cookies_minimas(auth_token, ct0)
-    except Exception as e:
-        logger.error(f"Error guardando cookies de {usuario}: {e}")
-
-
 def _proxy_operativo(usuario: str) -> str:
     """Proxy sticky por cuenta que SÍ alcanza x.com (rota la sesión si X la
     bloquea, igual que hace el bot al publicar)."""
@@ -107,17 +86,6 @@ def _proxy_operativo(usuario: str) -> str:
             return proxy
         proxy = pm.refrescar_sesion(proxy)
     return proxy
-
-
-def cookie_a_dict(cookies: list) -> dict:
-    """Convierte una lista de cookies a `{name: value}` (para el header Cookie)."""
-    resultado = {}
-    for c in _como_lista(cookies):
-        name = c.get("name")
-        value = c.get("value")
-        if name is not None and value is not None:
-            resultado[name] = value
-    return resultado
 
 
 def construir_headers(auth_token: str, ct0: str) -> dict:

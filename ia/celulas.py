@@ -82,7 +82,3 @@ class CelulasManager:
             if celula_id:
                 query = query.filter(Cliente.celula_id == celula_id)
             return query.all()
-    
-    def obtener_cliente(self, cliente_id: int) -> Cliente:
-        with get_db_session() as db:
-            return db.query(Cliente).filter(Cliente.id == cliente_id).first()

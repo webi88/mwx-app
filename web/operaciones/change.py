@@ -1,5 +1,13 @@
+import builtins
+
 import streamlit as st
 from web.ui import cabecera, stat
+
+# `input()` original del proceso: se guarda UNA vez al importar y se restaura
+# SIEMPRE tras el monkeypatch de la campana. Antes el `finally` borraba el
+# atributo y dejaba al proceso de Streamlit sin `input()` (rompia cualquier
+# libreria/pagina que lo usara hasta reiniciar el servidor).
+_INPUT_ORIGINAL = getattr(builtins, "input", None)
 
 
 def render(usuario: dict):
@@ -32,16 +40,19 @@ def render(usuario: dict):
         from cuentas.change_org import ChangeOrgBot
         
         with st.spinner("⏳ Iniciando campaña de firmas..."):
+            # Monkeypatch input() para que las pausas de IP avancen; el
+            # original se restaura SIEMPRE en el `finally` (ver
+            # `_INPUT_ORIGINAL`): nunca se elimina el builtin del proceso.
+            contador = {"n": 0}
+
+            def input_auto(prompt=""):
+                contador["n"] += 1
+                st.session_state.setdefault("web_change_pausas", []).append(prompt)
+                return ""
+
             try:
-                # Monkeypatch input() para que las pausas de IP avancen
-                import builtins
-                contador = {"n": 0}
-                def input_auto(prompt=""):
-                    contador["n"] += 1
-                    st.session_state.setdefault("web_change_pausas", []).append(prompt)
-                    return ""
                 builtins.input = input_auto
-                
+
                 bot = ChangeOrgBot()
                 resultados = bot.ejecutar_sesion(
                     url_peticion=url,
@@ -49,11 +60,11 @@ def render(usuario: dict):
                     reconexiones=int(reconexiones),
                 )
             finally:
-                import builtins
-                if hasattr(builtins, "input") and "input_auto" in globals():
-                    pass  # restaura al recargar la página
                 try:
-                    del builtins.input
+                    if _INPUT_ORIGINAL is not None:
+                        builtins.input = _INPUT_ORIGINAL
+                    else:
+                        builtins.__dict__.pop("input", None)
                 except Exception:
                     pass
         

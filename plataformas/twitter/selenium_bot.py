@@ -1197,18 +1197,23 @@ class TwitterBot:
 
         `driver.get(url)` puede lanzar `TimeoutException` con la pagina de
         error "something went wrong" montada (quema el page_load_timeout): aqui
-        se detecta y se hace UN `driver.refresh()` con espera acotada (<=10s o
-        lo que reste de `timeout_total`) y una segunda deteccion. NO navega a
-        ninguna otra ruta. Nunca lanza.
+        se detecta y se hacen hasta DOS `driver.refresh()` acotados (P1: el
+        generico de X a veces necesita un segundo refresh para curarse) con
+        detecciones intermedias, siempre dentro de un presupuesto de
+        recuperacion de ~15s. NO navega a ninguna otra ruta. Nunca lanza.
 
-        El `get` y el `refresh` corren con un `page_load_timeout` TEMPORAL
+        El segundo refresh NUNCA se hace para el challenge anti-bot de
+        Cloudflare, ni para login, ni para driver roto: esos se clasifican de
+        inmediato como siempre.
+
+        El `get` y los `refresh` corren con un `page_load_timeout` TEMPORAL
         (`min(previo, 25s)`) que se RESTAURA siempre (context manager con
         `finally`): un get atascado cuesta <=~25s en vez de los ~60-70s del
         timeout del bot (log real de Railway: "ok en 70.7s tras refresh").
 
         Devuelve:
-          - "ok":     pagina usable (al get o tras el refresh).
-          - "error":  sigue la pagina de error tras el refresh (fallo
+          - "ok":     pagina usable (al get o tras algun refresh).
+          - "error":  sigue la pagina de error tras los refrescos (fallo
                       controlado; deja `ultimo_error`).
           - "login":  X pide login (sesion caida; deja `ultimo_error`).
           - "driver": driver roto (`InvalidSessionId`/`NoSuchDriver`/`MaxRetry`
@@ -1272,9 +1277,15 @@ class TwitterBot:
             _log("ok")
             return "ok"
 
-        # 3) Pagina de error: UN refresh con espera acotada.
-        transcurrido = self._ahora() - t_inicio
-        espera_max = max(0.0, min(10.0, tiempo_total - transcurrido))
+        # 3) Pagina de error: UN refresh con espera acotada. Desde aqui corre
+        #    el presupuesto de recuperacion (P1: incluye un posible SEGUNDO
+        #    refresh; nunca mas de ~15s de esperas deliberadas).
+        t_recuperacion = self._ahora()
+        presupuesto_recuperacion = 15.0
+        transcurrido = t_recuperacion - t_inicio
+        espera_max = max(
+            0.0, min(10.0, tiempo_total - transcurrido, presupuesto_recuperacion)
+        )
         logger.info(
             f"navegar_tolerante: pagina de error de X al ir a {url}; "
             f"UN refresh ({self._diagnostico_pagina()})"
@@ -1295,7 +1306,7 @@ class TwitterBot:
                 if self._es_error_driver_duro(e):
                     return _marcar_driver(e)
 
-        # 4) Segunda deteccion (polling acotado).
+        # 4) Deteccion tras el primer refresh (polling acotado).
         fin = self._ahora() + espera_max
         while True:
             estado = self._estado_pagina()
@@ -1313,6 +1324,68 @@ class TwitterBot:
             except Exception:
                 break
 
+        # 5) P1: la pagina de error generica de X ("something went wrong") a
+        #    veces no se cura con UN refresh; UN refresh ADICIONAL acotado
+        #    (2 en total) dentro del presupuesto de recuperacion. NUNCA para
+        #    anti-bot Cloudflare (se detecta antes de refrescar), login ni
+        #    driver: esos ya retornaron arriba.
+        if self.es_pagina_anti_bot():
+            logger.info(
+                f"navegar_tolerante: anti-bot persiste en {url}; sin refresh "
+                f"adicional ({self._diagnostico_pagina()})"
+            )
+        else:
+            restante = presupuesto_recuperacion - (self._ahora() - t_recuperacion)
+            if restante <= 1.0:
+                logger.info(
+                    f"navegar_tolerante: sin presupuesto para el refresh "
+                    f"adicional de {url} ({restante:.1f}s restantes)"
+                )
+            else:
+                logger.info(
+                    f"navegar_tolerante: la pagina de error de X sigue tras el "
+                    f"refresh; refresh ADICIONAL acotado "
+                    f"({self._diagnostico_pagina()})"
+                )
+                with _page_load_timeout_acotado(self.driver, min(8.0, restante)):
+                    try:
+                        self.driver.refresh()
+                    except TimeoutException:
+                        logger.debug(
+                            "navegar_tolerante: segundo refresh lento/timed out"
+                        )
+                    except WebDriverException as e:
+                        if self._es_error_driver_duro(e):
+                            return _marcar_driver(e)
+                        logger.debug(
+                            f"navegar_tolerante: segundo refresh "
+                            f"WebDriverException transitoria "
+                            f"({type(e).__name__}: {e})"
+                        )
+                    except Exception as e:
+                        if self._es_error_driver_duro(e):
+                            return _marcar_driver(e)
+
+                espera_max = max(
+                    0.0, min(5.0, presupuesto_recuperacion - (self._ahora() - t_recuperacion))
+                )
+                fin = self._ahora() + espera_max
+                while True:
+                    estado = self._estado_pagina()
+                    if estado == "login":
+                        self.ultimo_error = self._error_sesion_navegacion(url)
+                        _log("login", f"err={self.ultimo_error}")
+                        return "login"
+                    if estado == "ok":
+                        _log("ok", "tras segundo refresh")
+                        return "ok"
+                    if self._ahora() >= fin:
+                        break
+                    try:
+                        time.sleep(0.5)
+                    except Exception:
+                        break
+
         if not self.ultimo_error:
             self.ultimo_error = (
                 f"página de error de X tras refresh: {self._diagnostico_pagina()}"
@@ -1325,8 +1398,9 @@ class TwitterBot:
         """Absorbe el interstitial inicial de X al CREAR una pestaña del pool.
 
         Navega UNA sola vez a `x.com/home` con `navegar_tolerante` (que ya
-        incluye UN refresh si aparece la pagina de error). Se usa al CREAR una
-        pestaña persistente; NO se llama en cada cambio de cuenta.
+        incluye hasta DOS refrescos acotados si aparece la pagina de error, P1).
+        Se usa al CREAR una pestaña persistente; NO se llama en cada cambio de
+        cuenta.
 
         Devuelve True si la pagina quedo usable ("ok"); en "login"/"error"/
         "driver" deja `ultimo_error` claro y devuelve False. Nunca lanza.
@@ -1728,13 +1802,6 @@ class TwitterBot:
         except Exception as e:
             logger.error(f"Error obteniendo tweets: {e}")
             return []
-    
-    def _parsear_fecha_mx(self, fecha_str: str, fin_de_dia: bool = False) -> datetime:
-        try:
-            fecha = datetime.strptime(fecha_str, "%a %b %d %H:%M:%S %z %Y")
-            return fecha.replace(tzinfo=None)
-        except:
-            return datetime.now()
     
     def contar_tweets_periodo(
         self,
@@ -2444,49 +2511,6 @@ class TwitterBot:
                 return "el tweet ancla tiene las respuestas limitadas"
         return self._detectar_tweet_no_disponible()
 
-    def _buscar_editor_respuesta(self, timeout: int = 12):
-        """Devuelve el textbox de composicion visible de la respuesta.
-
-        Prefiere el editor dentro del modal (`div[role='dialog']`) y luego
-        cualquier editor visible. Selectores (con fallback):
-        `[data-testid='tweetTextarea_0']`, `div[role='textbox']` y
-        `div[contenteditable='true']`. Devuelve None si no aparece.
-        """
-        selectores = [
-            "[data-testid='tweetTextarea_0']",
-            "div[role='textbox'][contenteditable='true']",
-            "div[contenteditable='true']",
-        ]
-        fin = time.time() + timeout
-        while time.time() < fin:
-            # 1) Preferir el editor dentro de un dialogo visible (modal reply).
-            try:
-                for dlg in self.driver.find_elements(By.CSS_SELECTOR, "div[role='dialog']"):
-                    try:
-                        if not dlg.is_displayed():
-                            continue
-                    except Exception:
-                        continue
-                    for sel in selectores:
-                        try:
-                            editor = dlg.find_element(By.CSS_SELECTOR, sel)
-                            if editor.is_displayed():
-                                return editor
-                        except Exception:
-                            continue
-            except Exception:
-                pass
-            # 2) Cualquier editor visible de la pagina.
-            for sel in selectores:
-                try:
-                    for editor in self.driver.find_elements(By.CSS_SELECTOR, sel):
-                        if editor.is_displayed():
-                            return editor
-                except Exception:
-                    continue
-            time.sleep(0.5)
-        return None
-
     def _esperar_article_tweet(self, timeout: int = 10):
         """Espera hasta `timeout`s a que exista `article[data-testid='tweet']`.
 
@@ -2681,8 +2705,13 @@ class TwitterBot:
         `responder_tweet`: un get atascado suele dejar la pagina de error de X
         ("something went wrong") o el challenge anti-bot de Cloudflare
         montados, y esperar 12s+8s el boton era tiro perdido (~20s por fallo).
-        Si hay interstitial hace UN refresh tolerante; si persiste, el
-        llamador falla rapido con el detalle correspondiente.
+
+        Para la PAGINA DE ERROR generica de X delega en `navegar_tolerante`,
+        que hace hasta DOS refrescos acotados (P1: el interstitial generico a
+        veces necesita un segundo) dentro de un presupuesto de ~15s; si
+        persiste, el llamador falla rapido con el detalle correspondiente.
+        Para el challenge anti-bot hace UN SOLO refresh corto (nunca el
+        adicional): es lo que puede limpiar Cloudflare.
 
         Devuelve:
           - "ok":       pagina usable (no habia interstitial o el refresh la arreglo).
@@ -2703,8 +2732,8 @@ class TwitterBot:
 
         logger.warning(
             f"interstitial en {url} "
-            f"({'anti-bot' if anti_bot else 'pagina de error de X'}); "
-            f"UN refresh tolerante antes de esperar el boton"
+            f"({'anti-bot (1 refresh)' if anti_bot else 'pagina de error de X (hasta 2 refrescos)'}); "
+            f"refresh tolerante antes de esperar el boton"
         )
 
         if anti_bot:
@@ -2738,6 +2767,10 @@ class TwitterBot:
             if not self._es_pagina_error_x():
                 return "ok"
 
+        # P1: la pagina de error generica delega en `navegar_tolerante`, que ya
+        # hace hasta DOS refrescos acotados (presupuesto ~15s). El anti-bot
+        # retorno arriba con SU unico refresh corto: aqui nunca se le agrega
+        # otro.
         resultado = self.navegar_tolerante(url, timeout_total=20.0)
         if self.es_pagina_anti_bot():
             return "anti-bot"
@@ -2774,17 +2807,131 @@ class TwitterBot:
         "div[contenteditable='true'][role='textbox']",
     )
 
+    # P0-A/P0-B: JS que resuelve el editable REAL (el elemento o un descendiente
+    # contenteditable/role=textbox) y lo enfoca. Con `arguments[1]` truthy
+    # ADEMAS selecciona todo su contenido (Range) para que la insercion
+    # posterior (CDP `Input.insertText` o Ctrl+V) REEMPLACE lo que hubiera
+    # (misma semantica que Ctrl+A + pegar). Devuelve True/False.
+    _JS_ENFOCAR_EDITABLE = """
+const raiz = arguments[0];
+if (!raiz) { return false; }
+const esEditable = (n) => {
+    if (!n || n.nodeType !== 1) { return false; }
+    try { if (n.isContentEditable) { return true; } } catch (e) {}
+    const tag = (n.tagName || '').toLowerCase();
+    return tag === 'textarea' || tag === 'input';
+};
+let objetivo = esEditable(raiz) ? raiz : null;
+if (!objetivo) {
+    const cands = raiz.querySelectorAll("[contenteditable='true'], [role='textbox']");
+    for (const c of cands) {
+        if (esEditable(c)) { objetivo = c; break; }
+    }
+}
+if (!objetivo) {
+    const cands = raiz.querySelectorAll("[role='textbox']");
+    for (const c of cands) {
+        const internos = c.querySelectorAll("[contenteditable='true'], textarea, input");
+        for (const i of internos) {
+            if (esEditable(i)) { objetivo = i; break; }
+        }
+        if (objetivo) { break; }
+    }
+}
+if (!objetivo) { return false; }
+try { objetivo.focus(); } catch (e) { return false; }
+if (arguments.length > 1 && arguments[1]) {
+    try {
+        const tag = (objetivo.tagName || '').toLowerCase();
+        if (tag === 'textarea' || tag === 'input') {
+            objetivo.select();
+        } else {
+            const rango = document.createRange();
+            rango.selectNodeContents(objetivo);
+            const sel = window.getSelection();
+            sel.removeAllRanges();
+            sel.addRange(rango);
+        }
+    } catch (e) {}
+}
+return true;
+"""
+
+    # P0-C: JS que comprueba que el punto CENTRAL del editor no este tapado por
+    # un overlay (`data-testid='mask'` del modal, etc.): `elementFromPoint`
+    # devuelve el nodo topmost en ese punto y debe ser el editor o un
+    # descendiente suyo. Devuelve true/false; null si el chequeo no se pudo
+    # hacer (el llamador cae al comportamiento anterior).
+    _JS_EDITOR_NO_OCLUIDO = """
+const el = arguments[0];
+if (!el) { return false; }
+try {
+    const r = el.getBoundingClientRect();
+    if (!r || r.width <= 0 || r.height <= 0) { return false; }
+    const x = r.left + (r.width / 2);
+    const y = r.top + (r.height / 2);
+    const top = document.elementFromPoint(x, y);
+    if (!top) { return false; }
+    return top === el || el.contains(top);
+} catch (e) { return null; }
+"""
+
+    def _editor_no_ocluido(self, editor) -> Optional[bool]:
+        """True/False si el centro del editor NO esta tapado por un overlay.
+
+        `None` si el chequeo JS no se pudo hacer (driver raro/Fake): el
+        llamador debe caer al comportamiento anterior. Nunca lanza.
+        """
+        try:
+            resultado = self.driver.execute_script(self._JS_EDITOR_NO_OCLUIDO, editor)
+        except Exception:
+            return None
+        if resultado is None:
+            return None
+        return bool(resultado)
+
+    def _enfocar_editable(self, elemento, seleccionar: bool = True) -> bool:
+        """Enfoca el editable REAL dentro de `elemento` (True si lo logro).
+
+        En algunas variantes de X `tweetTextarea_0` es un WRAPPER sin
+        `contenteditable` y el editor real es un descendiente: el CDP
+        `Input.insertText` escribe en el elemento ENFOCADO, asi que aqui se
+        resuelve y enfoca con JS (sin clic de Selenium: el `mask` del modal
+        intercepta el clic). Con `seleccionar=True` selecciona todo el
+        contenido con un Range para que la insercion lo REEMPLACE.
+
+        Devuelve False si no hay editable enfocable. Nunca lanza por si mismo:
+        las excepciones del driver se propagan al llamador (que las maneja).
+        """
+        try:
+            ok = self.driver.execute_script(
+                self._JS_ENFOCAR_EDITABLE, elemento, bool(seleccionar)
+            )
+        except Exception:
+            return False
+        return bool(ok)
+
     def _primer_editor_visible(self, selectores: Optional[list] = None, preferir_dialogo: bool = False):
-        """Devuelve el PRIMER editor VISIBLE de la pagina (None si no hay).
+        """Devuelve el PRIMER editor VISIBLE (y NO ocluido) de la pagina.
 
         X puede tener varios `[data-testid='tweetTextarea_0']` montados en el
         DOM (composers viejos/ocultos): buscar con `presence` agarra el primero
         aunque no se vea, el texto se escribe en el editor equivocado y el
         composer visible queda vacio (boton Post deshabilitado). Por eso aqui
         se exige `is_displayed()`. Con `preferir_dialogo=True` (modal de
-        respuesta) se busca primero dentro de un `div[role='dialog']` visible.
+        respuesta/cita) se busca primero dentro de un `div[role='dialog']`
+        visible.
+
+        P0-C: el primer editor VISIBLE tambien puede estar TAPADO por el
+        `data-testid='mask'` del modal (bug real: `send_keys: mask sigue
+        interceptando el clic`). Si hay VARIOS candidatos, se comprueba con
+        `_editor_no_ocluido` (JS `elementFromPoint`) y se devuelve el primero
+        cuyo centro no este tapado; si el chequeo JS falla o ninguno pasa, se
+        devuelve el primer visible (comportamiento anterior). Sigue devolviendo
+        None si no hay ningun editor visible.
         """
         selectores = list(selectores or self._EDITOR_SELECTORES)
+        candidatos = []
         if preferir_dialogo:
             try:
                 for dlg in self.driver.find_elements(By.CSS_SELECTOR, "div[role='dialog']"):
@@ -2797,7 +2944,7 @@ class TwitterBot:
                         try:
                             for editor in dlg.find_elements(By.CSS_SELECTOR, sel):
                                 if editor.is_displayed():
-                                    return editor
+                                    candidatos.append(editor)
                         except Exception:
                             continue
             except Exception:
@@ -2806,10 +2953,24 @@ class TwitterBot:
             try:
                 for editor in self.driver.find_elements(By.CSS_SELECTOR, sel):
                     if editor.is_displayed():
-                        return editor
+                        candidatos.append(editor)
             except Exception:
                 continue
-        return None
+        if not candidatos:
+            return None
+        if len(candidatos) == 1:
+            # Sin alternativa: el comportamiento de siempre (aunque el mask lo
+            # tape, no hay otro editor que elegir).
+            return candidatos[0]
+        for editor in candidatos:
+            estado = self._editor_no_ocluido(editor)
+            if estado is None:
+                # Chequeo JS no disponible: comportamiento anterior.
+                return candidatos[0]
+            if estado:
+                return editor
+        # Todos visibles pero ocluidos: no hay alternativa mejor.
+        return candidatos[0]
 
     def _buscar_editor_visible_actual(self, timeout: float = 5.0):
         """Devuelve el PRIMER editor VISIBLE actual (None si no aparece).
@@ -3815,13 +3976,18 @@ class TwitterBot:
         """Escribe `texto` en el editor verificando que REALMENTE quedo.
 
         Metodos en orden, cada uno verificado leyendo el contenido del editor:
-          1. Portapapeles (`pyperclip.copy` + Ctrl/Cmd+V).
-          2. `document.execCommand('insertText')` via JS: NO necesita clic ni
-             foco por Selenium (hace `arguments[0].focus()` en JS), asi que
-             funciona aunque el modal de X aun tenga un `data-testid="mask"`
-             encima que intercepta el clic
-             (`ElementClickInterceptedException` en Railway).
-          3. `send_keys(texto)` en UNA sola llamada como ULTIMO recurso (nada de
+          1. CDP `Input.insertText`: escribe en el elemento ENFOCADO sin clic ni
+             portapapeles, asi que funciona aunque el `data-testid="mask"` del
+             modal tape el editor (bug real de Railway: el clic de `send_keys`
+             interceptado y el portapapeles sin xclip). Antes de insertar se
+             resuelve el editable real (X monta `tweetTextarea_0` como wrapper
+             en algunas variantes) y se enfoca/selecciona todo con JS.
+          2. Portapapeles (`pyperclip.copy` + Ctrl/Cmd+V) SIN `el.click()`
+             (el mask lo intercepta): se enfoca por JS y se pega en el
+             `active_element`.
+          3. `document.execCommand('insertText')` via JS: NO necesita clic ni
+             foco por Selenium (hace `arguments[0].focus()` en JS).
+          4. `send_keys(texto)` en UNA sola llamada como ULTIMO recurso (nada de
              bucle char por char: miles de comandos al renderer son los que
              provocan los `Timed out receiving message from renderer` en el
              contenedor).
@@ -3968,19 +4134,43 @@ class TwitterBot:
                 return False
             return False
 
-        # 1) Portapapeles (rapido y natural). Todo dentro del try: en Railway
-        #    falta xclip y pyperclip puede fallar; si el pegado no deja el
-        #    texto, se continua con los fallbacks.
+        # 1) P0-A: CDP `Input.insertText` escribe en el elemento ENFOCADO: sin
+        #    clic (el `mask` del modal lo intercepta) y sin portapapeles (en
+        #    Railway no hay xclip). `_enfocar_editable` resuelve el editable
+        #    real del wrapper (`tweetTextarea_0`) y selecciona todo para que la
+        #    insercion REEMPLACE lo que hubiera.
+        def _cdp_inserttext(el):
+            if not self._enfocar_editable(el, seleccionar=True):
+                raise InvalidElementStateException(
+                    "no hay un editable enfocable dentro del editor"
+                )
+            self.driver.execute_cdp_cmd("Input.insertText", {"text": texto})
+
+        # 2) Portapapeles (`pyperclip.copy` + Ctrl/Cmd+V) SIN `el.click()`: el
+        #    `data-testid='mask'` del modal intercepta el clic y tiraba el
+        #    intento. Se enfoca el editable real por JS y se pega sobre el
+        #    `active_element`. Si pyperclip falla (sin xclip en Railway), la
+        #    PyperclipException se propaga y se pasa al siguiente metodo.
         def _portapapeles(el):
             import pyperclip
 
+            self._enfocar_editable(el, seleccionar=True)
             pyperclip.copy(texto)
             modifier = Keys.COMMAND if os.name == "posix" else Keys.CONTROL
-            el.click()
-            ActionChains(self.driver).key_down(modifier).send_keys("a").key_up(modifier).perform()
-            ActionChains(self.driver).key_down(modifier).send_keys("v").key_up(modifier).perform()
+            try:
+                activo = self.driver.switch_to.active_element
+            except Exception:
+                activo = None
+            if activo is not None:
+                activo.send_keys(modifier, "a")
+                activo.send_keys(modifier, "v")
+            else:
+                # El foco ya quedo puesto por JS: ActionChains manda las teclas
+                # al elemento activo del documento.
+                ActionChains(self.driver).key_down(modifier).send_keys("a").key_up(modifier).perform()
+                ActionChains(self.driver).key_down(modifier).send_keys("v").key_up(modifier).perform()
 
-        # 2) JS: insertText sobre el elemento (focus en JS, sin clic de Selenium:
+        # 3) JS: insertText sobre el elemento (focus en JS, sin clic de Selenium:
         #    el `mask` del modal de X intercepta el clic y tiraba el intento).
         def _execcommand(el):
             self.driver.execute_script(
@@ -3989,12 +4179,13 @@ class TwitterBot:
                 texto,
             )
 
-        # 3) Ultimo recurso: send_keys en UNA sola llamada.
+        # 4) Ultimo recurso: send_keys en UNA sola llamada.
         def _send_keys(el):
             el.click()
             el.send_keys(texto)
 
         for nombre, metodo in (
+            ("cdp_insertText", _cdp_inserttext),
             ("portapapeles", _portapapeles),
             ("execCommand", _execcommand),
             ("send_keys", _send_keys),
@@ -4345,7 +4536,11 @@ class TwitterBot:
                     # editor; la pausa fija de 2s era innecesaria.
                     time.sleep(random.uniform(0.5, 0.9))
                     
-                    editor = self._esperar_editor_visible()
+                    # P0-D: el modal de cita monta el editor dentro de un
+                    # `div[role='dialog']`; sin `preferir_dialogo` se elegia el
+                    # composer inline de la pagina (tapado por el mask del
+                    # modal) y el pegado fallaba.
+                    editor = self._esperar_editor_visible(preferir_dialogo=True)
                     mensaje = self._recortar_para_x(mensaje_cita)
                     self._pegar_texto(editor, mensaje)
                     time.sleep(0.3)
@@ -4625,25 +4820,6 @@ class TwitterBot:
             logger.error(f"Error recopilando links: {e}")
         
         return list(set(links))
-    
-    def _extraer_links_de_chat(self, mi_usuario: str) -> list[str]:
-        links = []
-        
-        try:
-            mensajes = self.driver.find_elements(By.CSS_SELECTOR, "[data-testid='messageText']")
-            
-            for mensaje in mensajes:
-                texto = mensaje.text
-                url_match = re.findall(r'https?://(?:twitter\.com|x\.com)/\w+/status/\d+', texto)
-                
-                for url in url_match:
-                    if mi_usuario.lower() not in url.lower():
-                        links.append(url)
-        
-        except Exception as e:
-            logger.error(f"Error extrayendo links: {e}")
-        
-        return links
     
     def compartir_en_grupos_dm(
         self,

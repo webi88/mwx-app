@@ -64,17 +64,18 @@ activo; aplica en el siguiente rerun y nunca toca URLs, hashtags, menciones,
 cuentas ni resultados). La pestana B incluye ademas una "Pausa entre
 comentarios al MISMO tweet" (anti-spam) y un aviso cuando solo hay 1 URL ancla.
 
-Opciones de velocidad (ambas pestanas de activacion): el expander "⚙️ Opciones
-de velocidad" expone `TWITTER_SIN_PROXY`, `CHROME_SIN_IMAGENES`,
-`MODO_PESTANA`/`PESTANA_MAX_ACCIONES` (pestanas persistentes: 1 Chrome por
-worker que cambia la sesion de cada cuenta en la misma pestana; reciclado tras
-N acciones, default 40), `API_PRIMERO`/`RT_POR_API` (default OFF: X bloquea/
-limita la API con anti-bot 226 / limite diario 344), `MAX_WORKERS` (trabajadores
-en paralelo, default 12) y `ACTIVACION_PERMITIR_PASSWORD` (login con
-password/TOTP en campanas, default OFF, lento). Los disyuntores de la API
+Opciones de velocidad (ambas pestanas de activacion): en la vista principal
+solo quedan los datos de la campaña (cuentas/seccion, URLs o modo solo-posts,
+contexto/hashtags, duracion y el boton de lanzar). Todo lo demas vive en
+«⚙️ Opciones avanzadas» con los valores recomendados ya fijos: 2 navegadores,
+12 trabajadores (`MAX_WORKERS`), "Repetir hasta agotar el tiempo" ON con
+40-90% de cuentas por ronda, "Sin proxy" OFF, "No cargar imagenes" ON, modo
+pestaña persistente ON (reciclado a las 40 acciones), "Publicar por API" OFF
+(X bloquea/limita la API con anti-bot 226 / limite diario 344) y pausa entre
+comentarios al MISMO tweet de 15s. Los disyuntores de la API
 (`API_BREAKER_FALLOS`, `API_BREAKER_SEG`) no se editan en la UI: se documentan
 en un caption y se ajustan por env. En Railway NO conviene pasar de 3-4
-"Navegadores simultaneos": si Chrome crashea, la campana se frena en cascada.
+"navegadores": si Chrome crashea, la campana se frena en cascada.
 """
 import os
 import threading
@@ -112,17 +113,20 @@ def _campana_en_curso() -> bool:
     return _CAMPANA_ACTIVA.is_set()
 
 
-def _navegadores_default() -> int:
-    """Valor por defecto (1-30) de "Navegadores simultáneos" (`MAX_BROWSERS`).
+# Navegadores recomendados para una campaña normal (valor FIJO que trae el
+# formulario; solo se cambia desde «⚙️ Opciones avanzadas»). Con modo pestaña
+# persistente 2 navegadores ya rinden bien y en Railway no conviene pasar de
+# 3-4 (si Chrome crashea, la campaña se frena en cascada).
+NAVEGADORES_RECOMENDADOS = 2
 
-    `settings.max_browsers` viene de la variable de entorno y podría quedar
-    fuera del rango del `number_input`; se acota para no romper el widget.
+
+def _navegadores_default() -> int:
+    """Valor por defecto de "Navegadores simultáneos" (2, recomendado).
+
+    El número es fijo para que lanzar una campaña normal no requiera tocar
+    nada; se puede subir en el mismo campo de «⚙️ Opciones avanzadas».
     """
-    try:
-        valor = int(settings.max_browsers)
-    except (TypeError, ValueError):
-        valor = 1
-    return min(30, max(1, valor))
+    return NAVEGADORES_RECOMENDADOS
 
 
 # ============================ LOGICA PURA ============================
@@ -1095,7 +1099,13 @@ def _panel_contexto_noticias(prefix: str) -> dict:
 # ============================ PESTANAS ============================
 
 def _cita_masiva():
-    """Pestana A: quote-RTs masivos con variaciones (formulario original)."""
+    """Pestana A: quote-RTs masivos con variaciones (formulario original).
+
+    La vista principal deja solo lo esencial (URLs, texto base, hashtags,
+    seccion, cantidad, duracion y boton de lanzar); cohortes, navegadores,
+    trabajadores, repetir/porcentajes, dar like, grupo, limpieza y las
+    opciones de velocidad viven en «⚙️ Opciones avanzadas» con los valores
+    recomendados ya fijos (no hace falta tocar nada para lanzar)."""
     # Limpieza diferida del contexto (fin de campana / "Limpiar contexto"):
     # SIEMPRE antes de crear cualquier widget de la pestana.
     _aplicar_limpieza_contexto_pendiente("act")
@@ -1114,57 +1124,158 @@ def _cita_masiva():
         help="Se agregan a los retweets con cita (con '#' garantizado).",
     )
 
-    panel_noticias = _panel_contexto_noticias("act")
+    opciones_seccion = [OPCION_TODAS_SECCIONES] + [
+        etiqueta_seccion(clave) for clave in SECCIONES
+    ]
+    seccion_opcion = st.selectbox(
+        "Sección",
+        opciones_seccion,
+        key="act_seccion",
+        help=(
+            "Solo publican las cuentas de esa sección. «Todas» no filtra por "
+            "sección; las cuentas sin asignar también entran con «Todas»."
+        ),
+    )
+    secciones_param = (
+        None
+        if seccion_opcion == OPCION_TODAS_SECCIONES
+        else [normalizar_seccion(seccion_opcion)]
+    )
+    cuentas_activas = _cargar_cuentas_con_roles()
+    if secciones_param:
+        n_seccion = sum(
+            1 for f in cuentas_activas if f.get("seccion") == secciones_param[0]
+        )
+        st.caption(
+            f"🚦 Publicarán las cuentas de **{etiqueta_seccion(secciones_param[0])}**: "
+            f"{n_seccion} de {len(cuentas_activas)} activas."
+        )
+    else:
+        st.caption(
+            f"🚦 Publicarán todas las cuentas activas: {len(cuentas_activas)}."
+        )
 
-    col1, col2, col3, col4, col5 = st.columns(5)
-    with col1:
+    col_cant, col_dur = st.columns(2)
+    with col_cant:
         cantidad = st.number_input(
             "Cantidad de cuentas (vacío = todas)",
             min_value=0, max_value=1000, value=0, step=10, key="act_cant",
         )
-    with col2:
+    with col_dur:
         duracion_min = st.number_input(
-            "Duración (min)", min_value=1, max_value=360, value=60, step=5, key="act_dur",
+            "Duración (min)", min_value=1, max_value=360, value=60, step=5,
+            key="act_dur",
         )
-    with col3:
-        cohortes = st.number_input(
-            "Cohortes", min_value=1, max_value=24, value=4, step=1, key="act_coh",
+
+    with st.expander(
+        "📰 Contexto desde noticias (opcional, solo trasfondo)", expanded=False
+    ):
+        panel_noticias = _panel_contexto_noticias("act")
+
+    with st.expander("⚙️ Opciones avanzadas (ya vienen configuradas)", expanded=False):
+        st.caption(
+            "Valores recomendados ya fijos: 2 navegadores, 12 trabajadores, "
+            "pestaña persistente, repetir por rondas (40-90% de cuentas), sin "
+            "proxy, sin API y pausa anti-spam. Cámbialos solo si sabes lo que "
+            "haces."
         )
-    with col4:
-        navegadores = st.number_input(
-            "Navegadores simultáneos",
-            min_value=1, max_value=30, value=_navegadores_default(), step=1,
-            key="act_nav",
+        col_coh, col_nav, col_work = st.columns(3)
+        with col_coh:
+            cohortes = st.number_input(
+                "Cohortes", min_value=1, max_value=24, value=4, step=1, key="act_coh",
+            )
+        with col_nav:
+            navegadores = st.number_input(
+                "Navegadores simultáneos",
+                min_value=1, max_value=30, value=_navegadores_default(), step=1,
+                key="act_nav",
+                help=(
+                    "Cada navegador ejecuta una cuenta a la vez. En Railway NO "
+                    "conviene pasar de 3-4: cada Chrome consume RAM/CPU/hilos y, "
+                    "si uno crashea, la campaña se frena en cascada (variable "
+                    "MAX_BROWSERS)."
+                ),
+            )
+        with col_work:
+            max_workers = st.number_input(
+                "Trabajadores simultáneos (acciones en paralelo)",
+                min_value=6, max_value=30, value=12, step=1,
+                key="act_workers",
+                help=(
+                    "Acciones que el motor ejecuta a la vez cuando la API va "
+                    "primero (variable MAX_WORKERS): con API primero este es el "
+                    "paralelismo REAL; súbelo a 16-24 si la API responde. Los "
+                    "navegadores solo se abren cuando la API falla."
+                ),
+            )
+
+        col_like, col_grupo = st.columns(2)
+        with col_like:
+            dar_like = st.checkbox("Dar like también", value=False, key="act_like")
+        with col_grupo:
+            grupo = st.text_input("Filtrar por grupo (A/B/C, opcional)", key="act_grupo")
+
+        repetir = st.checkbox(
+            "🔁 Repetir hasta agotar el tiempo (textos nuevos en cada ronda)",
+            value=True,
+            key="act_repetir",
             help=(
-                "Cada navegador ejecuta una cuenta a la vez. En Railway NO "
-                "conviene pasar de 3-4: cada Chrome consume RAM/CPU/hilos y, "
-                "si uno crashea, la campaña se frena en cascada (variable "
-                "MAX_BROWSERS)."
+                "Cada cuenta sigue trabajando en rondas hasta agotar la "
+                "duración, con textos nuevos regenerados en cada ronda."
             ),
         )
-    with col5:
-        max_workers = st.number_input(
-            "Trabajadores simultáneos (acciones en paralelo)",
-            min_value=6, max_value=30, value=12, step=1,
-            key="act_workers",
+        todas_cuentas = st.checkbox(
+            "📢 Todas las cuentas publican (solo con registro definido)",
+            value=False,
+            key="act_todas",
             help=(
-                "Acciones que el motor ejecuta a la vez cuando la API va "
-                "primero (variable MAX_WORKERS): con API primero este es el "
-                "paralelismo REAL; súbelo a 16-24 si la API responde. Los "
-                "navegadores solo se abren cuando la API falla."
+                "Ignora la cantidad y usa todas las cuentas activas; las "
+                "cuentas sin registro (político/activista/ciudadanía) no hacen nada."
+            ),
+        )
+        if todas_cuentas:
+            st.caption(
+                "📢 **Todas las cuentas publican**: se ignora la cantidad de "
+                "cuentas y se usan todas las activas. Solo publican las que tengan "
+                "registro definido (político/activista/ciudadanía); las cuentas sin "
+                "registro no hacen nada."
+            )
+
+        pct_min, pct_max = 40, 90
+        if repetir:
+            ayuda_pct = (
+                "Cada ronda usa un subconjunto aleatorio de cuentas: más del mín% "
+                "y menos del máx% (ej. 15 cuentas -> entre 7 y 13). La primera "
+                "ronda también."
+            )
+            col_pmin, col_pmax = st.columns(2)
+            with col_pmin:
+                pct_min = st.number_input(
+                    "Mín % de cuentas por ronda",
+                    min_value=1, max_value=99, value=40, step=5,
+                    key="act_pct_min",
+                    help=ayuda_pct,
+                )
+            with col_pmax:
+                pct_max = st.number_input(
+                    "Máx % de cuentas por ronda",
+                    min_value=1, max_value=99, value=90, step=5,
+                    key="act_pct_max",
+                    help=ayuda_pct,
+                )
+
+        limpiar_contexto_al_terminar = st.checkbox(
+            "🧹 Limpiar el contexto (noticias/tema) al terminar",
+            value=True,
+            key="act_limpiar_contexto",
+            help=(
+                "Al terminar la campaña borra el resultado/links/texto de noticias "
+                "y el tema manual; no toca URLs, hashtags, menciones, cuentas ni "
+                "resultados de la campaña."
             ),
         )
 
-    st.caption(
-        "⚡ Con API primero este es el paralelismo real: «Trabajadores "
-        "simultáneos» (`MAX_WORKERS`, default 12) — súbelo a 16-24 si la API "
-        "responde.\n\n"
-        "🖥️ En Railway NO conviene pasar de **3-4 navegadores**: los "
-        "navegadores solo se abren cuando la API falla y, si Chrome crashea, "
-        "todo se frena en cascada. No lances dos campañas a la vez."
-    )
-
-    with st.expander("⚙️ Opciones de velocidad", expanded=False):
+        st.markdown("##### 🏎️ Opciones de velocidad (recomendadas)")
         sin_proxy = st.checkbox(
             "🌐 Sin proxy: usar la IP del servidor (Railway)",
             value=False,
@@ -1207,12 +1318,6 @@ def _cita_masiva():
                 "acumular memoria/caché."
             ),
         )
-        st.caption(
-            "🪟 Con pestaña persistente se abre 1 Chrome por worker y se "
-            "conserva toda la campaña; cada cuenta cambia su sesión (cookies + "
-            "UA + proxy) en la misma pestaña, como la app de referencia. "
-            "Recomendado: 3-4 navegadores."
-        )
         rt_api = st.checkbox(
             "⚡ Publicar por API (RT, likes, posts, comentarios y citas)",
             value=False,
@@ -1238,106 +1343,6 @@ def _cita_masiva():
             ),
         )
         _caption_disyuntores_api()
-
-    opciones_seccion = [OPCION_TODAS_SECCIONES] + [
-        etiqueta_seccion(clave) for clave in SECCIONES
-    ]
-    seccion_opcion = st.selectbox(
-        "Sección",
-        opciones_seccion,
-        key="act_seccion",
-        help=(
-            "Solo publican las cuentas de esa sección. «Todas» no filtra por "
-            "sección; las cuentas sin asignar también entran con «Todas»."
-        ),
-    )
-    secciones_param = (
-        None
-        if seccion_opcion == OPCION_TODAS_SECCIONES
-        else [normalizar_seccion(seccion_opcion)]
-    )
-    cuentas_activas = _cargar_cuentas_con_roles()
-    if secciones_param:
-        n_seccion = sum(
-            1 for f in cuentas_activas if f.get("seccion") == secciones_param[0]
-        )
-        st.caption(
-            f"🚦 Publicarán las cuentas de **{etiqueta_seccion(secciones_param[0])}**: "
-            f"{n_seccion} de {len(cuentas_activas)} activas."
-        )
-    else:
-        st.caption(
-            f"🚦 Publicarán todas las cuentas activas: {len(cuentas_activas)}."
-        )
-
-    col4, col5 = st.columns(2)
-    with col4:
-        dar_like = st.checkbox("Dar like también", value=False, key="act_like")
-    with col5:
-        grupo = st.text_input("Filtrar por grupo (A/B/C, opcional)", key="act_grupo")
-
-    col6, col7 = st.columns(2)
-    with col6:
-        repetir = st.checkbox(
-            "🔁 Repetir hasta agotar el tiempo (textos nuevos en cada ronda)",
-            value=True,
-            key="act_repetir",
-            help=(
-                "Cada cuenta sigue trabajando en rondas hasta agotar la "
-                "duración, con textos nuevos regenerados en cada ronda."
-            ),
-        )
-    with col7:
-        todas_cuentas = st.checkbox(
-            "📢 Todas las cuentas publican (solo con registro definido)",
-            value=False,
-            key="act_todas",
-            help=(
-                "Ignora la cantidad y usa todas las cuentas activas; las "
-                "cuentas sin registro (político/activista/ciudadanía) no hacen nada."
-            ),
-        )
-    if todas_cuentas:
-        st.caption(
-            "📢 **Todas las cuentas publican**: se ignora la cantidad de "
-            "cuentas y se usan todas las activas. Solo publican las que tengan "
-            "registro definido (político/activista/ciudadanía); las cuentas sin "
-            "registro no hacen nada."
-        )
-
-    pct_min, pct_max = 40, 90
-    if repetir:
-        ayuda_pct = (
-            "Cada ronda usa un subconjunto aleatorio de cuentas: más del mín% "
-            "y menos del máx% (ej. 15 cuentas -> entre 7 y 13). La primera "
-            "ronda también."
-        )
-        col_pmin, col_pmax = st.columns(2)
-        with col_pmin:
-            pct_min = st.number_input(
-                "Mín % de cuentas por ronda",
-                min_value=1, max_value=99, value=40, step=5,
-                key="act_pct_min",
-                help=ayuda_pct,
-            )
-        with col_pmax:
-            pct_max = st.number_input(
-                "Máx % de cuentas por ronda",
-                min_value=1, max_value=99, value=90, step=5,
-                key="act_pct_max",
-                help=ayuda_pct,
-            )
-
-    limpiar_contexto_al_terminar = st.checkbox(
-        "🧹 Limpiar el contexto (noticias/tema) al terminar",
-        value=True,
-        key="act_limpiar_contexto",
-        help=(
-            "Al terminar la campaña borra el resultado/links/texto de noticias "
-            "y el tema manual; no toca URLs, hashtags, menciones, cuentas ni "
-            "resultados de la campaña."
-        ),
-    )
 
     if st.button("🎯 Lanzar activación", type="primary", key="btn_act"):
         urls = [u.strip() for u in urls_text.splitlines() if u.strip()]
@@ -1437,7 +1442,14 @@ def _cita_masiva():
 
 
 def _por_roles():
-    """Pestana B: subcuentas por rol (asignar + lanzar campana)."""
+    """Pestana B: subcuentas por rol (asignar + lanzar campana).
+
+    La vista principal deja lo esencial: selector de cuentas, seccion, modo
+    sin tweet ancla + URLs, contexto/hashtags/menciones, duracion y el boton
+    de lanzar. La asignacion manual de roles, los conteos y todo el resto
+    (cohortes, navegadores, trabajadores, cooldown, pausa anti-spam, rol
+    aleatorio, repetir/porcentajes y opciones de velocidad) viven en
+    «⚙️ Opciones avanzadas» con los valores recomendados ya fijos."""
     from core.roles import ROLES_ACTIVACION, etiqueta_rol_activacion, normalizar_rol_activacion
 
     # Import perezoso: cuentas.py importa Streamlit y compania y solo se
@@ -1459,90 +1471,99 @@ def _por_roles():
         )
         return
 
-    # ---------------- Asignar roles ----------------
-    st.markdown("### 🏷️ Asignar roles (subcuentas)")
+    # ---------------- Cuentas objetivo ----------------
+    st.markdown("### 👥 Cuentas objetivo")
     seleccion = _selector_masivo(cuentas, "act_roles_selector")
     usuarios_sel = [f.get("usuario") for f in seleccion if f.get("usuario")]
 
-    opciones_rol = [OPCION_SIN_ROL] + list(ROLES_ACTIVACION.values())
-    col_rol, col_btn = st.columns([2, 1])
-    with col_rol:
-        opcion_rol = st.selectbox(
-            "Rol a asignar",
-            opciones_rol,
-            key="act_roles_rol",
-            help="El rol vacio ('Sin rol') hace que la cuenta se salte en las campanas por rol.",
+    # ---------------- Asignar roles (avanzado) ----------------
+    # El modo recomendado es «🎲 Rol aleatorio por cuenta en cada ronda», que
+    # sortea la acción en cada ronda sin usar el rol guardado; la asignación
+    # manual de roles vive en un expander para no llenar la vista.
+    with st.expander("🏷️ Asignar roles manualmente (opcional)", expanded=False):
+        st.caption(
+            "Solo hace falta si vas a lanzar con «Rol aleatorio» desactivado: "
+            "en el modo recomendado el motor sortea la acción de cada cuenta."
         )
-    with col_btn:
-        st.write("")
-        asignar = st.button(
-            "💾 Asignar rol a seleccionadas",
-            key="btn_act_roles_assign",
+        opciones_rol = [OPCION_SIN_ROL] + list(ROLES_ACTIVACION.values())
+        col_rol, col_btn = st.columns([2, 1])
+        with col_rol:
+            opcion_rol = st.selectbox(
+                "Rol a asignar",
+                opciones_rol,
+                key="act_roles_rol",
+                help="El rol vacio ('Sin rol') hace que la cuenta se salte en las campanas por rol.",
+            )
+        with col_btn:
+            st.write("")
+            asignar = st.button(
+                "💾 Asignar rol a seleccionadas",
+                key="btn_act_roles_assign",
+            )
+        repartir = st.button(
+            "🎲 Repartir automáticamente entre los 4 roles",
+            key="btn_act_roles_tercios",
+            help=(
+                "En orden alfabético: reparte las cuentas seleccionadas entre "
+                "Retweet con cita, Hashtags y menciones, Comentario en el tweet "
+                "ancla y Retweet simple."
+            ),
         )
-    repartir = st.button(
-        "🎲 Repartir automáticamente entre los 4 roles",
-        key="btn_act_roles_tercios",
-        help=(
-            "En orden alfabético: reparte las cuentas seleccionadas entre "
-            "Retweet con cita, Hashtags y menciones, Comentario en el tweet "
-            "ancla y Retweet simple."
-        ),
-    )
 
-    if asignar:
-        if not usuarios_sel:
-            st.warning("Selecciona al menos una cuenta para asignarle rol.")
-        else:
-            codigo = normalizar_rol_activacion(opcion_rol)
-            n = _actualizar_roles(usuarios_sel, codigo)
-            st.success(
-                f"✅ Rol «{etiqueta_rol_activacion(codigo)}» asignado a {n} cuenta(s)."
-            )
-            st.rerun()
-
-    if repartir:
-        if not usuarios_sel:
-            st.warning(
-                "Selecciona al menos una cuenta para repartir entre los 4 roles."
-            )
-        else:
-            reparto = _repartir_tercios(usuarios_sel)
-            resumen = []
-            for rol in ORDEN_ROLES:
-                n = _actualizar_roles(reparto[rol], rol)
-                resumen.append(f"{etiqueta_rol_activacion(rol)}: {n}")
-            st.success("🎲 Reparto entre los 4 roles → " + " · ".join(resumen))
-            st.rerun()
-
-    # ---------------- Conteos y subcuentas ----------------
-    st.markdown("### 📊 Subcuentas por rol (reparto actual)")
-    _mostrar_panel_roles(cuentas)
-
-    if st.button(
-        "👁️ Previsualizar reparto actual",
-        key="btn_act_roles_preview",
-        help="Muestra el conteo por rol y ejemplos de usuarios sin lanzar nada.",
-    ):
-        st.session_state["act_roles_preview"] = True
-    if st.session_state.get("act_roles_preview"):
-        with st.expander(
-            "👁️ Previsualización del reparto actual (sin lanzar nada)",
-            expanded=True,
-        ):
-            for rol in ORDEN_ROLES + ("",):
-                subcuentas = [
-                    f.get("usuario")
-                    for f in cuentas
-                    if normalizar_rol_activacion(f.get("rol_activacion")) == rol
-                ]
-                st.markdown(
-                    f"**{etiqueta_rol_activacion(rol)}** — {len(subcuentas)} subcuenta(s)"
+        if asignar:
+            if not usuarios_sel:
+                st.warning("Selecciona al menos una cuenta para asignarle rol.")
+            else:
+                codigo = normalizar_rol_activacion(opcion_rol)
+                n = _actualizar_roles(usuarios_sel, codigo)
+                st.success(
+                    f"✅ Rol «{etiqueta_rol_activacion(codigo)}» asignado a {n} cuenta(s)."
                 )
-                if subcuentas:
-                    st.caption(
-                        "Ejemplos: " + ", ".join(f"@{u}" for u in subcuentas[:20])
-                        + (" …" if len(subcuentas) > 20 else "")
+                st.rerun()
+
+        if repartir:
+            if not usuarios_sel:
+                st.warning(
+                    "Selecciona al menos una cuenta para repartir entre los 4 roles."
+                )
+            else:
+                reparto = _repartir_tercios(usuarios_sel)
+                resumen = []
+                for rol in ORDEN_ROLES:
+                    n = _actualizar_roles(reparto[rol], rol)
+                    resumen.append(f"{etiqueta_rol_activacion(rol)}: {n}")
+                st.success("🎲 Reparto entre los 4 roles → " + " · ".join(resumen))
+                st.rerun()
+
+        # ---------------- Conteos y subcuentas ----------------
+        st.markdown("#### 📊 Subcuentas por rol (reparto actual)")
+        _mostrar_panel_roles(cuentas)
+
+        if st.button(
+            "👁️ Previsualizar reparto actual",
+            key="btn_act_roles_preview",
+            help="Muestra el conteo por rol y ejemplos de usuarios sin lanzar nada.",
+        ):
+            st.session_state["act_roles_preview"] = True
+        if st.session_state.get("act_roles_preview"):
+            with st.expander(
+                "👁️ Previsualización del reparto actual (sin lanzar nada)",
+                expanded=True,
+            ):
+                for rol in ORDEN_ROLES + ("",):
+                    subcuentas = [
+                        f.get("usuario")
+                        for f in cuentas
+                        if normalizar_rol_activacion(f.get("rol_activacion")) == rol
+                    ]
+                    st.markdown(
+                        f"**{etiqueta_rol_activacion(rol)}** — {len(subcuentas)} subcuenta(s)"
                     )
+                    if subcuentas:
+                        st.caption(
+                            "Ejemplos: " + ", ".join(f"@{u}" for u in subcuentas[:20])
+                            + (" …" if len(subcuentas) > 20 else "")
+                        )
 
     # ---------------- Lanzar campana ----------------
     st.markdown("### 🚀 Lanzar campaña por roles")
@@ -1577,10 +1598,16 @@ def _por_roles():
             f"🚦 La campaña usará todas las cuentas activas: {len(cuentas)}."
         )
 
-    # El checkbox "📝 Campaña solo de posts" se renderiza mas abajo (junto a
-    # "Rol aleatorio"); leemos su valor de session_state para poder deshabilitar
-    # las URLs en el mismo rerun en que se marca.
-    sin_ancla = bool(st.session_state.get("act_roles_sin_ancla", False))
+    sin_ancla = st.checkbox(
+        "📝 Campaña solo de posts (sin tweet ancla)",
+        value=False,
+        key="act_roles_sin_ancla",
+        help=(
+            "No hay tweet que retwittear/citar/comentar: todas las cuentas "
+            "publican posts con el contexto manual (tema), hashtags, texto "
+            "base o el trasfondo de noticias (que la IA no menciona)."
+        ),
+    )
     urls_text = st.text_area(
         "URLs objetivo (una por línea; las usan 'cita', 'comentario' y 'rt')",
         height=100,
@@ -1589,8 +1616,8 @@ def _por_roles():
     )
     if sin_ancla:
         st.caption(
-            "🚫 Sin tweet ancla: las URLs están deshabilitadas y no se usan; "
-            "todas las acciones serán posts con hashtag/contexto."
+            "🚫📌 Campaña solo de posts: no se usan URLs; todas las acciones "
+            "serán posts con hashtag/contexto."
         )
     texto_base = st.text_area(
         "Texto base de la cita / contexto por defecto de los posts con hashtag",
@@ -1624,90 +1651,185 @@ def _por_roles():
             key="act_roles_menciones",
         )
 
-    panel_noticias = _panel_contexto_noticias("act_roles")
+    with st.expander(
+        "📰 Contexto desde noticias (opcional, solo trasfondo)", expanded=False
+    ):
+        panel_noticias = _panel_contexto_noticias("act_roles")
 
-    col_dur, col_coh, col_nav, col_work, col_cool = st.columns(5)
-    with col_dur:
-        duracion_min = st.number_input(
-            "Duración (min)", min_value=1, max_value=360, value=60, step=5,
-            key="act_roles_dur",
-        )
-    with col_coh:
-        cohortes = st.number_input(
-            "Cohortes", min_value=1, max_value=24, value=4, step=1,
-            key="act_roles_coh",
-        )
-    with col_nav:
-        navegadores = st.number_input(
-            "Navegadores simultáneos",
-            min_value=1, max_value=30, value=_navegadores_default(), step=1,
-            key="act_roles_nav",
-            help=(
-                "Cada navegador ejecuta una cuenta a la vez. En Railway NO "
-                "conviene pasar de 3-4: cada Chrome consume RAM/CPU/hilos y, "
-                "si uno crashea, la campaña se frena en cascada (variable "
-                "MAX_BROWSERS)."
-            ),
-        )
-    with col_work:
-        max_workers = st.number_input(
-            "Trabajadores simultáneos (acciones en paralelo)",
-            min_value=6, max_value=30, value=12, step=1,
-            key="act_roles_workers",
-            help=(
-                "Acciones que el motor ejecuta a la vez cuando la API va "
-                "primero (variable MAX_WORKERS): con API primero este es el "
-                "paralelismo REAL; súbelo a 16-24 si la API responde. Los "
-                "navegadores solo se abren cuando la API falla."
-            ),
-        )
-    with col_cool:
-        cooldown_min = st.number_input(
-            "Descanso por cuenta (min)",
-            min_value=0, max_value=60, value=4, step=1,
-            key="act_roles_cooldown",
-            help=(
-                "Tiempo mínimo entre dos acciones de la MISMA cuenta (protege "
-                "de spam). Con muchas cuentas casi no afecta la velocidad; "
-                "0 = sin descanso."
-            ),
-        )
-
-    st.caption(
-        "⚡ Con API primero este es el paralelismo real: «Trabajadores "
-        "simultáneos» (`MAX_WORKERS`, default 12) — súbelo a 16-24 si la API "
-        "responde.\n\n"
-        "🖥️ En Railway NO conviene pasar de **3-4 navegadores**: los "
-        "navegadores solo se abren cuando la API falla y, si Chrome crashea, "
-        "todo se frena en cascada."
+    duracion_min = st.number_input(
+        "Duración (min)", min_value=1, max_value=360, value=60, step=5,
+        key="act_roles_dur",
     )
 
-    pausa_comentario = st.number_input(
-        "Pausa entre comentarios al MISMO tweet (s)",
-        min_value=0,
-        max_value=300,
-        value=15,
-        step=5,
-        key="act_roles_pausa_comentario",
-        help=(
-            "X marca como probable spam los comentarios masivos al mismo "
-            "tweet. Esta pausa espacia las respuestas a la MISMA URL; con 1 "
-            "sola URL los comentarios van en fila: usa 2-5 tweets ancla para "
-            "no frenar (con varias URLs casi no afecta la velocidad)."
-        ),
-    )
+    with st.expander("⚙️ Opciones avanzadas (ya vienen configuradas)", expanded=False):
+        st.caption(
+            "Valores recomendados ya fijos: 2 navegadores, 12 trabajadores, "
+            "pestaña persistente, rol aleatorio por ronda, repetir por rondas "
+            "(40-90% de cuentas), sin proxy, sin API y pausa anti-spam de 15s. "
+            "Cámbialos solo si sabes lo que haces."
+        )
+        col_coh, col_nav, col_work = st.columns(3)
+        with col_coh:
+            cohortes = st.number_input(
+                "Cohortes", min_value=1, max_value=24, value=4, step=1,
+                key="act_roles_coh",
+            )
+        with col_nav:
+            navegadores = st.number_input(
+                "Navegadores simultáneos",
+                min_value=1, max_value=30, value=_navegadores_default(), step=1,
+                key="act_roles_nav",
+                help=(
+                    "Cada navegador ejecuta una cuenta a la vez. En Railway NO "
+                    "conviene pasar de 3-4: cada Chrome consume RAM/CPU/hilos y, "
+                    "si uno crashea, la campaña se frena en cascada (variable "
+                    "MAX_BROWSERS)."
+                ),
+            )
+        with col_work:
+            max_workers = st.number_input(
+                "Trabajadores simultáneos (acciones en paralelo)",
+                min_value=6, max_value=30, value=12, step=1,
+                key="act_roles_workers",
+                help=(
+                    "Acciones que el motor ejecuta a la vez cuando la API va "
+                    "primero (variable MAX_WORKERS): con API primero este es el "
+                    "paralelismo REAL; súbelo a 16-24 si la API responde. Los "
+                    "navegadores solo se abren cuando la API falla."
+                ),
+            )
 
-    st.caption(
-        "⚡ Con API primero el techo lo marca «Trabajadores simultáneos» "
-        "(`MAX_WORKERS`), no los navegadores (solo se abren cuando la API "
-        "falla).\n\n"
-        "🚀 Con API primero cada acción tarda ~1-3s (RT, likes, posts, "
-        "comentarios y citas por HTTP). Usa 2-5 tweets ancla para no frenar "
-        "la pausa anti-spam de comentarios (15s por URL). No lances dos "
-        "campañas a la vez."
-    )
+        col_cool, col_pausa = st.columns(2)
+        with col_cool:
+            cooldown_min = st.number_input(
+                "Descanso por cuenta (min)",
+                min_value=0, max_value=60, value=4, step=1,
+                key="act_roles_cooldown",
+                help=(
+                    "Tiempo mínimo entre dos acciones de la MISMA cuenta (protege "
+                    "de spam). Con muchas cuentas casi no afecta la velocidad; "
+                    "0 = sin descanso."
+                ),
+            )
+        with col_pausa:
+            pausa_comentario = st.number_input(
+                "Pausa entre comentarios al MISMO tweet (s)",
+                min_value=0,
+                max_value=300,
+                value=15,
+                step=5,
+                key="act_roles_pausa_comentario",
+                help=(
+                    "X marca como probable spam los comentarios masivos al mismo "
+                    "tweet. Esta pausa espacia las respuestas a la MISMA URL; con "
+                    "1 sola URL los comentarios van en fila: usa 2-5 tweets ancla "
+                    "para no frenar (con varias URLs casi no afecta la velocidad)."
+                ),
+            )
 
-    with st.expander("⚙️ Opciones de velocidad", expanded=False):
+        roles_aleatorios = st.checkbox(
+            "🎲 Rol aleatorio por cuenta en cada ronda",
+            value=True,
+            key="act_roles_aleatorio",
+            help=(
+                "La IA sortea la acción de cada cuenta en cada ronda: RT con cita, "
+                "post con hashtags, comentario en el tweet ancla o RT simple. Una "
+                "cuenta que participa en rondas seguidas cambia de acción respecto "
+                "a su participación anterior (si hizo RT, la siguiente puede ser "
+                "cita, post con hashtag o comentario). Los inputs definen qué roles "
+                "entran: sin URLs no hay cita/rt/comentario; sin hashtags ni "
+                "contexto no hay posts con hashtag. Al marcarlo se ignora el rol "
+                "guardado y se desactiva el filtro «Solo cuentas con rol»."
+            ),
+        )
+
+        col_like, col_solo, col_rep = st.columns(3)
+        with col_like:
+            dar_like = st.checkbox(
+                "Dar like también", value=False, key="act_roles_like"
+            )
+        with col_solo:
+            solo_con_rol = st.checkbox(
+                "Solo cuentas con rol",
+                value=True,
+                key="act_roles_solo_rol",
+                disabled=roles_aleatorios,
+                help=(
+                    "Ignorado con «Rol aleatorio por cuenta»: el rol guardado no "
+                    "filtra; todas las cuentas con registro entran al sorteo."
+                    if roles_aleatorios
+                    else "Limita la campaña a las cuentas que ya tienen rol."
+                ),
+            )
+            if roles_aleatorios:
+                st.caption(
+                    "🎲 Deshabilitado: el rol se sortea por cuenta en cada ronda, "
+                    "sin usar el rol guardado."
+                )
+        with col_rep:
+            repetir = st.checkbox(
+                "🔁 Repetir hasta agotar el tiempo (textos nuevos en cada ronda)",
+                value=True,
+                key="act_roles_repetir",
+                help=(
+                    "Cada cuenta sigue trabajando en rondas hasta agotar la "
+                    "duración, con textos nuevos regenerados en cada ronda."
+                ),
+            )
+
+        pct_min, pct_max = 40, 90
+        if repetir:
+            ayuda_pct = (
+                "Cada ronda usa un subconjunto aleatorio de cuentas: más del mín% "
+                "y menos del máx% (ej. 15 cuentas -> entre 7 y 13). La primera "
+                "ronda también."
+            )
+            col_pmin, col_pmax = st.columns(2)
+            with col_pmin:
+                pct_min = st.number_input(
+                    "Mín % de cuentas por ronda",
+                    min_value=1, max_value=99, value=40, step=5,
+                    key="act_roles_pct_min",
+                    help=ayuda_pct,
+                )
+            with col_pmax:
+                pct_max = st.number_input(
+                    "Máx % de cuentas por ronda",
+                    min_value=1, max_value=99, value=90, step=5,
+                    key="act_roles_pct_max",
+                    help=ayuda_pct,
+                )
+
+        todas_cuentas = st.checkbox(
+            "📢 Todas las cuentas publican (solo con registro definido)",
+            value=False,
+            key="act_roles_todas",
+            help=(
+                "Ignora el selector y usa todas las cuentas activas; las cuentas "
+                "sin registro (político/activista/ciudadanía) no hacen nada."
+            ),
+        )
+        if todas_cuentas:
+            st.caption(
+                "📢 **Todas las cuentas publican**: se ignora el selector de "
+                "cuentas y se usan todas las activas (con rol aleatorio, sin "
+                "filtrar por rol guardado). Solo publican las que tengan registro "
+                "definido (político/activista/ciudadanía); las cuentas sin "
+                "registro no hacen nada."
+            )
+
+        limpiar_contexto_al_terminar = st.checkbox(
+            "🧹 Limpiar el contexto (noticias/tema) al terminar",
+            value=True,
+            key="act_roles_limpiar_contexto",
+            help=(
+                "Al terminar la campaña borra el resultado/links/texto de noticias "
+                "y el contexto manual de los posts; no toca URLs, hashtags, "
+                "menciones, cuentas ni resultados de la campaña."
+            ),
+        )
+
+        st.markdown("##### 🏎️ Opciones de velocidad (recomendadas)")
         sin_proxy = st.checkbox(
             "🌐 Sin proxy: usar la IP del servidor (Railway)",
             value=False,
@@ -1750,12 +1872,6 @@ def _por_roles():
                 "acumular memoria/caché."
             ),
         )
-        st.caption(
-            "🪟 Con pestaña persistente se abre 1 Chrome por worker y se "
-            "conserva toda la campaña; cada cuenta cambia su sesión (cookies + "
-            "UA + proxy) en la misma pestaña, como la app de referencia. "
-            "Recomendado: 3-4 navegadores."
-        )
         rt_api = st.checkbox(
             "⚡ Publicar por API (RT, likes, posts, comentarios y citas)",
             value=False,
@@ -1781,113 +1897,6 @@ def _por_roles():
             ),
         )
         _caption_disyuntores_api()
-
-    roles_aleatorios = st.checkbox(
-        "🎲 Rol aleatorio por cuenta en cada ronda",
-        value=True,
-        key="act_roles_aleatorio",
-        help=(
-            "La IA sortea la acción de cada cuenta en cada ronda: RT con cita, "
-            "post con hashtags, comentario en el tweet ancla o RT simple. Una "
-            "cuenta que participa en rondas seguidas cambia de acción respecto "
-            "a su participación anterior (si hizo RT, la siguiente puede ser "
-            "cita, post con hashtag o comentario). Los inputs definen qué roles "
-            "entran: sin URLs no hay cita/rt/comentario; sin hashtags ni "
-            "contexto no hay posts con hashtag. Al marcarlo se ignora el rol "
-            "guardado y se desactiva el filtro «Solo cuentas con rol»."
-        ),
-    )
-
-    sin_ancla = st.checkbox(
-        "📝 Campaña solo de posts (sin tweet ancla)",
-        value=False,
-        key="act_roles_sin_ancla",
-        help=(
-            "No hay tweet que retwittear/citar/comentar: todas las cuentas "
-            "publican posts con el contexto manual (tema), hashtags, texto "
-            "base o el trasfondo de noticias (que la IA no menciona)."
-        ),
-    )
-    if sin_ancla:
-        st.caption(
-            "🚫📌 Campaña solo de posts: no se usan URLs; todas las acciones "
-            "serán posts con hashtag/contexto."
-        )
-
-    col_like, col_solo, col_rep = st.columns(3)
-    with col_like:
-        dar_like = st.checkbox(
-            "Dar like también", value=False, key="act_roles_like"
-        )
-    with col_solo:
-        solo_con_rol = st.checkbox(
-            "Solo cuentas con rol",
-            value=True,
-            key="act_roles_solo_rol",
-            disabled=roles_aleatorios,
-            help=(
-                "Ignorado con «Rol aleatorio por cuenta»: el rol guardado no "
-                "filtra; todas las cuentas con registro entran al sorteo."
-                if roles_aleatorios
-                else "Limita la campaña a las cuentas que ya tienen rol."
-            ),
-        )
-        if roles_aleatorios:
-            st.caption(
-                "🎲 Deshabilitado: el rol se sortea por cuenta en cada ronda, "
-                "sin usar el rol guardado."
-            )
-    with col_rep:
-        repetir = st.checkbox(
-            "🔁 Repetir hasta agotar el tiempo (textos nuevos en cada ronda)",
-            value=True,
-            key="act_roles_repetir",
-            help=(
-                "Cada cuenta sigue trabajando en rondas hasta agotar la "
-                "duración, con textos nuevos regenerados en cada ronda."
-            ),
-        )
-
-    pct_min, pct_max = 40, 90
-    if repetir:
-        ayuda_pct = (
-            "Cada ronda usa un subconjunto aleatorio de cuentas: más del mín% "
-            "y menos del máx% (ej. 15 cuentas -> entre 7 y 13). La primera "
-            "ronda también."
-        )
-        col_pmin, col_pmax = st.columns(2)
-        with col_pmin:
-            pct_min = st.number_input(
-                "Mín % de cuentas por ronda",
-                min_value=1, max_value=99, value=40, step=5,
-                key="act_roles_pct_min",
-                help=ayuda_pct,
-            )
-        with col_pmax:
-            pct_max = st.number_input(
-                "Máx % de cuentas por ronda",
-                min_value=1, max_value=99, value=90, step=5,
-                key="act_roles_pct_max",
-                help=ayuda_pct,
-            )
-
-    todas_cuentas = st.checkbox(
-        "📢 Todas las cuentas publican (solo con registro definido)",
-        value=False,
-        key="act_roles_todas",
-        help=(
-            "Ignora el selector y usa todas las cuentas activas; las cuentas "
-            "sin registro (político/activista/ciudadanía) no hacen nada."
-        ),
-    )
-    if todas_cuentas:
-        st.caption(
-            "📢 **Todas las cuentas publican**: se ignora el selector de "
-            "cuentas y se usan todas las activas (con rol aleatorio, sin "
-            "filtrar por rol guardado). Solo publican las que tengan registro "
-            "definido (político/activista/ciudadanía); las cuentas sin "
-            "registro no hacen nada."
-        )
 
     # Filtros efectivos de la campana: los comparten el aviso anti-spam y el
     # boton de lanzamiento.
@@ -1923,17 +1932,6 @@ def _por_roles():
             "tweet y X los agrupa como 'Probable spam'. Usa 2-5 tweets ancla "
             "para no frenar: pega 2-5 URLs o sube la pausa."
         )
-
-    limpiar_contexto_al_terminar = st.checkbox(
-        "🧹 Limpiar el contexto (noticias/tema) al terminar",
-        value=True,
-        key="act_roles_limpiar_contexto",
-        help=(
-            "Al terminar la campaña borra el resultado/links/texto de noticias "
-            "y el contexto manual de los posts; no toca URLs, hashtags, "
-            "menciones, cuentas ni resultados de la campaña."
-        ),
-    )
 
     if st.button(
         "🗂️ Lanzar campaña por roles",
@@ -2094,9 +2092,11 @@ def render(usuario: dict):
     )
 
     st.info(
-        f"Concurrencia máxima de navegadores: **{settings.max_browsers}** "
-        f"(en Railway NO conviene pasar de 3-4: si Chrome crashea, la campaña "
-        f"se frena; configurable con `MAX_BROWSERS`). "
+        f"Configuración recomendada ya fija: **{NAVEGADORES_RECOMENDADOS} "
+        f"navegadores**, 12 trabajadores, modo pestaña persistente y pausa "
+        f"anti-spam. Solo cambia algo en «⚙️ Opciones avanzadas» si hace "
+        f"falta (en Railway NO conviene pasar de 3-4 navegadores: si Chrome "
+        f"crashea, la campaña se frena; `MAX_BROWSERS={settings.max_browsers}`). "
         f"Headless: **{settings.headless}**."
     )
 

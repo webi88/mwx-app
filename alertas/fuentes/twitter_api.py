@@ -148,15 +148,3 @@ class TwitterSource:
             logger.error(f"Error busqueda Twitter: {e}")
         
         return menciones
-    
-    def buscar_mencion_directa(self, handle: str, horas: int = 24) -> list[dict]:
-        cookies_paths = self._obtener_cookies_disponibles()
-        
-        if not cookies_paths:
-            return []
-        
-        session = self._crear_sesion(cookies_paths[0])
-        if not session:
-            return []
-        
-        return self._buscar_keyword(session, handle, horas)

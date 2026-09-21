@@ -1,7 +1,7 @@
 import json
 import os
 import time
-from datetime import datetime, timedelta
+from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional
 from loguru import logger
@@ -148,37 +148,6 @@ class MonitorActividad:
         
         return resultados
     
-    def obtener_estadisticas(self, horas: int = 24) -> dict:
-        if not os.path.exists(self.resultados_path):
-            return {"error": "Sin datos"}
-        
-        with open(self.resultados_path, "r", encoding="utf-8") as f:
-            historial = json.load(f)
-        
-        fecha_limite = datetime.now() - timedelta(hours=horas)
-        
-        recientes = [
-            r for r in historial
-            if datetime.fromisoformat(r.get("timestamp", "")) >= fecha_limite
-        ]
-        
-        if not recientes:
-            return {"error": "Sin datos recientes"}
-        
-        ultimo = recientes[-1]
-        
-        total_tweets = sum(c.get("tweets", 0) for c in ultimo.get("resumen", []))
-        total_retweets = sum(c.get("retweets", 0) for c in ultimo.get("resumen", []))
-        
-        return {
-            "ultima_ejecucion": ultimo.get("timestamp"),
-            "cuentas_monitor": ultimo.get("cuentas_monitor", 0),
-            "total_tweets": total_tweets,
-            "total_retweets": total_retweets,
-            "total_actividad": total_tweets + total_retweets
-        }
-
-
 def main():
     import argparse
     

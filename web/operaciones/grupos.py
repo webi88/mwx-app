@@ -33,7 +33,7 @@ def _enviar_grupos():
     cuenta = cuenta_opts[sel]
     
     link = st.text_input("Link a compartir", key="grupos_link")
-    mensaje = st.text_area("Mensaje", height=60, key="grupos_mensaje")
+    mensaje = st.text_area("Mensaje", height=80, key="grupos_mensaje")
     grupos_text = st.text_area(
         "Grupos (uno por línea o separados por coma)",
         height=80, key="grupos_lista",

@@ -16,7 +16,6 @@ from core.registros import normalizar_tipo_cuenta
 from ia.prompts import (
     bloque_estilo_perfil,
     bloque_tweet_ancla,
-    get_prompt_generico,
     get_prompt_hashtags,
     get_prompt_verificado_ambiental,
     get_prompt_harfuch,
@@ -3215,17 +3214,6 @@ def _perfil_normalizado(info) -> str:
         return normalizar_perfil((info or {}).get("perfil"))
     except Exception:
         return ""
-
-
-def _contiene_algun_hashtag(texto: str, tags) -> bool:
-    """True si el texto contiene alguno de los hashtags (case-insensitive)."""
-    bajo = str(texto or "").lower()
-    if not bajo:
-        return False
-    for tag in tags or []:
-        if str(tag or "").lower() in bajo:
-            return True
-    return False
 
 
 def _hashtag_al_final(texto: str) -> bool:

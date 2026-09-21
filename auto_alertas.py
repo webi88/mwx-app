@@ -70,9 +70,6 @@ class AutoAlertas:
         except Exception as e:
             logger.error(f"Error guardando historial: {e}")
     
-    def agrupar_por_temas(self, menciones: list[dict]) -> list[dict]:
-        return self.filtros_ai.agrupar_temas([m["titulo"] for m in menciones])
-    
     def _guardar_menciones_dia(self, menciones: list[dict], cliente_nombre: str):
         try:
             fecha = datetime.now().strftime("%Y-%m-%d")

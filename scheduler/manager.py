@@ -84,12 +84,6 @@ class SchedulerManager:
             logger.error(f"Error cancelando tarea: {e}")
             return False
     
-    def obtener_tareas_pendientes(self) -> list[Tarea]:
-        with get_db_session() as db:
-            return db.query(Tarea).filter(
-                Tarea.estado.in_(["pendiente", "ejecutando"])
-            ).order_by(Tarea.fecha_hora).all()
-    
     def detener(self):
         if self.scheduler.running:
             self.scheduler.shutdown()

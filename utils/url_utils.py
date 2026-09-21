@@ -36,25 +36,3 @@ def resolver_url_google_news(url_google_news: str) -> Optional[str]:
     except Exception as e:
         logger.error(f"Error resolviendo URL: {e}")
         return None
-
-
-def es_url_valida(url: str) -> bool:
-    patron = r"^https?://[^\s/$.?#].[^\s]*$"
-    return bool(re.match(patron, url))
-
-
-def extraer_dominio(url: str) -> Optional[str]:
-    try:
-        from urllib.parse import urlparse
-        parsed = urlparse(url)
-        return parsed.netloc
-    except:
-        return None
-
-
-def verificar_url_activa(url: str, timeout: int = 5) -> bool:
-    try:
-        response = requests.head(url, allow_redirects=True, timeout=timeout)
-        return response.status_code < 400
-    except:
-        return False

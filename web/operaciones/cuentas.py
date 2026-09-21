@@ -66,6 +66,33 @@ TABS = [
     "📤 Exportar",
 ]
 
+# Agrupación de las 15 pestañas en 3 MODOS (radio superior). Reduce el ruido
+# visual sin quitar ninguna pestaña: cada una aparece en UN solo modo y `TABS`
+# (exportado, lo usa web/app.py para validar ?tab=) se conserva intacto.
+MODOS_TABS = {
+    "🗂️ Cuentas": [
+        "📥 Importar",
+        "🔎 Validar",
+        "⏸️ Estado",
+        "📋 Inventario",
+        "📤 Exportar",
+    ],
+    "🎭 Identidad": [
+        "🗂️ Secciones (IP/CI/Libertad/Justicia)",
+        "🎭 Registro",
+        "🎨 Perfiles",
+        "🏷️ Nombres",
+        "📷 Fotos",
+    ],
+    "🛡️ Avanzado": [
+        "🛡️ Anti-detección",
+        "🔄 Sincronizar desde X",
+        "🏷️ Renombrar usuario",
+        "✏️ Cambiar nombre/@",
+        "🧾 Perfil completo",
+    ],
+}
+
 
 # ============================ HELPERS ============================
 
@@ -3716,12 +3743,37 @@ def _tab_exportar():
             st.markdown(linea)
 
 
+def _modo_de_tab(tab: str) -> str:
+    """Modo (clave de `MODOS_TABS`) que contiene la pestaña `tab`.
+
+    Si la pestaña no está en ningún modo devuelve el primero, para no dejar la
+    UI sin un modo válido."""
+    for modo, tabs in MODOS_TABS.items():
+        if tab in tabs:
+            return modo
+    return next(iter(MODOS_TABS))
+
+
+def _on_cambio_modo():
+    """Al cambiar de modo, abre la primera pestaña de ese modo.
+
+    Es un callback: corre antes de instanciar el radio de pestañas, así que
+    puede reescribir `cuentas_pestana_selector` sin tocar un widget ya creado."""
+    try:
+        tabs_modo = MODOS_TABS.get(st.session_state.get("cuentas_modo_selector")) or []
+        if tabs_modo:
+            st.session_state["cuentas_pestana_selector"] = tabs_modo[0]
+    except Exception:
+        pass
+
+
 def _restaurar_pestana_desde_url():
     """Restaura la pestaña interna desde `?tab=` en recargas del navegador.
 
     Solo actúa cuando `cuentas_pestana_selector` aún no existe en
     session_state (sesión nueva): en un st.rerun() normal el radio conserva
-    su valor solo y no se toca nada. Los valores inválidos se ignoran."""
+    su valor solo y no se toca nada. Los valores inválidos se ignoran.
+    También preselecciona el MODO que contiene esa pestaña."""
     if "cuentas_pestana_selector" in st.session_state:
         return
     try:
@@ -3732,6 +3784,7 @@ def _restaurar_pestana_desde_url():
         tab = tab[0] if tab else None
     if tab and str(tab) in TABS:
         st.session_state["cuentas_pestana_selector"] = str(tab)
+        st.session_state["cuentas_modo_selector"] = _modo_de_tab(str(tab))
 
 
 def _on_cambio_pestana():
@@ -3775,13 +3828,42 @@ def render(usuario):
     # Radio horizontal en vez de st.tabs: Streamlit ejecuta TODAS las pestanas
     # de st.tabs en cada rerun (11 consultas a BD por interaccion). Con radio
     # solo se renderiza la seleccionada (~1/N consultas).
+    # Primero se elige el MODO (3 grupos de pestañas) y luego la pestaña del
+    # modo; con 15 pestañas era demasiado ruido verlas todas juntas.
     # La pestaña persiste en ?tab= (ver _restaurar_pestana_desde_url): un
     # st.rerun() tras cambiar registro/tipo/sección conserva el radio vía
     # session_state, y una recarga del navegador lo restaura desde la URL.
     _restaurar_pestana_desde_url()
+
+    # La pestaña activa puede pertenecer a otro modo (p.ej. el botón
+    # "Ir a Renombrar usuario" de la pestaña Sincronizar): se cambia el modo
+    # para mostrarla en vez de caer a la primera pestaña del modo actual.
+    seleccion_guardada = st.session_state.get("cuentas_pestana_selector", TABS[0])
+    if "cuentas_modo_selector" not in st.session_state:
+        st.session_state["cuentas_modo_selector"] = _modo_de_tab(seleccion_guardada)
+    elif seleccion_guardada in TABS and seleccion_guardada not in (
+        MODOS_TABS.get(st.session_state["cuentas_modo_selector"]) or []
+    ):
+        st.session_state["cuentas_modo_selector"] = _modo_de_tab(seleccion_guardada)
+
+    modo = st.radio(
+        "📍 MODO:",
+        list(MODOS_TABS),
+        key="cuentas_modo_selector",
+        horizontal=True,
+        on_change=_on_cambio_modo,
+        help=(
+            "Cuentas: importar/validar/inventario · Identidad: secciones, "
+            "registro, perfiles, nombres y fotos · Avanzado: anti-detección, "
+            "sincronización y cambios de perfil en X."
+        ),
+    )
+    tabs_modo = MODOS_TABS.get(modo) or TABS
+    if st.session_state.get("cuentas_pestana_selector") not in tabs_modo:
+        st.session_state["cuentas_pestana_selector"] = tabs_modo[0]
     seleccion = st.radio(
         "📍 SECCIÓN:",
-        TABS,
+        tabs_modo,
         key="cuentas_pestana_selector",
         horizontal=True,
         on_change=_on_cambio_pestana,

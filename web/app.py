@@ -40,26 +40,86 @@ inyectar_css()
 OPCIONES = [
     "📰 Posts / Mantenimientos",
     "⏰ Reparto por Hora",
+    "📅 Calendario: Programación",
+    "🖼️ Multimedia",
     "⚡ RTS / Activaciones",
     "🎯 Activación Masiva",
-    "🚨 Alertas",
-    "👥 Grupos: Reciprocidad",
-    "💬 Crisis: Respuestas",
-    "👁️ Visualizaciones",
-    "📋 Resúmenes Ejecutivos",
-    "✍️ Change.org: Peticiones",
-    "🌐 Blogs Web",
     "❤️ Influencia: Likes",
-    "🚀 Impulso: Follows",
+    # OCULTO (sin soporte Twitter): reactivable borrando el '#'.
+    # "🚀 Impulso: Follows",
     "🚩 Reportar Posts",
-    "📅 Calendario: Programación",
+    # OCULTO (sin soporte Twitter): reactivable borrando el '#'.
+    # "👁️ Visualizaciones",
+    "🚨 Alertas",
+    "💬 Crisis: Respuestas",
+    "👥 Grupos: Reciprocidad",
+    "📋 Resúmenes Ejecutivos",
+    # OCULTO (sin backend real de blogs): reactivable borrando el '#'.
+    # "🌐 Blogs Web",
+    "✍️ Change.org: Peticiones",
     "📊 Reportes",
     "📈 Monitor: Actividad",
-    "🖼️ Multimedia",
 ]
 
 OPCIONES_ADMIN = ["👑 Admin: Usuarios"]
 OPCIONES_CREAR = ["🗂️ Cuentas: Perfiles, Secciones & Nombres"]
+
+# Navegación en 2 niveles (categoría -> operación): evita mostrar ~20 botones
+# a la vez. Cada operación aparece en UNA sola categoría y las categorías sin
+# operaciones visibles para el rol (p.ej. un operador no ve Cuentas/Admin) se
+# ocultan. `?op=` sigue funcionando: si la URL trae una operación se
+# preselecciona su categoría.
+CATEGORIAS = [
+    (
+        "✍️ Publicar y programar",
+        [
+            "📰 Posts / Mantenimientos",
+            "⏰ Reparto por Hora",
+            "📅 Calendario: Programación",
+            "🖼️ Multimedia",
+        ],
+    ),
+    (
+        "⚡ Automatización Twitter",
+        [
+            "⚡ RTS / Activaciones",
+            "🎯 Activación Masiva",
+            "❤️ Influencia: Likes",
+            # OCULTO (sin soporte Twitter en TwitterBot): reactivable borrando
+            # el '#' de la línea correspondiente en OPCIONES y aquí.
+            # "🚀 Impulso: Follows",
+            "🚩 Reportar Posts",
+            # OCULTO (sin soporte Twitter en TwitterBot): reactivable borrando
+            # el '#' de la línea correspondiente en OPCIONES y aquí.
+            # "👁️ Visualizaciones",
+        ],
+    ),
+    (
+        "📡 Monitoreo y respuesta",
+        [
+            "🚨 Alertas",
+            "💬 Crisis: Respuestas",
+            "👥 Grupos: Reciprocidad",
+            "📋 Resúmenes Ejecutivos",
+            # OCULTO (blogs.py no tiene backend real): reactivable borrando el
+            # '#' de la línea correspondiente en OPCIONES y aquí.
+            # "🌐 Blogs Web",
+            "✍️ Change.org: Peticiones",
+        ],
+    ),
+    (
+        "📊 Datos y cuentas",
+        [
+            "📊 Reportes",
+            "📈 Monitor: Actividad",
+            "🗂️ Cuentas: Perfiles, Secciones & Nombres",
+            "👑 Admin: Usuarios",
+        ],
+    ),
+]
+
+# Operación que se abre al entrar sin `?op=` (landing histórica del dashboard).
+OPERACION_POR_DEFECTO = "🚨 Alertas"
 
 
 def _leer_query_param(nombre: str):
@@ -94,6 +154,32 @@ def _op_desde_query_param(opciones: list) -> str | None:
         if op.startswith(crudo) or crudo.startswith(op):
             return op
     return None
+
+
+def _categorias_para(rol: str) -> list:
+    """[ (categoria, [operaciones]) ] visibles para el rol.
+
+    Un operador no ve las operaciones de admin (Cuentas/Admin): la categoría
+    "📊 Datos y cuentas" sigue visible con Reportes y Monitor. Las categorías
+    sin ninguna operación visible se omiten.
+    """
+    visibles = set(OPCIONES)
+    if rol == "admin":
+        visibles.update(OPCIONES_ADMIN + OPCIONES_CREAR)
+    categorias = []
+    for nombre, operaciones in CATEGORIAS:
+        filtradas = [op for op in operaciones if op in visibles]
+        if filtradas:
+            categorias.append((nombre, filtradas))
+    return categorias
+
+
+def _categoria_de(operacion: str, categorias: list) -> str:
+    """Categoría que contiene `operacion` (la primera si no está en ninguna)."""
+    for nombre, operaciones in categorias:
+        if operacion in operaciones:
+            return nombre
+    return categorias[0][0]
 
 
 def _sincronizar_op_en_url(seleccion: str):
@@ -186,28 +272,57 @@ def main():
     with st.sidebar:
         render_sidebar(usuario)
     
-    opciones = OPCIONES.copy()
-    if usuario["rol"] == "admin":
-        opciones += OPCIONES_ADMIN + OPCIONES_CREAR
+    categorias = _categorias_para(usuario["rol"])
+    mapa_categorias = dict(categorias)
+    opciones = [op for _, ops in categorias for op in ops]
+    default_op = (
+        OPERACION_POR_DEFECTO if OPERACION_POR_DEFECTO in opciones else opciones[0]
+    )
+
+    def _categoria_de_op(op: str) -> str:
+        return _categoria_de(op, categorias)
 
     # --- Navegación persistente (?op= + session_state) ---
     # Recarga del navegador -> session_state vacío -> se restaura desde ?op=.
-    # st.rerun() normal -> el selectbox conserva su valor y ?op= solo se
+    # st.rerun() normal -> los selectboxes conservan su valor y ?op= solo se
     # re-sincroniza. Nunca se vuelve a Alertas salvo que no haya ni estado
     # ni query param válido.
-    index_default = opciones.index("🚨 Alertas")
     if "web_nav_selector" not in st.session_state:
-        op_guardada = _op_desde_query_param(opciones)
-        if op_guardada is not None:
-            st.session_state["web_nav_selector"] = op_guardada
-            st.session_state["operacion_actual"] = op_guardada
-    seleccion = st.selectbox(
-        "📍 SELECCIONA LA OPERACIÓN:",
-        opciones,
-        index=index_default,
-        key="web_nav_selector",
-        on_change=_on_cambio_operacion,
-    )
+        st.session_state["web_nav_selector"] = (
+            _op_desde_query_param(opciones) or default_op
+        )
+    # Sesiones viejas o cambio de rol: si la operación guardada ya no es
+    # visible (p.ej. un operador con la operación Cuentas de un admin) se cae
+    # a la operación por defecto.
+    if st.session_state["web_nav_selector"] not in opciones:
+        st.session_state["web_nav_selector"] = default_op
+    # La categoría se deriva de la operación activa; el selectbox de categoría
+    # la actualiza al cambiarla.
+    if st.session_state.get("web_nav_categoria") not in mapa_categorias:
+        st.session_state["web_nav_categoria"] = _categoria_de_op(
+            st.session_state["web_nav_selector"]
+        )
+
+    col_categoria, col_operacion = st.columns([2, 3])
+    with col_categoria:
+        categoria = st.selectbox(
+            "📂 CATEGORÍA:",
+            list(mapa_categorias),
+            key="web_nav_categoria",
+        )
+    opciones_categoria = mapa_categorias.get(categoria) or opciones
+    if st.session_state.get("web_nav_selector") not in opciones_categoria:
+        # Cambió la categoría: abrir la primera operación de la nueva. Se
+        # escribe ANTES de instanciar el selectbox de operación, así el widget
+        # la toma como valor válido (sin "value not in options").
+        st.session_state["web_nav_selector"] = opciones_categoria[0]
+    with col_operacion:
+        seleccion = st.selectbox(
+            "📍 SELECCIONA LA OPERACIÓN:",
+            opciones_categoria,
+            key="web_nav_selector",
+            on_change=_on_cambio_operacion,
+        )
     st.session_state["operacion_actual"] = seleccion
     _sincronizar_op_en_url(seleccion)
 

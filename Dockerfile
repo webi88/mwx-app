@@ -12,7 +12,7 @@ WORKDIR /app
 # Dependencias del sistema: Chrome + Xvfb (pantalla virtual) + supervisord.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     wget curl gnupg unzip ca-certificates \
-    xvfb supervisor fonts-liberation \
+    xclip xsel xvfb supervisor fonts-liberation \
     libnss3 libasound2 libgbm1 libx11-6 libx11-xcb1 libxcb1 \
     libxcomposite1 libxdamage1 libxrandr2 libxss1 libxtst6 \
     libatk-bridge2.0-0 libatk1.0-0 libcups2 libdrm2 libxshmfence1 \

@@ -15,5 +15,8 @@ data/proxy_base.txt
 data/web_users.json
 data/bin/
 data/avatar*/*.png
+data/avatars/
+data/portadas/
+data/backups/
 .DS_Store
 Thumbs.db

@@ -1546,12 +1546,6 @@ class MotorActivacion:
         except Exception:
             pass
 
-    def _registrar_evento(self, usuario, ok, detalle, ronda=1, rol="",
-                          url="") -> None:
-        """Version thread-safe de `_registrar_evento_locked`."""
-        with self._lock:
-            self._registrar_evento_locked(usuario, ok, detalle, ronda, rol, url)
-
     def snapshot_progreso(self) -> dict:
         """Copia thread-safe del progreso en vivo para la UI.
 

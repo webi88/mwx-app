@@ -51,14 +51,6 @@ class Base(DeclarativeBase):
     pass
 
 
-def get_db() -> Generator:
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
-
-
 @contextmanager
 def get_db_session() -> Generator:
     db = SessionLocal()

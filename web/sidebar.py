@@ -36,7 +36,10 @@ def render_sidebar(usuario: dict):
     
     _seccion_gestion_clientes(usuario)
     _seccion_asistente_ia(usuario)
-    _seccion_multimedia(usuario)
+    # OCULTO (2 pasos y no genera): "🎨 Generar Imagen" solo guardaba el
+    # prompt en session_state y exigía ir a Multimedia para generarla. La
+    # función se conserva; reactivable descomentando esta llamada.
+    # _seccion_multimedia(usuario)
     _seccion_inventario(usuario)
 
 

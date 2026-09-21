@@ -88,7 +88,3 @@ class GoogleNewsSource:
             logger.error(f"Error busqueda Google News: {e}")
         
         return menciones
-    
-    def buscar_mencion_directa(self, handle: str, horas: int = 24) -> list[dict]:
-        query = f'"{handle}" site:x.com when:7d'
-        return self._buscar_query(query, horas)

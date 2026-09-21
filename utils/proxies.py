@@ -1,5 +1,4 @@
 import json
-import hashlib
 import os
 import random
 import re
@@ -65,15 +64,6 @@ def pais_normalizado(pais: str) -> Optional[str]:
         if p in aliases:
             return canon
     return p
-
-
-def codigo_a_pais(codigo: str) -> Optional[str]:
-    """Convierte un codigo ISO de 2 letras (ej. 'DE', 'FR') a la clave canonica
-    del pais ('alemania', 'francia'). Devuelve None si no hay codigo."""
-    if not codigo:
-        return None
-    c = codigo.strip().upper()
-    return PAIS_ISO.get(c, c.lower())
 
 
 def _sesion_aleatoria(longitud: int = 8) -> str:
@@ -651,78 +641,6 @@ class ProxyManager:
 
         return resultado
 
-    def verificar_ip_x(self, proxy: str, timeout: int = 20) -> dict:
-        """Comprueba si el proxy puede cargar X sin bloqueo HTTP evidente.
-
-        Devuelve {'ok': bool, 'status': int|None, 'error': str}. Solo marca ok=False
-        ante señales CLARAS de bloqueo (HTTP 403/429 o marcadores de bloqueo en el
-        body). Los errores de red/timeout NO se marcan como bloqueo (de eso ya se
-        encarga verificar_proxy); en ese caso se devuelve ok=True para no quemar
-        proxies por falsos negativos.
-        """
-        import requests
-
-        resultado = {"ok": True, "status": None, "error": ""}
-        info = self.analizar(proxy)
-        if not info:
-            resultado["ok"] = False
-            resultado["error"] = "proxy invalido"
-            return resultado
-
-        user = info.get("user")
-        pwd = info.get("password") or ""
-        creds = f"{user}:{pwd}@" if user else ""
-        url_proxy = f"{info['scheme']}://{creds}{info['host']}:{info['port']}"
-        proxies = {"http": url_proxy, "https": url_proxy}
-        headers = {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-            )
-        }
-
-        try:
-            r = requests.get(
-                "https://x.com/",
-                proxies=proxies,
-                timeout=timeout,
-                allow_redirects=True,
-                headers=headers,
-            )
-            resultado["status"] = r.status_code
-
-            if r.status_code in (403, 429):
-                resultado["ok"] = False
-                resultado["error"] = f"HTTP {r.status_code} (posible bloqueo de X)"
-                return resultado
-
-            texto = (r.text or "")[:3000].lower()
-            marcadores = (
-                "something went wrong",
-                "algo salio mal",
-                "access denied",
-                "privacy related extensions",
-                "enable javascript",
-            )
-            for m in marcadores:
-                if m in texto:
-                    resultado["ok"] = False
-                    resultado["error"] = f"X devolvió bloqueo ({m})"
-                    return resultado
-
-            return resultado
-        except Exception as e:
-            msg = str(e)
-            if "Tunnel connection failed" in msg:
-                # El proveedor rechazó el túnel CONNECT hacia x.com (bloqueo real).
-                resultado["ok"] = False
-                resultado["error"] = f"proveedor bloquea x.com: {msg[:120]}"
-                return resultado
-            # Errores de red/timeout NO queman el proxy: devolver ok=True.
-            resultado["ok"] = True
-            resultado["error"] = msg[:120]
-            return resultado
-
     def verificar_acceso_x(self, proxy: str, timeout: int = 20, reintentos: int = 1) -> dict:
         """Verificación PREVIA de que el proxy puede acceder a x.com.
 
@@ -901,73 +819,6 @@ class ProxyManager:
         if not info:
             return None
         return f"{info['host']}:{info['port']}"
-
-    def construir_extension_auth(self, proxy: str, base_dir: str = None) -> Optional[str]:
-        """Crea una extension de Chrome que autentica el proxy (407) y la carga.
-
-        Chrome no soporta credenciales dentro de --proxy-server de forma fiable,
-        asi que usamos una extension con chrome.proxy + onAuthRequired.
-        Devuelve la ruta de la extension o None si no requiere autenticacion.
-        """
-        info = self.analizar(proxy)
-        if not info or not info.get("user"):
-            return None
-
-        base_dir = base_dir or resolver_ruta("data/temp/proxy_extensions")
-        tag = hashlib.md5(proxy.encode()).hexdigest()[:12]
-        ext_dir = os.path.join(base_dir, tag)
-        os.makedirs(ext_dir, exist_ok=True)
-
-        manifest_json = """{
-            "version": "1.0.0",
-            "manifest_version": 3,
-            "name": "Chrome Proxy",
-            "permissions": ["proxy", "webRequest", "webRequestBlocking", "webRequestAuthProvider"],
-            "host_permissions": ["<all_urls>"],
-            "background": {"service_worker": "background.js"}
-        }
-        """
-
-        user_js = json.dumps(info["user"])
-        pass_js = json.dumps(info.get("password", ""))
-        scheme_js = json.dumps(info["scheme"])
-        host_js = json.dumps(info["host"])
-        port_js = json.dumps(str(info["port"]))
-
-        background_js = (
-            "var config = {\n"
-            '    mode: "fixed_servers",\n'
-            "    rules: {\n"
-            "      singleProxy: {\n"
-            f"        scheme: {scheme_js},\n"
-            f"        host: {host_js},\n"
-            f"        port: parseInt({port_js})\n"
-            "      },\n"
-            '      bypassList: ["localhost"]\n'
-            "    }\n"
-            "  };\n\n"
-            'chrome.proxy.settings.set({value: config, scope: "regular"}, function() {});\n\n'
-            "function callbackFn(details) {\n"
-            "    return {\n"
-            "        authCredentials: {\n"
-            f"            username: {user_js},\n"
-            f"            password: {pass_js}\n"
-            "        }\n"
-            "    };\n"
-            "}\n\n"
-            "chrome.webRequest.onAuthRequired.addListener(\n"
-            "    callbackFn,\n"
-            '    {urls: ["<all_urls>"]},\n'
-            '    ["blocking"]\n'
-            ");\n"
-        )
-
-        with open(os.path.join(ext_dir, "manifest.json"), "w", encoding="utf-8") as f:
-            f.write(manifest_json)
-        with open(os.path.join(ext_dir, "background.js"), "w", encoding="utf-8") as f:
-            f.write(background_js)
-
-        return ext_dir
 
     def aplicar_a_options(self, options, proxy: str, tag: str = "perfil", dinamico: bool = False):
         """Aplica el proxy a un objeto ChromeOptions de undetected_chromedriver.

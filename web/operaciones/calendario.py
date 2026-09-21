@@ -53,6 +53,7 @@ def _programar():
     if tipo == "post":
         variar_por_cuenta = st.checkbox(
             "🔀 Variar texto por cuenta (una versión distinta por cada cuenta)",
+            value=True,
             key="cal_variar_por_cuenta",
         )
         if variar_por_cuenta:
