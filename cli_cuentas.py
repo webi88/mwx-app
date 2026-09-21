@@ -16,8 +16,8 @@ Subcomandos:
     tipo             Asigna o limpia el tipo de voz (politica/ciudadana).
     desactivar       Marca las cuentas como inactivas (Cuenta.activa=False).
     activar          Reactiva cuentas previamente desactivadas.
-    generar-nombres  Genera propuestas de nombre/@ y las guarda en la BD.
-    aplicar-nombres  Aplica en X las propuestas pendientes (Selenium + Chrome).
+    generar-nombres  Genera propuestas de nombre/@ con IA/local y las guarda.
+    aplicar-nombres  Aplica en X las propuestas pendientes (Chrome, en paralelo).
     generar-fotos    Genera avatar/portada con IA (OpenAI; no toca X).
     aplicar-fotos    Aplica en X las fotos ya generadas (Selenium + Chrome).
     sincronizar      Lee el nombre/@ reales desde X por httpx (sin Chrome).
@@ -38,9 +38,13 @@ Ejemplos:
     python cli_cuentas.py desactivar --seccion IP --dry-run
     python cli_cuentas.py activar --desde a --hasta m
     python cli_cuentas.py generar-nombres --todas --identidad auto --json propuestas.json
+    python cli_cuentas.py generar-nombres --todas --identidad partido --limite 100
+    python cli_cuentas.py generar-nombres --seccion CI --identidad mixto --dry-run
     python cli_cuentas.py generar-nombres --status imported --dry-run
-    python cli_cuentas.py aplicar-nombres --usuarios u1,u2
-    python cli_cuentas.py aplicar-nombres --todas --password clave
+    python cli_cuentas.py aplicar-nombres --usuarios u1,u2 --max-workers 2
+    python cli_cuentas.py aplicar-nombres --todas --password clave --renombrar
+    python cli_cuentas.py aplicar-nombres --seccion CI --limite 20 --dry-run
+    python cli_cuentas.py aplicar-nombres --todas --renombrar --json resultado.json
     python cli_cuentas.py generar-fotos --todas --con-portada --limite 20
     python cli_cuentas.py generar-fotos --usuarios u1,u2 --forzar --dry-run
     python cli_cuentas.py aplicar-fotos --seccion CI
@@ -54,7 +58,7 @@ Ejemplos:
     python cli_cuentas.py renombrar --usuario u1 --actual
 
 Seleccion por rango (seccion, tipo, desactivar, activar, generar-fotos,
-aplicar-fotos, generar-nombres y sincronizar):
+aplicar-fotos, generar-nombres, aplicar-nombres y sincronizar):
     python cli_cuentas.py seccion --seccion CI --desde cuenta050 --hasta cuenta120
     python cli_cuentas.py tipo --tipo ciudadana --limite 100
     python cli_cuentas.py generar-nombres --seccion CI --limite 50 --json lote1.json
@@ -861,7 +865,13 @@ def cmd_preclasificar(args):
 
 
 def cmd_generar_nombres(args):
-    """Genera propuestas de nombre/@ y las guarda en la BD (salvo --dry-run)."""
+    """Genera propuestas de nombre/@ (IA en lotes o local) y las guarda.
+
+    ``--identidad`` acepta auto/persona/movimiento/partido/mixto: "partido" son
+    similitudes con partidos SIN nombrarlos (colores/simbolos: "Movimiento
+    Naranja", "Los Bolillos", "Amarillo de Luz"...) y "mixto" reparte ~mitad
+    persona / mitad partido. Con --dry-run no escribe en la BD.
+    """
     try:
         from cuentas.generador_identidades import asignar_propuestas
     except Exception as e:
@@ -910,6 +920,7 @@ def cmd_generar_nombres(args):
     )
     propuestas = resultado.get("propuestas") or []
     errores = resultado.get("errores") or []
+    origen_ia = bool(resultado.get("origen_ia"))
 
     if propuestas:
         filas = []
@@ -936,6 +947,10 @@ def cmd_generar_nombres(args):
     print(
         f"Resumen: total={resultado.get('total', len(cuentas))} "
         f"ok={resultado.get('ok', len(propuestas))} "
+        f"persona={resultado.get('persona', 0)} "
+        f"partido={resultado.get('partido', 0)} "
+        f"movimiento={resultado.get('movimiento', 0)} "
+        f"ia={'si' if origen_ia else 'no'} "
         f"errores={len(errores)}."
     )
     if not args.dry_run and propuestas:
@@ -955,6 +970,10 @@ def cmd_generar_nombres(args):
             "seccion": contexto_seccion,
             "total": resultado.get("total", len(cuentas)),
             "ok": resultado.get("ok", len(propuestas)),
+            "origen_ia": origen_ia,
+            "persona": resultado.get("persona", 0),
+            "partido": resultado.get("partido", 0),
+            "movimiento": resultado.get("movimiento", 0),
             "errores": errores,
             "propuestas": propuestas,
         }
@@ -977,29 +996,49 @@ def cmd_generar_nombres(args):
 
 
 def cmd_aplicar_nombres(args):
-    """Aplica en X las propuestas pendientes de las cuentas seleccionadas.
+    """Aplica en X las propuestas pendientes (en paralelo, Chrome).
 
     Requiere Chrome. AVISO: ejecuta cambios REALES en X; el cambio de @ puede
     pedir la contrasena de la cuenta (si no se pasa --password se usa la BD).
+    ``--max-workers`` controla cuantas cuentas se aplican a la vez (1-4; con
+    SQLite conviene 2-3) y ``--renombrar`` migra la clave interna al @ real
+    despues de cada cambio exitoso.
     """
     try:
-        from cuentas.generador_identidades import aplicar_propuesta
+        from cuentas.generador_identidades import aplicar_propuestas_en_lote
     except Exception as e:
         _error(f"no se pudo importar el aplicador de propuestas: {e}")
 
+    _exigir_selector(args, incluir_seccion=True, incluir_tipo=True)
     usuarios = None
-    if args.usuarios is not None:
+    if getattr(args, "usuarios", None) is not None:
         usuarios = _parsear_usuarios(args.usuarios)
         if not usuarios:
             _error("--usuarios no contiene ningun usuario valido")
+    status = (getattr(args, "status", None) or "").strip() or None
+    seccion = _resolver_filtro_seccion(getattr(args, "seccion", None))
+    tipo = _resolver_filtro_tipo(getattr(args, "tipo", None))
 
-    cuentas = _cargar_cuentas(usuarios=usuarios)
+    cuentas = _seleccionar_cuentas(
+        args, usuarios=usuarios, status=status, seccion=seccion, tipo=tipo
+    )
     if not cuentas:
-        print("No se encontraron cuentas twitter con esa seleccion.")
         return 0
 
     con_propuesta = [c for c in cuentas if c.nombre_propuesto or c.handle_propuesto]
     sin_propuesta = len(cuentas) - len(con_propuesta)
+
+    if getattr(args, "dry_run", False):
+        print(
+            f"DRY-RUN: se aplicarian propuestas en {len(con_propuesta)} de "
+            f"{len(cuentas)} cuentas SIN abrir Chrome ni tocar X."
+        )
+        for c in con_propuesta:
+            print(f"  @{c.usuario}: {_ascii(_texto_propuesta(c))}")
+        if sin_propuesta:
+            print(f"  ({sin_propuesta} cuentas sin propuesta pendiente)")
+        print("DRY-RUN: no se abrio Chrome ni se modifico nada.")
+        return 0
 
     print("AVISO: este comando abre Chrome (Selenium) y aplica cambios REALES en X.")
     print(
@@ -1014,43 +1053,88 @@ def cmd_aplicar_nombres(args):
         )
         return 0
 
-    resumen = {"aplicadas": 0, "fallidas": 0, "sin_propuesta": sin_propuesta}
     total = len(con_propuesta)
-    for idx, c in enumerate(con_propuesta, start=1):
-        objetivo = f"{c.nombre_propuesto or '-'} (@{c.handle_propuesto or '-'})"
-        print(f"[{idx:>3}/{total}] @{c.usuario}: {objetivo} ...", flush=True)
-        try:
-            resultado = aplicar_propuesta(c.usuario, args.password or "")
-        except Exception as e:
-            resultado = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+    max_workers = int(getattr(args, "max_workers", 2) or 2)
+    renombrar = bool(getattr(args, "renombrar", False))
+    print(
+        f"Aplicando {total} propuestas con hasta {max_workers} cuenta(s) en "
+        f"paralelo"
+        + (" (y renombrando la clave interna al @ real)." if renombrar else ".")
+    )
 
-        if resultado.get("ok"):
-            resumen["aplicadas"] += 1
-            detalle = []
-            if resultado.get("nombre"):
-                detalle.append("nombre OK")
-            if resultado.get("handle"):
-                detalle.append("handle OK")
-            print(
-                f"[{idx:>3}/{total}] @{c.usuario} -> OK "
-                f"({', '.join(detalle) or 'aplicado'})",
-                flush=True,
-            )
+    def _progreso(progreso):
+        """Callback del lote (hilo recolector): imprime una linea por cuenta."""
+        hechas = int(progreso.get("hechas", 0) or 0)
+        usuario = progreso.get("usuario", "")
+        if progreso.get("ok"):
+            print(f"[{hechas:>3}/{total}] @{usuario} -> OK", flush=True)
         else:
-            resumen["fallidas"] += 1
-            error = (resultado.get("error") or "").strip() or "(sin detalle)"
+            error = (progreso.get("error") or "").strip() or "(sin detalle)"
             print(
-                f"[{idx:>3}/{total}] @{c.usuario} -> ERROR: {error}",
+                f"[{hechas:>3}/{total}] @{usuario} -> ERROR: {error}",
                 file=sys.stderr,
                 flush=True,
             )
 
+    resultado = aplicar_propuestas_en_lote(
+        [c.usuario for c in con_propuesta],
+        max_workers=max_workers,
+        password=(args.password or ""),
+        renombrar=renombrar,
+        callback=_progreso,
+    )
+
+    if renombrar:
+        for entrada in resultado.get("resultados") or []:
+            if entrada.get("renombrado"):
+                print(
+                    f"  @{entrada.get('usuario', '')}: clave interna renombrada "
+                    "al @ real."
+                )
+            elif entrada.get("error_renombrado"):
+                print(
+                    f"AVISO @{entrada.get('usuario', '')}: no se pudo renombrar "
+                    f"la clave interna: {entrada.get('error_renombrado')}",
+                    file=sys.stderr,
+                )
+
+    for error in resultado.get("errores") or []:
+        print(f"ERROR: {error}", file=sys.stderr)
+
     print("")
     print(
-        f"Resumen: aplicadas={resumen['aplicadas']} "
-        f"fallidas={resumen['fallidas']} "
-        f"sin_propuesta={resumen['sin_propuesta']}."
+        f"Resumen: aplicadas={resultado.get('ok', 0)} "
+        f"fallidas={resultado.get('fallidos', 0)} "
+        f"renombrados={resultado.get('renombrados', 0)} "
+        f"sin_propuesta={sin_propuesta}."
     )
+    if resultado.get("cancelado"):
+        print("AVISO: lote cancelado; quedaron cuentas sin procesar.")
+
+    if getattr(args, "json", None):
+        ruta = args.json
+        if not os.path.isabs(ruta):
+            ruta = resolver_ruta(ruta)
+        payload = {
+            "generado": datetime.now().isoformat(timespec="seconds"),
+            "total": resultado.get("total", total),
+            "ok": resultado.get("ok", 0),
+            "fallidos": resultado.get("fallidos", 0),
+            "renombrados": resultado.get("renombrados", 0),
+            "cancelado": bool(resultado.get("cancelado")),
+            "resultados": resultado.get("resultados") or [],
+            "errores": resultado.get("errores") or [],
+        }
+        try:
+            carpeta = os.path.dirname(ruta)
+            if carpeta:
+                os.makedirs(carpeta, exist_ok=True)
+            with open(ruta, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+                f.write("\n")
+        except OSError as e:
+            _error(f"no se pudo escribir el JSON {ruta!r}: {e}")
+        print(f"JSON exportado: {ruta}")
     return 0
 
 
@@ -1482,10 +1566,14 @@ def construir_parser():
             "  python cli_cuentas.py desactivar --seccion IP --dry-run\n"
             "  python cli_cuentas.py activar --desde a --hasta m\n"
             "  python cli_cuentas.py generar-nombres --todas --json propuestas.json\n"
+            "  python cli_cuentas.py generar-nombres --todas --identidad partido\n"
+            "  python cli_cuentas.py generar-nombres --seccion CI --identidad mixto --limite 100\n"
             "  python cli_cuentas.py generar-nombres --status imported --dry-run\n"
             "  python cli_cuentas.py generar-nombres --seccion CI --limite 50 --json lote1.json\n"
-            "  python cli_cuentas.py aplicar-nombres --usuarios u1,u2\n"
-            "  python cli_cuentas.py aplicar-nombres --todas --password clave\n"
+            "  python cli_cuentas.py aplicar-nombres --usuarios u1,u2 --max-workers 2\n"
+            "  python cli_cuentas.py aplicar-nombres --todas --password clave --renombrar\n"
+            "  python cli_cuentas.py aplicar-nombres --seccion CI --limite 20 --dry-run\n"
+            "  python cli_cuentas.py aplicar-nombres --todas --renombrar --json resultado.json\n"
             "  python cli_cuentas.py generar-fotos --todas --con-portada --limite 20\n"
             "  python cli_cuentas.py generar-fotos --usuarios u1,u2 --forzar --dry-run\n"
             "  python cli_cuentas.py aplicar-fotos --seccion CI\n"
@@ -1640,7 +1728,11 @@ def construir_parser():
             "nombre_propuesto/handle_propuesto en la base de datos (salvo "
             "--dry-run). NO cambia nada en X: para aplicar usa 'aplicar-nombres'. "
             "Con --identidad auto se respeta Cuenta.tipo_cuenta "
-            "(politica->movimiento, ciudadana->persona). La seleccion acepta "
+            "(politica->movimiento, ciudadana->persona); 'partido' genera "
+            "similitudes con partidos SIN nombrarlos (colores/simbolos: "
+            "Movimiento Naranja, Los Bolillos, Amarillo de Luz...) y 'mixto' "
+            "reparte mitad persona / mitad partido. Usa OpenAI en lotes si hay "
+            "key real y completa con el generador local. La seleccion acepta "
             "usuarios/todas/status/seccion y --desde/--hasta/--limite."
         ),
     )
@@ -1654,9 +1746,13 @@ def construir_parser():
     grupo.add_argument("--seccion", metavar="CI|IP|LIB|JUS|sin-asignar",
                        help="Solo cuentas de esa seccion; 'sin-asignar' = vacia")
     _agregar_rango(p)
-    p.add_argument("--identidad", choices=["auto", "persona", "movimiento"],
-                   default="auto", metavar="auto|persona|movimiento",
-                   help="Tipo de identidad (default: auto, segun tipo_cuenta)")
+    p.add_argument("--identidad",
+                   choices=["auto", "persona", "movimiento", "partido", "mixto"],
+                   default="auto",
+                   metavar="auto|persona|movimiento|partido|mixto",
+                   help="Tipo de identidad (default: auto, segun tipo_cuenta; "
+                        "partido = similitud de partido sin nombrarlo; "
+                        "mixto = mitad persona / mitad partido)")
     p.add_argument("--dry-run", action="store_true",
                    help="Genera y muestra propuestas sin escribir en la BD")
     p.add_argument("--json", default=None, metavar="RUTA",
@@ -1668,19 +1764,27 @@ def construir_parser():
         "aplicar-nombres",
         help="Aplica en X las propuestas pendientes (Selenium + Chrome)",
         description=(
-            "Abre Chrome con las cookies de cada cuenta y aplica la propuesta "
-            "pendiente (nombre_propuesto/handle_propuesto). Solo procesa cuentas "
-            "con propuesta. AVISO: hace cambios REALES en X; el cambio de @ puede "
-            "pedir la contrasena (si no se pasa --password, se usa la de la BD)."
+            "Abre Chrome con las cookies de cada cuenta y aplica en paralelo la "
+            "propuesta pendiente (nombre_propuesto/handle_propuesto). Solo "
+            "procesa cuentas con propuesta. AVISO: hace cambios REALES en X; el "
+            "cambio de @ puede pedir la contrasena (si no se pasa --password, se "
+            "usa la de la BD). Con --renombrar, ademas del cambio en X migra la "
+            "clave interna (Cuenta.usuario) al @ real. Con SQLite conviene "
+            "--max-workers 2-3. La seleccion acepta "
+            "usuarios/todas/status/seccion/tipo y --desde/--hasta/--limite."
         ),
     )
-    grupo = p.add_mutually_exclusive_group(required=True)
-    grupo.add_argument("--usuarios", metavar="a,b,c",
-                       help="Lista de logins internos separados por comas")
-    grupo.add_argument("--todas", action="store_true",
-                       help="Todas las cuentas con propuesta pendiente")
+    _agregar_selectores_masivos(p)
     p.add_argument("--password", default=None, metavar="PASS",
                    help="Contrasena de X (opcional; si falta se lee de la BD)")
+    p.add_argument("--max-workers", type=_entero_positivo, default=2, metavar="N",
+                   help="Cuentas aplicadas a la vez, acotado a 1-4 (default: 2)")
+    p.add_argument("--renombrar", action="store_true",
+                   help="Tras cambiar el @ en X, migra la clave interna al @ real")
+    p.add_argument("--dry-run", action="store_true",
+                   help="Solo lista las propuestas a aplicar (no abre Chrome)")
+    p.add_argument("--json", default=None, metavar="RUTA",
+                   help="Exporta el resultado del lote a un JSON legible")
     p.set_defaults(func=cmd_aplicar_nombres)
 
     # --- generar-fotos -----------------------------------------------------

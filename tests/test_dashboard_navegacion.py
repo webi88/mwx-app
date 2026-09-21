@@ -17,6 +17,9 @@ Verifica (sin Chrome y sin Streamlit runtime) que:
     (RT 45 / Citas 25 / Hashtags 20 / Comentarios 10) de Activacion Masiva.
   - El marcador `data/.campana_activa` del guard de campana unica (se crea al
     adquirir, se borra al liberar incluso si la campana falla).
+  - La pestana "Nombres" de Cuentas renderiza con `AppTest` y expone el flujo
+    masivo con IA: tipos partido/mixto, contexto para la IA, "aplicar a
+    TODAS", navegadores simultaneos y renombrar la clave interna.
 
 El recorrido completo de operaciones visibles con `AppTest` se corre aparte
 (script temporal del agente) porque es lento para la suite rapida.
@@ -169,6 +172,193 @@ def _change_no_borra_input() -> tuple[bool, bool, bool]:
     # Chequeo literal pedido: el archivo NO debe contener `del builtins.input`.
     sin_del = "del builtins.input" not in fuente
     return (not borra) and sin_del, restaura, define_original
+
+
+def _tipo_mapa_nombres() -> dict:
+    """Extrae el `tipo_mapa` de `_tab_nombres` (cuentas.py) via AST."""
+    fuente = (RAIZ / "web" / "operaciones" / "cuentas.py").read_text(encoding="utf-8")
+    arbol = ast.parse(fuente)
+    for nodo in ast.walk(arbol):
+        if isinstance(nodo, ast.FunctionDef) and nodo.name == "_tab_nombres":
+            for sub in ast.walk(nodo):
+                if isinstance(sub, ast.Assign):
+                    for objetivo in sub.targets:
+                        if isinstance(objetivo, ast.Name) and objetivo.id == "tipo_mapa":
+                            try:
+                                return ast.literal_eval(sub.value)
+                            except Exception:
+                                return {}
+    return {}
+
+
+def _fallbacks_nombres() -> dict:
+    """Fallbacks de la UI cuando el backend de identidades es viejo/falta.
+
+    - `_llamar_asignar_propuestas` omite `contexto` con firma vieja, lo pasa
+      con la nueva y reintenta sin el si el backend lanza `TypeError`.
+    - `_aplicar_lote_con_progreso` devuelve None (bucle secuencial) si el
+      backend no expone `aplicar_propuestas_en_lote` o su firma no acepta los
+      kwargs nuevos."""
+    from web.operaciones import cuentas
+    import cuentas.generador_identidades as gid
+
+    def _viejo(usuarios, tipo="auto", seccion="", dry_run=False):
+        return {"firma": "vieja", "tipo": tipo, "contexto": None}
+
+    def _nuevo(usuarios, tipo="auto", seccion="", dry_run=False, contexto=""):
+        return {"firma": "nueva", "contexto": contexto}
+
+    def _terco(usuarios, tipo="auto", seccion="", dry_run=False, contexto=""):
+        if contexto:
+            raise TypeError("contexto no soportado")
+        return {"firma": "terca"}
+
+    res_viejo = cuentas._llamar_asignar_propuestas(_viejo, ["u"], "partido", "CI", "ctx")
+    res_nuevo = cuentas._llamar_asignar_propuestas(_nuevo, ["u"], "mixto", "", "ctx")
+    res_terco = cuentas._llamar_asignar_propuestas(_terco, ["u"], "auto", "", "ctx")
+
+    original = getattr(gid, "aplicar_propuestas_en_lote", None)
+    try:
+        if original is not None:
+            delattr(gid, "aplicar_propuestas_en_lote")
+        sin_backend = cuentas._aplicar_lote_con_progreso(["u"], 2, False)
+
+        def _firma_vieja(usuarios, password="", callback=None):
+            return {}
+
+        gid.aplicar_propuestas_en_lote = _firma_vieja
+        firma_vieja = cuentas._aplicar_lote_con_progreso(["u"], 2, False)
+    finally:
+        if original is None:
+            if hasattr(gid, "aplicar_propuestas_en_lote"):
+                delattr(gid, "aplicar_propuestas_en_lote")
+        else:
+            gid.aplicar_propuestas_en_lote = original
+
+    return {
+        "viejo_ok": res_viejo.get("firma") == "vieja"
+        and res_viejo.get("tipo") == "partido",
+        "nuevo_ok": res_nuevo.get("contexto") == "ctx",
+        "terco_ok": res_terco.get("firma") == "terca",
+        "sin_backend_none": sin_backend is None,
+        "firma_vieja_none": firma_vieja is None,
+    }
+
+
+def _app_nombres():
+    """Script de AppTest: pestana Nombres de Cuentas con cuentas simuladas.
+
+    Solo ASCII: `AppTest.from_function` escribe el script temporal con la
+    codificacion local de Windows y los acentos lo rompen en silencio."""
+    from web.operaciones import cuentas
+
+    class _ListarFake:
+        def __call__(self, *args, **kwargs):
+            return [
+                {
+                    "usuario": "cuenta_uno",
+                    "email": "",
+                    "status": "active",
+                    "last_checked": "",
+                    "cookies": "si",
+                    "seccion": "",
+                    "seccion_etiqueta": "Sin asignar",
+                    "tipo_cuenta": "ciudadana",
+                    "tipo_etiqueta": "Ciudadana",
+                    "handle_actual": "cuenta_uno",
+                    "nombre_mostrado": "",
+                    "nombre_propuesto": "Naranja Uno",
+                    "handle_propuesto": "naranja_uno",
+                    "password": "",
+                    "user_agent": "",
+                    "sector": "",
+                    "grupo": "",
+                    "grupo_etiqueta": "sin grupo",
+                    "proxy": "",
+                    "activa": True,
+                    "avatar": False,
+                    "banner": False,
+                    "avatar_path": "",
+                    "banner_path": "",
+                    "perfil_personalidad": "",
+                    "personalidad": "",
+                },
+                {
+                    "usuario": "cuenta_dos",
+                    "email": "",
+                    "status": "active",
+                    "last_checked": "",
+                    "cookies": "si",
+                    "seccion": "",
+                    "seccion_etiqueta": "Sin asignar",
+                    "tipo_cuenta": "politica",
+                    "tipo_etiqueta": "Politica",
+                    "handle_actual": "cuenta_dos",
+                    "nombre_mostrado": "",
+                    "nombre_propuesto": "",
+                    "handle_propuesto": "",
+                    "password": "",
+                    "user_agent": "",
+                    "sector": "",
+                    "grupo": "",
+                    "grupo_etiqueta": "sin grupo",
+                    "proxy": "",
+                    "activa": True,
+                    "avatar": False,
+                    "banner": False,
+                    "avatar_path": "",
+                    "banner_path": "",
+                    "perfil_personalidad": "",
+                    "personalidad": "",
+                },
+            ]
+
+        def clear(self):
+            pass
+
+    original = cuentas._listar_cuentas
+    cuentas._listar_cuentas = _ListarFake()
+    try:
+        cuentas._tab_nombres()
+    finally:
+        # Sin esto, el fake quedaria activo para el resto de la suite.
+        cuentas._listar_cuentas = original
+
+
+def _app_test_nombres() -> tuple[bool, str, dict]:
+    """Corre la pestana Nombres con `AppTest` y reporta los widgets nuevos."""
+    from streamlit.testing.v1 import AppTest
+
+    resultado = {
+        "sin_excepciones": False,
+        "tipo_partido": False,
+        "tipo_mixto": False,
+        "contexto": False,
+        "todas": False,
+        "workers": False,
+        "renombrar": False,
+    }
+    try:
+        at = AppTest.from_function(_app_nombres, default_timeout=60)
+        at.run()
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}", resultado
+
+    if at.exception:
+        return False, str(at.exception[0].value)[:200], resultado
+    resultado["sin_excepciones"] = True
+
+    try:
+        opciones = list(at.selectbox(key="nom_tipo_identidad").options)
+    except KeyError:
+        opciones = []
+    resultado["tipo_partido"] = any("Similitudes de partido" in op for op in opciones)
+    resultado["tipo_mixto"] = any("Mixto" in op for op in opciones)
+    resultado["contexto"] = any(t.key == "nom_tipo_contexto" for t in at.text_area)
+    resultado["todas"] = any(c.key == "nom_lote_todas" for c in at.checkbox)
+    resultado["workers"] = any(n.key == "nom_lote_workers" for n in at.number_input)
+    resultado["renombrar"] = any(c.key == "nom_lote_renombrar" for c in at.checkbox)
+    return True, "", resultado
 
 
 def _marcador_campana_prueba() -> dict:
@@ -378,6 +568,48 @@ def run(check):
     check(
         "change: sin 'del builtins.input' y con restauracion del original",
         no_borra and restaura and define_original,
+    )
+
+    # ---------------- Pestana Nombres: nombres masivos con IA ----------------
+    mapa_tipos = _tipo_mapa_nombres()
+    check(
+        "cuentas nombres: tipo_mapa incluye partido y mixto",
+        mapa_tipos.get("Similitudes de partido (naranja, bolillos, amarilloluz)")
+        == "partido"
+        and mapa_tipos.get(
+            "Mixto: mitad personas + mitad similitudes de partido"
+        )
+        == "mixto",
+        f"({len(mapa_tipos)} tipos)",
+    )
+
+    fallbacks = _fallbacks_nombres()
+    check(
+        "cuentas nombres: contexto se omite con firma vieja y se pasa con la nueva",
+        fallbacks["viejo_ok"] and fallbacks["nuevo_ok"] and fallbacks["terco_ok"],
+    )
+    check(
+        "cuentas nombres: sin aplicar_propuestas_en_lote cae al bucle secuencial",
+        fallbacks["sin_backend_none"] and fallbacks["firma_vieja_none"],
+    )
+
+    app_ok, app_detalle, app_widgets = _app_test_nombres()
+    check(
+        "cuentas nombres: la pestana Nombres renderiza sin excepciones (AppTest)",
+        app_ok,
+        app_detalle,
+    )
+    check(
+        "cuentas nombres: widgets del lote masivo presentes (tipo/contexto/"
+        "todas/workers/renombrar)",
+        app_widgets["sin_excepciones"]
+        and app_widgets["tipo_partido"]
+        and app_widgets["tipo_mixto"]
+        and app_widgets["contexto"]
+        and app_widgets["todas"]
+        and app_widgets["workers"]
+        and app_widgets["renombrar"],
+        str({k: v for k, v in app_widgets.items() if not v}) or "todos presentes",
     )
 
     # ---------------- Preset "Trending 1 hora" ----------------

@@ -1430,6 +1430,68 @@ def _etiqueta_propuesta(fila: dict) -> str:
     return f"@{usuario} → @{handle} ({fila.get('tipo_etiqueta') or OPCION_SIN_DEFINIR})"
 
 
+def _ia_nombres_disponible():
+    """True/False si el backend expone `ia_disponible`; None si aún no existe.
+
+    Import perezoso y tolerante: `cuentas/generador_identidades.py` se
+    desarrolla en paralelo, así que durante la transición la función puede no
+    existir o cambiar de firma. En ese caso se devuelve None (caption neutro)."""
+    try:
+        from cuentas.generador_identidades import ia_disponible
+    except ImportError:
+        return None
+    except Exception:
+        return None
+    try:
+        return bool(ia_disponible())
+    except TypeError:
+        return None
+    except Exception:
+        return None
+
+
+def _soporta_kwargs(func, nombres) -> bool:
+    """True si `func` acepta todos los kwargs de `nombres` (o tiene **kwargs)."""
+    import inspect
+
+    try:
+        parametros = inspect.signature(func).parameters
+    except (TypeError, ValueError):
+        return False
+    var_kwargs = any(
+        p.kind == inspect.Parameter.VAR_KEYWORD for p in parametros.values()
+    )
+    return all(nombre in parametros or var_kwargs for nombre in nombres)
+
+
+def _a_int(valor) -> int:
+    """Conteo entero tolerante: acepta número/str o lista (devuelve su largo)."""
+    if isinstance(valor, (list, tuple, set)):
+        return len(valor)
+    try:
+        return int(valor or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _llamar_asignar_propuestas(func, usuarios, tipo, seccion, contexto=""):
+    """Llama `asignar_propuestas` pasando `contexto` solo si el backend lo acepta.
+
+    Fallback para firmas viejas: si el backend aún no tiene el parámetro
+    `contexto` se omite, y si lanza `TypeError` al recibirlo se reintenta sin
+    él (la UI no se rompe mientras el backend se actualiza en paralelo)."""
+    kwargs = {"tipo": tipo, "seccion": seccion, "dry_run": False}
+    if contexto and _soporta_kwargs(func, ("contexto",)):
+        kwargs["contexto"] = contexto
+    try:
+        return func(usuarios, **kwargs)
+    except TypeError:
+        if "contexto" in kwargs:
+            kwargs.pop("contexto", None)
+            return func(usuarios, **kwargs)
+        raise
+
+
 def _tab_nombres():
     st.markdown("### 🏷️ Nombres propuestos (display name + @)")
     st.caption(
@@ -1469,6 +1531,8 @@ def _tab_nombres():
             "Auto (según tipo de cuenta)",
             "Solo personas reales",
             "Solo cuentas de movimiento",
+            "Similitudes de partido (naranja, bolillos, amarilloluz)",
+            "Mixto: mitad personas + mitad similitudes de partido",
         ],
         key="nom_tipo_identidad",
     )
@@ -1476,12 +1540,51 @@ def _tab_nombres():
         "Auto (según tipo de cuenta)": "auto",
         "Solo personas reales": "persona",
         "Solo cuentas de movimiento": "movimiento",
+        "Similitudes de partido (naranja, bolillos, amarilloluz)": "partido",
+        "Mixto: mitad personas + mitad similitudes de partido": "mixto",
     }
+    tipo_codigo = tipo_mapa.get(tipo_etiqueta, "auto")
     if tipo_etiqueta.startswith("Auto"):
         st.caption(
             "Auto: política → cuenta de movimiento; ciudadana → persona real; "
-            "sin definir → aleatorio 50/50."
+            "sin definir → aleatorio 50/50 (no genera similitudes de partido)."
         )
+    elif tipo_codigo == "partido":
+        st.caption(
+            "Similitudes de partido: nombres/handles con **guiños** (colores, "
+            "símbolos o apodos como naranja, bolillos, amarilloluz) que NO "
+            "nombran a ningún partido."
+        )
+    elif tipo_codigo == "mixto":
+        st.caption(
+            "Mixto: ~mitad **personas reales** y ~mitad **similitudes de "
+            "partido** (guiños sin nombrar partidos)."
+        )
+
+    ia_estado = _ia_nombres_disponible()
+    if ia_estado is True:
+        st.caption("🧠 IA de nombres: activada (OpenAI)")
+    elif ia_estado is False:
+        st.caption("🧠 IA de nombres: no configurada; se usará el generador local")
+    else:
+        st.caption(
+            "🧠 IA de nombres: estado desconocido; se usará el generador local "
+            "si la IA no está disponible"
+        )
+
+    contexto_ia = st.text_area(
+        "Contexto para la IA (opcional)",
+        key="nom_tipo_contexto",
+        height=80,
+        placeholder=(
+            "Ej. 'oposición al gobierno actual, tono ciudadano' o "
+            "'similitudes naranjas del partido en el poder'"
+        ),
+        help=(
+            "Se pasa tal cual al generador de identidades. Solo aplica cuando "
+            "la IA de nombres está activa."
+        ),
+    )
 
     if st.button(
         "✨ Generar propuestas",
@@ -1495,23 +1598,40 @@ def _tab_nombres():
             seccion_ctx = (
                 st.session_state.get("nom_selector_detalle") or {}
             ).get("seccion_codigo") or ""
+            contexto_generar = (contexto_ia or "").strip()
             try:
                 from cuentas.generador_identidades import asignar_propuestas
 
                 with st.spinner(
                     f"✨ Generando propuestas para {len(usuarios)} cuenta(s)..."
                 ):
-                    res = asignar_propuestas(
+                    res = _llamar_asignar_propuestas(
+                        asignar_propuestas,
                         usuarios,
-                        tipo_mapa[tipo_etiqueta],
-                        seccion=seccion_ctx,
-                        dry_run=False,
+                        tipo_codigo,
+                        seccion_ctx,
+                        contexto_generar,
                     )
                 _listar_cuentas.clear()
-                c1, c2, c3 = st.columns(3)
+                c1, c2, c3, c4 = st.columns(4)
                 c1.metric("Total", res.get("total", 0))
                 c2.metric("Propuestas", res.get("ok", 0))
                 c3.metric("Errores", len(res.get("errores") or []))
+                origen_ia = res.get("origen_ia")
+                c4.metric(
+                    "Origen",
+                    "🧠 IA" if origen_ia else ("Local" if origen_ia is not None else "—"),
+                )
+                personas = _a_int(res.get("persona"))
+                partidos = _a_int(res.get("partido"))
+                movimientos = _a_int(res.get("movimiento"))
+                if personas or partidos or movimientos or origen_ia is not None:
+                    st.caption(
+                        "Origen: "
+                        + ("IA (OpenAI)" if origen_ia else "generador local")
+                        + f" · 👤 personas: {personas} · 🎩 partido: {partidos} · "
+                        f"🏳️ movimiento: {movimientos}"
+                    )
                 if descripcion_sel:
                     st.caption(f"Generado con: {descripcion_sel}")
                 _flash(
@@ -1639,34 +1759,98 @@ def _tab_nombres():
 
     # ---------------- Aplicación en lote ----------------
     st.markdown("---")
-    st.markdown("#### 5️⃣ Aplicar en lote (Chrome, lento)")
+    st.markdown("#### 5️⃣ Aplicar en lote (Chrome, en paralelo)")
+    st.caption(
+        "Aplica las propuestas con varios navegadores a la vez, muestra el "
+        "progreso en vivo y se puede cancelar. El cambio de nombre/@ es real "
+        "en X."
+    )
+
+    if _lote_pendiente():
+        st.markdown("**⏳ Aplicación en lote en curso**")
+        _monitorear_lote()
+
+    aplicar_todas = st.checkbox(
+        "Aplicar a TODAS las cuentas con propuesta pendiente",
+        key="nom_lote_todas",
+        help=(
+            "Ignora el multiselect de abajo y usa las cuentas listadas en el "
+            "punto 3️⃣ (las que tienen propuesta pendiente)."
+        ),
+    )
+    if aplicar_todas:
+        usuarios_lote = [f["usuario"] for f in con_propuesta]
+        st.caption(
+            f"✅ Se aplicará a **{len(usuarios_lote)}** cuenta(s) con propuesta "
+            "pendiente (el multiselect de abajo se ignora al aplicar)."
+        )
+    else:
+        usuarios_lote = []
+
     seleccion_lote = st.multiselect(
         "Cuentas con propuesta a aplicar",
         list(opciones_aplicar.keys()),
         key="nom_lote_cuentas",
+        help="Para elegir cuentas puntuales al aplicar o para 🗑️ Descartar.",
     )
+    if not aplicar_todas:
+        usuarios_lote = [
+            opciones_aplicar[label]["usuario"]
+            for label in seleccion_lote
+            if label in opciones_aplicar
+        ]
+
+    col_workers, col_renombrar = st.columns([1, 2])
+    with col_workers:
+        max_workers = st.number_input(
+            "Navegadores simultáneos",
+            min_value=1,
+            max_value=4,
+            value=2,
+            step=1,
+            key="nom_lote_workers",
+            help="2-3 es lo estable con Chrome; 4 solo si hay RAM de sobra.",
+        )
+    with col_renombrar:
+        renombrar_lote = st.checkbox(
+            "Renombrar también la clave interna al nuevo @ (recomendado para "
+            "no desalinear cookies/tareas)",
+            value=True,
+            key="nom_lote_renombrar",
+            help=(
+                "Migra cookies, avatar/portada y registros internos al nuevo "
+                "usuario; evita que las tareas queden apuntando a la clave vieja."
+            ),
+        )
+
     confirmado_lote = st.checkbox(
-        "Confirmo que quiero aplicar las propuestas seleccionadas en X, "
-        "una por una (puede tardar horas)",
+        "Confirmo que quiero aplicar las propuestas en X (cambios REALES de "
+        "nombre/@; puede tardar)",
         key="nom_lote_confirm",
     )
     if st.button(
-        "✏️ Aplicar en lote (Chrome, lento)",
+        "✏️ Aplicar en lote",
         type="primary",
         use_container_width=True,
         key="btn_nom_lote",
     ):
         if not confirmado_lote:
             st.warning("Marca la casilla de confirmación para continuar.")
-        elif not seleccion_lote:
-            st.warning("Selecciona al menos una cuenta.")
+        elif not usuarios_lote:
+            st.warning(
+                "Selecciona al menos una cuenta o marca 'Aplicar a TODAS las "
+                "cuentas con propuesta pendiente'."
+            )
         else:
-            usuarios_lote = [
-                opciones_aplicar[label]["usuario"]
-                for label in seleccion_lote
-                if label in opciones_aplicar
-            ]
-            _aplicar_propuestas_en_lote(usuarios_lote)
+            resumen = _aplicar_lote_con_progreso(
+                usuarios_lote, int(max_workers or 2), bool(renombrar_lote)
+            )
+            if resumen is None:
+                st.info(
+                    "El backend de identidades aún no expone la aplicación en "
+                    "paralelo; se aplica una por una con el flujo anterior."
+                )
+                _aplicar_propuestas_en_lote(usuarios_lote)
 
     # ---------------- Descartar ----------------
     if st.button(
@@ -1711,6 +1895,300 @@ def _mostrar_resultado_aplicacion(res: dict, usuario: str):
     if res.get("error"):
         with st.expander("🔍 Detalle del error"):
             st.markdown(str(res.get("error")))
+
+
+def _lote_pendiente() -> bool:
+    """True si hay un lote de aplicación en curso o su resumen sin mostrar."""
+    return st.session_state.get("nom_lote_hilo") is not None
+
+
+def _formato_duracion(segundos) -> str:
+    """MM:SS (o H:MM:SS si pasa de una hora) para el contador de progreso."""
+    try:
+        total = max(0, int(segundos))
+    except (TypeError, ValueError):
+        total = 0
+    horas, resto = divmod(total, 3600)
+    minutos, segs = divmod(resto, 60)
+    if horas:
+        return f"{horas}:{minutos:02d}:{segs:02d}"
+    return f"{minutos:02d}:{segs:02d}"
+
+
+def _linea_evento_lote(evento: dict) -> str:
+    """Línea del feed para una cuenta terminada: `✅ @usuario — detalle`."""
+    if not isinstance(evento, dict):
+        return ""
+    icono = "✅" if evento.get("ok") else "❌"
+    usuario = str(evento.get("usuario") or "?").strip().lstrip("@") or "?"
+    linea = f"{icono} @{usuario}"
+    if not evento.get("ok"):
+        error = _abreviar(evento.get("error") or "", 70)
+        if error:
+            linea += f" — {error}"
+    return linea
+
+
+def _contar_fallidos(resumen: dict) -> int:
+    """Número de cuentas fallidas del resumen (acepta int o lista)."""
+    fallidos = resumen.get("fallidos")
+    if isinstance(fallidos, (list, tuple, set)):
+        return len(fallidos)
+    try:
+        return int(fallidos or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _mostrar_resumen_lote(resumen: dict, cancelado: bool = False):
+    """Métricas y fallidas del resumen final de `aplicar_propuestas_en_lote`."""
+    total = _a_int(resumen.get("total"))
+    ok = _a_int(resumen.get("ok"))
+    fallidas = _contar_fallidos(resumen)
+    renombrados = _a_int(resumen.get("renombrados"))
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Total", total)
+    c2.metric("Aplicadas", ok)
+    c3.metric("Fallidas", fallidas)
+    c4.metric("Renombradas", renombrados)
+
+    if cancelado or resumen.get("cancelado"):
+        st.warning(
+            f"⏹️ Lote cancelado por el usuario: se aplicaron {ok}/{total} "
+            "cuenta(s)."
+        )
+    elif ok:
+        st.success(f"Propuestas aplicadas: {ok}/{total} cuenta(s).")
+
+    detalles = []
+    for err in resumen.get("errores") or []:
+        texto = err if isinstance(err, str) else str(err)
+        if texto:
+            detalles.append(texto)
+    if not detalles:
+        # Backend sin lista de errores: se derivan de `resultados`.
+        for fila in resumen.get("resultados") or []:
+            if isinstance(fila, dict) and not fila.get("ok"):
+                usuario = str(fila.get("usuario") or "?")
+                detalles.append(f"`@{usuario}`: {fila.get('error') or 'sin detalle'}")
+    for fila in resumen.get("resultados") or []:
+        if not isinstance(fila, dict):
+            continue
+        error_renombrado = str(fila.get("error_renombrado") or "").strip()
+        if error_renombrado:
+            usuario = str(fila.get("usuario") or "?")
+            detalles.append(
+                f"`@{usuario}`: no se renombró la clave interna "
+                f"({error_renombrado})"
+            )
+    if detalles:
+        with st.expander(f"🔍 Detalle de fallidas ({len(detalles)})", expanded=True):
+            for detalle in detalles[:100]:
+                st.markdown(f"- {detalle}")
+
+
+def _monitorear_lote() -> dict:
+    """Pinta el progreso del lote activo y devuelve el resumen final.
+
+    Se llama justo tras lanzar el hilo y también en reruns posteriores: el
+    clic en "⏹️ Cancelar" interrumpe el script actual y el nuevo run vuelve a
+    entrar aquí con el botón en True (el evento vive en `st.session_state`).
+    El callback del backend corre en hilos de trabajo y solo escribe en el
+    dict compartido `nom_lote_estado` bajo lock; todos los `st.*` se pintan
+    aquí, en el hilo principal, cada ~0.5s. Al terminar limpia la caché de
+    cuentas (`_listar_cuentas.clear()`)."""
+    import time
+
+    hilo = st.session_state.get("nom_lote_hilo")
+    if hilo is None:
+        return {}
+    cancelar = st.session_state.get("nom_lote_cancelar")
+    lock = st.session_state.get("nom_lote_lock")
+    estado = st.session_state.get("nom_lote_estado") or {}
+    resultado = st.session_state.get("nom_lote_resultado") or {}
+    inicio = st.session_state.get("nom_lote_inicio") or time.monotonic()
+
+    def _snapshot() -> dict:
+        copia = {
+            "total": estado.get("total", 0),
+            "hechas": estado.get("hechas", 0),
+            "ok": estado.get("ok", 0),
+            "fallidas": estado.get("fallidas", 0),
+            "eventos": list(estado.get("eventos") or []),
+        }
+        if lock is None:
+            return copia
+        try:
+            with lock:
+                return {
+                    "total": estado.get("total", 0),
+                    "hechas": estado.get("hechas", 0),
+                    "ok": estado.get("ok", 0),
+                    "fallidas": estado.get("fallidas", 0),
+                    "eventos": list(estado.get("eventos") or []),
+                }
+        except Exception:
+            return copia
+
+    barra = st.progress(0.0, text="⏳ Iniciando el lote...")
+    metricas = st.empty()
+    feed = st.empty()
+    col_cancelar, _ = st.columns([1, 3])
+    with col_cancelar:
+        cancelado_por_boton = st.button("⏹️ Cancelar", key="nom_lote_cancelar_btn")
+    if cancelado_por_boton and cancelar is not None:
+        cancelar.set()
+
+    while callable(getattr(hilo, "is_alive", None)) and hilo.is_alive():
+        snap = _snapshot()
+        hechas = _a_int(snap.get("hechas"))
+        total = max(1, _a_int(snap.get("total")) or 1)
+        transcurrido = _formato_duracion(time.monotonic() - inicio)
+        barra.progress(
+            min(1.0, hechas / total),
+            text=f"⏳ {hechas}/{total} · {transcurrido}",
+        )
+        metricas.markdown(
+            f"**✅ {_a_int(snap.get('ok'))} aplicadas · "
+            f"❌ {_a_int(snap.get('fallidas'))} fallidas · "
+            f"🧮 {hechas}/{total} · ⏱️ {transcurrido}**"
+        )
+        lineas = [
+            _linea_evento_lote(ev)
+            for ev in (snap.get("eventos") or [])[-8:]
+            if isinstance(ev, dict)
+        ]
+        feed.markdown(
+            "  \n".join(lineas) if lineas else "⏳ Esperando las primeras cuentas…"
+        )
+        time.sleep(0.5)
+
+    try:
+        hilo.join(timeout=5)
+    except Exception:
+        pass
+    barra.progress(1.0, text="✅ Lote finalizado")
+
+    resumen = dict(resultado.get("resumen") or {})
+    error = resultado.get("error")
+    snap_final = _snapshot()
+    lineas = [
+        _linea_evento_lote(ev)
+        for ev in (snap_final.get("eventos") or [])[-8:]
+        if isinstance(ev, dict)
+    ]
+    if error is not None:
+        lineas.append(f"**❌ Lote interrumpido: {_abreviar(error, 120)}**")
+    else:
+        lineas.append(
+            f"**✅ Lote finalizado: {_a_int(resumen.get('ok'))} aplicadas · "
+            f"{_contar_fallidos(resumen)} fallidas**"
+        )
+    feed.markdown("  \n".join(lineas) if lineas else "✅ Lote finalizado")
+
+    if error is not None:
+        st.error(f"El lote se interrumpió: {error}")
+    else:
+        _mostrar_resumen_lote(resumen, cancelado=bool(cancelado_por_boton))
+
+    _listar_cuentas.clear()
+    for clave in (
+        "nom_lote_hilo",
+        "nom_lote_cancelar",
+        "nom_lote_lock",
+        "nom_lote_estado",
+        "nom_lote_resultado",
+        "nom_lote_inicio",
+    ):
+        st.session_state.pop(clave, None)
+    return resumen
+
+
+def _aplicar_lote_con_progreso(usuarios: list, max_workers: int, renombrar: bool):
+    """Aplica propuestas en paralelo con progreso en vivo y cancelación.
+
+    Devuelve el resumen final, o `None` si el backend aún no expone
+    `aplicar_propuestas_en_lote` o su firma no acepta los kwargs nuevos; en
+    ese caso el llamador cae al bucle secuencial `_aplicar_propuestas_en_lote`.
+
+    El hilo, el evento de cancelación y el estado del progreso viven en
+    `st.session_state`: si un clic interrumpe el script, el siguiente run
+    retoma el monitoreo sin relanzar el lote."""
+    import time
+
+    try:
+        from cuentas.generador_identidades import aplicar_propuestas_en_lote
+    except ImportError:
+        return None
+    except Exception:
+        return None
+
+    if not callable(aplicar_propuestas_en_lote):
+        return None
+    if not _soporta_kwargs(
+        aplicar_propuestas_en_lote,
+        ("max_workers", "renombrar", "callback", "cancelar"),
+    ):
+        return None
+
+    lock = threading.Lock()
+    cancelar = threading.Event()
+    estado = {
+        "total": len(usuarios),
+        "hechas": 0,
+        "ok": 0,
+        "fallidas": 0,
+        "eventos": [],
+    }
+    resultado: dict = {}
+
+    def _callback(progreso):
+        """Callback del backend (corre en hilos): SOLO escribe en `estado`."""
+        try:
+            datos = progreso if isinstance(progreso, dict) else {}
+            with lock:
+                total = _a_int(datos.get("total"))
+                if total:
+                    estado["total"] = total
+                if datos.get("hechas") is not None:
+                    estado["hechas"] = _a_int(datos.get("hechas"))
+                ok = bool(datos.get("ok"))
+                if ok:
+                    estado["ok"] += 1
+                else:
+                    estado["fallidas"] += 1
+                estado["eventos"].append(
+                    {
+                        "usuario": str(datos.get("usuario") or ""),
+                        "ok": ok,
+                        "error": str(datos.get("error") or ""),
+                    }
+                )
+                del estado["eventos"][:-8]
+        except Exception:
+            pass
+
+    def _runner():
+        try:
+            resultado["resumen"] = aplicar_propuestas_en_lote(
+                list(usuarios),
+                max_workers=max(1, _a_int(max_workers)),
+                renombrar=bool(renombrar),
+                callback=_callback,
+                cancelar=cancelar,
+            )
+        except BaseException as e:
+            resultado["error"] = e
+
+    hilo = threading.Thread(target=_runner, daemon=True)
+    st.session_state["nom_lote_hilo"] = hilo
+    st.session_state["nom_lote_cancelar"] = cancelar
+    st.session_state["nom_lote_lock"] = lock
+    st.session_state["nom_lote_estado"] = estado
+    st.session_state["nom_lote_resultado"] = resultado
+    st.session_state["nom_lote_inicio"] = time.monotonic()
+    hilo.start()
+    return _monitorear_lote()
 
 
 def _aplicar_propuestas_en_lote(usuarios: list):

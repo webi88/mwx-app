@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """Generador de identidades (display name + @) para cuentas de X.
 
-Dos tipos de identidad:
+Tipos de identidad:
 
 * ``"movimiento"`` — nombres de ciudadania organizada, genericos y variados
   (ej. "Ciudadania Feliz", "Ciudad Unida", "Movimientos Unidos", "Voces del
@@ -9,13 +9,27 @@ Dos tipos de identidad:
   la sigla "MC" aislada o siglas/nombres de partidos.
 * ``"persona"`` — nombres mexicanos reales y variados (Faker ``es_MX`` con
   listas de respaldo), para cuentas que simulan personas "reales".
+* ``"partido"`` — organizaciones que EVOCAN a un partido SIN nombrarlo ni usar
+  siglas: colores y simbolos cotidianos (ej. "Movimiento Naranja", "Fuerza
+  Naranja", "Marea Naranja", "Amarillo de Luz", "Los Bolillos", "Bolillos de
+  la Colonia", "Corazon Naranja", "Faro Azul", "Bandera Guinda", "Rosa en
+  Movimiento"). PROHIBIDO "Morena"/"PAN"/"PRI"/siglas o "Movimiento
+  Ciudadano" (ver ``_TOKENS_PARTIDO`` y ``_nombre_prohibido``).
+
+``asignar_propuestas`` acepta ademas ``"mixto"`` (sinonimos "mezcla"/"mitad"):
+reparte ~50% persona / ~50% partido, barajado cuenta por cuenta.
 
 Interfaz congelada (consumida por dashboard y CLI):
 
+    ia_disponible() -> bool
     generar_identidad(tipo="persona", seccion="", contexto="", evitar=None) -> dict
     generar_identidades(cantidad, tipo="persona", seccion="", contexto="",
                         usuarios_existentes=None) -> list[dict]
-    asignar_propuestas(usuarios, tipo="auto", seccion="", dry_run=False) -> dict
+    asignar_propuestas(usuarios, tipo="auto", seccion="", dry_run=False,
+                       contexto="") -> dict
+    aplicar_propuestas_en_lote(usuarios, max_workers=2, password="",
+                               renombrar=False, callback=None,
+                               cancelar=None) -> dict
     aplicar_propuesta(usuario, password="") -> dict
     descartar_propuesta(usuario) -> bool
 
@@ -39,6 +53,7 @@ import json
 import random
 import re
 import unicodedata
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from loguru import logger
 
@@ -51,9 +66,11 @@ from core.perfiles import (
 
 __all__ = [
     "HANDLE_RE",
+    "ia_disponible",
     "generar_identidad",
     "generar_identidades",
     "asignar_propuestas",
+    "aplicar_propuestas_en_lote",
     "aplicar_propuesta",
     "descartar_propuesta",
     "generar_personalidad",
@@ -210,6 +227,127 @@ _PRESETS_MOVIMIENTO = [
     "Barrio con Voz",
     "Todos por la Colonia",
     "Unión Ciudadana",
+]
+
+# --- Vocabulario "partido" (similitud con partidos, SIN nombrarlos) --------- #
+# Guiños = COLORES + SIMBOLOS cotidianos combinados en plantillas. El dueño
+# pidio expresamente ejemplos como "naranja", "bolillos" o "amarilloluz"; se
+# prohibe CUALQUIER sigla/nombre literal de partido (ver _TOKENS_PARTIDO).
+_COLORES_PARTIDO = [
+    "Naranja",
+    "Guinda",
+    "Azul",
+    "Rojo",
+    "Verde",
+    "Amarillo",
+    "Rosa",
+    "Morado",
+    "Dorado",
+    "Celeste",
+    "Turquesa",
+]
+_SIMBOLOS_PARTIDO = [
+    "Luz",
+    "Marea",
+    "Corriente",
+    "Ola",
+    "Sol",
+    "Faro",
+    "Estrella",
+    "Alba",
+    "Aurora",
+    "Viento",
+    "Bandera",
+    "Corazón",
+    "Bolillos",
+    "Antorcha",
+    "Manantial",
+    "Cauce",
+    "Eco",
+    "Amanecer",
+    "Semilla",
+    "Raíz",
+]
+# Plurales ya declinados para la plantilla "Los {plural}".
+_PLURALES_PARTIDO = [
+    "Bolillos",
+    "Faros",
+    "Corazones",
+    "Soles",
+    "Ecos",
+    "Cauces",
+    "Antorchas",
+    "Estrellas",
+    "Semillas",
+    "Raíces",
+    "Manantiales",
+    "Amaneceres",
+]
+_COLECTIVOS_PARTIDO = [
+    "Movimiento",
+    "Fuerza",
+    "Barrio",
+    "Pueblo",
+    "Frente",
+    "Unión",
+    "Causa",
+    "Voz",
+    "Alianza",
+    "Comunidad",
+    "Red",
+    "Camino",
+]
+_COLECTIVOS_F_PARTIDO = ["Colonia", "Comunidad", "Ciudad", "Gente", "Vecindad"]
+# Cierres de la plantilla "{color} con {sustantivo}" (ej. "Naranja con Causa").
+_SUSTANTIVOS_CON = [
+    "Causa",
+    "Luz",
+    "Corazón",
+    "Rumbo",
+    "Orgullo",
+    "Raíz",
+    "Fuerza",
+    "Esperanza",
+]
+
+# Nombres partidistas ya validados (incluye los ejemplos exactos del dueño).
+_PRESETS_PARTIDO = [
+    "Movimiento Naranja",
+    "Fuerza Naranja",
+    "Marea Naranja",
+    "Corriente Naranja",
+    "Amarillo de Luz",
+    "Los Bolillos",
+    "Bolillos de la Colonia",
+    "Corazón Naranja",
+    "Sol Naranja",
+    "Faro Azul",
+    "Bandera Guinda",
+    "Rosa en Movimiento",
+    "Aurora Naranja",
+    "Barrio Naranja",
+    "Naranja con Causa",
+    "Movimiento Guinda",
+    "Fuerza Amarilla",
+    "Marea Verde",
+    "Corriente Rosa",
+    "Luz de Barrio",
+    "Antorcha Naranja",
+    "Estrella Guinda",
+    "Faro Naranja",
+    "Ola Morada",
+    "Aurora Rosa",
+    "Viento Verde",
+    "Bandera Naranja",
+    "Sol de la Colonia",
+    "Bolillos con Causa",
+    "Corazón Guinda",
+    "Celeste de Luz",
+    "Dorado de Luz",
+    "Los Faros",
+    "Cauce Naranja",
+    "Turquesa en Movimiento",
+    "Gente Naranja",
 ]
 
 # Respaldo si Faker es_MX no esta instalado o falla.
@@ -374,6 +512,50 @@ def _nombre_movimiento(rng=random) -> str:
     return nombre
 
 
+def _nombre_partido(rng=random) -> str:
+    """Nombre que EVOCA a un partido sin nombrarlo (colores + simbolos).
+
+    Usa presets ya validados (ej. "Movimiento Naranja", "Los Bolillos",
+    "Amarillo de Luz") y 8 plantillas de combinacion ("Movimiento {color}",
+    "{color} de {simbolo}", "Los {plurales}", "{simbolo} {color}",
+    "{colectivo} {color}", "{color} con {sustantivo}", "{color} en
+    Movimiento", "Bolillos de la {colonia}"). Nunca incluye siglas ni nombres
+    de partidos: ``_validar_nombre``/``_nombre_prohibido`` lo bloquean despues.
+    """
+    if rng.random() < 0.4:
+        return rng.choice(_PRESETS_PARTIDO)
+    color = rng.choice(_COLORES_PARTIDO)
+    simbolo = rng.choice(_SIMBOLOS_PARTIDO)
+    colectivo = rng.choice(_COLECTIVOS_PARTIDO)
+    opciones = [
+        f"Movimiento {color}",
+        f"{color} de {simbolo}",
+        f"Los {rng.choice(_PLURALES_PARTIDO)}",
+        f"{simbolo} {color}",
+        f"{colectivo} {color}",
+        f"{color} con {rng.choice(_SUSTANTIVOS_CON)}",
+        f"{color} en Movimiento",
+        f"Bolillos de la {rng.choice(_COLECTIVOS_F_PARTIDO)}",
+    ]
+    nombre = rng.choice(opciones)
+    palabras = nombre.split()
+    if len(palabras) >= 2:
+        primera = _normalizar_texto(palabras[0])
+        ultima = _normalizar_texto(palabras[-1])
+        if primera == ultima or primera[:6] == ultima[:6]:
+            nombre = f"Movimiento {color}"
+    return nombre
+
+
+def _nombre_por_tipo(tipo: str, rng=random) -> str:
+    """Nombre local segun el tipo de identidad (persona/movimiento/partido)."""
+    if tipo == "movimiento":
+        return _nombre_movimiento(rng)
+    if tipo == "partido":
+        return _nombre_partido(rng)
+    return _nombre_persona(rng)
+
+
 def _nombre_persona(rng=random) -> str:
     """Nombre mexicano real (Faker es_MX si esta; si no, listas propias)."""
     fake = _obtener_faker()
@@ -505,9 +687,15 @@ def _handle_desde_nombre(nombre: str, evitar=None, rng=random) -> str:
 # Generacion local (nunca usa red)
 # --------------------------------------------------------------------------- #
 def _generar_identidad_local(tipo: str, usados: set, nombres_usados: set, rng=random) -> dict:
-    """Genera una identidad valida evitando handles y nombres ya usados."""
+    """Genera una identidad valida evitando handles y nombres ya usados.
+
+    Acepta ``"persona"``, ``"movimiento"`` y ``"partido"`` (con ``"mixto"``
+    elige persona/partido al azar por identidad).
+    """
+    if tipo not in ("persona", "movimiento", "partido"):
+        tipo = rng.choice(("persona", "partido"))
     for _ in range(80):
-        nombre = _nombre_movimiento(rng) if tipo == "movimiento" else _nombre_persona(rng)
+        nombre = _nombre_por_tipo(tipo, rng)
         limpio = _validar_nombre(nombre)
         if limpio is None:
             continue
@@ -522,7 +710,9 @@ def _generar_identidad_local(tipo: str, usados: set, nombres_usados: set, rng=ra
 
     # Reserva: espacio de nombres practicamente inagotable, pero por si acaso.
     for _ in range(1000):
-        if tipo == "movimiento":
+        if tipo == "partido":
+            nombre = _nombre_partido(rng)
+        elif tipo == "movimiento":
             concepto = rng.choice(_CONCEPTOS)[0]
             adjetivo = rng.choice(_ADJETIVOS[("f", "s")] + _ADJETIVOS[("m", "s")])
             nombre = f"{concepto} {adjetivo}"
@@ -534,19 +724,28 @@ def _generar_identidad_local(tipo: str, usados: set, nombres_usados: set, rng=ra
         if HANDLE_RE.match(handle) and _clave_handle(handle) not in usados:
             return {"nombre": nombre, "handle": handle, "tipo": tipo}
 
-    nombre = (
-        f"Ciudadanía Activa {len(nombres_usados) + 1}"
-        if tipo == "movimiento"
-        else f"Juan Pérez {len(nombres_usados) + 1}"
-    )
+    if tipo == "partido":
+        nombre = f"Movimiento Naranja {len(nombres_usados) + 1}"
+    elif tipo == "movimiento":
+        nombre = f"Ciudadanía Activa {len(nombres_usados) + 1}"
+    else:
+        nombre = f"Juan Pérez {len(nombres_usados) + 1}"
     handle = _handle_emergencia(usados, rng)
     return {"nombre": nombre, "handle": handle, "tipo": tipo}
 
 
 def _identidad_emergencia(tipo: str) -> dict:
     rng = random
+    if tipo not in ("persona", "movimiento", "partido"):
+        tipo = rng.choice(("persona", "partido"))
+    if tipo == "partido":
+        nombre = "Movimiento Naranja"
+    elif tipo == "movimiento":
+        nombre = "Ciudadanía Activa"
+    else:
+        nombre = "Juan Pérez"
     return {
-        "nombre": "Ciudadanía Activa" if tipo == "movimiento" else "Juan Pérez",
+        "nombre": nombre,
         "handle": _handle_emergencia(set(), rng),
         "tipo": tipo,
     }
@@ -592,6 +791,23 @@ def _construir_prompt(cantidad: int, tipo: str, seccion: str, contexto: str, evi
             "Esperanza, Progreso, Comunidad, Vecinos) con adjetivos variados "
             "(Feliz, Unida, Despierta, Viva, Imparable, Conectada, Activa, "
             "Naranja) o conectores (del Pueblo, de la Colonia, en Movimiento).\n"
+        )
+    elif tipo == "partido":
+        detalle = (
+            "Tipo SIMILITUD DE PARTIDO: organizaciones que EVOQUEN a un partido "
+            "politico SIN nombrarlo ni usar siglas, mediante COLORES y SIMBOLOS "
+            "cotidianos (ej. Movimiento Naranja, Fuerza Naranja, Marea Naranja, "
+            "Corriente Naranja, Amarillo de Luz, Los Bolillos, Bolillos de la "
+            "Colonia, Corazon Naranja, Sol Naranja, Faro Azul, Bandera Guinda, "
+            "Rosa en Movimiento, Aurora Naranja, Barrio Naranja, Naranja con "
+            "Causa).\n"
+            "Colores utiles: Naranja, Guinda, Azul, Rojo, Verde, Amarillo, "
+            "Rosa, Morado, Dorado, Celeste, Turquesa. Simbolos utiles: Luz, "
+            "Marea, Corriente, Ola, Sol, Faro, Estrella, Alba, Aurora, Viento, "
+            "Bandera, Corazon, Bolillos.\n"
+            "PROHIBIDO escribir siglas o nombres de partidos (MC, Morena, PAN, "
+            "PRI, PRD, PVEM, PT, PES) o frases parecidas a 'Movimiento "
+            "Ciudadano'.\n"
         )
     else:
         detalle = (
@@ -723,12 +939,16 @@ def _identidad_desde_item(item, tipo: str, usados: set, rng=random):
 # Normalizacion de "tipo" de identidad
 # --------------------------------------------------------------------------- #
 def _normalizar_tipo(tipo) -> str:
-    """Normaliza a "persona" o "movimiento" (default "persona").
+    """Normaliza a "persona", "movimiento", "partido" o "mixto" (default "persona").
 
     Acepta variantes con acentos/mayusculas y sinonimos:
     "movimiento(s)", "politica/o", "institucional", "colectivo", "ciudadania",
     "apoyo" -> "movimiento"; "persona(s)", "ciudadana/o", "real", "individual"
-    -> "persona". Cualquier valor desconocido o vacio cae a "persona".
+    -> "persona"; "partido(s)", "similitud(es)", "guino"/"guiño", "espectro",
+    "color(es)" -> "partido" (similitud con un partido SIN nombrarlo);
+    "mixto"/"mixta(s)", "mezcla(s)", "mitad(es)" -> "mixto" (es un reparto
+    ~50/50 persona/partido que interpreta ``asignar_propuestas``). Cualquier
+    valor desconocido o vacio cae a "persona".
     """
     clave = _normalizar_handle_texto(tipo)  # sin acentos/espacios
     if not clave:
@@ -736,9 +956,17 @@ def _normalizar_tipo(tipo) -> str:
     if clave in (
         "movimiento", "movimientos", "politica", "politico", "institucional",
         "formal", "organizacion", "colectivo", "coordinadora", "agrupacion",
-        "ciudadania", "apoyo", "partido",
+        "ciudadania", "apoyo",
     ):
         return "movimiento"
+    if clave in (
+        "partido", "partidos", "similitud", "similitudes", "guino", "espectro",
+        "color", "colores",
+    ):
+        return "partido"
+    if clave in ("mixto", "mixta", "mixtos", "mixtas", "mezcla", "mezclas",
+                 "mitad", "mitades"):
+        return "mixto"
     if clave in (
         "persona", "personas", "ciudadana", "ciudadano", "individual", "real",
         "informal", "coloquial", "usuario",
@@ -747,6 +975,10 @@ def _normalizar_tipo(tipo) -> str:
     if clave.startswith(("movimient", "politic", "institucional", "organiz",
                          "colectiv", "agrupac", "ciudadani")):
         return "movimiento"
+    if clave.startswith(("partid", "similitud", "espectro", "color")):
+        return "partido"
+    if clave.startswith("mixt"):
+        return "mixto"
     if clave.startswith(("person", "ciudadan")):
         return "persona"
     return "persona"
@@ -783,6 +1015,15 @@ def _tipo_desde_cuenta(valor) -> str:
 # --------------------------------------------------------------------------- #
 # API publica
 # --------------------------------------------------------------------------- #
+def ia_disponible() -> bool:
+    """True si hay OPENAI_API_KEY real (no placeholder). Publica.
+
+    Envuelve ``_openai_disponible`` para que el dashboard/CLI puedan avisar
+    si las propuestas se generaran con IA o 100% local. Nunca lanza.
+    """
+    return _openai_disponible()
+
+
 def generar_identidad(
     tipo: str = "persona",
     seccion: str = "",
@@ -804,27 +1045,27 @@ def generar_identidad(
         return _identidad_emergencia(tipo_norm)
 
 
-def generar_identidades(
+def _generar_identidades_con_origen(
     cantidad: int,
     tipo: str = "persona",
     seccion: str = "",
     contexto: str = "",
     usuarios_existentes: set | None = None,
-) -> list[dict]:
-    """Genera exactamente ``cantidad`` identidades unicas (nombre y handle).
+) -> tuple:
+    """Igual que ``generar_identidades`` pero devuelve ``(identidades, uso_ia)``.
 
-    Usa OpenAI en lotes (max ~30 por llamada) si hay key real; completa con el
-    generador local (Faker es_MX + listas). Si OpenAI falla o no hay key,
-    devuelve todo local. Evita los handles de ``usuarios_existentes``.
-    Nunca lanza excepcion; si algo revienta devuelve lo que tenga.
+    ``uso_ia`` es True solo si al menos una identidad del resultado vino de un
+    lote validado de OpenAI (no del fallback local). Interno: lo usa
+    ``asignar_propuestas`` para reportar ``origen_ia``.
     """
     resultado: list[dict] = []
+    uso_ia = False
     try:
         objetivo = int(cantidad)
     except (TypeError, ValueError):
-        return resultado
+        return resultado, uso_ia
     if objetivo <= 0:
-        return resultado
+        return resultado, uso_ia
 
     tipo_norm = _normalizar_tipo(tipo)
     usados = _preparar_evitar(usuarios_existentes)
@@ -856,6 +1097,7 @@ def generar_identidades(
                         resultado.append(ident)
                         nombres_usados.add(clave_nombre)
                         usados.add(_clave_handle(ident["handle"]))
+                        uso_ia = True
                 else:
                     usar_openai = False
 
@@ -867,7 +1109,27 @@ def generar_identidades(
             usados.add(_clave_handle(ident["handle"]))
     except Exception as e:
         logger.warning(f"generar_identidades se corto en {len(resultado)}/{objetivo}: {e}")
-    return resultado
+    return resultado, uso_ia
+
+
+def generar_identidades(
+    cantidad: int,
+    tipo: str = "persona",
+    seccion: str = "",
+    contexto: str = "",
+    usuarios_existentes: set | None = None,
+) -> list[dict]:
+    """Genera exactamente ``cantidad`` identidades unicas (nombre y handle).
+
+    Usa OpenAI en lotes (max ~30 por llamada) si hay key real; completa con el
+    generador local (Faker es_MX + listas). Si OpenAI falla o no hay key,
+    devuelve todo local. Evita los handles de ``usuarios_existentes``.
+    Nunca lanza excepcion; si algo revienta devuelve lo que tenga.
+    """
+    return _generar_identidades_con_origen(
+        cantidad, tipo, seccion=seccion, contexto=contexto,
+        usuarios_existentes=usuarios_existentes,
+    )[0]
 
 
 def descartar_propuesta(usuario: str) -> bool:
@@ -895,27 +1157,74 @@ def descartar_propuesta(usuario: str) -> bool:
         return False
 
 
+def _tipos_mezcla(cantidad: int, rng=random) -> list:
+    """Reparto ~50% persona / ~50% partido, barajado por cuenta.
+
+    Con cantidad par queda exactamente mitad y mitad; con impar se sortea el
+    cupo sobrante. Nunca lanza.
+    """
+    try:
+        cantidad = int(cantidad)
+    except (TypeError, ValueError):
+        return []
+    if cantidad <= 0:
+        return []
+    if cantidad == 1:
+        return [rng.choice(("persona", "partido"))]
+    n_persona = cantidad // 2
+    if cantidad % 2:
+        n_persona += rng.choice((0, 1))
+    tipos = ["persona"] * n_persona + ["partido"] * (cantidad - n_persona)
+    rng.shuffle(tipos)
+    return tipos
+
+
+def _identidad_es_unica(candidata, ocupados: set, nombres_ocupados: set) -> bool:
+    """True si el handle y el nombre de la candidata no chocan con los ocupados."""
+    if not isinstance(candidata, dict):
+        return False
+    handle = str(candidata.get("handle") or "")
+    nombre = _normalizar_texto(candidata.get("nombre"))
+    if not nombre or not HANDLE_RE.match(handle):
+        return False
+    clave_h = _clave_handle(handle)
+    return bool(
+        clave_h
+        and clave_h not in ocupados
+        and nombre not in nombres_ocupados
+    )
+
+
 def asignar_propuestas(
     usuarios: list[str],
     tipo: str = "auto",
     seccion: str = "",
     dry_run: bool = False,
+    contexto: str = "",
 ) -> dict:
     """Genera y guarda ``nombre_propuesto``/``handle_propuesto`` por cuenta.
 
-    ``tipo``:
+    ``tipo`` (acepta sinonimos via ``_normalizar_tipo``):
       * ``"auto"`` (default): usa ``Cuenta.tipo_cuenta`` — "politica" ->
         "movimiento", "ciudadana" -> "persona"; sin tipo definido elige al azar
-        (50/50).
-      * ``"persona"``/``"movimiento"`` (o sinonimos): fuerza ese tipo.
+        (50/50 persona/movimiento).
+      * ``"persona"``/``"movimiento"``/``"partido"``: fuerza ese tipo
+        ("partido" = similitud con un partido SIN nombrarlo: colores/simbolos).
+      * ``"mixto"`` ("mezcla"/"mitad"): reparte ~50% persona / ~50% partido,
+        barajado cuenta por cuenta.
 
-    Evita handles ya ocupados por cualquier Cuenta (usuario, handle_actual,
-    handle_propuesto). Con ``dry_run=True`` genera y devuelve las propuestas
-    SIN escribir en la BD.
+    Usa ``generar_identidades``/OpenAI en lotes (<=30 por llamada) agrupando
+    las cuentas por (tipo, seccion) y completa con el generador local; si no
+    hay key real de OpenAI sigue 100% local. Valida que nombre y handle no
+    choquen con NINGUN ocupado (``usuario``, ``handle_actual``,
+    ``handle_propuesto`` y ``nombre_mostrado``/``nombre_propuesto`` de todas
+    las Cuentas) ni con las identidades ya generadas en esta corrida; con
+    ``dry_run=True`` genera y devuelve SIN escribir en la BD.
 
     Devuelve:
         {"total", "ok", "propuestas": [{"usuario","nombre","handle","tipo"}],
-         "errores": [str], "dry_run": bool}
+         "errores": [str], "dry_run": bool, "origen_ia": bool,
+         "persona": n, "partido": n, "movimiento": n}
     """
     resultado = {
         "total": 0,
@@ -923,6 +1232,10 @@ def asignar_propuestas(
         "propuestas": [],
         "errores": [],
         "dry_run": bool(dry_run),
+        "origen_ia": False,
+        "persona": 0,
+        "partido": 0,
+        "movimiento": 0,
     }
     try:
         lista_usuarios = []
@@ -949,14 +1262,17 @@ def asignar_propuestas(
         resultado["errores"].append(f"BD no disponible: {e}")
         return resultado
 
+    # (1) Lee cuentas/ocupados y decide el tipo efectivo de CADA cuenta.
+    asignacion = []
+    ocupados = set()
+    nombres_ocupados = set()
     try:
         with get_db_session() as db:
             filas = db.query(Cuenta).filter(Cuenta.usuario.in_(lista_usuarios)).all()
             por_usuario = {fila.usuario: fila for fila in filas}
 
-            # Ocupados: TODAS las cuentas (usuario / handle_actual / propuesto).
-            ocupados = set()
-            nombres_ocupados = set()
+            # Ocupados: TODAS las cuentas (usuario / handle_actual / propuesto)
+            # y nombres ya visibles/propuestos.
             for fila in db.query(Cuenta).all():
                 for valor in (fila.usuario, fila.handle_actual, fila.handle_propuesto):
                     clave = _clave_handle(valor)
@@ -978,48 +1294,124 @@ def asignar_propuestas(
                     if not tipo_identidad:
                         tipo_identidad = "movimiento" if random.random() < 0.5 else "persona"
                 else:
-                    tipo_identidad = tipo_forzado
+                    tipo_identidad = tipo_forzado  # se ajusta abajo si es "mixto"
 
                 seccion_ctx = str(seccion or getattr(cuenta, "seccion", "") or "").strip()
-
-                identidad = None
-                for _ in range(60):
-                    candidata = generar_identidad(
-                        tipo_identidad, seccion=seccion_ctx, evitar=ocupados
-                    )
-                    clave_h = _clave_handle(candidata["handle"])
-                    clave_n = _normalizar_texto(candidata["nombre"])
-                    if (
-                        HANDLE_RE.match(candidata["handle"])
-                        and clave_h not in ocupados
-                        and clave_n not in nombres_ocupados
-                    ):
-                        identidad = candidata
-                        break
-                if identidad is None:
-                    resultado["errores"].append(
-                        f"no se pudo generar identidad unica para {usuario}"
-                    )
-                    continue
-
-                ocupados.add(_clave_handle(identidad["handle"]))
-                nombres_ocupados.add(_normalizar_texto(identidad["nombre"]))
-                resultado["propuestas"].append(
+                asignacion.append(
                     {
                         "usuario": usuario,
-                        "nombre": identidad["nombre"],
-                        "handle": identidad["handle"],
-                        "tipo": identidad["tipo"],
+                        "tipo": tipo_identidad,
+                        "seccion": seccion_ctx,
                     }
                 )
-                resultado["ok"] += 1
-
-                if not dry_run:
-                    cuenta.nombre_propuesto = identidad["nombre"]
-                    cuenta.handle_propuesto = identidad["handle"]
     except Exception as e:
-        logger.exception(f"Error en asignar_propuestas: {e}")
+        logger.exception(f"Error leyendo cuentas en asignar_propuestas: {e}")
         resultado["errores"].append(f"error de BD: {e}")
+        return resultado
+
+    if not asignacion:
+        return resultado
+
+    # (1b) "mixto": baraja ~50% persona / ~50% partido entre las cuentas reales.
+    if tipo_forzado == "mixto":
+        for item, tipo_mezcla in zip(asignacion, _tipos_mezcla(len(asignacion))):
+            item["tipo"] = tipo_mezcla
+
+    # (2) Genera por lotes agrupando por (tipo, seccion). Fuera de la sesion de
+    # BD: la IA puede tardar y no hay que retener la conexion (SQLite).
+    grupos = {}
+    orden = []
+    for indice, item in enumerate(asignacion):
+        clave = (item["tipo"], item["seccion"])
+        if clave not in grupos:
+            grupos[clave] = []
+            orden.append(clave)
+        grupos[clave].append(indice)
+
+    generadas = {}
+    generados = set()  # handles de TODOS los lotes (evita choques entre grupos)
+    for clave in orden:
+        indices = grupos[clave]
+        tipo_grupo, seccion_grupo = clave
+        try:
+            lote, uso_ia = _generar_identidades_con_origen(
+                len(indices),
+                tipo_grupo,
+                seccion=seccion_grupo,
+                contexto=contexto,
+                usuarios_existentes=set(ocupados) | generados,
+            )
+        except Exception as e:
+            logger.warning(f"Lote de identidades fallo ({tipo_grupo}): {e}")
+            lote, uso_ia = [], False
+        if uso_ia:
+            resultado["origen_ia"] = True
+        for ident in lote:
+            generados.add(_clave_handle(ident.get("handle")))
+        for indice, ident in zip(indices, lote):
+            generadas[indice] = ident
+
+    # (3) Asigna una identidad valida por cuenta; completa con el generador
+    # local (max 60 intentos por cuenta) si el lote no alcanzo o choco.
+    asignados = set()
+    nombres_asignados = set()
+    for indice, item in enumerate(asignacion):
+        usuario = item["usuario"]
+        identidad = None
+        candidata = generadas.get(indice)
+        if candidata is not None and _identidad_es_unica(
+            candidata, ocupados | asignados, nombres_ocupados | nombres_asignados
+        ):
+            identidad = candidata
+        if identidad is None:
+            evitar = set(ocupados) | generados | asignados
+            for _ in range(60):
+                candidata = generar_identidad(
+                    item["tipo"], seccion=item["seccion"], evitar=evitar
+                )
+                if _identidad_es_unica(
+                    candidata, ocupados | asignados, nombres_ocupados | nombres_asignados
+                ):
+                    identidad = candidata
+                    break
+        if identidad is None:
+            resultado["errores"].append(
+                f"no se pudo generar identidad unica para {usuario}"
+            )
+            continue
+
+        asignados.add(_clave_handle(identidad["handle"]))
+        nombres_asignados.add(_normalizar_texto(identidad["nombre"]))
+        tipo_real = identidad.get("tipo") if identidad.get("tipo") in (
+            "persona", "movimiento", "partido",
+        ) else "persona"
+        resultado["propuestas"].append(
+            {
+                "usuario": usuario,
+                "nombre": identidad["nombre"],
+                "handle": identidad["handle"],
+                "tipo": tipo_real,
+            }
+        )
+        resultado["ok"] += 1
+        resultado[tipo_real] = resultado.get(tipo_real, 0) + 1
+
+    # (4) Persiste (fuera de la sesion de generacion) salvo dry_run.
+    if not dry_run and resultado["propuestas"]:
+        try:
+            with get_db_session() as db:
+                filas = db.query(Cuenta).filter(
+                    Cuenta.usuario.in_([p["usuario"] for p in resultado["propuestas"]])
+                ).all()
+                por_usuario = {fila.usuario: fila for fila in filas}
+                for propuesta in resultado["propuestas"]:
+                    cuenta = por_usuario.get(propuesta["usuario"])
+                    if cuenta is not None:
+                        cuenta.nombre_propuesto = propuesta["nombre"]
+                        cuenta.handle_propuesto = propuesta["handle"]
+        except Exception as e:
+            logger.exception(f"Error guardando propuestas en la BD: {e}")
+            resultado["errores"].append(f"error de BD al guardar: {e}")
 
     return resultado
 
@@ -1101,6 +1493,207 @@ def aplicar_propuesta(usuario: str, password: str = "") -> dict:
         resultado["error"] = f"{type(e).__name__}: {e}"
         logger.warning(f"Error aplicando propuesta de {usuario}: {e}")
         return resultado
+
+
+def _renombrar_clave_interna(usuario: str) -> dict:
+    """Renombra la clave interna al @ real tras aplicar (NUNCA lanza).
+
+    Import perezoso de ``core.renombrar`` (solo se carga si ``renombrar=True``).
+    Devuelve ``{"ok": bool, "error": str}``.
+    """
+    try:
+        from core.renombrar import renombrar_al_handle_actual
+
+        salida = renombrar_al_handle_actual(usuario)
+        if isinstance(salida, dict) and salida.get("ok") and salida.get("renombrado"):
+            return {"ok": True, "error": ""}
+        error = ""
+        if isinstance(salida, dict):
+            error = str(salida.get("error") or "").strip()
+        return {"ok": False, "error": error or "renombrado no confirmado"}
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+
+def aplicar_propuestas_en_lote(
+    usuarios: list[str],
+    max_workers: int = 2,
+    password: str = "",
+    renombrar: bool = False,
+    callback=None,
+    cancelar=None,
+) -> dict:
+    """Aplica ``aplicar_propuesta`` en paralelo (ThreadPoolExecutor).
+
+    Parametros:
+      * ``usuarios``: lista de claves internas; se deduplica y se descartan
+        vacios.
+      * ``max_workers``: cuantas cuentas se procesan a la vez, acotado a
+        ``1..4`` (default 2). Con SQLite conviene 2-3: cada worker abre Chrome
+        y hace escrituras cortas; mas concurrencia puede bloquear la BD.
+      * ``password``: se pasa TAL CUAL a ``aplicar_propuesta`` (vacio = usa la
+        de la BD).
+      * ``renombrar=True``: tras un ok con handle aplicado llama
+        ``core.renombrar.renombrar_al_handle_actual`` (import perezoso; nunca
+        lanza). Si el renombrado funciona marca ``"renombrado": True``; si
+        falla guarda ``"error_renombrado"`` y ``ok`` sigue True. Se ejecuta en
+        el hilo recolector (serializado) para no competir por SQLite.
+      * ``callback(progreso)``: se invoca por cada cuenta TERMINADA, SIEMPRE
+        desde el hilo recolector (nunca desde los workers) con
+        ``{"total", "hechas", "usuario", "ok", "error"}``. Sus excepciones se
+        ignoran.
+      * ``cancelar``: ``threading.Event`` opcional; si esta set, no se lanzan
+        mas cuentas (las que ya estan en curso terminan).
+
+    Nunca lanza. Devuelve:
+        {"total", "ok", "fallidos", "renombrados", "cancelado": bool,
+         "resultados": [{"usuario", "ok", "nombre", "handle", "error",
+                         "renombrado", "error_renombrado"}],
+         "errores": [str, ...]}
+    """
+    resultado = {
+        "total": 0,
+        "ok": 0,
+        "fallidos": 0,
+        "renombrados": 0,
+        "cancelado": False,
+        "resultados": [],
+        "errores": [],
+    }
+
+    try:
+        lista_usuarios = []
+        vistos = set()
+        for usuario in usuarios or []:
+            usuario = str(usuario or "").strip()
+            if usuario and usuario not in vistos:
+                vistos.add(usuario)
+                lista_usuarios.append(usuario)
+    except Exception as e:
+        resultado["errores"].append(f"lista de usuarios invalida: {e}")
+        return resultado
+    resultado["total"] = len(lista_usuarios)
+    if not lista_usuarios:
+        return resultado
+
+    try:
+        n_workers = int(max_workers)
+    except (TypeError, ValueError):
+        n_workers = 2
+    n_workers = max(1, min(4, n_workers))
+
+    def _aplicar_una(usuario: str) -> dict:
+        """Worker: aplica la propuesta y arma el dict de resultado base."""
+        entrada = {
+            "usuario": usuario,
+            "ok": False,
+            "nombre": False,
+            "handle": False,
+            "error": "",
+            "renombrado": False,
+            "error_renombrado": "",
+        }
+        try:
+            salida = aplicar_propuesta(usuario, password)
+            if isinstance(salida, dict):
+                entrada["ok"] = bool(salida.get("ok"))
+                entrada["nombre"] = bool(salida.get("nombre"))
+                entrada["handle"] = bool(salida.get("handle"))
+                entrada["error"] = str(salida.get("error") or "")
+            else:
+                entrada["error"] = "respuesta invalida de aplicar_propuesta"
+        except Exception as e:
+            entrada["error"] = f"{type(e).__name__}: {e}"
+        return entrada
+
+    hechas = 0
+    cancelado = False
+    try:
+        with ThreadPoolExecutor(max_workers=n_workers) as ejecutor:
+            pendientes = list(lista_usuarios)
+            futuros = {}
+
+            def _en_cancelacion() -> bool:
+                return cancelar is not None and cancelar.is_set()
+
+            def _lanzar_hasta_llenar():
+                """Lanza cuentas hasta llenar los workers; False si cancelaron."""
+                while pendientes and len(futuros) < n_workers:
+                    if _en_cancelacion():
+                        return False
+                    usuario = pendientes.pop(0)
+                    futuros[ejecutor.submit(_aplicar_una, usuario)] = usuario
+                return True
+
+            if not _lanzar_hasta_llenar():
+                cancelado = True
+
+            while futuros:
+                for futuro in as_completed(list(futuros)):
+                    usuario = futuros.pop(futuro)
+                    try:
+                        entrada = futuro.result()
+                    except Exception as e:
+                        entrada = {
+                            "usuario": usuario,
+                            "ok": False,
+                            "nombre": False,
+                            "handle": False,
+                            "error": f"{type(e).__name__}: {e}",
+                            "renombrado": False,
+                            "error_renombrado": "",
+                        }
+                    # Renombrado (hilo recolector, serializado): solo si el
+                    # handle se aplico de verdad en X.
+                    if renombrar and entrada.get("ok") and entrada.get("handle"):
+                        info = _renombrar_clave_interna(usuario)
+                        if info.get("ok"):
+                            entrada["renombrado"] = True
+                            resultado["renombrados"] += 1
+                        else:
+                            entrada["error_renombrado"] = (
+                                info.get("error") or "renombrado no confirmado"
+                            )
+
+                    if entrada.get("ok"):
+                        resultado["ok"] += 1
+                    else:
+                        resultado["fallidos"] += 1
+                        error = str(entrada.get("error") or "").strip()
+                        resultado["errores"].append(
+                            f"{usuario}: {error}" if error else usuario
+                        )
+                    hechas += 1
+                    resultado["resultados"].append(entrada)
+
+                    if callback is not None:
+                        try:
+                            callback(
+                                {
+                                    "total": resultado["total"],
+                                    "hechas": hechas,
+                                    "usuario": usuario,
+                                    "ok": bool(entrada.get("ok")),
+                                    "error": str(entrada.get("error") or ""),
+                                }
+                            )
+                        except Exception:
+                            pass
+
+                    if pendientes:
+                        if _en_cancelacion():
+                            cancelado = True
+                        else:
+                            siguiente = pendientes.pop(0)
+                            futuros[ejecutor.submit(_aplicar_una, siguiente)] = siguiente
+    except Exception as e:
+        logger.warning(f"Error en aplicar_propuestas_en_lote: {e}")
+        resultado["errores"].append(f"error del lote: {type(e).__name__}: {e}")
+        if cancelar is not None and cancelar.is_set():
+            cancelado = True
+
+    resultado["cancelado"] = bool(cancelado)
+    return resultado
 
 
 # --------------------------------------------------------------------------- #
@@ -1714,7 +2307,7 @@ def _normalizar_registro(registro, tipo="") -> str:
     if texto_tipo:
         if _normalizar_handle_texto(texto_tipo).startswith("activis"):
             return "activista"
-        if _normalizar_tipo(texto_tipo) == "movimiento":
+        if _normalizar_tipo(texto_tipo) in ("movimiento", "partido"):
             return "politica"
         return "ciudadana"
     return ""
@@ -1764,7 +2357,7 @@ def _generar_personalidad_local(
     evitar_norm = {_normalizar_texto(x) for x in (evitar or set()) if str(x or "").strip()}
 
     if registro == "politica" or perfil_n == "formal":
-        sujeto = "Cuenta institucional" if tipo_norm == "movimiento" else "Perfil político"
+        sujeto = "Cuenta institucional" if tipo_norm in ("movimiento", "partido") else "Perfil político"
         plantillas = _PLANTILLAS_POLITICAS
         tonos = _TONOS_POLITICOS
         intereses = _INTERESES_POLITICOS
