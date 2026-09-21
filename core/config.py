@@ -135,7 +135,23 @@ class Settings(BaseSettings):
     # Rate Limiting
     twitter_delay_min: float = 2.5
     twitter_delay_max: float = 6.0
-    
+
+    # Cuotas inteligentes por hora (cuentas no premium): maximo de acciones
+    # EXITOSAS por cuenta en la ventana de minutos configurada, por rol de
+    # activacion. 0 = sin limite para ese rol. Se ajustan por .env.
+    limite_posts_hora: int = Field(default=5, env="LIMITE_POSTS_HORA")
+    limite_citas_hora: int = Field(default=5, env="LIMITE_CITAS_HORA")
+    limite_rts_hora: int = Field(default=7, env="LIMITE_RTS_HORA")
+    limite_comentarios_hora: int = Field(default=3, env="LIMITE_COMENTARIOS_HORA")
+    limite_ventana_min: int = Field(default=60, env="LIMITE_VENTANA_MIN")
+    # pydantic-settings v2 ignora el kwarg `env=` de Field: el nombre efectivo
+    # de la variable de entorno es `validation_alias` (por eso aqui va explicito).
+    limite_cuotas_activo: bool = Field(
+        default=True,
+        env="CUOTAS_HORARIAS_ACTIVO",
+        validation_alias="CUOTAS_HORARIAS_ACTIVO",
+    )
+
     # Alertas
     alertas_max_results: int = 50
     alertas_timeout: int = 120

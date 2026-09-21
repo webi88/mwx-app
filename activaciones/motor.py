@@ -27,7 +27,11 @@ from core.secciones import normalizar_seccion
 from core.registros import normalizar_tipo_cuenta
 from core.perfiles import normalizar_perfil, colocar_hashtag_en_medio
 from activaciones.variaciones import generar_pool_variaciones_openai, variar_texto
-from core.registro import registrar_accion, marcar_cuenta_suspendida
+from core.registro import (
+    registrar_accion,
+    marcar_cuenta_suspendida,
+    tipo_registro_rol,
+)
 
 
 def _env_activo(nombre: str, default: bool = True) -> bool:
@@ -117,6 +121,30 @@ MENSAJE_SOLO_PASSWORD = (
     "sin sesión: solo password; activa cookies/auth_token para "
     "campañas rápidas"
 )
+
+# Resultado de una accion NO ejecutada por cuota horaria agotada (`ok=None`):
+# no es exito ni fallo, no registra nada en la BD y no dispara callback.
+MENSAJE_CUOTA_AGOTADA = "cuota agotada: la cuenta alcanzo sus limites por hora"
+
+
+def _avisar_cuota_agotada_log(cuotas, usuario) -> bool:
+    """Avisa (una vez por minuto y cuenta) que la cuenta agoto sus cuotas.
+
+    Usa `cuotas.avisar_agotada` (throttle por cuenta) y emite el mensaje
+    EXACTO con `logger.debug`. Es un helper de modulo para que el metodo
+    estatico `_asignar_roles_aleatorios` (sin `self`) pueda usarlo igual que
+    `MotorActivacion._avisar_cuota_agotada`. Nunca lanza.
+    """
+    try:
+        if cuotas is not None and cuotas.avisar_agotada(usuario):
+            logger.debug(
+                f"Cuenta {usuario} alcanzó todos sus límites por hora, "
+                f"descansando"
+            )
+            return True
+    except Exception:
+        pass
+    return False
 
 
 def _mensaje_sin_sesion(cuenta) -> str:
@@ -1064,9 +1092,14 @@ class MotorActivacion:
             "hechas": 0,
             "exitosas": 0,
             "fallidas": 0,
+            "omitidas": 0,
             "ronda_actual": 1,
             "eventos": [],
         }
+        # Sistema de Cuotas Inteligente por Hora: lo prepara cada campana
+        # (`_preparar_cuotas`) con las cuentas ejecutables. Con None no hay
+        # cuotas (comportamiento clasico, sin limites).
+        self._cuotas = None
         self._ultimo_comentario_url: dict = {}
         self.pausa_comentario_url_seg: float = 0.0
         # GATE ADAPTATIVO de NAVEGADORES: las acciones HTTP (API primero) no lo
@@ -1515,6 +1548,23 @@ class MotorActivacion:
             except Exception:
                 pass
 
+    def _claves_cuotas(self, resumen) -> dict:
+        """Agrega al resumen las claves de cuotas horarias (nunca lanza).
+
+        `omitidas_por_cuota` queda SIEMPRE presente (0 si no hubo omisiones) y
+        `cuotas` es el resumen del contador o `{}` sin cuotas/campana.
+        """
+        if not isinstance(resumen, dict):
+            resumen = {"resultado": resumen}
+        resumen.setdefault("omitidas_por_cuota", 0)
+        try:
+            resumen["cuotas"] = (
+                self._cuotas.resumen() if self._cuotas is not None else {}
+            )
+        except Exception:
+            resumen["cuotas"] = {}
+        return resumen
+
     def _con_claves_pestana(self, resumen) -> dict:
         """Agrega al resumen las claves del pool de pestañas (nunca lanza)."""
         if not isinstance(resumen, dict):
@@ -1568,6 +1618,39 @@ class MotorActivacion:
             return max(12, int(self.max_concurrente or 1))
         except Exception:
             return 12
+
+    def _preparar_cuotas(self, usuarios) -> None:
+        """Prepara el contador de cuotas horarias de la campana (nunca lanza).
+
+        Import perezoso de `activaciones.cuotas.CuotasHorarias` (capa nueva):
+        crea el contador, carga el conteo base desde la BD con
+        `preparar(usuarios)` (una sola consulta agrupada) y lo asigna a
+        `self._cuotas`. Ante cualquier excepcion registra un WARNING y deja
+        `self._cuotas = None`: la campana sigue sin limites, como antes.
+        """
+        try:
+            from activaciones.cuotas import CuotasHorarias
+
+            cuotas = CuotasHorarias()
+            cuotas.preparar(
+                [str(u) for u in (usuarios or []) if str(u or "").strip()]
+            )
+            self._cuotas = cuotas
+        except Exception as e:
+            logger.warning(
+                f"Activacion: no se pudieron preparar las cuotas horarias "
+                f"({type(e).__name__}: {e}); se sigue sin limites"
+            )
+            self._cuotas = None
+
+    def _avisar_cuota_agotada(self, usuario) -> bool:
+        """Avisa (throttle de 1/min por cuenta) que la cuenta agoto sus cuotas.
+
+        Usa el helper de modulo `_avisar_cuota_agotada_log`, compartido con el
+        metodo estatico `_asignar_roles_aleatorios` (que no tiene `self`).
+        Nunca lanza.
+        """
+        return _avisar_cuota_agotada_log(self._cuotas, usuario)
 
     def _marcar_sesion_caida(self, usuario) -> None:
         """Anota la cuenta como 'sesion caida' para las rondas siguientes."""
@@ -1728,6 +1811,7 @@ class MotorActivacion:
                 "hechas": self.progreso.get("hechas", 0),
                 "exitosas": self.progreso.get("exitosas", 0),
                 "fallidas": self.progreso.get("fallidas", 0),
+                "omitidas": self.progreso.get("omitidas", 0),
                 "ronda_actual": self.progreso.get("ronda_actual", 1),
                 "eventos": list(eventos) if isinstance(eventos, list) else [],
             }
@@ -1864,7 +1948,8 @@ class MotorActivacion:
 
     @staticmethod
     def _asignar_roles_aleatorios(cuentas: list, disponibles: list,
-                                  roles_previos: dict | None = None) -> dict:
+                                  roles_previos: dict | None = None,
+                                  cuotas=None) -> dict:
         """Sortea un rol de `disponibles` para cada cuenta de `cuentas`.
 
         Devuelve `{usuario: rol}`. Con `roles_previos` ({usuario: rol}) la
@@ -1872,7 +1957,14 @@ class MotorActivacion:
         hay mas de una opcion; si `disponibles` solo trae un rol (o ninguno),
         se usa la lista completa como fallback y puede repetirlo. Con
         `disponibles` vacio deja "" (defensivo, el llamador ya valida que haya
-        al menos uno). Nunca lanza.
+        al menos uno).
+
+        `cuotas` (opcional, `CuotasHorarias`): las opciones de cada cuenta se
+        reducen a las que aun tienen cupo (`cuotas.viables`); si ninguna
+        queda, la cuenta recibe "" (sin accion) y se avisa con
+        `cuotas.avisar_agotada` (helper de modulo, este metodo es estatico).
+        Con `cuotas=None` el comportamiento es EXACTO al de antes. Nunca
+        lanza.
         """
         roles = {}
         previos = roles_previos if isinstance(roles_previos, dict) else {}
@@ -1883,8 +1975,17 @@ class MotorActivacion:
         for cuenta in (cuentas or []):
             try:
                 usuario = cuenta.usuario
+                opciones_cuenta = opciones
+                if cuotas is not None:
+                    opciones_cuenta = cuotas.viables(usuario, opciones)
+                    if not opciones_cuenta:
+                        roles[usuario] = ""
+                        _avisar_cuota_agotada_log(cuotas, usuario)
+                        continue
                 previo = previos.get(usuario)
-                candidatos = [r for r in opciones if r != previo] or opciones
+                candidatos = [
+                    r for r in opciones_cuenta if r != previo
+                ] or opciones_cuenta
                 roles[usuario] = random.choice(candidatos) if candidatos else ""
             except Exception:
                 try:
@@ -2858,31 +2959,65 @@ class MotorActivacion:
         Si el fallo es de RECURSOS (sin hilos/RAM) reduce el limite de
         navegadores y NO reintenta (mas Chrome empeoraria).
 
-        Devuelve una tupla de 4 elementos:
-        (usuario, exito, detalle, url_publicada).
-        """
-        if not _tiene_credencial_sesion(cuenta, _permitir_password()):
-            return (cuenta.usuario, False, _mensaje_sin_sesion(cuenta)[:120], "")
-        if retardo > 0:
-            time.sleep(retardo)
+        Con cuotas horarias (`self._cuotas`) reserva ATOMICAMENTE un cupo del
+        rol "cita" antes de cualquier trabajo; sin cupo devuelve `exito=None`
+        con `MENSAJE_CUOTA_AGOTADA` (no es exito ni fallo) y la reserva se
+        cierra en el `finally`.
 
-        resultado = self._intentar_quote_rt(cuenta, urls, texto, dar_like)
-        if not resultado[1]:
-            detalle = resultado[2]
-            if _es_error_recursos(detalle):
-                # Recursos agotados: bajar el limite y NO reintentar.
-                self._reducir_navegadores(detalle)
-            elif _es_error_reintentable(detalle) and not self._recursos_recientes():
-                pausa = random.uniform(0.5, 1.5)
-                logger.warning(
-                    f"Reintento de quote-RT para @{cuenta.usuario} por error de "
-                    f"driver/navegador ({detalle}); espero {pausa:.1f}s"
+        Devuelve una tupla de 4 elementos:
+        (usuario, exito, detalle, url_publicada). `exito=None` = omitida por
+        cuota agotada.
+        """
+        cuotas = self._cuotas
+        reservado = False
+        if cuotas is not None:
+            reservado = bool(cuotas.reservar(cuenta.usuario, "cita"))
+            if not reservado:
+                self._avisar_cuota_agotada(cuenta.usuario)
+                return (
+                    cuenta.usuario, None, MENSAJE_CUOTA_AGOTADA, "",
                 )
-                time.sleep(pausa)
-                resultado = self._intentar_quote_rt(cuenta, urls, texto, dar_like)
-        if not resultado[1]:
-            self._registrar_sesion_caida(resultado[0], resultado[2])
-        return resultado
+        resultado = (cuenta.usuario, False, "", "")
+        try:
+            if not _tiene_credencial_sesion(cuenta, _permitir_password()):
+                resultado = (
+                    cuenta.usuario, False,
+                    _mensaje_sin_sesion(cuenta)[:120], "",
+                )
+                return resultado
+            if retardo > 0:
+                time.sleep(retardo)
+
+            resultado = self._intentar_quote_rt(cuenta, urls, texto, dar_like)
+            if not resultado[1]:
+                detalle = resultado[2]
+                if _es_error_recursos(detalle):
+                    # Recursos agotados: bajar el limite y NO reintentar.
+                    self._reducir_navegadores(detalle)
+                elif (
+                    _es_error_reintentable(detalle)
+                    and not self._recursos_recientes()
+                ):
+                    pausa = random.uniform(0.5, 1.5)
+                    logger.warning(
+                        f"Reintento de quote-RT para @{cuenta.usuario} por error "
+                        f"de driver/navegador ({detalle}); espero {pausa:.1f}s"
+                    )
+                    time.sleep(pausa)
+                    resultado = self._intentar_quote_rt(
+                        cuenta, urls, texto, dar_like
+                    )
+            if not resultado[1]:
+                self._registrar_sesion_caida(resultado[0], resultado[2])
+            return resultado
+        finally:
+            if reservado and cuotas is not None:
+                try:
+                    cuotas.liberar(
+                        cuenta.usuario, "cita", bool(resultado[1])
+                    )
+                except Exception:
+                    pass
 
     def _esperar_turno_comentario(self, url: str) -> float:
         """Espera el turno de ESTE worker para comentar `url` (anti-spam).
@@ -3118,35 +3253,79 @@ class MotorActivacion:
         hace <30s (`_recursos_agotados`), NO se reintenta: mas Chrome empeora
         el agotamiento.
 
-        Devuelve una tupla de 5 elementos:
-        (usuario, rol, exito, detalle, url).
-        Nunca lanza: cualquier error se reporta como fallo.
-        """
-        if not _tiene_credencial_sesion(cuenta, _permitir_password()):
-            return (cuenta.usuario, rol, False, _mensaje_sin_sesion(cuenta)[:120], "")
-        if retardo > 0:
-            time.sleep(retardo)
+        Con cuotas horarias (`self._cuotas`): ANTES de cualquier trabajo
+        (credenciales, retardo, navegador) reserva un cupo del rol de forma
+        ATOMICA; si no hay cupo, o el rol efectivo quedo vacio (cuenta sin
+        cupo en modo aleatorio), devuelve `ok=None` con
+        `MENSAJE_CUOTA_AGOTADA` y NO ejecuta nada. La reserva se cierra en el
+        `finally` (`liberar`): con exito consume cupo, sin exito lo devuelve.
 
-        resultado = self._intentar_accion_rol(cuenta, rol, urls, texto, dar_like)
-        if not resultado[2]:
-            detalle = resultado[3]
-            if _es_error_recursos(detalle):
-                # Recursos del contenedor agotados: bajar el limite y NO
-                # reintentar; el worker sigue con otra cuenta.
-                self._reducir_navegadores(detalle)
-            elif _es_error_reintentable(detalle) and not self._recursos_recientes():
-                pausa = random.uniform(0.5, 1.5)
-                logger.warning(
-                    f"Reintento de acción '{rol}' para @{cuenta.usuario} por error "
-                    f"de driver/navegador ({detalle}); espero {pausa:.1f}s"
+        Devuelve una tupla de 5 elementos:
+        (usuario, rol, exito, detalle, url). `exito=None` significa omitida
+        por cuota agotada (no es exito ni fallo). Nunca lanza: cualquier
+        error se reporta como fallo.
+        """
+        cuotas = self._cuotas
+        rol_norm = "hashtags" if rol == "post" else (rol or "")
+        reservado = False
+        if cuotas is not None:
+            if not rol_norm:
+                return (
+                    cuenta.usuario, rol, None, MENSAJE_CUOTA_AGOTADA, "",
                 )
-                time.sleep(pausa)
-                resultado = self._intentar_accion_rol(cuenta, rol, urls, texto, dar_like)
-        if not resultado[2]:
-            # Sesion caida (cookies vencidas/sin credenciales): se omite en las
-            # rondas siguientes de la campana (conteo unico, sin abrir Chrome).
-            self._registrar_sesion_caida(resultado[0], resultado[3])
-        return resultado
+            reservado = bool(cuotas.reservar(cuenta.usuario, rol_norm))
+            if not reservado:
+                self._avisar_cuota_agotada(cuenta.usuario)
+                return (
+                    cuenta.usuario, rol, None, MENSAJE_CUOTA_AGOTADA, "",
+                )
+        resultado = (cuenta.usuario, rol, False, "", "")
+        try:
+            if not _tiene_credencial_sesion(cuenta, _permitir_password()):
+                resultado = (
+                    cuenta.usuario, rol, False,
+                    _mensaje_sin_sesion(cuenta)[:120], "",
+                )
+                return resultado
+            if retardo > 0:
+                time.sleep(retardo)
+
+            resultado = self._intentar_accion_rol(
+                cuenta, rol, urls, texto, dar_like
+            )
+            if not resultado[2]:
+                detalle = resultado[3]
+                if _es_error_recursos(detalle):
+                    # Recursos del contenedor agotados: bajar el limite y NO
+                    # reintentar; el worker sigue con otra cuenta.
+                    self._reducir_navegadores(detalle)
+                elif (
+                    _es_error_reintentable(detalle)
+                    and not self._recursos_recientes()
+                ):
+                    pausa = random.uniform(0.5, 1.5)
+                    logger.warning(
+                        f"Reintento de acción '{rol}' para @{cuenta.usuario} por "
+                        f"error de driver/navegador ({detalle}); espero {pausa:.1f}s"
+                    )
+                    time.sleep(pausa)
+                    resultado = self._intentar_accion_rol(
+                        cuenta, rol, urls, texto, dar_like
+                    )
+            if not resultado[2]:
+                # Sesion caida (cookies vencidas/sin credenciales): se omite en
+                # las rondas siguientes de la campana (conteo unico, sin abrir
+                # Chrome).
+                self._registrar_sesion_caida(resultado[0], resultado[3])
+            return resultado
+        finally:
+            if reservado and cuotas is not None:
+                try:
+                    cuotas.liberar(
+                        cuenta.usuario, rol_norm, bool(resultado[2])
+                    )
+                except Exception:
+                    pass
 
     def ejecutar(
         self,
@@ -3225,6 +3404,9 @@ class MotorActivacion:
         - porcentaje_min_ronda/porcentaje_max_ronda: con `repetir=True`, rango
           de cuentas por ronda (estricto: mas del minimo, menos que todas).
         """
+        # Cuotas horarias: cada campana arranca limpia y las prepara con las
+        # cuentas que realmente van a ejecutar (mas abajo).
+        self._cuotas = None
         with self._lock:
             self.progreso["ronda_actual"] = 1
         cuentas = self._obtener_cuentas(
@@ -3246,7 +3428,7 @@ class MotorActivacion:
 
         if not cuentas:
             logger.warning("No hay cuentas activas de twitter para la activacion")
-            return {
+            return self._claves_cuotas({
                 "exitosas": 0, "fallidas": 0, "detalles": [], "total": 0,
                 "sin_sesion": 0, "sin_sesion_usuarios": [],
                 "sugerencia_sesion": "",
@@ -3254,7 +3436,8 @@ class MotorActivacion:
                 "sin_registro_usuarios": sin_registro_usuarios,
                 "sugerencia_registro": sugerencia_registro,
                 "rondas": 0 if repetir else 1,
-            }
+                "omitidas_por_cuota": 0,
+            })
 
         con_sesion, sin_sesion = _partir_por_sesion(cuentas)
         sin_sesion_usuarios = [c.usuario for c in sin_sesion]
@@ -3308,7 +3491,11 @@ class MotorActivacion:
                 f"{resumen_vacio['fallidas']} fallidas de {resumen_vacio['total']} "
                 f"({resumen_vacio['sin_sesion']} sin sesión)"
             )
-            return resumen_vacio
+            return self._claves_cuotas(resumen_vacio)
+
+        # Con cuentas ejecutables: preparar el contador de cuotas horarias
+        # (base desde la BD + reservas de esta campana).
+        self._preparar_cuotas([c.usuario for c in con_sesion])
 
         tags_pedidos = _normalizar_hashtags(hashtags)
 
@@ -3325,6 +3512,7 @@ class MotorActivacion:
                 "sin_registro_usuarios": sin_registro_usuarios,
                 "sugerencia_registro": sugerencia_registro,
                 "rondas": 0,
+                "omitidas_por_cuota": 0,
             }
 
             usados: dict = {}
@@ -3362,6 +3550,17 @@ class MotorActivacion:
 
             def _reportar_ronda(resultado, ronda):
                 usuario_res, ok, detalle, url = resultado
+                if ok is None:
+                    # Omitida por cuota agotada: no es exito ni fallo, no se
+                    # registra en la BD y no dispara callback.
+                    with self._lock:
+                        self.progreso["omitidas"] = (
+                            self.progreso.get("omitidas", 0) + 1
+                        )
+                        resumen["omitidas_por_cuota"] = (
+                            resumen.get("omitidas_por_cuota", 0) + 1
+                        )
+                    return
                 with self._lock:
                     self.progreso["hechas"] += 1
                     self.progreso["exitosas" if ok else "fallidas"] += 1
@@ -3371,7 +3570,7 @@ class MotorActivacion:
                     )
                     registrar_accion(
                         usuario_res,
-                        "activacion",
+                        tipo_registro_rol("cita"),
                         "exito" if ok else "fallido",
                         url,
                         detalle,
@@ -3411,7 +3610,7 @@ class MotorActivacion:
                 f"({resumen['sin_sesion']} sin sesión, "
                 f"{resumen['sin_registro']} sin registro)"
             )
-            return resumen
+            return self._claves_cuotas(resumen)
 
         # Un pool por grupo (registro, perfil): cada cuenta publica una cita con
         # su propio estilo. La narrativa viaja solo como trasfondo.
@@ -3432,6 +3631,10 @@ class MotorActivacion:
 
         intervalo_cohorte = max(1, (duracion_min * 60) // max(cohortes, 1))
 
+        # Omitidas por cuota horaria ANTES de encolar (la garantia atomica la
+        # da la reserva interna de `_quote_rt_una_cuenta`).
+        omitidas_por_cuota = 0
+
         # El ThreadPoolExecutor ya limita la concurrencia; el retardo solo
         # distribuye los INICIOS a lo largo de la ventana para no disparar
         # todas las cuentas al mismo tiempo.
@@ -3439,6 +3642,17 @@ class MotorActivacion:
             futuros = []
             for idx, bloque in enumerate(bloques):
                 for cuenta in bloque:
+                    if (
+                        self._cuotas is not None
+                        and not self._cuotas.rol_permitido(cuenta.usuario, "cita")
+                    ):
+                        self._avisar_cuota_agotada(cuenta.usuario)
+                        with self._lock:
+                            self.progreso["omitidas"] = (
+                                self.progreso.get("omitidas", 0) + 1
+                            )
+                        omitidas_por_cuota += 1
+                        continue
                     retardo = idx * intervalo_cohorte + random.uniform(0, 15)
                     futuros.append((retardo, pool_exec.submit(
                         self._quote_rt_una_cuenta, cuenta, urls,
@@ -3453,6 +3667,15 @@ class MotorActivacion:
                 except Exception as e:
                     usuario_res, ok, detalle, url = usuario, False, str(e)[:80], ""
 
+                if ok is None:
+                    # Omitida por cuota agotada (carrera con otro worker).
+                    with self._lock:
+                        self.progreso["omitidas"] = (
+                            self.progreso.get("omitidas", 0) + 1
+                        )
+                    omitidas_por_cuota += 1
+                    continue
+
                 with self._lock:
                     self.progreso["hechas"] += 1
                     if ok:
@@ -3464,7 +3687,7 @@ class MotorActivacion:
                     )
                     registrar_accion(
                         usuario_res,
-                        "activacion",
+                        tipo_registro_rol("cita"),
                         "exito" if ok else "fallido",
                         url,
                         detalle,
@@ -3485,6 +3708,7 @@ class MotorActivacion:
             "sin_registro_usuarios": sin_registro_usuarios,
             "sugerencia_registro": sugerencia_registro,
             "rondas": 1,
+            "omitidas_por_cuota": omitidas_por_cuota,
         }
         logger.info(
             f"Activacion finalizada: {resumen['exitosas']} exitosas, "
@@ -3492,7 +3716,7 @@ class MotorActivacion:
             f"({resumen['sin_sesion']} sin sesión, "
             f"{resumen['sin_registro']} sin registro)"
         )
-        return resumen
+        return self._claves_cuotas(resumen)
 
     def ejecutar_por_roles(
         self,
@@ -3607,6 +3831,9 @@ class MotorActivacion:
           igual que `ejecutar()`.
         - Nunca lanza: cada cuenta fallida se reporta en `detalles`.
         """
+        # Cuotas horarias: cada campana arranca limpia y las prepara con las
+        # cuentas ejecutables (mas abajo).
+        self._cuotas = None
         urls = [str(u).strip() for u in (urls or []) if str(u).strip()]
         try:
             cooldown_val = max(0.0, float(cooldown_min or 0))
@@ -3629,7 +3856,7 @@ class MotorActivacion:
         if roles_aleatorios and not roles_sortear:
             sugerencia_roles = _sugerencia_roles_aleatorios()
             logger.warning(f"Activacion por roles: {sugerencia_roles}")
-            return {
+            return self._claves_cuotas({
                 "total": 0,
                 "exitosas": 0,
                 "fallidas": 0,
@@ -3653,7 +3880,8 @@ class MotorActivacion:
                 "cooldown_min": cooldown_val,
                 "pausa_comentario_url_seg": pausa_comentario_val,
                 "sugerencia_roles": sugerencia_roles,
-            }
+                "omitidas_por_cuota": 0,
+            })
         cuentas = self._obtener_cuentas_por_rol(
             usuarios, None if roles_aleatorios else solo_roles, secciones
         )
@@ -3738,6 +3966,7 @@ class MotorActivacion:
             "roles_aleatorios": bool(roles_aleatorios),
             "cooldown_min": cooldown_val,
             "pausa_comentario_url_seg": pausa_comentario_val,
+            "omitidas_por_cuota": 0,
         }
         for cuenta in sin_sesion:
             rol = rol_de.get(cuenta.usuario, "")
@@ -3757,7 +3986,7 @@ class MotorActivacion:
                 "Activacion por roles: no hay cuentas con rol para ejecutar "
                 f"({len(sin_rol_usuarios)} sin rol)"
             )
-            return resumen
+            return self._claves_cuotas(resumen)
 
         if sin_sesion:
             logger.warning(
@@ -3772,12 +4001,16 @@ class MotorActivacion:
                 f"{resumen['fallidas']} fallidas de {resumen['total']} "
                 f"({resumen['sin_rol']} sin rol, {resumen['sin_sesion']} sin sesión)"
             )
-            return resumen
+            return self._claves_cuotas(resumen)
 
         rol_por_usuario = {
             cuenta.usuario: rol_de.get(cuenta.usuario, "")
             for cuenta in ejecutables
         }
+
+        # Con cuentas ejecutables: preparar el contador de cuotas horarias
+        # (base desde la BD + reservas de esta campana).
+        self._preparar_cuotas([c.usuario for c in ejecutables])
 
         logger.info(
             f"Activacion por roles: {len(ejecutables)} cuentas con sesión "
@@ -3793,6 +4026,7 @@ class MotorActivacion:
                 "hechas": len(sin_sesion),
                 "exitosas": 0,
                 "fallidas": len(sin_sesion),
+                "omitidas": 0,
                 "ronda_actual": 1,
                 "eventos": [],
             }
@@ -3841,7 +4075,8 @@ class MotorActivacion:
                     base = [c for c in ejecutables if c.usuario in deseados]
                 if roles_aleatorios:
                     roles_ronda = self._asignar_roles_aleatorios(
-                        base, roles_sortear, roles_previos=roles_ultimos
+                        base, roles_sortear, roles_previos=roles_ultimos,
+                        cuotas=self._cuotas,
                     )
                     roles_ultimos.update(roles_ronda)
                     grupos_ronda = self._grupos_desde_roles(
@@ -3869,6 +4104,25 @@ class MotorActivacion:
                         rol: [c for c in cuentas if c.usuario in deseados]
                         for rol, cuentas in grupos_ejec.items()
                     }
+                if self._cuotas is not None:
+                    # Filtra (SIN mutar `grupos_ejec`) las cuentas sin cupo del
+                    # rol: no se les genera texto ni se les despacha accion.
+                    grupos_filtrados: dict = {}
+                    for rol, lista in grupos_ronda.items():
+                        permitidas = []
+                        for candidata in lista:
+                            try:
+                                hay_cupo = self._cuotas.rol_permitido(
+                                    candidata.usuario, rol
+                                )
+                            except Exception:
+                                hay_cupo = True
+                            if hay_cupo:
+                                permitidas.append(candidata)
+                            else:
+                                self._avisar_cuota_agotada(candidata.usuario)
+                        grupos_filtrados[rol] = permitidas
+                    grupos_ronda = grupos_filtrados
                 textos = self._generar_textos_por_rol(
                     grupos_ronda,
                     texto_base,
@@ -3884,6 +4138,12 @@ class MotorActivacion:
 
             def _ejecutar_una_rol(cuenta, texto, rol=""):
                 rol_efectivo = rol or rol_por_usuario.get(cuenta.usuario, "")
+                if self._cuotas is not None and not rol_efectivo:
+                    # Cuenta sin cupo en modo aleatorio: no abre nada.
+                    return (
+                        cuenta.usuario, rol_efectivo, None,
+                        MENSAJE_CUOTA_AGOTADA, "",
+                    )
                 try:
                     return self._ejecutar_accion_rol(
                         cuenta, rol_efectivo, urls, texto, dar_like, 0
@@ -3896,6 +4156,17 @@ class MotorActivacion:
 
             def _reportar_rol(resultado, ronda):
                 usuario_res, rol_res, ok, detalle, url = resultado
+                if ok is None:
+                    # Omitida por cuota agotada: no es exito ni fallo, no se
+                    # registra en la BD, no genera evento ni callback.
+                    with self._lock:
+                        self.progreso["omitidas"] = (
+                            self.progreso.get("omitidas", 0) + 1
+                        )
+                        resumen["omitidas_por_cuota"] = (
+                            resumen.get("omitidas_por_cuota", 0) + 1
+                        )
+                    return
                 with self._lock:
                     self.progreso["hechas"] += 1
                     self.progreso["exitosas" if ok else "fallidas"] += 1
@@ -3911,7 +4182,7 @@ class MotorActivacion:
                     )
                     registrar_accion(
                         usuario_res,
-                        "activacion",
+                        tipo_registro_rol(rol_res),
                         "exito" if ok else "fallido",
                         url,
                         detalle,
@@ -3949,11 +4220,13 @@ class MotorActivacion:
                 f"({resumen['sin_rol']} sin rol, {resumen['sin_sesion']} sin sesión, "
                 f"{resumen['sin_registro']} sin registro)"
             )
-            return resumen
+            return self._claves_cuotas(resumen)
 
         # --- Pool de textos por rol (una sola ronda) ---
         if roles_aleatorios:
-            roles_una = self._asignar_roles_aleatorios(ejecutables, roles_sortear)
+            roles_una = self._asignar_roles_aleatorios(
+                ejecutables, roles_sortear, cuotas=self._cuotas
+            )
             grupos_ejec_una = self._grupos_desde_roles(ejecutables, roles_una)
         else:
             roles_una = dict(rol_por_usuario)
@@ -3976,6 +4249,21 @@ class MotorActivacion:
             for idx, bloque in enumerate(bloques):
                 for cuenta in bloque:
                     rol = roles_una.get(cuenta.usuario, "")
+                    if (
+                        self._cuotas is not None
+                        and not self._cuotas.rol_permitido(cuenta.usuario, rol or "")
+                    ):
+                        # Omitida ANTES de encolar (la garantia atomica la da
+                        # la reserva interna de `_ejecutar_accion_rol`).
+                        self._avisar_cuota_agotada(cuenta.usuario)
+                        with self._lock:
+                            self.progreso["omitidas"] = (
+                                self.progreso.get("omitidas", 0) + 1
+                            )
+                            resumen["omitidas_por_cuota"] = (
+                                resumen.get("omitidas_por_cuota", 0) + 1
+                            )
+                        continue
                     retardo = idx * intervalo_cohorte + random.uniform(0, 15)
                     futuros.append((retardo, pool_exec.submit(
                         self._ejecutar_accion_rol, cuenta, rol, urls,
@@ -3989,6 +4277,17 @@ class MotorActivacion:
                     usuario_res = usuario
                     rol_res = roles_una.get(usuario, "")
                     ok, detalle, url = False, str(e)[:80], ""
+
+                if ok is None:
+                    # Omitida por cuota agotada (carrera con otro worker).
+                    with self._lock:
+                        self.progreso["omitidas"] = (
+                            self.progreso.get("omitidas", 0) + 1
+                        )
+                        resumen["omitidas_por_cuota"] = (
+                            resumen.get("omitidas_por_cuota", 0) + 1
+                        )
+                    continue
 
                 with self._lock:
                     self.progreso["hechas"] += 1
@@ -4005,7 +4304,7 @@ class MotorActivacion:
                     )
                     registrar_accion(
                         usuario_res,
-                        "activacion",
+                        tipo_registro_rol(rol_res),
                         "exito" if ok else "fallido",
                         url,
                         detalle,
@@ -4028,7 +4327,7 @@ class MotorActivacion:
             f"{resumen['fallidas']} fallidas de {resumen['total']} "
             f"({resumen['sin_rol']} sin rol, {resumen['sin_sesion']} sin sesión)"
         )
-        return resumen
+        return self._claves_cuotas(resumen)
 
     def _ejecutar_campana_una_cuenta(self, cuenta: Cuenta, acciones: list,
                                      retardo: float = 0,
@@ -4149,6 +4448,9 @@ class MotorActivacion:
         :meth:`ejecutar_por_roles`. Nunca lanza por cuenta: los fallos van
         en ``detalles``.
         """
+        # Cuotas horarias: cada campana arranca limpia y las prepara con las
+        # cuentas ejecutables (mas abajo).
+        self._cuotas = None
         try:
             urls_rt_limpias = [
                 str(u).strip() for u in (urls_rt or []) if str(u or "").strip()
@@ -4202,10 +4504,11 @@ class MotorActivacion:
             "sin_sesion": 0,
             "sin_sesion_usuarios": [],
             "sugerencia_sesion": "",
+            "omitidas_por_cuota": 0,
         }
         if not cuentas:
             logger.warning("Campana 3+3+3: no hay cuentas activas de twitter")
-            return base_resumen
+            return self._claves_cuotas(base_resumen)
 
         con_sesion, sin_sesion = _partir_por_sesion(cuentas)
         sin_sesion_usuarios = [c.usuario for c in sin_sesion]
@@ -4221,6 +4524,7 @@ class MotorActivacion:
                 "hechas": 0,
                 "exitosas": 0,
                 "fallidas": 0,
+                "omitidas": 0,
                 "ronda_actual": 1,
                 "eventos": [],
             }
@@ -4274,7 +4578,11 @@ class MotorActivacion:
                 f"{base_resumen['fallidas']} fallidas de "
                 f"{base_resumen['total_acciones']} ({base_resumen['sin_sesion']} sin sesión)"
             )
-            return base_resumen
+            return self._claves_cuotas(base_resumen)
+
+        # Con cuentas ejecutables: preparar el contador de cuotas horarias
+        # (base desde la BD + reservas de esta campana).
+        self._preparar_cuotas([c.usuario for c in con_sesion])
 
         acciones_por_cuenta: dict = {}
         for cuenta in con_sesion:
@@ -4345,6 +4653,17 @@ class MotorActivacion:
                 except Exception as e:
                     resultados = [(usuario, "campana", False, str(e)[:120], "")]
                 for usuario_res, rol_res, ok, detalle, url in resultados:
+                    if ok is None:
+                        # Omitida por cuota agotada: no es exito ni fallo, no
+                        # se registra en la BD ni dispara callback.
+                        with self._lock:
+                            base_resumen["omitidas_por_cuota"] = (
+                                base_resumen.get("omitidas_por_cuota", 0) + 1
+                            )
+                            self.progreso["omitidas"] = (
+                                self.progreso.get("omitidas", 0) + 1
+                            )
+                        continue
                     tipo = mapa_tipo.get(rol_res, rol_res)
                     if tipo not in base_resumen["por_tipo"]:
                         tipo = "post"
@@ -4358,7 +4677,7 @@ class MotorActivacion:
                             usuario_res, ok, detalle, 1, rol_res, url
                         )
                         registrar_accion(
-                            usuario_res, "campana_3_3_3",
+                            usuario_res, tipo_registro_rol(rol_res),
                             "exito" if ok else "fallido", url, detalle,
                         )
                         base_resumen["detalles"].append({
@@ -4381,4 +4700,4 @@ class MotorActivacion:
             f"{base_resumen['fallidas']} fallidas de {base_resumen['total_acciones']} "
             f"({base_resumen['sin_sesion']} sin sesión)"
         )
-        return base_resumen
+        return self._claves_cuotas(base_resumen)
