@@ -208,8 +208,9 @@ MENSAJE_SESION_INVALIDA = "sesión de X expirada: renueva cookies/login"
 # Senales de ANTI-BOT / PAGINA INTERMEDIA de X (Cloudflare "Just a moment",
 # interstitial "something went wrong", etc.): el bot puede confundirlas con
 # una cuenta suspendida. El motor NUNCA desactiva una cuenta por estas
-# senales; ademas las saca de las rondas de ESTA campana (no se reintentan:
-# las cuentas con solo auth_token pagan challenges seguido).
+# senales. El subconjunto DURO se omite en lo que resta de la campana; las
+# paginas de error transitorias llevan contador por cuenta
+# (`_SENALES_NAVEGACION_TRANSITORIA`) y siguen participando hasta agotarlo.
 _SENALES_ANTI_BOT = (
     "verificación anti-bot",
     "verificacion anti-bot",
@@ -239,13 +240,43 @@ _SENALES_ANTI_BOT_BLOQUEO = (
     "challenges.cloudflare",
 )
 
+# Fallos TRANSITORIOS de NAVEGACION de X (pagina de error generica /
+# interstitial): NO significan que la sesion de la cuenta este caida. Cada
+# cuenta lleva un contador por campana y SIGUE participando en las rondas;
+# solo tras `_MAX_FALLOS_TRANSITORIOS` se omite (sin desactivarla en la BD).
+_SENALES_NAVEGACION_TRANSITORIA = (
+    "something went wrong",
+    "algo salió mal",
+    "algo salio mal",
+    "pagina de error de x",
+    "página de error de x",
+    "interstitial",
+)
+
+_MAX_FALLOS_TRANSITORIOS = 2
+
+# Rechazos DEFINITIVOS de X a la accion de la cuenta ("may not be allowed",
+# "cuenta limitada por X"): se omite el resto de la campana (mismo mecanismo
+# en memoria que la sesion caida, SIN tocar la BD) y NO se reintentan: gastar
+# otro navegador no cambia el rechazo.
+_SENALES_RECHAZO_X = (
+    "your account may not be allowed to perform this action",
+    "not allowed to perform",
+    "x rechazó el post",
+    "x rechazo el post",
+    "cuenta limitada por x",
+    "limitada por x",
+)
+
 # Detalles que indican que la SESION de la cuenta ya no sirve dentro de la
 # campana (cookies vencidas, sin credenciales, login fallido, challenge
 # anti-bot): esas cuentas se sacan del orden de las rondas siguientes para no
 # quemar intentos ni abrir navegadores inutiles. Incluye las variantes de
 # password/TOTP que antes no entraban ("X pidio verificar identidad...",
 # challenge sin resolver, etc.) y TODAS las senales anti-bot (sin desactivar
-# la cuenta).
+# la cuenta). Las paginas de error transitorias entran aqui como senal, pero
+# la politica real (contador por cuenta vs omision) la decide
+# `_registrar_sesion_caida`.
 _SENALES_SESION_CAIDA_POOL = (
     "sesión de x expirada",
     "sesion de x expirada",
@@ -417,6 +448,35 @@ def _es_anti_bot_bloqueo(detalle) -> bool:
     return any(senal in texto for senal in _SENALES_ANTI_BOT_BLOQUEO)
 
 
+def _es_fallo_navegacion_transitorio(detalle) -> bool:
+    """True si el detalle es una pagina de error/interstitial TRANSITORIO de X.
+
+    Estas senales NO son sesion caida: la cuenta puede curarse con un intento
+    posterior, asi que el motor la deja seguir en las rondas con un contador
+    (`_registrar_fallo_transitorio`). Tolera None; nunca lanza.
+    """
+    try:
+        texto = "" if detalle is None else str(detalle).lower()
+    except Exception:
+        return False
+    return any(senal in texto for senal in _SENALES_NAVEGACION_TRANSITORIA)
+
+
+def _es_rechazo_x(detalle) -> bool:
+    """True si X RECHAZO definitivamente la accion de la cuenta.
+
+    Senales como "Your account may not be allowed to perform this action" o
+    "cuenta limitada por X": la cuenta se omite el resto de la campana (sin
+    desactivarla en la BD) y el fallo NO se reintenta. Tolera None; nunca
+    lanza.
+    """
+    try:
+        texto = "" if detalle is None else str(detalle).lower()
+    except Exception:
+        return False
+    return any(senal in texto for senal in _SENALES_RECHAZO_X)
+
+
 def _es_error_reintentable(detalle) -> bool:
     """True si el fallo amerita UN reintento sin riesgo de duplicar el post.
 
@@ -425,14 +485,17 @@ def _es_error_reintentable(detalle) -> bool:
     editor que no registro el texto). EXCLUYE la sesion expirada/invalida:
     reintentar con las mismas cookies no arregla nada y hay que renovarlas.
     EXCLUYE el challenge anti-bot DURO (Cloudflare/"just a moment"): la cuenta
-    se omite en la campana y reintentar pagaria otro challenge. Las paginas de
-    error transitorias ("compositor no disponible (pagina de error de X)",
-    "compositor de X no cargo") SI se reintentan: un refresh las resuelve.
-    Nunca lanza.
+    se omite en la campana y reintentar pagaria otro challenge. EXCLUYE los
+    rechazos DEFINITIVOS de X ("may not be allowed", "cuenta limitada por X"):
+    otro navegador recibe el mismo rechazo. Las paginas de error transitorias
+    ("compositor no disponible (pagina de error de X)", "compositor de X no
+    cargo") SI se reintentan: un refresh las resuelve. Nunca lanza.
     """
     if _es_error_sesion_invalida(detalle):
         return False
     if _es_anti_bot_bloqueo(detalle):
+        return False
+    if _es_rechazo_x(detalle):
         return False
     if _es_error_driver_transitorio(detalle):
         return True
@@ -1023,6 +1086,14 @@ class MotorActivacion:
         # Cuentas con la sesion caida DENTRO de esta campana: se descartan del
         # orden de las rondas siguientes (no cuentan como fallo por ronda).
         self._sesiones_caidas: set = set()
+        # Cuentas omitidas por RECHAZO DEFINITIVO de X en esta campana (mismo
+        # mecanismo en memoria que `_sesiones_caidas`, SIN tocar la BD).
+        self._rechazos_x: set = set()
+        # Fallos TRANSITORIOS de navegacion por cuenta (pagina de error /
+        # interstitial): la cuenta sigue en las rondas; al agotar
+        # `_MAX_FALLOS_TRANSITORIOS` pasa a `_transitorios_omitidos`.
+        self._fallos_transitorios: dict = {}
+        self._transitorios_omitidos: set = set()
         # Ancla asignada a cada cuenta de comentario al generar su texto: la
         # ejecucion usa ESA misma URL para que el comentario corresponda al
         # tweet que describe.
@@ -1460,6 +1531,24 @@ class MotorActivacion:
             resumen["modo_pestana"] = False
         resumen["pestanas_creadas"] = creadas
         resumen["pestanas_recicladas"] = recicladas
+        rechazos_x, transitorios = self._contadores_omitidas()
+        resumen["rechazos_x"] = rechazos_x
+        resumen["transitorios_omitidos"] = transitorios
+        try:
+            with self._lock:
+                resumen["rechazos_x_usuarios"] = sorted(self._rechazos_x)
+                resumen["transitorios_omitidos_usuarios"] = sorted(
+                    self._transitorios_omitidos
+                )
+        except Exception:
+            resumen["rechazos_x_usuarios"] = []
+            resumen["transitorios_omitidos_usuarios"] = []
+        if rechazos_x or transitorios:
+            logger.info(
+                f"Activacion: {rechazos_x} cuenta(s) omitidas por rechazo de "
+                f"X y {transitorios} por fallos transitorios de navegacion "
+                f"(NINGUNA desactivada en la BD)"
+            )
         return resumen
 
     def _n_workers(self) -> int:
@@ -1489,20 +1578,45 @@ class MotorActivacion:
             pass
 
     def _sesion_caida(self, usuario) -> bool:
-        """True si la cuenta ya se marco como sesion caida en esta campana."""
+        """True si la cuenta ya NO debe participar en esta campana.
+
+        Incluye la sesion caida real, el rechazo definitivo de X y las cuentas
+        que agotaron el maximo de fallos transitorios de navegacion.
+        """
         try:
+            clave = str(usuario)
             with self._lock:
-                return str(usuario) in self._sesiones_caidas
+                return (
+                    clave in self._sesiones_caidas
+                    or clave in self._rechazos_x
+                    or clave in self._transitorios_omitidos
+                )
         except Exception:
             return False
 
     def _registrar_sesion_caida(self, usuario, detalle) -> None:
-        """Marca la cuenta si `detalle` indica sesion caida (nunca lanza).
+        """Aplica la politica de fallos al cerrar una accion (nunca lanza).
 
-        Los detalles anti-bot se registran con un log claro (la cuenta se
-        omite en la campana pero NO se desactiva); el resto queda en DEBUG.
+        - Rechazo DEFINITIVO de X ("may not be allowed", "cuenta limitada"):
+          `_registrar_rechazo_x` omite la cuenta el resto de la campana SIN
+          tocar la BD.
+        - Pagina de error/interstitial TRANSITORIO de X: `+1` en el contador de
+          la cuenta; SIGUE participando en las rondas hasta superar
+          `_MAX_FALLOS_TRANSITORIOS`.
+        - Sesion caida real (cookies vencidas, login fallido, muro de login) y
+          anti-bot DURO/Cloudflare: la cuenta se omite el resto de la campana
+          (log claro; NUNCA se desactiva en la BD).
+        - Cualquier otro detalle no se registra.
         """
+        if _es_rechazo_x(detalle):
+            self._registrar_rechazo_x(usuario, detalle)
+            return
         if not _es_sesion_caida_detalle(detalle):
+            return
+        if _es_fallo_navegacion_transitorio(detalle) and not _es_anti_bot_bloqueo(
+            detalle
+        ):
+            self._registrar_fallo_transitorio(usuario, detalle)
             return
         self._marcar_sesion_caida(usuario)
         if _es_anti_bot_bloqueo(detalle):
@@ -1510,16 +1624,71 @@ class MotorActivacion:
                 f"X pidió verificación anti-bot; se omite @{usuario} en esta "
                 f"campaña (NO se desactiva)"
             )
-        elif _es_anti_bot_detalle(detalle):
-            logger.warning(
-                f"Página de error/interstitial de X en @{usuario}; se omite "
-                f"en esta campaña (NO se desactiva)"
-            )
         else:
             logger.debug(
                 f"sesion caida registrada para @{usuario}; se omite en las "
                 f"siguientes rondas"
             )
+
+    def _registrar_fallo_transitorio(self, usuario, detalle="") -> None:
+        """Suma un fallo TRANSITORIO de navegacion a la cuenta (nunca lanza).
+
+        La cuenta SIGUE participando en las rondas; al alcanzar
+        `_MAX_FALLOS_TRANSITORIOS` se agrega a `_transitorios_omitidos` (misma
+        omision en memoria que la sesion caida) con un log claro. No toca la
+        BD.
+        """
+        try:
+            clave = str(usuario)
+            with self._lock:
+                fallos = int(self._fallos_transitorios.get(clave, 0)) + 1
+                self._fallos_transitorios[clave] = fallos
+                if fallos >= _MAX_FALLOS_TRANSITORIOS:
+                    self._transitorios_omitidos.add(clave)
+                    omitida = True
+                else:
+                    omitida = False
+            if omitida:
+                logger.warning(
+                    f"X devolvió {fallos} páginas de error/interstitial a "
+                    f"@{clave}; se omite el resto de la campaña (NO se "
+                    f"desactiva)"
+                )
+            else:
+                logger.info(
+                    f"Página de error/interstitial transitoria en @{clave} "
+                    f"({fallos}/{_MAX_FALLOS_TRANSITORIOS}); sigue en las "
+                    f"rondas siguientes"
+                )
+        except Exception:
+            pass
+
+    def _registrar_rechazo_x(self, usuario, detalle="") -> None:
+        """Omite la cuenta por RECHAZO definitivo de X (nunca lanza).
+
+        Mismo mecanismo en memoria que `_marcar_sesion_caida`; JAMAS toca la
+        BD (`marcar_cuenta_suspendida` no se llama para estas senales).
+        """
+        try:
+            clave = str(usuario)
+            with self._lock:
+                ya_marcada = clave in self._rechazos_x
+                self._rechazos_x.add(clave)
+            if not ya_marcada:
+                logger.warning(
+                    f"X bloqueó la acción para @{clave}; se omite el resto de "
+                    f"la campaña (NO se desactiva)"
+                )
+        except Exception:
+            pass
+
+    def _contadores_omitidas(self) -> tuple:
+        """(rechazos de X, transitorios omitidos) de esta campana (nunca lanza)."""
+        try:
+            with self._lock:
+                return len(self._rechazos_x), len(self._transitorios_omitidos)
+        except Exception:
+            return 0, 0
 
     def _registrar_evento_locked(self, usuario, ok, detalle, ronda=1, rol="",
                                  url="") -> None:
@@ -2218,8 +2387,9 @@ class MotorActivacion:
                     subset = random.sample(procesables, k)
                 except Exception:
                     subset = list(procesables)
-            # Las cuentas con la sesion caida NO vuelven a entrar en ninguna
-            # ronda: sus cookies no reviven solas y solo quemarian intentos.
+            # Las cuentas omitidas (sesion caida, rechazo de X o transitorios
+            # agotados) NO vuelven a entrar en ninguna ronda: sus cookies no
+            # reviven solas y solo quemarian intentos.
             subset = [c for c in subset if not self._sesion_caida(c.usuario)]
             if not subset:
                 subset = [
@@ -2260,8 +2430,9 @@ class MotorActivacion:
                     return None
                 candidata = orden[estado["cursor"]]
                 if self._sesion_caida(candidata.usuario):
-                    # Sesion caida en esta campana: se saca del orden sin
-                    # contar un fallo nuevo ni abrir navegador por ella.
+                    # Cuenta omitida en esta campana (sesion caida, rechazo de
+                    # X o transitorios agotados): se saca del orden sin contar
+                    # un fallo nuevo ni abrir navegador por ella.
                     orden.pop(estado["cursor"])
                     revisados += 1
                     continue
@@ -2460,11 +2631,11 @@ class MotorActivacion:
 
         El bot puede marcar `cuenta_suspendida=True` ante un challenge
         anti-bot de Cloudflare o un interstitial de X: eso NO es una
-        suspension real, asi que la cuenta NO se desactiva. Si el detalle trae
-        cualquier senal anti-bot (`_SENALES_ANTI_BOT`) se registra la cuenta
-        como sesion caida de ESTA campana (`_registrar_sesion_caida`) para no
-        volver a pagar challenges por ella. Devuelve True solo cuando
-        desactivo la cuenta de verdad.
+        suspension real, asi que la cuenta NO se desactiva. Las senales
+        anti-bot DURAS se registran (`_registrar_sesion_caida`) para no volver
+        a pagar challenges; los rechazos definitivos de X se omiten sin tocar
+        la BD y los interstitials transitorios quedan solo con su contador.
+        Devuelve True solo cuando desactivo la cuenta de verdad.
 
         La senal del detalle manda sobre la bandera del bot: `bot.ultimo_error`
         se suma al detalle para no perder la causa anti-bot si el resultado
@@ -2485,9 +2656,22 @@ class MotorActivacion:
             )
         except Exception:
             texto = ""
+        if _es_rechazo_x(texto):
+            # Rechazo DEFINITIVO de X: omitir el resto de la campana SIN
+            # desactivar la cuenta en la BD (aunque el bot haya puesto
+            # `cuenta_suspendida=True`).
+            self._registrar_rechazo_x(usuario, texto)
+            return False
         if _es_anti_bot_detalle(texto):
-            # Anti-bot/Cloudflare/interstitial: NO desactivar; omitir en la
-            # campana (el log claro lo emite `_registrar_sesion_caida`).
+            if _es_fallo_navegacion_transitorio(texto) and not _es_anti_bot_bloqueo(
+                texto
+            ):
+                # Interstitial transitorio: NO es suspension ni sesion caida;
+                # el contador por cuenta lo registra la accion al reportar su
+                # fallo (aqui solo se evita desactivar la cuenta).
+                return False
+            # Anti-bot/Cloudflare: NO desactivar; omitir en la campana (el log
+            # claro lo emite `_registrar_sesion_caida`).
             self._registrar_sesion_caida(usuario, texto or "anti-bot")
             return False
         try:

@@ -76,6 +76,15 @@ comentarios al MISMO tweet de 15s. Los disyuntores de la API
 (`API_BREAKER_FALLOS`, `API_BREAKER_SEG`) no se editan en la UI: se documentan
 en un caption y se ajustan por env. En Railway NO conviene pasar de 3-4
 "navegadores": si Chrome crashea, la campana se frena en cascada.
+
+Caso de uso "trending con UN solo tweet ancla" (pestana B): el boton «🎯
+Preset: Trending 1 hora» deja la campana lista en un clic (60 min, 2
+navegadores, 12 trabajadores, rol aleatorio, repetir 40-90%, descanso de 8 min
+por cuenta y pausa de 30s entre comentarios al mismo tweet) y «🎯 Reparto
+trending» reparte las cuentas seleccionadas con pesos RT 45 / Citas 25 /
+Hashtags 20 / Comentarios 10 (`_repartir_trending`): X castiga las rafagas de
+respuestas al mismo tweet y el RT simple es la accion mas confiable para
+amplificar, mientras citas y hashtags alimentan el trending.
 """
 import os
 import threading
@@ -107,10 +116,75 @@ ICONOS_ROL = {
 # terminar (o fallar) el lanzamiento.
 _CAMPANA_ACTIVA = threading.Event()
 
+# Marcador de ARCHIVO de campana activa: lo leen otros procesos del sistema
+# (p. ej. el calentamiento continuo del scheduler) para NO lanzar acciones
+# mientras hay una campana de activacion en curso. Se escribe al adquirir el
+# guard y se borra al liberarlo (ver `_adquirir_campana`/`_liberar_campana`).
+RUTA_CAMPANA_ACTIVA = "data/.campana_activa"
+
 
 def _campana_en_curso() -> bool:
     """True si hay una campana de activacion ejecutandose en este proceso."""
     return _CAMPANA_ACTIVA.is_set()
+
+
+def _marcar_campana_activa() -> None:
+    """Escribe `data/.campana_activa` con el timestamp actual (epoch).
+
+    El archivo es el aviso para otros procesos (calentamiento continuo del
+    scheduler): mientras exista, no deben lanzar acciones. Es tolerante a
+    errores: si no se puede escribir, el guard en memoria sigue funcionando
+    igual (nunca rompe el lanzamiento de la campana).
+    """
+    try:
+        import time
+
+        from core.config import resolver_ruta
+
+        ruta = resolver_ruta(RUTA_CAMPANA_ACTIVA)
+        try:
+            os.makedirs(os.path.dirname(ruta), exist_ok=True)
+        except Exception:
+            pass
+        with open(ruta, "w", encoding="utf-8") as archivo:
+            archivo.write(str(time.time()))
+    except Exception:
+        pass
+
+
+def _limpiar_campana_activa() -> None:
+    """Borra `data/.campana_activa` si existe (tolerante a errores)."""
+    try:
+        from core.config import resolver_ruta
+
+        ruta = resolver_ruta(RUTA_CAMPANA_ACTIVA)
+        if os.path.exists(ruta):
+            os.remove(ruta)
+    except Exception:
+        pass
+
+
+def _adquirir_campana() -> bool:
+    """Toma el guard de campana unica (evento en memoria + marcador de archivo).
+
+    Devuelve False si ya habia una campana en curso en este proceso. El
+    marcador se escribe SOLO si se logro tomar el evento, para no pisar el de
+    una campana que ya esta corriendo.
+    """
+    if _CAMPANA_ACTIVA.is_set():
+        return False
+    _CAMPANA_ACTIVA.set()
+    _marcar_campana_activa()
+    return True
+
+
+def _liberar_campana() -> None:
+    """Libera el guard de campana unica (evento + marcador). Idempotente.
+
+    Centraliza la liberacion para todos los caminos (exito, error del motor,
+    excepcion inesperada o fallo al arrancar el hilo)."""
+    _CAMPANA_ACTIVA.clear()
+    _limpiar_campana_activa()
 
 
 # Navegadores recomendados para una campaña normal (valor FIJO que trae el
@@ -127,6 +201,39 @@ def _navegadores_default() -> int:
     nada; se puede subir en el mismo campo de «⚙️ Opciones avanzadas».
     """
     return NAVEGADORES_RECOMENDADOS
+
+
+# Valores del preset "🎯 Trending 1 hora" (campana de UN solo tweet ancla):
+# deja la campana lista sin tocar nada. La clave es la `key` del widget de la
+# pestana "Por roles" y el valor lo que se escribe en session_state.
+PRESET_TRENDING = {
+    "act_roles_dur": 60,
+    "act_roles_repetir": True,
+    "act_roles_cooldown": 8,
+    "act_roles_pausa_comentario": 30,
+    "act_roles_pct_min": 40,
+    "act_roles_pct_max": 90,
+    "act_roles_nav": NAVEGADORES_RECOMENDADOS,
+    "act_roles_workers": 12,
+    "act_roles_aleatorio": True,
+    "act_roles_seccion": OPCION_TODAS_SECCIONES,
+}
+
+
+def _aplicar_preset_trending():
+    """Callback (`on_click`) del boton «🎯 Preset: Trending 1 hora».
+
+    Escribe las keys de `PRESET_TRENDING` en `st.session_state`. Al correr como
+    callback del boton, se ejecuta ANTES del rerun (cuando los widgets de la
+    pestana todavia no estan instanciados), por lo que funciona aunque el
+    expander «⚙️ Opciones avanzadas» este cerrado: los widgets leen el valor
+    nuevo al construirse. No lanza: cada asignacion va en try/except.
+    """
+    for clave, valor in PRESET_TRENDING.items():
+        try:
+            st.session_state[clave] = valor
+        except Exception:
+            pass
 
 
 # ============================ LOGICA PURA ============================
@@ -171,6 +278,89 @@ def _repartir_tercios(usuarios: list) -> dict:
     for rol, tam in zip(ORDEN_ROLES, tamanos):
         reparto[rol] = limpios[inicio:inicio + tam]
         inicio += tam
+    return reparto
+
+
+# Pesos (%) del reparto "trending" para campanas de UN SOLO tweet ancla: el RT
+# simple amplifica, es la accion mas confiable y la que X castiga menos; las
+# citas y los hashtags son el combustible del trending; los comentarios van en
+# minoria porque X marca como spam cuando muchas cuentas responden al mismo
+# tweet en rafaga.
+PESOS_TRENDING = {"cita": 25, "hashtags": 20, "comentario": 10, "rt": 45}
+
+
+def _repartir_trending(usuarios: list) -> dict:
+    """Reparte 'usuarios' (en orden) con los pesos trending 25/20/10/45.
+
+    Pensado para posicionar trending con UN solo tweet ancla:
+      - RT 45%: amplificacion pura (lo mas confiable y lo que menos castiga X).
+      - Citas 25%: texto original con el enlace (combustible del trending).
+      - Hashtags 20%: posts con hashtag (combustible del trending).
+      - Comentarios 10%: minoria y espaciados (X castiga las rafagas de
+        respuestas al mismo tweet; ver `pausa_comentario_url_seg`).
+
+    Metodo del resto mayor para que la suma sea EXACTA = len(usuarios):
+      - Cuota de cada rol = n * peso / 100; se toma la parte entera.
+      - Los puestos restantes van a los mayores restos (empate -> mayor peso).
+      - Con pocas cuentas (n <= 4) se reparte 0-1 por rol en orden de
+        prioridad (rt -> cita -> hashtags -> comentario): todas participan en
+        un rol distinto y ninguna se pierde.
+
+    Mismas garantias que `_repartir_tercios`: limpia vacios y duplicados
+    (ignorando un '@' inicial), cortes contiguos y ningun usuario queda en dos
+    roles a la vez.
+
+    Ejemplos (claves de ORDEN_ROLES): 100 -> cita 25 / hashtags 20 /
+    comentario 10 / rt 45; 141 -> 35/28/14/64; 4 -> 1/1/1/1 (uno por rol);
+    3 -> 1/1/0/1; 1 -> 0/0/0/1.
+    """
+    limpios, vistos = [], set()
+    for u in (usuarios or []):
+        if u is None:
+            continue
+        nombre = str(u).strip().lstrip("@")
+        if not nombre:
+            continue
+        clave = nombre.lower()
+        if clave in vistos:
+            continue
+        vistos.add(clave)
+        limpios.append(nombre)
+
+    reparto = {rol: [] for rol in ORDEN_ROLES}
+    n = len(limpios)
+    if n == 0:
+        return reparto
+
+    if n <= len(ORDEN_ROLES):
+        # Pocas cuentas: un rol por cuenta en orden de prioridad (el mas
+        # pesado primero) para cubrir al maximo los 4 tipos de accion.
+        prioridad = sorted(
+            ORDEN_ROLES, key=lambda rol: (-PESOS_TRENDING[rol], ORDEN_ROLES.index(rol))
+        )
+        asignados = {rol: 0 for rol in ORDEN_ROLES}
+        for i in range(n):
+            asignados[prioridad[i]] = 1
+    else:
+        cuotas = {rol: n * PESOS_TRENDING[rol] / 100.0 for rol in ORDEN_ROLES}
+        asignados = {rol: int(cuotas[rol]) for rol in ORDEN_ROLES}
+        restantes = n - sum(asignados.values())
+        if restantes > 0:
+            orden_restos = sorted(
+                ORDEN_ROLES,
+                key=lambda rol: (
+                    -(cuotas[rol] - int(cuotas[rol])),
+                    -PESOS_TRENDING[rol],
+                    ORDEN_ROLES.index(rol),
+                ),
+            )
+            for rol in orden_restos[:restantes]:
+                asignados[rol] += 1
+
+    inicio = 0
+    for rol in ORDEN_ROLES:
+        reparto[rol] = limpios[inicio:inicio + asignados[rol]]
+        inicio += asignados[rol]
     return reparto
 
 
@@ -342,21 +532,21 @@ def _lanzar_con_progreso(lanzar, motor, duracion_min: int, repetir: bool) -> dic
     Devuelve el resumen del motor.
 
     Guard de campana unica: si otra campana ya esta en curso en este proceso,
-    muestra `st.error` y devuelve `{}` sin lanzar hilo ni barra. El guard se
-    libera SIEMPRE: en el `finally` del hilo runner (exito, error del motor o
-    excepcion inesperada) y tambien si falla el arranque del hilo.
+    muestra `st.error` y devuelve `{}` sin lanzar hilo ni barra. Al adquirir el
+    guard se escribe el marcador `data/.campana_activa` (lo lee el calentamiento
+    continuo del scheduler) y se borra SIEMPRE al liberarlo: en el `finally`
+    del hilo runner (exito, error del motor o excepcion inesperada) y tambien
+    si falla el arranque del hilo.
     """
     import time
 
-    if _campana_en_curso():
+    if not _adquirir_campana():
         st.error(
             "⚠️ Ya hay una campaña de activación en curso. Espera a que "
             "termine antes de lanzar otra: dos campañas simultáneas saturan "
             "Chrome (tab crashed) y hacen más lenta la que ya corre."
         )
         return {}
-
-    _CAMPANA_ACTIVA.set()
 
     resultado: dict = {}
     estado: dict = {"total": 0}
@@ -373,9 +563,10 @@ def _lanzar_con_progreso(lanzar, motor, duracion_min: int, repetir: bool) -> dic
         except BaseException as e:  # re-lanzada en el hilo principal
             resultado["error"] = e
         finally:
-            # El guard se libera SIEMPRE (exito, error del motor o excepcion
-            # inesperada) antes de que el hilo principal re-lance el error.
-            _CAMPANA_ACTIVA.clear()
+            # El guard (y el marcador de archivo) se libera SIEMPRE: exito,
+            # error del motor o excepcion inesperada, antes de que el hilo
+            # principal re-lance el error.
+            _liberar_campana()
 
     try:
         hilo = threading.Thread(target=_runner, daemon=True)
@@ -383,7 +574,7 @@ def _lanzar_con_progreso(lanzar, motor, duracion_min: int, repetir: bool) -> dic
         hilo.start()
     except BaseException:
         # Si el hilo no llego a arrancar, nadie mas liberaria el guard.
-        _CAMPANA_ACTIVA.clear()
+        _liberar_campana()
         raise
 
     barra = st.progress(0.0)
@@ -1476,6 +1667,52 @@ def _por_roles():
     seleccion = _selector_masivo(cuentas, "act_roles_selector")
     usuarios_sel = [f.get("usuario") for f in seleccion if f.get("usuario")]
 
+    # ---------------- Trending de 1 clic (un solo tweet ancla) ----------------
+    # Solo 2 botones visibles: el reparto ponderado y el preset de 1 hora.
+    col_reparto, col_preset = st.columns([2, 1])
+    with col_reparto:
+        repartir_trending = st.button(
+            "🎯 Reparto trending (RT 45 / Citas 25 / Hashtags 20 / Comentarios 10)",
+            key="btn_act_roles_trending",
+            help=(
+                "Asigna roles ponderados a las cuentas seleccionadas: RT simple "
+                "45%, citas 25%, posts con hashtag 20% y comentarios 10%. "
+                "Pensado para posicionar trending con UN solo tweet ancla."
+            ),
+        )
+    with col_preset:
+        st.button(
+            "🎯 Preset: Trending 1 hora",
+            key="btn_preset_trending",
+            on_click=_aplicar_preset_trending,
+            help=(
+                "Deja la campaña lista en 1 clic: 60 min, 2 navegadores, 12 "
+                "trabajadores, rol aleatorio, repetir por rondas (40-90%), "
+                "descanso de 8 min por cuenta y pausa de 30s entre comentarios "
+                "al mismo tweet. Funciona con «Opciones avanzadas» cerradas."
+            ),
+        )
+    st.caption(
+        "🔥 Estrategia de ancla única: **RT = amplificación** (el más "
+        "confiable), **Citas y Hashtags = combustible del trending**, "
+        "**Comentarios = minoría y espaciados** (X marca spam en ráfagas al "
+        "mismo tweet). Deja el preset puesto y lanza; no toques nada más."
+    )
+
+    if repartir_trending:
+        if not usuarios_sel:
+            st.warning(
+                "Selecciona al menos una cuenta para el reparto trending."
+            )
+        else:
+            reparto = _repartir_trending(usuarios_sel)
+            resumen = []
+            for rol in ORDEN_ROLES:
+                n = _actualizar_roles(reparto[rol], rol)
+                resumen.append(f"{etiqueta_rol_activacion(rol)}: {n}")
+            st.success("🎯 Reparto trending → " + " · ".join(resumen))
+            st.rerun()
+
     # ---------------- Asignar roles (avanzado) ----------------
     # El modo recomendado es «🎲 Rol aleatorio por cuenta en cada ronda», que
     # sortea la acción en cada ronda sin usar el rol guardado; la asignación
@@ -1931,6 +2168,17 @@ def _por_roles():
             "⚠️ Con una sola URL ancla todos los comentarios van al mismo "
             "tweet y X los agrupa como 'Probable spam'. Usa 2-5 tweets ancla "
             "para no frenar: pega 2-5 URLs o sube la pausa."
+        )
+
+    # "Solo cuentas con registro": para el RT simple no se necesita registro,
+    # asi que este filtro puede dejar fuera cuentas utiles para el trending.
+    # (El checkbox no se toca; el aviso solo aparece si esta encendido.)
+    if todas_cuentas:
+        st.warning(
+            "⚠️ «Todas las cuentas publican» está encendido: solo entran las "
+            "cuentas con registro (político/activista/ciudadanía) y el RT "
+            "simple no necesita registro, así que podrías dejar fuera cuentas "
+            "útiles para el trending."
         )
 
     if st.button(

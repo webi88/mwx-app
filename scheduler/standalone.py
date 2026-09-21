@@ -32,7 +32,9 @@ def main():
     try:
         from scheduler.manager import SchedulerManager
 
-        SchedulerManager()
+        # Unico proceso que corre el calentamiento continuo; el dashboard
+        # instancia SchedulerManager() sin argumentos y NO lo registra.
+        SchedulerManager(con_calentamiento=True)
     except Exception:
         logger.exception("Error iniciando SchedulerManager")
         raise

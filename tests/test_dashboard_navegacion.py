@@ -13,6 +13,10 @@ Verifica (sin Chrome y sin Streamlit runtime) que:
     es 2.
   - `iniciar_dashboard` se importa sin arrancar Streamlit (def main + guard) y
     `web/operaciones/change.py` NO borra `builtins.input` (lo restaura).
+  - El preset "Trending 1 hora" y el reparto ponderado `_repartir_trending`
+    (RT 45 / Citas 25 / Hashtags 20 / Comentarios 10) de Activacion Masiva.
+  - El marcador `data/.campana_activa` del guard de campana unica (se crea al
+    adquirir, se borra al liberar incluso si la campana falla).
 
 El recorrido completo de operaciones visibles con `AppTest` se corre aparte
 (script temporal del agente) porque es lento para la suite rapida.
@@ -167,8 +171,108 @@ def _change_no_borra_input() -> tuple[bool, bool, bool]:
     return (not borra) and sin_del, restaura, define_original
 
 
+def _marcador_campana_prueba() -> dict:
+    """Prueba funcional del marcador `data/.campana_activa`.
+
+    Crea el archivo via `_adquirir_campana`, valida contenido numerico y guard
+    unico, simula el fallo de campana (try/finally con `_liberar_campana`) y
+    comprueba el borrado. SIEMPRE limpia el archivo/evento al terminar."""
+    from web.operaciones import activacion_masiva as am
+
+    ruta = RAIZ / "data" / ".campana_activa"
+    resultados = {
+        "creado": False,
+        "numerico": False,
+        "unico": False,
+        "borrado": False,
+        "sin_archivo_ok": False,
+    }
+    try:
+        try:
+            ruta.unlink()
+        except Exception:
+            pass
+
+        resultados["creado"] = am._adquirir_campana() and ruta.exists()
+        if ruta.exists():
+            try:
+                resultados["numerico"] = (
+                    float(ruta.read_text(encoding="utf-8").strip()) > 0
+                )
+            except Exception:
+                resultados["numerico"] = False
+        resultados["unico"] = am._adquirir_campana() is False
+
+        # Simula una campana que lanza: el finally del runner la libera.
+        try:
+            raise RuntimeError("campana de prueba")
+        except RuntimeError:
+            pass  # el error de la campana no debe romper el test
+        finally:
+            am._liberar_campana()
+        resultados["borrado"] = not ruta.exists()
+
+        # Sin archivo tambien es tolerante.
+        am._limpiar_campana_activa()
+        resultados["sin_archivo_ok"] = not ruta.exists()
+    finally:
+        am._liberar_campana()
+    return resultados
+
+
+def _guard_centralizado_en_lanzar() -> tuple[bool, int, int, bool]:
+    """(adquiere, finales con liberar, liberaciones, sin set/clear crudos).
+
+    Revisa por AST `_lanzar_con_progreso`: debe adquirir con
+    `_adquirir_campana`, liberar con `_liberar_campana` dentro de un `finally`
+    y no tocar `_CAMPANA_ACTIVA` directamente (centralizacion)."""
+    fuente = (RAIZ / "web" / "operaciones" / "activacion_masiva.py").read_text(
+        encoding="utf-8"
+    )
+    arbol = ast.parse(fuente)
+    funcion = None
+    for nodo in ast.walk(arbol):
+        if isinstance(nodo, ast.FunctionDef) and nodo.name == "_lanzar_con_progreso":
+            funcion = nodo
+            break
+    if funcion is None:
+        return False, 0, 0, False
+
+    llamadas = [
+        n.func.id
+        for n in ast.walk(funcion)
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+    ]
+    adquiere = "_adquirir_campana" in llamadas
+    liberaciones = llamadas.count("_liberar_campana")
+
+    finales = 0
+    for nodo in ast.walk(funcion):
+        if isinstance(nodo, ast.Try) and nodo.finalbody:
+            for sub in ast.walk(ast.Module(body=nodo.finalbody, type_ignores=[])):
+                if (
+                    isinstance(sub, ast.Call)
+                    and isinstance(sub.func, ast.Name)
+                    and sub.func.id == "_liberar_campana"
+                ):
+                    finales += 1
+
+    crudo = any(
+        isinstance(n, ast.Attribute)
+        and n.attr in ("set", "clear")
+        and isinstance(n.value, ast.Name)
+        and n.value.id == "_CAMPANA_ACTIVA"
+        for n in ast.walk(funcion)
+    )
+    return adquiere, finales, liberaciones, not crudo
+
+
 def run(check):
-    from web.operaciones.activacion_masiva import _navegadores_default
+    from web.operaciones.activacion_masiva import (
+        PRESET_TRENDING,
+        _navegadores_default,
+        _repartir_trending,
+    )
     from web.operaciones.cuentas import MODOS_TABS, TABS, _modo_de_tab
 
     constantes = _leer_constantes_app()
@@ -274,4 +378,102 @@ def run(check):
     check(
         "change: sin 'del builtins.input' y con restauracion del original",
         no_borra and restaura and define_original,
+    )
+
+    # ---------------- Preset "Trending 1 hora" ----------------
+    esperado_preset = {
+        "act_roles_dur": 60,
+        "act_roles_repetir": True,
+        "act_roles_cooldown": 8,
+        "act_roles_pausa_comentario": 30,
+        "act_roles_pct_min": 40,
+        "act_roles_pct_max": 90,
+        "act_roles_nav": 2,
+        "act_roles_workers": 12,
+        "act_roles_aleatorio": True,
+        "act_roles_seccion": "Todas",
+    }
+    check(
+        "trending: PRESET_TRENDING fija duracion/rondas/cooldown/pausa/equipo",
+        PRESET_TRENDING == esperado_preset,
+        f"(real={PRESET_TRENDING!r})",
+    )
+
+    # ---------------- Reparto ponderado `_repartir_trending` ----------------
+    def _cuentas(n: int) -> list:
+        return [f"cuenta_{i:03d}" for i in range(1, n + 1)]
+
+    esperados_exactos = {
+        100: {"cita": 25, "hashtags": 20, "comentario": 10, "rt": 45},
+        141: {"cita": 35, "hashtags": 28, "comentario": 14, "rt": 64},
+    }
+    exactos_ok = True
+    for n, esperado in esperados_exactos.items():
+        reparto = _repartir_trending(_cuentas(n))
+        exactos_ok = exactos_ok and {
+            rol: len(v) for rol, v in reparto.items()
+        } == esperado
+    check(
+        "trending: reparto ponderado exacto en n=100 (25/20/10/45) y n=141",
+        exactos_ok,
+    )
+
+    general_ok = True
+    for n in range(1, 11):
+        limpios = _cuentas(n)
+        reparto = _repartir_trending(limpios)
+        # Suma exacta + particion + orden original preservado (bloques).
+        concatenados = [u for rol in ("cita", "hashtags", "comentario", "rt")
+                        for u in reparto[rol]]
+        if concatenados != limpios:
+            general_ok = False
+        # Resto mayor: cada rol a menos de 1 de su cuota.
+        for rol, peso in (("cita", 25), ("hashtags", 20), ("comentario", 10), ("rt", 45)):
+            if abs(len(reparto[rol]) - n * peso / 100.0) > 1:
+                general_ok = False
+        # Pocas cuentas: 0-1 por rol (nadie se pierde).
+        if n <= 4 and any(len(v) > 1 for v in reparto.values()):
+            general_ok = False
+    check(
+        "trending: n=1..10 suma exacta, sin perder cuentas y proporcional",
+        general_ok,
+    )
+
+    reparto_1 = _repartir_trending(["solo_una"])
+    check(
+        "trending: con 1 cuenta va al RT (rol mas confiable)",
+        reparto_1["rt"] == ["solo_una"]
+        and sum(len(v) for v in reparto_1.values()) == 1,
+    )
+
+    reparto_limpio = _repartir_trending(["@Ana", "ana", "", None, "Beto"])
+    check(
+        "trending: limpia '@'/vacios/duplicados (2 unicas de 5 entradas)",
+        sum(len(v) for v in reparto_limpio.values()) == 2
+        and len(reparto_limpio["rt"]) == 1
+        and len(reparto_limpio["cita"]) == 1,
+    )
+
+    # ---------------- Marcador de campana activa (data/.campana_activa) -------
+    marcador = _marcador_campana_prueba()
+    check(
+        "campana: _adquirir/_marcar crea data/.campana_activa",
+        marcador["creado"],
+    )
+    check(
+        "campana: el marcador contiene un timestamp numerico",
+        marcador["numerico"],
+    )
+    check(
+        "campana: guard unico (2do acquire False) y _liberar borra el archivo",
+        marcador["unico"] and marcador["borrado"],
+    )
+    check(
+        "campana: _limpiar_campana_activa es tolerante si no existe",
+        marcador["sin_archivo_ok"],
+    )
+    adquiere, finales, liberaciones, sin_raw = _guard_centralizado_en_lanzar()
+    check(
+        "campana: _lanzar_con_progreso centraliza adquirir/liberar en finally",
+        adquiere and finales >= 1 and liberaciones >= 2 and sin_raw,
     )

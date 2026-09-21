@@ -2270,12 +2270,14 @@ class TwitterBot:
             time.sleep(0.5)
 
         # Diagnostico al fallar: longitud del texto que realmente quedo en el
-        # editor VISIBLE (si se puede leer) y del que se intento escribir.
+        # editor VISIBLE (si se puede leer) y del que se intento escribir. Se
+        # usa la lectura EXACTA: `_leer_texto_editor` concatena `.text` +
+        # `textContent` + `innerText` y reportaba longitudes 2-3x infladas.
         largo_editor = None
         try:
             editor = self._primer_editor_visible()
             if editor is not None:
-                largo_editor = len(self._leer_texto_editor(editor))
+                largo_editor = self._largo_editor(editor)
         except Exception:
             largo_editor = None
         detalle_editor = (
@@ -3947,6 +3949,69 @@ try {
                 continue
         return "\n".join(partes)
 
+    def _leer_texto_editor_exacto(self, elemento) -> str:
+        """Lectura UNICA del editor para medir su largo REAL (sin duplicados).
+
+        `_leer_texto_editor` concatena `.text` + `textContent` + `innerText` +
+        `value`; en un contenteditable eso es el MISMO contenido 2-3 veces y la
+        longitud medida queda inflada (diagnostico real de Railway: "2632 chars
+        en el editor visible" con ~3 borradores acumulados). Aqui se elige la
+        fuente mas larga disponible: `value` para `input`/`textarea` y
+        `.text`/`textContent`/`innerText` para contenteditable. Nunca lanza:
+        devuelve `""` si no se pudo leer (p. ej. elemento stale).
+        """
+        candidatos = []
+        for lector in (
+            lambda: elemento.text or "",
+            lambda: elemento.get_attribute("textContent") or "",
+            lambda: elemento.get_attribute("innerText") or "",
+            lambda: elemento.get_attribute("value") or "",
+        ):
+            try:
+                valor = lector()
+            except Exception:
+                continue
+            if valor:
+                candidatos.append(valor)
+        if not candidatos:
+            return ""
+        return max(candidatos, key=len)
+
+    def _editor_vacio(self, elemento) -> bool:
+        """True si el editor no tiene contenido (ignora espacios/zero-width).
+
+        Mide sobre la lectura exacta (sin duplicados de `_leer_texto_editor`).
+        Si el elemento esta stale (no se pudo leer) devuelve True: el flujo de
+        pegado re-localiza el editor y la validacion posterior lo detecta.
+        """
+        try:
+            texto = self._leer_texto_editor_exacto(elemento)
+        except Exception:
+            return True
+        return not texto.replace("\u200b", "").strip()
+
+    def _largo_editor(self, elemento) -> int:
+        """Largo del texto REAL del editor (0 si no se pudo leer). Nunca lanza."""
+        return len(self._leer_texto_editor_exacto(elemento))
+
+    def _editor_con_restos(self, elemento, texto: str, margen: int = 30) -> int:
+        """Largo TOTAL del editor si quedo sucio (0 = sin restos).
+
+        Bug real de Railway: X restaura el borrador del composer entre
+        intentos y el pegado lo ACUMULA (el texto nuevo se inserta junto al
+        viejo). Si el editor supera `len(texto) + margen` chars quedaron
+        restos; se devuelve su largo total para el mensaje de error. Nunca
+        lanza (un fallo de lectura se trata como "sin restos": la verificacion
+        `_verificar_texto_en_editor` ya valido que el texto esta).
+        """
+        try:
+            largo = self._largo_editor(elemento)
+        except Exception:
+            return 0
+        if largo > len(texto or "") + max(0, margen):
+            return largo
+        return 0
+
     def _verificar_texto_en_editor(
         self, elemento, texto: str, intentos: int = 3, espera: float = 0.3
     ) -> bool:
@@ -3972,6 +4037,97 @@ try {
             time.sleep(espera)
         return False
 
+    # Bit de modificador Ctrl para `Input.dispatchKeyEvent` de CDP
+    # (Alt=1, Ctrl=2, Meta=4, Shift=8).
+    _CDP_MOD_CTRL = 2
+
+    def _cdp_tecla(self, tipo: str, key: str, code: str, vk: int, modifiers: int = 0):
+        """Envia UNA tecla al elemento ENFOCADO via CDP (sin clic ni foco).
+
+        `rawKeyDown` no genera evento `char` (los atajos de edicion se
+        procesan en el `keydown`): es el patron que usa Playwright para
+        Ctrl+A/Delete. El evento entra por el pipeline real de Chrome, asi que
+        `selectAll`/borrado nativos se ejecutan de verdad (a diferencia del
+        Range de JS, que React pierde al re-renderizar y hacia que
+        `Input.insertText` insertara en el caret en vez de reemplazar).
+        """
+        self.driver.execute_cdp_cmd(
+            "Input.dispatchKeyEvent",
+            {
+                "type": tipo,
+                "modifiers": modifiers,
+                "key": key,
+                "code": code,
+                "windowsVirtualKeyCode": vk,
+                "nativeVirtualKeyCode": vk,
+            },
+        )
+
+    def _limpiar_editor_cdp(self, elemento):
+        """Vacia el editor con Ctrl+A + Delete por CDP (4 eventos).
+
+        Sin clic (el `data-testid='mask'` del modal de X lo intercepta) y sin
+        portapapeles (Railway no tiene xclip). `_enfocar_editable` deja el foco
+        en el editable REAL: en algunas variantes `tweetTextarea_0` es un
+        wrapper y el contenteditable es un descendiente.
+        """
+        self._enfocar_editable(elemento, seleccionar=False)
+        ctrl = self._CDP_MOD_CTRL
+        self._cdp_tecla("rawKeyDown", "a", "KeyA", 65, ctrl)
+        self._cdp_tecla("keyUp", "a", "KeyA", 65, ctrl)
+        self._cdp_tecla("rawKeyDown", "Delete", "Delete", 46)
+        self._cdp_tecla("keyUp", "Delete", "Delete", 46)
+
+    def _limpiar_editor_actionchains(self, elemento):
+        """UN reintento de borrado con ActionChains (Ctrl+A + Delete).
+
+        Sin clic: el foco ya lo dejo `_enfocar_editable` por JS y las teclas de
+        W3C van al elemento activo, asi que el `mask` del modal no las
+        intercepta. Se usa si la via CDP no dejo el editor vacio.
+        """
+        self._enfocar_editable(elemento, seleccionar=False)
+        modifier = Keys.COMMAND if os.name == "posix" else Keys.CONTROL
+        ActionChains(self.driver).key_down(modifier).send_keys("a").key_up(
+            modifier
+        ).send_keys(Keys.DELETE).perform()
+
+    def _limpiar_editor_x(self, elemento):
+        """Deja VACIO el editor antes de pegar (borrador restaurado por X).
+
+        Bug real de Railway (pestaña persistente): X RESTAURA el borrador del
+        composer entre intentos de la misma cuenta y el pegado se ACUMULABA
+        (1800-2600 chars en el editor, > 280: boton Post deshabilitado para
+        siempre, con un falso "el texto no quedo registrado"). La causa era el
+        Range de `_enfocar_editable(seleccionar=True)`: React lo pierde al
+        re-renderizar y `Input.insertText` inserta en el caret en vez de
+        reemplazar. Aqui se limpia primero:
+          1. CDP Ctrl+A + Delete sobre el editable enfocado.
+          2. UN reintento con ActionChains (Ctrl+A + Delete), tambien sin clic.
+        Lanza `"editor de X con borrador que no se pudo limpiar (N chars)"` si
+        sigue sucio: nada se publico aun, el motor lo trata como fallo seguro.
+        """
+        if self._editor_vacio(elemento):
+            return
+        for intento, limpiador in enumerate(
+            (self._limpiar_editor_cdp, self._limpiar_editor_actionchains), start=1
+        ):
+            try:
+                limpiador(elemento)
+            except Exception as e:
+                logger.debug(
+                    f"limpieza de borrador intento {intento} fallo "
+                    f"({type(e).__name__}: {e}); se sigue al siguiente"
+                )
+            if self._editor_vacio(elemento):
+                logger.info(
+                    "Editor de X limpiado (borrador previo eliminado antes de escribir)"
+                )
+                return
+        raise Exception(
+            "editor de X con borrador que no se pudo limpiar "
+            f"({self._largo_editor(elemento)} chars)"
+        )
+
     def _pegar_texto(self, elemento, texto: str):
         """Escribe `texto` en el editor verificando que REALMENTE quedo.
 
@@ -3991,6 +4147,14 @@ try {
              bucle char por char: miles de comandos al renderer son los que
              provocan los `Timed out receiving message from renderer` en el
              contenedor).
+
+        Antes de escribir se VACIA el editor (`_limpiar_editor_x`): X restaura
+        el borrador del composer entre intentos de la misma cuenta y el pegado
+        lo ACUMULABA (1800-2600 chars, > 280: boton Post deshabilitado para
+        siempre). Despues de escribir se valida el largo: si el editor quedo
+        con restos (`_editor_con_restos`), se limpia y escribe UNA vez mas; si
+        sigue sucio se lanza `"editor de X con borrador que no se pudo limpiar
+        (N chars)"` (nada se publico: fallo seguro para el motor).
 
         El DOM de X (React) se re-renderiza y el `WebElement` guardado puede
         quedar viejo (`StaleElementReferenceException`), perdiendo el intento:
@@ -4184,16 +4348,50 @@ try {
             el.click()
             el.send_keys(texto)
 
-        for nombre, metodo in (
-            ("cdp_insertText", _cdp_inserttext),
-            ("portapapeles", _portapapeles),
-            ("execCommand", _execcommand),
-            ("send_keys", _send_keys),
-        ):
-            if _intentar(nombre, metodo):
-                return
+        def _escribir_con_metodos() -> bool:
+            """Recorre los 4 metodos de pegado (mismo orden) hasta que el texto quede."""
+            for nombre, metodo in (
+                ("cdp_insertText", _cdp_inserttext),
+                ("portapapeles", _portapapeles),
+                ("execCommand", _execcommand),
+                ("send_keys", _send_keys),
+            ):
+                if _intentar(nombre, metodo):
+                    return True
+            return False
 
-        raise Exception("no se pudo escribir el texto en el editor de X")
+        # P0: ANTES de escribir, VACIAR el editor. X restaura el borrador del
+        # composer entre intentos (misma cuenta/pestaña) y el pegado lo
+        # ACUMULABA (1800-2600 chars > 280: el boton Post quedaba deshabilitado
+        # para siempre). Si no se puede limpiar, se corta aqui con un error
+        # explicito: nada se publico y el motor lo reintenta sin riesgo.
+        self._limpiar_editor_x(estado["elemento"])
+
+        if not _escribir_con_metodos():
+            raise Exception("no se pudo escribir el texto en el editor de X")
+
+        # P0: el borrador puede restaurarse DESPUES de la limpieza (React) y
+        # colarse junto al texto nuevo. Si el editor quedo con restos, se
+        # limpia y se escribe UNA vez mas; si sigue sucio, error explicito.
+        restante = self._editor_con_restos(estado["elemento"], texto)
+        if restante <= 0:
+            return
+        logger.warning(
+            f"El editor de X quedo con restos tras escribir ({restante} chars "
+            f"para {len(texto)} intentados); limpiando y reescribiendo"
+        )
+        self._limpiar_editor_x(estado["elemento"])
+        if _escribir_con_metodos():
+            restante = self._editor_con_restos(estado["elemento"], texto)
+            if restante <= 0:
+                return
+        else:
+            raise Exception("no se pudo escribir el texto en el editor de X")
+
+        raise Exception(
+            "editor de X con borrador que no se pudo limpiar "
+            f"({restante} chars)"
+        )
     
     def _subir_imagen(self, imagen_path: str):
         try:
