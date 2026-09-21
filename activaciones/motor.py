@@ -205,11 +205,47 @@ _SENALES_SESION_INVALIDA = (
 MENSAJE_SESION_INVALIDA = "sesión de X expirada: renueva cookies/login"
 
 
+# Senales de ANTI-BOT / PAGINA INTERMEDIA de X (Cloudflare "Just a moment",
+# interstitial "something went wrong", etc.): el bot puede confundirlas con
+# una cuenta suspendida. El motor NUNCA desactiva una cuenta por estas
+# senales; ademas las saca de las rondas de ESTA campana (no se reintentan:
+# las cuentas con solo auth_token pagan challenges seguido).
+_SENALES_ANTI_BOT = (
+    "verificación anti-bot",
+    "verificacion anti-bot",
+    "cloudflare",
+    "just a moment",
+    "un momento",
+    "challenges.cloudflare",
+    "something went wrong",
+    "algo salió mal",
+    "algo salio mal",
+    "pagina de error de x",
+    "página de error de x",
+    "interstitial",
+)
+
+# Subconjunto DURO: el challenge anti-bot que impide confirmar la sesion. La
+# cuenta se omite en lo que resta de la campana (no se desactiva) y NO se
+# reintenta. Las paginas de error transitorias ("something went wrong",
+# "pagina de error de X", "interstitial") quedan fuera a proposito: esas se
+# reintentan UNA vez porque un refresh suele resolverlas.
+_SENALES_ANTI_BOT_BLOQUEO = (
+    "verificación anti-bot",
+    "verificacion anti-bot",
+    "cloudflare",
+    "just a moment",
+    "un momento",
+    "challenges.cloudflare",
+)
+
 # Detalles que indican que la SESION de la cuenta ya no sirve dentro de la
-# campana (cookies vencidas, sin credenciales, login fallido): esas cuentas se
-# sacan del orden de las rondas siguientes para no quemar intentos ni abrir
-# navegadores inutiles. Incluye las variantes de password/TOTP que antes no
-# entraban ("X pidio verificar identidad...", challenge sin resolver, etc.).
+# campana (cookies vencidas, sin credenciales, login fallido, challenge
+# anti-bot): esas cuentas se sacan del orden de las rondas siguientes para no
+# quemar intentos ni abrir navegadores inutiles. Incluye las variantes de
+# password/TOTP que antes no entraban ("X pidio verificar identidad...",
+# challenge sin resolver, etc.) y TODAS las senales anti-bot (sin desactivar
+# la cuenta).
 _SENALES_SESION_CAIDA_POOL = (
     "sesión de x expirada",
     "sesion de x expirada",
@@ -227,7 +263,7 @@ _SENALES_SESION_CAIDA_POOL = (
     "sin cookies",
     "sin sesion",
     "sin sesión",
-)
+) + _SENALES_ANTI_BOT
 
 # Senales de AGOTAMIENTO DE RECURSOS del contenedor (hilos/RAM): si aparecen,
 # abrir MAS Chrome empeora el problema: el motor baja el limite de navegadores
@@ -351,6 +387,36 @@ def _es_error_recursos(detalle) -> bool:
     return any(senal in texto for senal in _SENALES_ERROR_RECURSOS)
 
 
+def _es_anti_bot_detalle(detalle) -> bool:
+    """True si el detalle menciona anti-bot/Cloudflare/interstitial de X.
+
+    Estas senales NO son una suspension real de la cuenta: el motor jamas
+    debe desactivarla por ellas (solo omitirla en la campana). Tolera None y
+    tipos raros; nunca lanza.
+    """
+    try:
+        texto = "" if detalle is None else str(detalle).lower()
+    except Exception:
+        return False
+    return any(senal in texto for senal in _SENALES_ANTI_BOT)
+
+
+def _es_anti_bot_bloqueo(detalle) -> bool:
+    """True si el detalle es el challenge anti-bot DURO (Cloudflare).
+
+    A diferencia de `_es_anti_bot_detalle` incluye solo las senales que
+    impiden confirmar la sesion: la cuenta se omite en la campana y NO se
+    reintenta. Las paginas de error transitorias de X ("something went wrong",
+    "pagina de error de X", "interstitial") no entran aqui a proposito (esas
+    se reintentan una vez). Tolera None; nunca lanza.
+    """
+    try:
+        texto = "" if detalle is None else str(detalle).lower()
+    except Exception:
+        return False
+    return any(senal in texto for senal in _SENALES_ANTI_BOT_BLOQUEO)
+
+
 def _es_error_reintentable(detalle) -> bool:
     """True si el fallo amerita UN reintento sin riesgo de duplicar el post.
 
@@ -358,9 +424,15 @@ def _es_error_reintentable(detalle) -> bool:
     publicacion donde el texto no llego a enviarse (boton Post deshabilitado o
     editor que no registro el texto). EXCLUYE la sesion expirada/invalida:
     reintentar con las mismas cookies no arregla nada y hay que renovarlas.
+    EXCLUYE el challenge anti-bot DURO (Cloudflare/"just a moment"): la cuenta
+    se omite en la campana y reintentar pagaria otro challenge. Las paginas de
+    error transitorias ("compositor no disponible (pagina de error de X)",
+    "compositor de X no cargo") SI se reintentan: un refresh las resuelve.
     Nunca lanza.
     """
     if _es_error_sesion_invalida(detalle):
+        return False
+    if _es_anti_bot_bloqueo(detalle):
         return False
     if _es_error_driver_transitorio(detalle):
         return True
@@ -1425,14 +1497,29 @@ class MotorActivacion:
             return False
 
     def _registrar_sesion_caida(self, usuario, detalle) -> None:
-        """Marca la cuenta si `detalle` indica sesion caida (nunca lanza)."""
+        """Marca la cuenta si `detalle` indica sesion caida (nunca lanza).
+
+        Los detalles anti-bot se registran con un log claro (la cuenta se
+        omite en la campana pero NO se desactiva); el resto queda en DEBUG.
+        """
         if not _es_sesion_caida_detalle(detalle):
             return
         self._marcar_sesion_caida(usuario)
-        logger.debug(
-            f"sesion caida registrada para @{usuario}; se omite en las "
-            f"siguientes rondas"
-        )
+        if _es_anti_bot_bloqueo(detalle):
+            logger.warning(
+                f"X pidió verificación anti-bot; se omite @{usuario} en esta "
+                f"campaña (NO se desactiva)"
+            )
+        elif _es_anti_bot_detalle(detalle):
+            logger.warning(
+                f"Página de error/interstitial de X en @{usuario}; se omite "
+                f"en esta campaña (NO se desactiva)"
+            )
+        else:
+            logger.debug(
+                f"sesion caida registrada para @{usuario}; se omite en las "
+                f"siguientes rondas"
+            )
 
     def _registrar_evento_locked(self, usuario, ok, detalle, ronda=1, rol="",
                                  url="") -> None:
@@ -2374,13 +2461,58 @@ class MotorActivacion:
             detalle = _detalle_con_sesion(f"{type(e).__name__}: {e}")
             return (cuenta.usuario, rol, False, detalle[:120], url_objetivo)
 
+    def _procesar_suspension_cuenta(self, cuenta, bot, detalle="") -> bool:
+        """Desactiva la cuenta SOLO si la suspension es real (nunca lanza).
+
+        El bot puede marcar `cuenta_suspendida=True` ante un challenge
+        anti-bot de Cloudflare o un interstitial de X: eso NO es una
+        suspension real, asi que la cuenta NO se desactiva. Si el detalle trae
+        cualquier senal anti-bot (`_SENALES_ANTI_BOT`) se registra la cuenta
+        como sesion caida de ESTA campana (`_registrar_sesion_caida`) para no
+        volver a pagar challenges por ella. Devuelve True solo cuando
+        desactivo la cuenta de verdad.
+
+        La senal del detalle manda sobre la bandera del bot: `bot.ultimo_error`
+        se suma al detalle para no perder la causa anti-bot si el resultado
+        venia sin ella (p.ej. el detalle es una URL).
+        """
+        try:
+            if not getattr(bot, "cuenta_suspendida", False):
+                return False
+        except Exception:
+            return False
+        usuario = str(getattr(cuenta, "usuario", "") or "")
+        try:
+            texto = " ".join(
+                x for x in (
+                    str(detalle or ""),
+                    str(getattr(bot, "ultimo_error", "") or ""),
+                ) if x
+            )
+        except Exception:
+            texto = ""
+        if _es_anti_bot_detalle(texto):
+            # Anti-bot/Cloudflare/interstitial: NO desactivar; omitir en la
+            # campana (el log claro lo emite `_registrar_sesion_caida`).
+            self._registrar_sesion_caida(usuario, texto or "anti-bot")
+            return False
+        try:
+            marcar_cuenta_suspendida(usuario)
+            logger.warning(
+                f"@{usuario} marcada como suspendida (desactivada)"
+            )
+        except Exception:
+            pass
+        return True
+
     def _finalizar_pestana(self, pestana, cuenta, resultado) -> None:
         """Devuelve o descarta la pestaña segun el resultado (nunca lanza).
 
-        Marca la cuenta suspendida si el bot lo detecto, descarta la pestaña
-        si el driver murio o el detalle es un error transitorio de navegador
-        y, en cualquier otro caso, la libera para que otro worker la reutilice
-        (el `finally` del llamador no necesita hacer nada mas).
+        Aplica la politica de suspension (`_procesar_suspension_cuenta`: las
+        senales anti-bot NO desactivan la cuenta), descarta la pestaña si el
+        driver murio o el detalle es un error transitorio de navegador y, en
+        cualquier otro caso, la libera para que otro worker la reutilice (el
+        `finally` del llamador no necesita hacer nada mas).
         """
         exito, detalle = False, ""
         try:
@@ -2392,14 +2524,7 @@ class MotorActivacion:
         except Exception:
             exito, detalle = False, ""
         bot = getattr(pestana, "bot", None)
-        try:
-            if getattr(bot, "cuenta_suspendida", False):
-                marcar_cuenta_suspendida(cuenta.usuario)
-                logger.warning(
-                    f"@{cuenta.usuario} marcada como suspendida (desactivada)"
-                )
-        except Exception:
-            pass
+        self._procesar_suspension_cuenta(cuenta, bot, detalle)
         descartar = bool(_es_error_driver_transitorio(detalle))
         if not descartar:
             try:
@@ -2487,6 +2612,7 @@ class MotorActivacion:
         (usuario, exito, detalle, url_publicada).
         """
         bot = None
+        detalle_final = ""
         try:
             from plataformas.twitter.selenium_bot import TwitterBot
 
@@ -2510,6 +2636,7 @@ class MotorActivacion:
             bot = TwitterBot(cuenta.usuario)
             ok_sesion, detalle_sesion = self._asegurar_sesion(bot, cuenta)
             if not ok_sesion:
+                detalle_final = str(detalle_sesion or "")
                 return (cuenta.usuario, False, detalle_sesion[:120], "")
 
             res = bot.solo_retwittear(
@@ -2522,19 +2649,21 @@ class MotorActivacion:
             ok = res.get("exitos", 0) > 0
             url_publicada = (res.get("urls") or [""])[0] if res.get("urls") else ""
             if ok:
+                detalle_final = "ok"
                 return (cuenta.usuario, True, "ok", url_publicada)
             motivo = getattr(bot, "ultimo_error", "") or "sin exito"
             detalle = _detalle_con_sesion(motivo) or "sin exito"
+            detalle_final = detalle
             return (cuenta.usuario, False, detalle[:120], url_publicada)
 
         except Exception as e:
             logger.error(f"Error en @{cuenta.usuario}: {e}")
             detalle = _detalle_con_sesion(f"{type(e).__name__}: {e}") or str(e)
+            detalle_final = detalle
             return (cuenta.usuario, False, detalle[:120], "")
         finally:
             if bot is not None:
-                if getattr(bot, "cuenta_suspendida", False):
-                    marcar_cuenta_suspendida(cuenta.usuario)
+                self._procesar_suspension_cuenta(cuenta, bot, detalle_final)
                 try:
                     bot.cerrar()
                 except Exception as e:
@@ -2682,18 +2811,16 @@ class MotorActivacion:
             )
             return None
 
-    def _cerrar_bot(self, cuenta, bot) -> None:
-        """Cierra el navegador del bot y marca suspendidas; nunca lanza."""
+    def _cerrar_bot(self, cuenta, bot, detalle="") -> None:
+        """Cierra el navegador del bot y aplica la politica de suspension.
+
+        Solo desactiva la cuenta si la suspension es real
+        (`_procesar_suspension_cuenta`: las senales anti-bot NO desactivan).
+        Nunca lanza.
+        """
         if bot is None:
             return
-        try:
-            if getattr(bot, "cuenta_suspendida", False):
-                marcar_cuenta_suspendida(cuenta.usuario)
-                logger.warning(
-                    f"@{cuenta.usuario} marcada como suspendida (desactivada)"
-                )
-        except Exception:
-            pass
+        self._procesar_suspension_cuenta(cuenta, bot, detalle)
         try:
             bot.cerrar()
         except Exception as e:
@@ -2769,19 +2896,30 @@ class MotorActivacion:
 
             # --- Selenium (fallback clasico): gate de navegadores. ---
             self._adquirir_navegador()
+            detalle_accion = ""
             try:
                 bot = TwitterBot(cuenta.usuario)
                 ok_sesion, detalle_sesion = self._asegurar_sesion(bot, cuenta)
                 if not ok_sesion:
+                    detalle_accion = str(detalle_sesion or "")
                     return (
                         cuenta.usuario, rol, False,
                         detalle_sesion[:120], url_objetivo,
                     )
-                return self._accion_en_bot(
+                resultado_accion = self._accion_en_bot(
                     bot, cuenta, rol, texto, dar_like, url_objetivo
                 )
+                try:
+                    if (
+                        isinstance(resultado_accion, tuple)
+                        and len(resultado_accion) > 3
+                    ):
+                        detalle_accion = str(resultado_accion[3] or "")
+                except Exception:
+                    detalle_accion = ""
+                return resultado_accion
             finally:
-                self._cerrar_bot(cuenta, bot)
+                self._cerrar_bot(cuenta, bot, detalle_accion)
                 self._liberar_navegador()
 
         except Exception as e:

@@ -5,6 +5,7 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.common.action_chains import ActionChains
 from selenium.common.exceptions import (
+    ElementClickInterceptedException,
     InvalidElementStateException,
     InvalidSessionIdException,
     NoSuchDriverException,
@@ -22,6 +23,7 @@ import re
 import hashlib
 import threading
 import unicodedata
+from contextlib import contextmanager
 from typing import Optional
 from datetime import datetime, timedelta
 from loguru import logger
@@ -71,6 +73,61 @@ def _env_float_seg(nombre: str, por_defecto: float) -> float:
         return float(str(valor).strip())
     except Exception:
         return float(por_defecto)
+
+
+@contextmanager
+def _page_load_timeout_acotado(driver, timeout_max: float = 25.0):
+    """Baja TEMPORALMENTE el `page_load_timeout` del driver y lo RESTAURA.
+
+    `driver.get()`/`driver.refresh()` con la SPA de X atascada quemaban el
+    timeout completo del bot (~60-70s; log real de Railway:
+    `navegar_tolerante: ... ok en 70.7s tras refresh`). Aqui se guarda el valor
+    previo y se pone `min(previo, timeout_max)`. La restauracion SIEMPRE ocurre
+    en el `finally` (aunque el cuerpo lance). Nunca lanza por si mismo.
+
+    Selenium expone el valor previo de dos formas segun la version:
+    `driver.page_load_timeout` (propiedad vieja) o `driver.timeouts.page_load`
+    (Selenium 4.48+). Si no es legible pero el driver SOPORTA
+    `set_page_load_timeout`, se asume el default del bot (60s, fijado en
+    `iniciar_driver`) para poder restaurarlo; si el driver no lo soporta
+    (Fakes de tests), el helper queda como no-op.
+    """
+    previo = None
+    for getter in (
+        lambda d: d.page_load_timeout,
+        lambda d: d.timeouts.page_load,
+    ):
+        try:
+            valor = getter(driver)
+        except Exception:
+            continue
+        try:
+            valor = float(valor)
+        except (TypeError, ValueError):
+            continue
+        if valor > 0:
+            previo = valor
+            break
+    if previo is None:
+        try:
+            driver.set_page_load_timeout(60)
+        except Exception:
+            previo = None
+        else:
+            previo = 60.0
+    if previo is not None:
+        try:
+            driver.set_page_load_timeout(min(previo, float(timeout_max)))
+        except Exception:
+            previo = None
+    try:
+        yield
+    finally:
+        if previo is not None:
+            try:
+                driver.set_page_load_timeout(previo)
+            except Exception:
+                pass
 
 
 def _proxy_x_valido_reciente(proxy: str) -> bool:
@@ -652,6 +709,19 @@ class TwitterBot:
                 logger.warning(f"Cuenta suspendida detectada para {self.usuario}")
                 return False
 
+            # Anti-bot (Cloudflare) TAMPOCO es "login exitoso": `/account/access`
+            # no contiene "login" en la URL y antes se reportaba sesion
+            # confirmada. Se devuelve False sin tocar `cuenta_suspendida`.
+            if self.es_pagina_anti_bot():
+                self.ultimo_error = (
+                    "X pidió verificación anti-bot (Cloudflare); sesión no confirmada"
+                )
+                logger.warning(
+                    f"Anti-bot (Cloudflare) en login .pkl de {self.usuario} "
+                    f"({self._diagnostico_pagina()}); la cuenta NO se marca suspendida"
+                )
+                return False
+
             if "login" in self.driver.current_url.lower():
                 logger.warning(
                     f"Sesion .pkl expirada para {self.usuario}; "
@@ -753,6 +823,21 @@ class TwitterBot:
                 time.sleep(0.3)
             except Exception:
                 pass
+
+            # Anti-bot ANTES de suspension (falso positivo real de Railway): X
+            # redirige a `/account/access?__cf_chl_rt_tk=...` con el challenge
+            # de Cloudflare ("Just a moment...") y antes se marcaba como
+            # suspendida, desactivando cuentas buenas (`marcar_cuenta_suspendida`).
+            # Aqui se devuelve False SIN tocar `cuenta_suspendida`.
+            if self.es_pagina_anti_bot():
+                self.ultimo_error = (
+                    "X pidió verificación anti-bot (Cloudflare); sesión no confirmada"
+                )
+                logger.warning(
+                    f"Anti-bot (Cloudflare) al confirmar sesion de {self.usuario} "
+                    f"({self._diagnostico_pagina()}); la cuenta NO se marca suspendida"
+                )
+                return False
 
             if self._detectar_cuenta_propia_suspendida():
                 self.cuenta_suspendida = True
@@ -1024,6 +1109,64 @@ class TwitterBot:
             return True
         return not titulo and ("x.com" in url.lower() or "twitter.com" in url.lower())
 
+    # Señales de la pagina anti-bot (Cloudflare u otros): NO es una suspension
+    # ni el desafio de identidad de X. Falso positivo real en Railway:
+    # `https://x.com/account/access?__cf_chl_rt_tk=...` con title "Just a
+    # moment..." se marcaba como cuenta suspendida y el motor DESACTIVABA
+    # cuentas buenas (`marcar_cuenta_suspendida`). El page_source se compara en
+    # minusculas.
+    _FRAGMENTOS_ANTI_BOT_URL = (
+        "/account/access",
+        "challenges.cloudflare.com",
+    )
+    _FRASES_ANTI_BOT_TITULO = (
+        "just a moment",
+        "un momento",
+        "attention required",
+        "checking your browser",
+    )
+    _FRASES_ANTI_BOT_FUENTE = (
+        "__cf_chl",
+        "challenges.cloudflare.com",
+        "verifying you are human",
+        "verificando que eres humano",
+        "checking your browser",
+        "enable javascript and cookies",
+        "cf-chl",
+    )
+
+    def es_pagina_anti_bot(self) -> bool:
+        """True si la pagina actual es un challenge/interstitial ANTI-BOT.
+
+        Un challenge de Cloudflare (`/account/access?__cf_chl_rt_tk=...`,
+        title "Just a moment...", `__cf_chl` en el HTML) NO es una cuenta
+        suspendida: el chequeo de suspension llama aqui PRIMERO para no
+        desactivar cuentas buenas (`marcar_cuenta_suspendida`), y el login no
+        gasta password/TOTP (no es el desafio de identidad de X). Detecta por
+        URL, title y `page_source`. Nunca lanza: ante driver muerto devuelve
+        False y los flujos deciden.
+        """
+        try:
+            try:
+                url = (self.driver.current_url or "").lower()
+            except Exception:
+                url = ""
+            try:
+                title = (self.driver.title or "").lower()
+            except Exception:
+                title = ""
+            try:
+                fuente = (self.driver.page_source or "").lower()
+            except Exception:
+                fuente = ""
+        except Exception:
+            return False
+        if any(frag in url for frag in self._FRAGMENTOS_ANTI_BOT_URL):
+            return True
+        if any(frase in title for frase in self._FRASES_ANTI_BOT_TITULO):
+            return True
+        return any(frase in fuente for frase in self._FRASES_ANTI_BOT_FUENTE)
+
     def _estado_pagina(self) -> str:
         """Clasifica la pagina actual: "login", "error" u "ok".
 
@@ -1057,6 +1200,11 @@ class TwitterBot:
         se detecta y se hace UN `driver.refresh()` con espera acotada (<=10s o
         lo que reste de `timeout_total`) y una segunda deteccion. NO navega a
         ninguna otra ruta. Nunca lanza.
+
+        El `get` y el `refresh` corren con un `page_load_timeout` TEMPORAL
+        (`min(previo, 25s)`) que se RESTAURA siempre (context manager con
+        `finally`): un get atascado cuesta <=~25s en vez de los ~60-70s del
+        timeout del bot (log real de Railway: "ok en 70.7s tras refresh").
 
         Devuelve:
           - "ok":     pagina usable (al get o tras el refresh).
@@ -1093,24 +1241,26 @@ class TwitterBot:
             tiempo_total = 45.0
 
         # 1) get: TimeoutException y WebDriverException transitorias se toleran;
-        #    los fallos DUROS de driver devuelven "driver" de inmediato.
-        try:
-            self.driver.get(url)
-        except TimeoutException:
-            logger.debug(
-                f"navegar_tolerante: get lento/timed out en {url} "
-                f"({self._diagnostico_pagina()})"
-            )
-        except WebDriverException as e:
-            if self._es_error_driver_duro(e):
-                return _marcar_driver(e)
-            logger.debug(
-                f"navegar_tolerante: WebDriverException transitoria en {url} "
-                f"({type(e).__name__}: {e})"
-            )
-        except Exception as e:
-            if self._es_error_driver_duro(e):
-                return _marcar_driver(e)
+        #    los fallos DUROS de driver devuelven "driver" de inmediato. El
+        #    get corre con page_load_timeout acotado a 25s (se restaura siempre).
+        with _page_load_timeout_acotado(self.driver, 25.0):
+            try:
+                self.driver.get(url)
+            except TimeoutException:
+                logger.debug(
+                    f"navegar_tolerante: get lento/timed out en {url} "
+                    f"({self._diagnostico_pagina()})"
+                )
+            except WebDriverException as e:
+                if self._es_error_driver_duro(e):
+                    return _marcar_driver(e)
+                logger.debug(
+                    f"navegar_tolerante: WebDriverException transitoria en {url} "
+                    f"({type(e).__name__}: {e})"
+                )
+            except Exception as e:
+                if self._es_error_driver_duro(e):
+                    return _marcar_driver(e)
 
         # 2) Primera deteccion.
         estado = self._estado_pagina()
@@ -1129,20 +1279,21 @@ class TwitterBot:
             f"navegar_tolerante: pagina de error de X al ir a {url}; "
             f"UN refresh ({self._diagnostico_pagina()})"
         )
-        try:
-            self.driver.refresh()
-        except TimeoutException:
-            logger.debug("navegar_tolerante: refresh lento/timed out")
-        except WebDriverException as e:
-            if self._es_error_driver_duro(e):
-                return _marcar_driver(e)
-            logger.debug(
-                f"navegar_tolerante: refresh WebDriverException transitoria "
-                f"({type(e).__name__}: {e})"
-            )
-        except Exception as e:
-            if self._es_error_driver_duro(e):
-                return _marcar_driver(e)
+        with _page_load_timeout_acotado(self.driver, 25.0):
+            try:
+                self.driver.refresh()
+            except TimeoutException:
+                logger.debug("navegar_tolerante: refresh lento/timed out")
+            except WebDriverException as e:
+                if self._es_error_driver_duro(e):
+                    return _marcar_driver(e)
+                logger.debug(
+                    f"navegar_tolerante: refresh WebDriverException transitoria "
+                    f"({type(e).__name__}: {e})"
+                )
+            except Exception as e:
+                if self._es_error_driver_duro(e):
+                    return _marcar_driver(e)
 
         # 4) Segunda deteccion (polling acotado).
         fin = self._ahora() + espera_max
@@ -1222,7 +1373,13 @@ class TwitterBot:
         flujo de `login_con_password` la URL es `/i/flow/login` durante TODO
         el proceso (tambien en los pasos normales de usuario/password), asi
         que ahi solo el texto de la pagina es una senal confiable.
+
+        Un challenge ANTI-BOT (Cloudflare, p. ej. `/account/access?__cf_chl_...`)
+        devuelve False: no es el desafio de identidad de X y no se debe gastar
+        password/TOTP. Ese caso lo maneja `es_pagina_anti_bot()`.
         """
+        if self.es_pagina_anti_bot():
+            return False
         if revisar_url:
             try:
                 url = (self.driver.current_url or "").lower()
@@ -1654,10 +1811,22 @@ class TwitterBot:
         cuenta objetivo) fue suspendida/bloqueada por X. A diferencia de
         `_detectar_limite_cuenta()` (limites blandos y temporales), esto solo
         reconoce frases de bloqueo permanente para no marcar como baneada una
-        cuenta con un limite recuperable."""
+        cuenta con un limite recuperable.
+
+        FALSO POSITIVO ARREGLADO: `/account/access` NO es prueba de suspension
+        por si solo; X/CDN lo usa tambien para el challenge anti-bot de
+        Cloudflare. Antes, `https://x.com/account/access?__cf_chl_rt_tk=...`
+        con title "Just a moment..." marcaba cuentas BUENAS como suspendidas y
+        el motor las desactivaba (`marcar_cuenta_suspendida`). Ahora un
+        challenge anti-bot devuelve False de inmediato y el title con
+        "suspended" solo cuenta si NO es anti-bot.
+        """
         try:
+            if self.es_pagina_anti_bot():
+                return False
+
             url_actual = (self.driver.current_url or "").lower()
-            if "/account/access" in url_actual or "/suspended" in url_actual:
+            if "/suspended" in url_actual:
                 return True
 
             page_source = self.driver.page_source.lower()
@@ -1670,7 +1839,15 @@ class TwitterBot:
                 "tu cuenta fue suspendida",
                 "hemos suspendido tu cuenta",
             ]
-            return any(frase in page_source for frase in frases)
+            if any(frase in page_source for frase in frases):
+                return True
+
+            # Titulo con "suspended" SOLO si la pagina no es anti-bot (arriba).
+            try:
+                titulo = (self.driver.title or "").lower()
+            except Exception:
+                titulo = ""
+            return "suspended" in titulo
         except Exception:
             return False
 
@@ -2358,10 +2535,12 @@ class TwitterBot:
     # ruta (10+5 en /compose/post y 8+4 en cada alterna) pueden sumar mas que
     # esto en el peor caso; cuando se agota, las esperas de las rutas
     # siguientes se recortan para cortar hacia el error final (el motor
-    # reintenta con otro navegador). Una PAGINA DE ERROR de X ("something went
-    # wrong") aborta antes de recorrer las otras rutas (ver
-    # `_abrir_compositor`): antes se quemaban ~44s de proxy sin cambiar nada.
-    _PRESUPUESTO_COMPOSITOR = 20.0
+    # reintenta con otro navegador). Si una ruta cae en la PAGINA DE ERROR de X
+    # ("something went wrong"), ya NO se aborta: se refresca la pestaña por
+    # /home con `navegar_tolerante` (absorbe el interstitial) y se prueba la
+    # SIGUIENTE ruta con este presupuesto (~35-40s; antes se quemaban ~44s de
+    # proxy sin cambiar el resultado).
+    _PRESUPUESTO_COMPOSITOR = 38.0
 
     def _hay_muro_login(self) -> bool:
         """True si X pidio login en la pagina actual (sesion caida).
@@ -2494,6 +2673,75 @@ class TwitterBot:
                 "tab crashed/navegador sin navegar: la ventana de X no cargo "
                 f"({self._diagnostico_pagina()})"
             )
+
+    def _recuperar_interstitial(self, url: str) -> str:
+        """Clasifica la pagina objetivo tras el `get` y refresca si es interstitial.
+
+        Se llama JUSTO despues del `driver.get(url)` de `solo_retwittear` y
+        `responder_tweet`: un get atascado suele dejar la pagina de error de X
+        ("something went wrong") o el challenge anti-bot de Cloudflare
+        montados, y esperar 12s+8s el boton era tiro perdido (~20s por fallo).
+        Si hay interstitial hace UN refresh tolerante; si persiste, el
+        llamador falla rapido con el detalle correspondiente.
+
+        Devuelve:
+          - "ok":       pagina usable (no habia interstitial o el refresh la arreglo).
+          - "error":    sigue la pagina de error de X.
+          - "anti-bot": sigue el challenge anti-bot (Cloudflare).
+          - "login":    X pide login (sesion caida).
+          - "driver":   driver roto (el motor descarta la pestaña).
+
+        Nunca lanza.
+        """
+        try:
+            anti_bot = self.es_pagina_anti_bot()
+            error = self._es_pagina_error_x()
+        except Exception:
+            return "ok"
+        if not anti_bot and not error:
+            return "ok"
+
+        logger.warning(
+            f"interstitial en {url} "
+            f"({'anti-bot' if anti_bot else 'pagina de error de X'}); "
+            f"UN refresh tolerante antes de esperar el boton"
+        )
+
+        if anti_bot:
+            # `navegar_tolerante` clasifica la pagina anti-bot como "ok"/"login"
+            # y no refrescaria: el refresh directo es lo que puede limpiar el
+            # challenge de Cloudflare.
+            self._refresh_corto(8.0)
+            try:
+                time.sleep(0.5)
+            except Exception:
+                pass
+            if self.es_pagina_anti_bot():
+                return "anti-bot"
+            return "error" if self._es_pagina_error_x() else "ok"
+
+        # El "error" puede venir de un `chrome://`/`about:blank` donde el get
+        # NUNCA navego (tab crashed): eso no es el interstitial de X. UN
+        # reintento de get (como `_asegurar_pagina_tweet`) y, si sigue sin X,
+        # "driver" para que el llamador reporte tab crashed y el motor
+        # reintente con un navegador nuevo rapido (sin esperar 12s+8s).
+        if not self._url_en_x():
+            self._get_acotado(url)
+            if self.es_pagina_anti_bot():
+                return "anti-bot"
+            if not self._url_en_x():
+                self.ultimo_error = (
+                    "tab crashed/navegador sin navegar: la ventana de X no cargo "
+                    f"({self._diagnostico_pagina()})"
+                )
+                return "driver"
+            if not self._es_pagina_error_x():
+                return "ok"
+
+        resultado = self.navegar_tolerante(url, timeout_total=20.0)
+        if self.es_pagina_anti_bot():
+            return "anti-bot"
+        return resultado
 
     @classmethod
     def _es_error_fatal_compositor(cls, error) -> bool:
@@ -2754,44 +3002,90 @@ class TwitterBot:
         """Hace UN refresh tolerante con `page_load_timeout` corto (nunca lanza).
 
         X a veces sirve su pagina de error generica; refrescar suele montar la
-        SPA. `driver.refresh()` puede bloquear hasta el page_load_timeout de
-        60s del bot, asi que se baja a ~5s para el refresh y se restaura
-        despues.
+        SPA. `driver.refresh()` puede bloquear hasta el page_load_timeout del
+        bot, asi que se baja a `timeout` y se RESTAURA el valor previo con el
+        context manager (antes restauraba 60 fijo).
         """
-        try:
-            self.driver.set_page_load_timeout(max(0.5, float(timeout)))
-        except Exception:
-            pass
-        try:
-            self.driver.refresh()
-        except Exception as e:
-            logger.debug(
-                f"Refresh corto del compositor fallo ({type(e).__name__}: {e})"
-            )
-        finally:
+        with _page_load_timeout_acotado(self.driver, max(0.5, float(timeout))):
             try:
-                self.driver.set_page_load_timeout(60)
-            except Exception:
-                pass
+                self.driver.refresh()
+            except Exception as e:
+                logger.debug(
+                    f"Refresh corto del compositor fallo ({type(e).__name__}: {e})"
+                )
+
+    def _get_acotado(self, url: str, timeout_max: float = 20.0) -> None:
+        """`driver.get(url)` con `page_load_timeout` temporal (nunca lanza).
+
+        Un get atascado con la SPA de X quemaba el timeout completo del bot
+        (~60s): aqui se acota a `min(previo, timeout_max)` y se restaura
+        SIEMPRE (context manager con finally). El `TimeoutException` de carga
+        lenta se tolera: la pagina suele seguir cargando y las esperas
+        explicitas de elementos deciden.
+        """
+        with _page_load_timeout_acotado(self.driver, timeout_max):
+            try:
+                self.driver.get(url)
+            except TimeoutException:
+                logger.warning(f"Carga lenta de {url}; sigo con esperas explicitas")
+
+    def _verificar_anti_bot_compositor(self) -> None:
+        """Lanza el fallo claro si la pagina actual es un challenge anti-bot.
+
+        Un challenge de Cloudflare en el compositor NO es una cuenta
+        suspendida: el motor lo trata como sesion caida de la campana
+        ("renueva cookies/login") y NO debe marcar suspendida. Se comprueba en
+        cada ruta ANTES del muro de login porque `/account/access` figura en
+        ambas heuristicas y el anti-bot manda (falso positivo real arreglado).
+        """
+        if self.es_pagina_anti_bot():
+            raise Exception(
+                "X pidió verificación anti-bot (Cloudflare); no se pudo abrir "
+                f"el compositor ({self._diagnostico_pagina()})"
+            )
+
+    def _navegar_home_tolerante(self) -> None:
+        """Refresca la pestaña por `/home` tolerando el interstitial de X.
+
+        Se usa cuando una ruta del compositor cae en la pagina de error de X:
+        `navegar_tolerante` absorbe el interstitial con UN refresh y deja la
+        pestaña lista para probar la SIGUIENTE ruta (antes se abortaba tras el
+        refresh de la misma ruta). Si el anti-bot persiste lanza el fallo
+        anti-bot; si X pide login, el fallo de sesion; si el driver esta roto,
+        un `WebDriverException` (el motor reintenta con navegador nuevo).
+        """
+        resultado = self.navegar_tolerante(f"{self.base_url}/home")
+        self._verificar_anti_bot_compositor()
+        if resultado == "login":
+            raise Exception(
+                "sesión de X expirada o inválida: se pidió login al abrir "
+                f"el compositor ({self._diagnostico_pagina()})"
+            )
+        if resultado == "driver":
+            raise WebDriverException(
+                self.ultimo_error or "driver roto al recuperar /home del compositor"
+            )
 
     def _abrir_compositor(self):
         """Abre el compositor de un POST NUEVO y devuelve el editor visible.
 
         Prueba en orden, con UN refresh corto + UN segundo intento de la MISMA
         ruta cuando X sirve su pagina de error o el editor no aparece:
-        1. `/compose/post` (ruta clasica, timeout 18/10).
-        2. `/compose/tweet`.
-        3. `/home` + boton "Nuevo post" (10/10).
+        1. `/compose/post` (ruta clasica, timeout 10/5).
+        2. `/compose/tweet` (8/4).
+        3. `/home` + boton "Nuevo post" (8/4).
 
-        Los timeouts son agresivos a proposito: un fallo de compositor debe
-        costar <= ~45s (antes hasta ~150s sumando los 35/20 + 25/15 + 25/15).
-        Ademas hay un presupuesto total (`_PRESUPUESTO_COMPOSITOR`): si las
-        rutas anteriores ya lo agotaron, las esperas siguientes se recortan
-        para cortar hacia el error final (el motor reintenta con un navegador
-        nuevo) en vez de seguir esperando una SPA muerta.
+        Si una ruta cae en la pagina de error de X y el refresh de la MISMA
+        ruta no la arregla, NO se aborta: se refresca la pestaña por `/home`
+        con `navegar_tolerante` (absorbe el interstitial con UN refresh) y se
+        prueba la SIGUIENTE ruta con el presupuesto restante. El presupuesto
+        total (`_PRESUPUESTO_COMPOSITOR` ~38s) recorta las esperas para no
+        eternizarse y los gets van acotados con `_get_acotado` (~20s).
 
-        La pagina de error generica de X ("something went wrong"/"algo salio
-        mal") ya NO aborta: es un fallo de RUTA y se prueba la siguiente. La
+        Un challenge anti-bot (Cloudflare en `/account/access`, "Just a
+        moment...") lanza "X pidió verificación anti-bot (Cloudflare); no se
+        pudo abrir el compositor": el motor lo trata como sesion caida de la
+        campaña y NO marca suspendida (falso positivo real arreglado). La
         sesion caida ("sesión de X expirada o inválida") y los errores duros
         de driver (InvalidSessionId/NoSuchDriver/MaxRetry/connection refused)
         SI se propagan tal cual (el motor los reconoce). Si ninguna ruta da
@@ -2834,18 +3128,19 @@ class TwitterBot:
             Si la ruta cae en la pagina de error de X, hace UN `driver.refresh()`
             corto y UN segundo intento de la MISMA ruta; si la pagina de error
             PERSISTE, lanza "compositor no disponible (pagina de error de X)"
-            para que `_abrir_compositor` aborte YA (recorrer las otras rutas
-            quemaba ~40s de proxy sin cambiar el resultado).
+            y `_abrir_compositor` refresca por /home y prueba la SIGUIENTE ruta
+            con el presupuesto acotado (antes se abortaba). Un challenge
+            anti-bot se corta con su propio mensaje antes que el muro de login.
             """
-            try:
-                self.driver.get(f"{self.base_url}{ruta}")
-            except TimeoutException:
-                logger.warning(
-                    f"Carga lenta de {self.base_url}{ruta}; sigo con esperas explicitas"
-                )
+            self._get_acotado(f"{self.base_url}{ruta}")
             # Sin sleep fijo: basta con que el documento este interactivo y,
             # sobre todo, con la espera por elemento VISIBLE (`_esperar_editor_visible`).
             self._esperar_documento_listo(timeout=min(3, max(0.2, restante())))
+
+            # Anti-bot ANTES del muro de login: `/account/access` (Cloudflare)
+            # figura en ambos chequeos y una verificacion anti-bot NO es sesion
+            # caida ni suspension.
+            self._verificar_anti_bot_compositor()
 
             # Si X ya redirigio al login no hay SPA que esperar: cortar ya.
             if self._hay_muro_login():
@@ -2861,6 +3156,8 @@ class TwitterBot:
                         f"segundo intento"
                     )
                     self._refresh_corto()
+                    # El refresh pudo caer en un challenge anti-bot.
+                    self._verificar_anti_bot_compositor()
                 # Deteccion temprana de la pagina de error de X: no tiene
                 # sentido agotar el timeout del editor si X ya sirvio
                 # "something went wrong" y no hay ningun editor visible.
@@ -2945,25 +3242,30 @@ class TwitterBot:
                 if self._es_error_fatal_compositor(e):
                     # Sesion caida: probar otra ruta no ayuda.
                     raise
+                # Si la pagina quedo en anti-bot, ese es el fallo real (no es
+                # sesion confirmada ni suspension).
+                self._verificar_anti_bot_compositor()
                 if self._es_fallo_pagina_error(e):
-                    # La pagina de error de X ya se reintento UNA vez en la
-                    # MISMA ruta: recorrer las otras 2 quemaba ~40s sin
-                    # cambiar el resultado. Fallo rapido y reintentable.
-                    logger.warning(f"Compositor no disponible en {ruta}: {e}")
-                    raise
+                    # NUEVO (antes se abortaba): la pagina de error de X se
+                    # reintento UNA vez en la MISMA ruta sin exito. Se refresca
+                    # la pestaña por /home con `navegar_tolerante` (absorbe el
+                    # interstitial de X) y se prueba la SIGUIENTE ruta con el
+                    # presupuesto restante en vez de fallar de inmediato.
+                    logger.warning(
+                        f"pagina de error de X persistente en {ruta}; "
+                        "refresh tolerante por /home y siguiente ruta"
+                    )
+                    self._navegar_home_tolerante()
+                    continue
                 logger.warning(f"Compositor no disponible en {ruta}: {e}")
                 continue
             logger.info(f"compositor abierto via {ruta}")
             return editor
 
         # 3) /home + boton "Nuevo post" (ultima ruta de la SPA)
-        try:
-            self.driver.get(f"{self.base_url}/home")
-        except TimeoutException:
-            logger.warning(
-                f"Carga lenta de {self.base_url}/home; sigo con esperas explicitas"
-            )
+        self._get_acotado(f"{self.base_url}/home")
         self._esperar_documento_listo(timeout=min(3, max(0.2, restante())))
+        self._verificar_anti_bot_compositor()
         if self._hay_muro_login():
             raise Exception(
                 "sesión de X expirada o inválida: se pidió login al abrir "
@@ -3109,6 +3411,32 @@ class TwitterBot:
                 # cargando; las esperas explicitas de elementos deciden.
                 logger.warning(f"Carga lenta de {url}; sigo con esperas explicitas")
             time.sleep(0.3)
+
+            # Interstitial/anti-bot tras el get: UN refresh tolerante y fallo
+            # RAPIDO con detalle si persiste (evita quemar 12s+8s buscando el
+            # boton Responder en una pagina que no es el tweet).
+            estado_interstitial = self._recuperar_interstitial(url)
+            if estado_interstitial == "anti-bot":
+                self.ultimo_error = (
+                    "X pidió verificación anti-bot (Cloudflare) en el tweet "
+                    f"ancla (interstitial) ({self._diagnostico_pagina()})"
+                )
+                logger.error(self.ultimo_error)
+                return None
+            if estado_interstitial == "error":
+                self.ultimo_error = (
+                    "pagina de error de X (interstitial) en el tweet ancla "
+                    f"({self._diagnostico_pagina()})"
+                )
+                logger.error(self.ultimo_error)
+                return None
+            if estado_interstitial == "driver":
+                self.ultimo_error = (
+                    self.ultimo_error
+                    or "tab crashed/navegador sin navegar al abrir el tweet"
+                )
+                logger.error(self.ultimo_error)
+                return None
 
             if self._hay_muro_login():
                 # Sesion CDP invalida: UN fallback a login lento y UN reintento
@@ -3536,18 +3864,66 @@ class TwitterBot:
             estado["elemento"] = fresco
             return True
 
+        def _esperar_mask_desaparezca(timeout: float = 2.0) -> bool:
+            """Espera <=`timeout`s a que el overlay `data-testid='mask'` se vaya.
+
+            El modal de X monta un `mask` que intercepta los clics
+            (`ElementClickInterceptedException` en Railway); esperar a que
+            desaparezca suele bastar para que el MISMO metodo funcione. True
+            tambien si no hay mask. Nunca lanza.
+            """
+            try:
+                WebDriverWait(self.driver, max(0.2, float(timeout))).until(
+                    EC.invisibility_of_element_located(
+                        (By.CSS_SELECTOR, "[data-testid='mask']")
+                    )
+                )
+                return True
+            except Exception:
+                pass
+            try:
+                return not any(
+                    el.is_displayed()
+                    for el in self.driver.find_elements(
+                        By.CSS_SELECTOR, "[data-testid='mask']"
+                    )
+                )
+            except Exception:
+                return False
+
         def _intentar(nombre, metodo) -> bool:
             """Ejecuta `metodo(elemento)` con hasta 2 pasadas. Nunca lanza.
 
             Si el elemento queda viejo (por la excepcion o porque el texto no
             quedo), re-localiza el editor visible y reintenta UNA vez con el
-            elemento fresco. Devuelve True SOLO si el texto quedo en el editor.
+            elemento fresco. Si el clic lo intercepta el `mask` del modal
+            (`ElementClickInterceptedException`), espera <=2s a que el mask
+            desaparezca y reintenta UNA vez. Devuelve True SOLO si el texto
+            quedo en el editor.
             """
             for intento in (1, 2):
                 el = estado["elemento"]
                 try:
                     metodo(el)
                 except Exception as e:
+                    if (
+                        isinstance(e, ElementClickInterceptedException)
+                        and intento == 1
+                    ):
+                        # Overlay `data-testid="mask"` del modal: espera corta
+                        # (<=2s) a que desaparezca y reintenta UNA vez; si no,
+                        # se sigue con el metodo siguiente como siempre.
+                        if _esperar_mask_desaparezca(2.0):
+                            logger.debug(
+                                f"{nombre}: mask del modal intercepto el clic; "
+                                f"desaparecio, reintentando"
+                            )
+                            continue
+                        logger.debug(
+                            f"{nombre}: mask sigue interceptando el clic; "
+                            f"probando el siguiente metodo"
+                        )
+                        return False
                     if (
                         isinstance(
                             e,
@@ -3842,6 +4218,26 @@ class TwitterBot:
                     # cargando; las esperas explicitas de elementos deciden.
                     logger.warning(f"Carga lenta de {url}; sigo con esperas explicitas")
                 time.sleep(0.3)
+
+                # Interstitial real (logs de Railway): un get atascado deja la
+                # pagina de error de X o el challenge anti-bot montados y
+                # esperar 12s+8s el boton era tiro perdido. UN refresh
+                # tolerante aqui y fallo RAPIDO con detalle si persiste.
+                estado_interstitial = self._recuperar_interstitial(url)
+                if estado_interstitial == "anti-bot":
+                    raise Exception(
+                        "X pidió verificación anti-bot (Cloudflare) "
+                        f"(interstitial) ({self._diagnostico_pagina()})"
+                    )
+                if estado_interstitial == "error":
+                    raise Exception(
+                        "pagina de error de X (interstitial) "
+                        f"({self._diagnostico_pagina()})"
+                    )
+                if estado_interstitial == "driver":
+                    raise Exception(
+                        self.ultimo_error or "tab crashed/navegador sin navegar"
+                    )
 
                 if self._sesion_cdp and self._hay_muro_login():
                     # Sesion CDP invalida: UN fallback a login lento y UN
