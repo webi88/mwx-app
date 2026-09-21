@@ -58,6 +58,21 @@ def _proxy_x_cache_segundos() -> float:
         return 300.0
 
 
+def _env_float_seg(nombre: str, por_defecto: float) -> float:
+    """Lee un float de entorno (segundos); usa el default si falta o es invalido.
+
+    A diferencia de `max(0, ...)`, los negativos se devuelven tal cual: el
+    llamador decide (p.ej. `<= 0` = desactivar la funcion). Nunca lanza.
+    """
+    try:
+        valor = os.environ.get(nombre)
+        if valor is None or not str(valor).strip():
+            return float(por_defecto)
+        return float(str(valor).strip())
+    except Exception:
+        return float(por_defecto)
+
+
 def _proxy_x_valido_reciente(proxy: str) -> bool:
     """True si `proxy` se valido hace menos de `PROXY_X_CACHE_SEG` segundos."""
     try:
@@ -302,7 +317,16 @@ class TwitterBot:
             )
         return ua
     
-    def iniciar_driver(self, pantalla_externa: bool = False) -> bool:
+    def iniciar_driver(self, pantalla_externa: bool = False, proxy_dinamico: bool = False) -> bool:
+        """Inicia Chrome para `self.usuario`.
+
+        `proxy_dinamico=True` (pestaña persistente): Chrome SIEMPRE se enruta
+        por el `LocalForwardProxy` local (aunque la cuenta no tenga proxy =>
+        modo directo), de forma que `cambiar_cuenta()` puede cambiar la IP de
+        salida en caliente con `cambiar_upstream()`. `proxy_dinamico=False`
+        conserva el comportamiento anterior (solo se aplica proxy si la cuenta
+        tiene uno).
+        """
         self.ultimo_error = ""
         try:
             perfil = settings.profiles_dir / self.usuario
@@ -339,7 +363,16 @@ class TwitterBot:
                 options.add_argument("--window-size=1366,768")
             
             proxy = self._proxy_para_x()
-            if proxy:
+            if proxy_dinamico:
+                # Pestaña persistente: SIEMPRE forwarder local (modo directo si
+                # la cuenta no tiene proxy) para poder cambiar el upstream en
+                # caliente al cambiar de cuenta.
+                # El proxy local es de ESTE bot: se guarda para cerrarlo en
+                # `cerrar()`.
+                self._fwd_proxy = ProxyManager().aplicar_a_options(
+                    options, proxy, tag=self.usuario, dinamico=True
+                )
+            elif proxy:
                 # El proxy local es de ESTE bot: se guarda para cerrarlo en
                 # `cerrar()` (sin esto quedaba un hilo aceptador + workers por
                 # cada navegador lanzado hasta agotar el contenedor).
@@ -371,7 +404,222 @@ class TwitterBot:
             # Si el driver no llego a crearse, no dejar vivo el proxy local.
             self._cerrar_fwd_proxy()
             return False
-    
+
+    def esta_vivo(self) -> bool:
+        """True si hay driver y RESPONDE (`current_url`). Nunca lanza.
+
+        Lo usa `cambiar_cuenta` para no inyectar cookies en un Chrome muerto
+        (`tab crashed`, driver cerrado, sesion cdp colgada...).
+        """
+        try:
+            driver = self.driver
+            if driver is None:
+                return False
+            _ = driver.current_url
+            return True
+        except Exception:
+            return False
+
+    def _limpiar_cache_no_bloqueante(self, usuario: str = "") -> None:
+        """Lanza `Network.clearBrowserCache` en un hilo daemon con tope.
+
+        `clearBrowserCache` NO borra cookies, por lo que puede solaparse con la
+        inyeccion de las cookies nuevas sin riesgo. En Windows/Chrome se
+        observo UN hipo de ~30s al limpiar la cache con la pestaña cargada: la
+        llamada se ejecuta en un hilo daemon y `cambiar_cuenta` espera como
+        maximo `CAMBIO_CUENTA_CACHE_TIMEOUT` segundos (env, default 3.0;
+        `<=0` omite la llamada por completo); si el hilo sigue vivo, se informa
+        a DEBUG y el flujo continua. Nunca lanza ni cambia el retorno.
+        """
+        try:
+            tope = _env_float_seg("CAMBIO_CUENTA_CACHE_TIMEOUT", 3.0)
+        except Exception:
+            tope = 3.0
+        if tope <= 0:
+            logger.debug(
+                "cambiar_cuenta: clearBrowserCache omitido "
+                "(CAMBIO_CUENTA_CACHE_TIMEOUT<=0)"
+            )
+            return
+        driver = self.driver
+        etiqueta = usuario or self.usuario
+
+        def _limpiar():
+            try:
+                driver.execute_cdp_cmd("Network.clearBrowserCache", {})
+            except Exception as e:
+                logger.debug(
+                    f"clearBrowserCache (segundo plano) fallo para {etiqueta}: "
+                    f"{type(e).__name__}: {e}"
+                )
+
+        try:
+            hilo = threading.Thread(
+                target=_limpiar, name="clear-cache-cuenta", daemon=True
+            )
+            hilo.start()
+        except Exception as e:
+            logger.debug(
+                f"No se pudo lanzar el hilo de clearBrowserCache para "
+                f"{etiqueta}: {type(e).__name__}: {e}"
+            )
+            return
+        hilo.join(timeout=tope)
+        if hilo.is_alive():
+            logger.debug(
+                f"clearBrowserCache sigue en segundo plano (> {tope:.1f}s); "
+                "se continua con el cambio de cuenta"
+            )
+
+    def cambiar_cuenta(
+        self,
+        usuario: str,
+        proxy: str = "",
+        validar_proxy: bool = False,
+    ) -> bool:
+        """Cambia la sesion EN CALIENTE a `usuario` sobre el MISMO Chrome.
+
+        "Pestaña persistente": el navegador se abre UNA vez (con
+        `iniciar_driver(proxy_dinamico=True)`) y por cada cuenta solo se cambia
+        cookies + user-agent + upstream del proxy. Devuelve True si quedo lista
+        la sesion de la cuenta nueva; nunca lanza.
+
+        - `usuario` == `self.usuario` y driver vivo => True (no-op).
+        - Sin driver vivo => False con `self.ultimo_error` explicativo.
+        - `proxy` explicito o `self._obtener_proxy()` (cuenta nueva; respeta
+          `TWITTER_SIN_PROXY`). Con `validar_proxy=True` se usa la logica de
+          `_proxy_para_x()` (puede tardar hasta ~60s rotando; default False).
+        - Si no hay `_fwd_proxy` y hace falta proxy, se avisa por WARNING: a un
+          Chrome ya abierto no se le puede inyectar `--proxy-server`; las
+          cookies igual se cambian.
+        - Limpieza: `clearBrowserCookies` (+ fallback `delete_all_cookies`) es
+          SINCRONA (rapida y critica para no mezclar sesiones);
+          `clearBrowserCache` corre en un hilo daemon con tope
+          `CAMBIO_CUENTA_CACHE_TIMEOUT` (env, default 3.0s; <=0 la omite): un
+          hipo de Chrome/Windows de ~30s ya no puede frenar el cambio de cuenta
+          (no borra cookies, asi que se solapa con la inyeccion sin riesgo).
+        - Estado por cuenta que se resetea: `cookies_path`, `_ua_persistente`,
+          `_proxy_cache`, `_sesion_cdp`, `ultima_url_publicada`,
+          `cuenta_suspendida` y `ultimo_error`. (Escaneado de atributos: son
+          TODOS los caches por cuenta de la clase.)
+        """
+        usuario = (usuario or "").strip()
+        if not usuario:
+            self.ultimo_error = "cambiar_cuenta: usuario vacio"
+            return False
+        if usuario == self.usuario and self.esta_vivo():
+            return True
+        if not self.esta_vivo():
+            self.ultimo_error = (
+                "cambiar_cuenta: el navegador no esta vivo; hay que iniciar "
+                "driver de nuevo"
+            )
+            logger.warning(self.ultimo_error)
+            return False
+
+        try:
+            t_inicio = self._ahora()
+            ua_anterior = self._ua_persistente or ""
+
+            # Actualiza la identidad de la cuenta y resetea TODO su estado
+            # cacheado antes de inyectar nada.
+            self.usuario = usuario
+            self.cookies_path = resolver_ruta(f"data/cookies/twitter/{usuario}.pkl")
+            self._ua_persistente = None
+            self._proxy_cache = None
+            self._sesion_cdp = False
+            self.ultimo_error = ""
+            self.cuenta_suspendida = False
+            self.ultima_url_publicada = ""
+
+            # UA de la cuenta nueva (CDP lo cambia en caliente).
+            ua = self._obtener_ua_consistente()
+            if ua:
+                if ua != ua_anterior:
+                    aplicar_user_agent(self.driver, ua)
+            elif ua_anterior:
+                # La cuenta nueva no tiene UA propio y la anterior si tenia
+                # override: intentar volver al UA NATURAL de Chrome (best
+                # effort: si CDP no lo soporta, se queda el anterior).
+                try:
+                    self.driver.execute_cdp_cmd(
+                        "Emulation.setUserAgentOverride", {"userAgent": ""}
+                    )
+                except Exception as e:
+                    logger.debug(
+                        f"No se pudo resetear el UA natural de {usuario}: "
+                        f"{type(e).__name__}: {e}"
+                    )
+            t_ua = self._ahora()
+
+            # Limpia cookies (SINCRONO: rapido y critico para no mezclar
+            # sesiones) y cache (NO bloqueante con tope: en Windows/Chrome se
+            # vio un hipo de ~30s; clearBrowserCache no toca cookies, asi que
+            # puede seguir en segundo plano mientras se inyectan las nuevas).
+            try:
+                self.driver.execute_cdp_cmd("Network.clearBrowserCookies", {})
+            except Exception as e:
+                logger.debug(f"clearBrowserCookies fallo para {usuario}: {e}")
+                try:
+                    self.driver.delete_all_cookies()
+                except Exception as e2:
+                    logger.debug(f"delete_all_cookies fallo para {usuario}: {e2}")
+            self._limpiar_cache_no_bloqueante(usuario)
+            t_limpieza = self._ahora()
+
+            # Proxy objetivo: explicito o el de la cuenta nueva.
+            proxy_objetivo = (proxy or "").strip()
+            if not proxy_objetivo:
+                proxy_objetivo = self._obtener_proxy()
+            if validar_proxy:
+                self._proxy_cache = None
+                proxy_objetivo = self._proxy_para_x()
+
+            if self._fwd_proxy is not None:
+                self._fwd_proxy.cambiar_upstream(proxy_objetivo)
+                if proxy_objetivo:
+                    logger.info(f"{usuario}: upstream cambiado")
+                else:
+                    logger.info(f"{usuario}: upstream en modo directo (sin proxy)")
+            elif proxy_objetivo:
+                logger.warning(
+                    f"{usuario}: sin forwarder local; no se puede aplicar el "
+                    f"proxy a un Chrome ya abierto (la sesion de cookies si se "
+                    f"cambia)"
+                )
+            t_proxy = self._ahora()
+
+            # Inyecta las cookies de la cuenta nueva sin navegar.
+            ok = bool(self.preparar_sesion_cdp())
+            t_cookies = self._ahora()
+            if not ok:
+                self.ultimo_error = (
+                    self.ultimo_error
+                    or "la cuenta no tiene cookies ni auth_token usable"
+                )
+                logger.warning(
+                    f"cambiar_cuenta: sin sesion para {usuario} "
+                    f"({self.ultimo_error})"
+                )
+            try:
+                logger.debug(
+                    f"perf @{usuario}: cambiar_cuenta total="
+                    f"{t_cookies - t_inicio:.2f}s "
+                    f"(ua={t_ua - t_inicio:.2f} "
+                    f"limpieza={t_limpieza - t_ua:.2f} "
+                    f"proxy={t_proxy - t_limpieza:.2f} "
+                    f"cookies={t_cookies - t_proxy:.2f})"
+                )
+            except Exception:
+                pass
+            return ok
+        except Exception as e:
+            self.ultimo_error = f"{type(e).__name__}: {e}"
+            logger.warning(
+                f"No se pudo cambiar la cuenta a {usuario} en caliente: {e}"
+            )
+            return False
+
     def login_con_cookies(self) -> bool:
         if not os.path.exists(self.cookies_path):
             logger.warning(f"No hay cookies .pkl para {self.usuario}, intentando cookies_json")
@@ -708,6 +956,244 @@ class TwitterBot:
             logger.debug(f"Preparacion de sesion CDP fallo para {self.usuario}: {e}")
             self._sesion_cdp = False
             return False
+
+    # ------------------------------------------------------------------ #
+    # Navegacion tolerante al interstitial de error inicial de X
+    # ------------------------------------------------------------------ #
+    # El PRIMER render de una pestaña recien creada (cookies inyectadas por
+    # CDP, headless/Railway) a veces cae en la pagina "something went wrong"
+    # de X, y el `driver.get` quema el page_load_timeout completo (~60s). Un
+    # refresh inmediato la resuelve. Estas señales identifican cuando hay que
+    # DESCARTAR la pestaña en vez de reintentar.
+    _SENALES_ERROR_DRIVER_DURO = (
+        "invalid session id",
+        "session id is null",
+        "no such driver",
+        "connection refused",
+        "err_connection_refused",
+        "max retries",
+        "maxretry",
+        "newconnectionerror",
+        "tab crashed",
+        "chrome not reachable",
+        "cannot connect to chrome",
+        "disconnected",
+        "target closed",
+    )
+
+    @classmethod
+    def _es_error_driver_duro(cls, error) -> bool:
+        """True si el error indica que hay que DESCARTAR la pestaña/driver.
+
+        Cubre `InvalidSessionIdException`, `NoSuchDriverException`,
+        `MaxRetryError` y sus mensajes tipicos ("connection refused", "tab
+        crashed", "cannot connect to chrome"...). Nunca lanza.
+        """
+        try:
+            if isinstance(
+                error,
+                (InvalidSessionIdException, NoSuchDriverException, MaxRetryError),
+            ):
+                return True
+            texto = str(error or "").lower()
+            return any(senal in texto for senal in cls._SENALES_ERROR_DRIVER_DURO)
+        except Exception:
+            return False
+
+    def _es_pagina_error_x(self) -> bool:
+        """True si la pagina actual es el interstitial de error de X (o blank).
+
+        Combina `_frase_error_pagina()` ("something went wrong"/"algo salió
+        mal"/"rate limit"/"try again", tambien en el title) con URL
+        vacia/`chrome://`/`about:` y title vacio estando en x.com, que es como
+        suele quedar el interstitial real. Nunca lanza.
+        """
+        try:
+            url = (self.driver.current_url or "").strip()
+        except Exception:
+            return True
+        if not url or url.startswith("chrome://") or url.startswith("about:"):
+            return True
+        if self._frase_error_pagina():
+            return True
+        try:
+            titulo = (self.driver.title or "").strip().lower()
+        except Exception:
+            return False
+        if any(frase in titulo for frase in self._FRASES_ERROR_PAGINA):
+            return True
+        return not titulo and ("x.com" in url.lower() or "twitter.com" in url.lower())
+
+    def _estado_pagina(self) -> str:
+        """Clasifica la pagina actual: "login", "error" u "ok".
+
+        "login" manda sobre "error" (una pagina de login jamas es usable).
+        Nunca lanza.
+        """
+        try:
+            if self._hay_muro_login():
+                return "login"
+        except Exception:
+            pass
+        try:
+            if self._es_pagina_error_x():
+                return "error"
+        except Exception:
+            pass
+        return "ok"
+
+    def _error_sesion_navegacion(self, url: str) -> str:
+        """Mensaje (ya existente en el proyecto) de sesion de X expirada."""
+        return (
+            "sesión de X expirada o inválida: se pidió login al navegar a "
+            f"{url} ({self._diagnostico_pagina()})"
+        )
+
+    def navegar_tolerante(self, url: str, timeout_total: float = 45.0) -> str:
+        """Navega a `url` tolerando el interstitial inicial de error de X.
+
+        `driver.get(url)` puede lanzar `TimeoutException` con la pagina de
+        error "something went wrong" montada (quema el page_load_timeout): aqui
+        se detecta y se hace UN `driver.refresh()` con espera acotada (<=10s o
+        lo que reste de `timeout_total`) y una segunda deteccion. NO navega a
+        ninguna otra ruta. Nunca lanza.
+
+        Devuelve:
+          - "ok":     pagina usable (al get o tras el refresh).
+          - "error":  sigue la pagina de error tras el refresh (fallo
+                      controlado; deja `ultimo_error`).
+          - "login":  X pide login (sesion caida; deja `ultimo_error`).
+          - "driver": driver roto (`InvalidSessionId`/`NoSuchDriver`/`MaxRetry`
+                      /"connection refused"/"tab crashed"...): el motor debe
+                      descartar la pestaña.
+        """
+        t_inicio = self._ahora()
+
+        def _log(final: str, extra: str = ""):
+            try:
+                logger.info(
+                    f"perf @{self.usuario}: navegar {url} -> {final} "
+                    f"en {self._ahora() - t_inicio:.1f}s {extra}".rstrip()
+                )
+            except Exception:
+                pass
+
+        def _marcar_driver(error) -> str:
+            self.ultimo_error = f"{type(error).__name__}: {error}"
+            _log("driver", f"err={self.ultimo_error}")
+            logger.warning(
+                f"navegar_tolerante: driver roto al ir a {url}: "
+                f"{self.ultimo_error}"
+            )
+            return "driver"
+
+        try:
+            tiempo_total = max(0.0, float(timeout_total))
+        except (TypeError, ValueError):
+            tiempo_total = 45.0
+
+        # 1) get: TimeoutException y WebDriverException transitorias se toleran;
+        #    los fallos DUROS de driver devuelven "driver" de inmediato.
+        try:
+            self.driver.get(url)
+        except TimeoutException:
+            logger.debug(
+                f"navegar_tolerante: get lento/timed out en {url} "
+                f"({self._diagnostico_pagina()})"
+            )
+        except WebDriverException as e:
+            if self._es_error_driver_duro(e):
+                return _marcar_driver(e)
+            logger.debug(
+                f"navegar_tolerante: WebDriverException transitoria en {url} "
+                f"({type(e).__name__}: {e})"
+            )
+        except Exception as e:
+            if self._es_error_driver_duro(e):
+                return _marcar_driver(e)
+
+        # 2) Primera deteccion.
+        estado = self._estado_pagina()
+        if estado == "login":
+            self.ultimo_error = self._error_sesion_navegacion(url)
+            _log("login", f"err={self.ultimo_error}")
+            return "login"
+        if estado == "ok":
+            _log("ok")
+            return "ok"
+
+        # 3) Pagina de error: UN refresh con espera acotada.
+        transcurrido = self._ahora() - t_inicio
+        espera_max = max(0.0, min(10.0, tiempo_total - transcurrido))
+        logger.info(
+            f"navegar_tolerante: pagina de error de X al ir a {url}; "
+            f"UN refresh ({self._diagnostico_pagina()})"
+        )
+        try:
+            self.driver.refresh()
+        except TimeoutException:
+            logger.debug("navegar_tolerante: refresh lento/timed out")
+        except WebDriverException as e:
+            if self._es_error_driver_duro(e):
+                return _marcar_driver(e)
+            logger.debug(
+                f"navegar_tolerante: refresh WebDriverException transitoria "
+                f"({type(e).__name__}: {e})"
+            )
+        except Exception as e:
+            if self._es_error_driver_duro(e):
+                return _marcar_driver(e)
+
+        # 4) Segunda deteccion (polling acotado).
+        fin = self._ahora() + espera_max
+        while True:
+            estado = self._estado_pagina()
+            if estado == "login":
+                self.ultimo_error = self._error_sesion_navegacion(url)
+                _log("login", f"err={self.ultimo_error}")
+                return "login"
+            if estado == "ok":
+                _log("ok", "tras refresh")
+                return "ok"
+            if self._ahora() >= fin:
+                break
+            try:
+                time.sleep(0.5)
+            except Exception:
+                break
+
+        if not self.ultimo_error:
+            self.ultimo_error = (
+                f"página de error de X tras refresh: {self._diagnostico_pagina()}"
+            )
+        _log("error", f"err={self.ultimo_error}")
+        logger.warning(f"navegar_tolerante: {self.ultimo_error}")
+        return "error"
+
+    def calentar(self) -> bool:
+        """Absorbe el interstitial inicial de X al CREAR una pestaña del pool.
+
+        Navega UNA sola vez a `x.com/home` con `navegar_tolerante` (que ya
+        incluye UN refresh si aparece la pagina de error). Se usa al CREAR una
+        pestaña persistente; NO se llama en cada cambio de cuenta.
+
+        Devuelve True si la pagina quedo usable ("ok"); en "login"/"error"/
+        "driver" deja `ultimo_error` claro y devuelve False. Nunca lanza.
+        """
+        try:
+            resultado = self.navegar_tolerante(f"{self.base_url}/home")
+        except Exception as e:
+            self.ultimo_error = f"{type(e).__name__}: {e}"
+            logger.warning(f"calentar: fallo inesperado para {self.usuario}: {e}")
+            return False
+        if resultado == "ok":
+            logger.info(f"calentar: pestaña de {self.usuario} lista para usar")
+            return True
+        self.ultimo_error = self.ultimo_error or (
+            f"calentar: navegacion a x.com/home no usable ({resultado})"
+        )
+        logger.warning(f"calentar: {self.ultimo_error}")
+        return False
 
     def _revivir_sesion_cdp(self) -> bool:
         """Fallback UNICO tras detectar muro de login con `_sesion_cdp`.

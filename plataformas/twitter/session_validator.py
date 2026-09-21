@@ -7,7 +7,6 @@ cuenta para no levantar alarmas de anti-spam.
 """
 import hashlib
 from datetime import datetime
-from typing import Optional
 
 import httpx
 from loguru import logger

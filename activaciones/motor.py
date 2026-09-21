@@ -10,6 +10,7 @@ Caracteristicas:
 - Delay aleatorio entre acciones y arranque escalonado por cohortes.
 - Headless para correr en Railway/VPS sin pantalla.
 """
+import inspect
 import os
 import random
 import re
@@ -27,6 +28,46 @@ from core.registros import normalizar_tipo_cuenta
 from core.perfiles import normalizar_perfil, colocar_hashtag_en_medio
 from activaciones.variaciones import generar_pool_variaciones_openai, variar_texto
 from core.registro import registrar_accion, marcar_cuenta_suspendida
+
+
+def _env_activo(nombre: str, default: bool = True) -> bool:
+    """True si la env `nombre` no esta desactivada.
+
+    Valores que desactivan: "0", "false", "no", "off" (sin distinguir
+    mayusculas ni espacios). Vacia o ausente devuelve `default`. Nunca lanza.
+    """
+    try:
+        valor = os.environ.get(nombre)
+    except Exception:
+        return bool(default)
+    if valor is None or not str(valor).strip():
+        return bool(default)
+    return str(valor).strip().lower() not in ("0", "false", "no", "off")
+
+
+def _env_int(nombre: str, default: int, minimo: int = None,
+             maximo: int = None) -> int:
+    """Entero de la env `nombre`, acotado a [minimo, maximo].
+
+    Si la variable no existe o no parsea se usa `default`; luego se aplican
+    los limites. Nunca lanza.
+    """
+    try:
+        valor = os.environ.get(nombre)
+        if valor is not None and str(valor).strip():
+            numero = int(float(str(valor).strip()))
+        else:
+            numero = int(default)
+    except Exception:
+        try:
+            numero = int(default)
+        except Exception:
+            numero = 0
+    if minimo is not None and numero < int(minimo):
+        numero = int(minimo)
+    if maximo is not None and numero > int(maximo):
+        numero = int(maximo)
+    return numero
 
 
 def _parsear_tokens(valor: str) -> list[str]:
@@ -860,6 +901,24 @@ def _aplicar_anti_repeticion(asignaciones: dict, usados: dict) -> dict:
     return finales
 
 
+class _Pestana:
+    """Entrada del pool de pestañas persistentes del motor.
+
+    Guarda el `TwitterBot` (Chrome) abierto, la cuenta que atiende ahora
+    (`usuario`), cuantas acciones lleva desde el ultimo cambio de cuenta
+    (`acciones`) y si algun worker la tiene tomada (`ocupada`).
+    """
+
+    __slots__ = ("bot", "usuario", "acciones", "ocupada")
+
+    def __init__(self, bot=None, usuario: str = "", acciones: int = 0,
+                 ocupada: bool = False):
+        self.bot = bot
+        self.usuario = str(usuario or "")
+        self.acciones = int(acciones or 0)
+        self.ocupada = bool(ocupada)
+
+
 class MotorActivacion:
     """Ejecuta una campaña de activacion (RT con cita) sobre N cuentas."""
 
@@ -896,6 +955,25 @@ class MotorActivacion:
         # ejecucion usa ESA misma URL para que el comentario corresponda al
         # tweet que describe.
         self._ancla_por_cuenta: dict = {}
+        # POOL DE PESTAÑAS PERSISTENTES: en vez de abrir/cerrar un Chrome por
+        # accion, se mantienen hasta `_limite_navegadores` Chrome abiertos y
+        # cada worker cambia de cuenta en caliente (`bot.cambiar_cuenta`).
+        # Si el contrato no existe en selenium_bot, todo cae al camino clasico.
+        self._modo_pestana = _env_activo("MODO_PESTANA", True)
+        # Default 40 acciones por pestaña. El minimo duro es 1: los valores
+        # explicitos por env se respetan (p.ej. 3 para reciclar rapido en
+        # pruebas); 5 es el minimo RECOMENDADO para produccion.
+        self._pestana_max_acciones = _env_int(
+            "PESTANA_MAX_ACCIONES", 40, minimo=1
+        )
+        self._pestana_espera_seg = _env_int(
+            "PESTANA_ESPERA_SEG", 180, minimo=0
+        )
+        self._pestanas: list = []
+        self._pestanas_lock = threading.Lock()
+        self._pestanas_cond = threading.Condition(self._pestanas_lock)
+        self._pestanas_creadas = 0
+        self._pestanas_recicladas = 0
 
     _VENTANA_RECURSOS_SEG = 30.0
 
@@ -931,6 +1009,10 @@ class MotorActivacion:
                 self._navegadores_cond.notify_all()
         except Exception:
             return 1
+        if nuevo < previo:
+            # El pool de pestañas tambien respeta el limite nuevo: cerrar las
+            # pestañas LIBRES sobrantes (las ocupadas se descartan al liberar).
+            self._cerrar_pestanas_libres()
         texto = str(motivo or "")[:120]
         if nuevo < previo:
             logger.warning(
@@ -958,6 +1040,355 @@ class MotorActivacion:
             return (time.monotonic() - float(marca)) < limite
         except Exception:
             return False
+
+    def _pestana_capaz(self) -> bool:
+        """True si el pool de pestañas persistentes puede usarse.
+
+        Requiere `MODO_PESTANA` activo y que `plataformas.twitter
+        .selenium_bot.TwitterBot` implemente el contrato del pool
+        (`cambiar_cuenta`, `esta_vivo` e `iniciar_driver(proxy_dinamico=...)`).
+        Si el contrato no existe se devuelve False y el motor cae
+        automaticamente al camino clasico (un Chrome por accion). Nunca lanza.
+        """
+        if not self._modo_pestana:
+            return False
+        try:
+            from plataformas.twitter.selenium_bot import TwitterBot
+        except Exception:
+            return False
+        try:
+            if getattr(TwitterBot, "cambiar_cuenta", None) is None:
+                return False
+            if getattr(TwitterBot, "esta_vivo", None) is None:
+                return False
+            iniciar = getattr(TwitterBot, "iniciar_driver", None)
+            if iniciar is None:
+                return False
+            parametros = inspect.signature(iniciar).parameters
+            if "proxy_dinamico" in parametros:
+                return True
+            return any(
+                p.kind == inspect.Parameter.VAR_KEYWORD
+                for p in parametros.values()
+            )
+        except Exception:
+            return False
+
+    def _adquirir_pestana(self, cuenta):
+        """Toma una pestaña libre del pool (o crea una si hay cupo).
+
+        Devuelve la `_Pestana` marcada como ocupada o None: modo pestaña
+        inactivo/contrato ausente, fallo al crear la pestaña o espera agotada
+        (`PESTANA_ESPERA_SEG`) sin cupo. Con None el llamador usa el camino
+        clasico (navegador por accion). Nunca lanza.
+        """
+        if not self._pestana_capaz():
+            return None
+        try:
+            from plataformas.twitter.selenium_bot import TwitterBot
+        except Exception:
+            return None
+        try:
+            espera_total = max(0.0, float(self._pestana_espera_seg))
+        except Exception:
+            espera_total = 180.0
+        deadline = time.monotonic() + espera_total
+        while True:
+            reserva = None
+            with self._pestanas_cond:
+                for pestana in self._pestanas:
+                    if not getattr(pestana, "ocupada", True):
+                        pestana.ocupada = True
+                        return pestana
+                try:
+                    hay_cupo = (
+                        len(self._pestanas) < int(self._limite_navegadores)
+                    )
+                except Exception:
+                    hay_cupo = False
+                if hay_cupo:
+                    # La reserva consume el cupo desde ya: la creacion (lenta)
+                    # se hace FUERA del lock para no congelar a los demas.
+                    reserva = _Pestana(bot=None, usuario="", ocupada=True)
+                    self._pestanas.append(reserva)
+                else:
+                    restante = deadline - time.monotonic()
+                    if restante <= 0:
+                        return None
+                    self._pestanas_cond.wait(
+                        timeout=min(1.0, max(0.05, restante))
+                    )
+                    continue
+
+            bot = None
+            try:
+                bot = TwitterBot(cuenta.usuario)
+                iniciar = getattr(bot, "iniciar_driver", None)
+                ok_driver = (
+                    bool(iniciar(proxy_dinamico=True))
+                    if callable(iniciar) else False
+                )
+                if not ok_driver:
+                    raise RuntimeError(
+                        "iniciar_driver(proxy_dinamico=True) fallo"
+                    )
+                ok_sesion = False
+                try:
+                    preparar = getattr(bot, "preparar_sesion_cdp", None)
+                    ok_sesion = bool(preparar()) if callable(preparar) else False
+                except Exception:
+                    ok_sesion = False
+                if not ok_sesion:
+                    login = getattr(bot, "login_con_cookies", None)
+                    ok_sesion = bool(login()) if callable(login) else False
+                if not ok_sesion:
+                    raise RuntimeError(
+                        str(getattr(bot, "ultimo_error", "") or "sin sesion")
+                    )
+                # Calentamiento UNICO por pestaña recien creada: la PRIMERA
+                # navegacion de X puede caer en el interstitial "something went
+                # wrong"; `calentar()` lo tolera (refresh unico). NO es
+                # requisito para usar la pestaña: si falla o no existe, se usa
+                # igual y la accion maneja el interstitial. Jamas se llama al
+                # cambiar de cuenta ni al liberar.
+                try:
+                    calentar = getattr(bot, "calentar", None)
+                    if callable(calentar):
+                        try:
+                            calentar()
+                        except Exception as e:
+                            logger.debug(
+                                f"pestana: calentamiento fallo para "
+                                f"@{cuenta.usuario} ({type(e).__name__}: {e})"
+                            )
+                        else:
+                            logger.debug(
+                                f"pestana: calentada @{cuenta.usuario}"
+                            )
+                    else:
+                        logger.debug(
+                            f"pestana: calentamiento no disponible "
+                            f"@{cuenta.usuario}"
+                        )
+                except Exception:
+                    pass
+            except Exception as e:
+                logger.warning(
+                    f"pestana: no se pudo crear para "
+                    f"@{getattr(cuenta, 'usuario', '')} "
+                    f"({type(e).__name__}: {e}); se usa el camino clasico"
+                )
+                try:
+                    if bot is not None:
+                        bot.cerrar()
+                except Exception:
+                    pass
+                with self._pestanas_cond:
+                    try:
+                        self._pestanas.remove(reserva)
+                    except ValueError:
+                        pass
+                    self._pestanas_cond.notify_all()
+                return None
+            reserva.bot = bot
+            reserva.usuario = str(getattr(cuenta, "usuario", "") or "")
+            reserva.acciones = 0
+            reserva.ocupada = True
+            with self._pestanas_cond:
+                if reserva not in self._pestanas:
+                    # El pool se cerro mientras se creaba (campaña terminada o
+                    # cancelada): no dejar el Chrome huerfano.
+                    self._pestanas_cond.notify_all()
+                    crear_ok = False
+                else:
+                    self._pestanas_creadas += 1
+                    self._pestanas_cond.notify_all()
+                    crear_ok = True
+            if not crear_ok:
+                try:
+                    bot.cerrar()
+                except Exception:
+                    pass
+                return None
+            return reserva
+
+    def _cambiar_cuenta_pestana(self, pestana, cuenta) -> bool:
+        """Cambia la pestaña a `cuenta`; False = driver roto/descartado.
+
+        Si la pestaña ya atiende a esa cuenta devuelve True sin tocar nada. Si
+        `bot.cambiar_cuenta` falla, la pestaña se descarta (nunca deja un
+        Chrome huerfano) y el llamador cae al camino clasico. Nunca lanza.
+        """
+        try:
+            usuario = str(getattr(cuenta, "usuario", "") or "")
+            if str(getattr(pestana, "usuario", "") or "") == usuario:
+                return True
+            bot = getattr(pestana, "bot", None)
+            cambiar = getattr(bot, "cambiar_cuenta", None)
+            if not callable(cambiar):
+                self._descartar_pestana(pestana)
+                return False
+            ok = False
+            try:
+                ok = bool(cambiar(usuario, validar_proxy=False))
+            except TypeError:
+                try:
+                    ok = bool(cambiar(usuario))
+                except Exception:
+                    ok = False
+            except Exception:
+                ok = False
+            if not ok:
+                self._descartar_pestana(pestana)
+                return False
+            pestana.usuario = usuario
+            pestana.acciones = 0
+            return True
+        except Exception:
+            try:
+                self._descartar_pestana(pestana)
+            except Exception:
+                pass
+            return False
+
+    def _liberar_pestana(self, pestana, exito: bool) -> None:
+        """Devuelve la pestaña al pool (o la recicla si toca).
+
+        Suma una accion; si alcanzo `PESTANA_MAX_ACCIONES` o el driver murio,
+        descarta la pestaña (y la cuenta como reciclada); si no, la marca
+        libre. SIEMPRE despierta a los workers que esperan cupo. Nunca lanza.
+        """
+        reciclar = False
+        try:
+            with self._pestanas_cond:
+                try:
+                    pestana.acciones = int(pestana.acciones or 0) + 1
+                except Exception:
+                    pestana.acciones = 1
+                try:
+                    if pestana.acciones >= int(self._pestana_max_acciones):
+                        reciclar = True
+                except Exception:
+                    pass
+                try:
+                    if not bool(pestana.bot.esta_vivo()):
+                        reciclar = True
+                except Exception:
+                    reciclar = True
+                if reciclar:
+                    self._pestanas_recicladas += 1
+                else:
+                    pestana.ocupada = False
+                self._pestanas_cond.notify_all()
+        except Exception:
+            reciclar = True
+        if reciclar:
+            self._descartar_pestana(pestana)
+
+    def _descartar_pestana(self, pestana) -> None:
+        """Saca la pestaña del pool y cierra su Chrome (nunca lanza).
+
+        Es segura de llamar mas de una vez y desde cualquier hilo: si ya no
+        esta en el pool solo cierra el bot (idempotente en el contrato).
+        """
+        bot = None
+        try:
+            with self._pestanas_cond:
+                try:
+                    self._pestanas.remove(pestana)
+                except ValueError:
+                    pass
+                pestana.ocupada = True
+                self._pestanas_cond.notify_all()
+            bot = getattr(pestana, "bot", None)
+        except Exception:
+            bot = getattr(pestana, "bot", None)
+        try:
+            if bot is not None:
+                bot.cerrar()
+        except Exception:
+            pass
+        try:
+            with self._pestanas_cond:
+                self._pestanas_cond.notify_all()
+        except Exception:
+            pass
+
+    def _cerrar_pestanas_libres(self) -> int:
+        """Cierra pestañas LIBRES sobrantes para respetar el limite actual.
+
+        Se llama al reducir navegadores por agotamiento de recursos: las
+        pestañas ocupadas terminan su accion y se liberan/descartan solas.
+        Devuelve cuantas cerro; nunca lanza.
+        """
+        sobrantes = []
+        try:
+            with self._pestanas_cond:
+                try:
+                    limite = int(self._limite_navegadores)
+                except Exception:
+                    limite = 1
+                libres = [p for p in self._pestanas if not p.ocupada]
+                while len(self._pestanas) > limite and libres:
+                    pestana = libres.pop()
+                    try:
+                        self._pestanas.remove(pestana)
+                    except ValueError:
+                        continue
+                    sobrantes.append(pestana)
+                if sobrantes:
+                    self._pestanas_cond.notify_all()
+        except Exception:
+            sobrantes = []
+        for pestana in sobrantes:
+            try:
+                bot = getattr(pestana, "bot", None)
+                if bot is not None:
+                    bot.cerrar()
+            except Exception:
+                pass
+        return len(sobrantes)
+
+    def _cerrar_pestanas(self) -> None:
+        """Cierra TODAS las pestañas del pool y lo vacia (nunca lanza).
+
+        Se llama en el `finally` de las campañas (`ejecutar`,
+        `ejecutar_por_roles` y 3+3+3): ninguna pestaña debe quedar viva al
+        terminar, pase lo que pase.
+        """
+        pestanas = []
+        try:
+            with self._pestanas_cond:
+                pestanas = list(self._pestanas)
+                self._pestanas.clear()
+                self._pestanas_cond.notify_all()
+        except Exception:
+            pestanas = []
+        for pestana in pestanas:
+            try:
+                bot = getattr(pestana, "bot", None)
+                if bot is not None:
+                    bot.cerrar()
+            except Exception:
+                pass
+
+    def _con_claves_pestana(self, resumen) -> dict:
+        """Agrega al resumen las claves del pool de pestañas (nunca lanza)."""
+        if not isinstance(resumen, dict):
+            resumen = {"resultado": resumen}
+        try:
+            with self._pestanas_lock:
+                creadas = int(self._pestanas_creadas)
+                recicladas = int(self._pestanas_recicladas)
+        except Exception:
+            creadas, recicladas = 0, 0
+        try:
+            resumen["modo_pestana"] = bool(self._pestana_capaz())
+        except Exception:
+            resumen["modo_pestana"] = False
+        resumen["pestanas_creadas"] = creadas
+        resumen["pestanas_recicladas"] = recicladas
+        return resumen
 
     def _n_workers(self) -> int:
         """Trabajadores del pool de rondas: env `MAX_WORKERS`.
@@ -1813,13 +2244,244 @@ class MotorActivacion:
 
         return estado["ronda"]
 
+    def _asegurar_sesion(self, bot, cuenta) -> tuple:
+        """Deja lista la sesion del bot (CDP rapido o login lento).
+
+        Devuelve `(ok, detalle)`: `(True, "")` si la sesion quedo lista;
+        `(False, detalle)` con el detalle normalizado de login para que el
+        llamador lo reporte. Nunca lanza.
+        """
+        usuario = getattr(cuenta, "usuario", "")
+        motivo = ""
+        try:
+            preparar_cdp = getattr(bot, "preparar_sesion_cdp", None)
+            sesion_cdp = bool(preparar_cdp()) if callable(preparar_cdp) else False
+        except Exception as e:
+            logger.debug(f"preparar_sesion_cdp fallo para @{usuario}: {e}")
+            sesion_cdp = False
+        if sesion_cdp:
+            logger.debug(f"sesion: CDP para @{usuario}")
+            return True, ""
+        logger.debug(f"sesion: login lento para @{usuario}")
+        try:
+            login = getattr(bot, "login_con_cookies", None)
+            ok = bool(login()) if callable(login) else False
+        except Exception as e:
+            ok = False
+            motivo = f"{type(e).__name__}: {e}"
+        if ok:
+            return True, ""
+        motivo = getattr(bot, "ultimo_error", "") or motivo or "login fallido"
+        logger.warning(f"Login fallido para @{usuario}: {motivo}")
+        return False, _detalle_login_fallido(motivo)
+
+    def _accion_en_bot(self, bot, cuenta, rol: str, texto: str,
+                       dar_like: bool, url_objetivo: str) -> tuple:
+        """Ejecuta la accion del rol en un bot con la sesion ya lista.
+
+        Replica EXACTAMENTE los metodos y detalles del flujo clasico
+        (cita/rt/comentario/hashtags) de `_intentar_accion_rol`, para que el
+        pool de pestañas y el camino clasico publiquen igual. Nunca lanza:
+        cualquier error se reporta como fallo.
+
+        Devuelve una tupla de 5 elementos:
+        (usuario, rol, exito, detalle, url).
+        """
+        try:
+            if rol == "like":
+                return (
+                    cuenta.usuario, rol, False,
+                    "like sin soporte por API en este momento", url_objetivo,
+                )
+
+            if rol == "cita":
+                res = bot.solo_retwittear(
+                    [url_objetivo],
+                    cuenta.usuario,
+                    mensaje_cita=texto,
+                    dar_like=dar_like,
+                )
+                ok = res.get("exitos", 0) > 0
+                urls_pub = res.get("urls") or []
+                url_publicada = urls_pub[0] if urls_pub else url_objetivo
+                detalle = "ok" if ok else (
+                    _detalle_con_sesion(getattr(bot, "ultimo_error", ""))
+                    or "sin exito"
+                )
+                return (cuenta.usuario, rol, ok, detalle[:120], url_publicada)
+
+            if rol == "rt":
+                res = bot.solo_retwittear(
+                    [url_objetivo],
+                    cuenta.usuario,
+                    dar_like=dar_like,
+                )
+                ok = res.get("exitos", 0) > 0
+                urls_pub = res.get("urls") or []
+                # El RT simple no genera un post propio: `solo_retwittear`
+                # ya devuelve el perfil de quien retwittea, no el tweet original.
+                url_publicada = (
+                    urls_pub[0] if urls_pub
+                    else f"https://twitter.com/{cuenta.usuario}"
+                )
+                detalle = "ok" if ok else (
+                    _detalle_con_sesion(getattr(bot, "ultimo_error", ""))
+                    or "sin exito"
+                )
+                return (cuenta.usuario, rol, ok, detalle[:120], url_publicada)
+
+            if rol == "comentario":
+                if not (texto or "").strip():
+                    return (
+                        cuenta.usuario, rol, False, "sin texto asignado",
+                        url_objetivo,
+                    )
+                responder = getattr(bot, "responder_tweet", None)
+                if responder is None:
+                    return (
+                        cuenta.usuario, rol, False, "sin soporte de respuesta",
+                        url_objetivo,
+                    )
+                ok = bool(responder(url_objetivo, texto))
+                if ok:
+                    detalle = "comentario publicado"
+                else:
+                    motivo = getattr(bot, "ultimo_error", "") or "sin exito"
+                    # La sesion caida se reporta sin prefijo, con la accion
+                    # concreta (renovar cookies/login); no es suspension. Las
+                    # respuestas limitadas del tweet ancla se reportan claras.
+                    detalle = _detalle_comentario(motivo)
+                return (cuenta.usuario, rol, ok, detalle[:120], url_objetivo)
+
+            # rol == "hashtags"
+            res = bot.publicar_tweet(texto, buscar_url=False)
+            ok = bool(res)
+            if isinstance(res, str):
+                url_publicada = res
+            elif ok:
+                url_publicada = getattr(bot, "ultima_url_publicada", "") or ""
+            else:
+                url_publicada = ""
+            if ok:
+                detalle = "hashtags publicados"
+            else:
+                motivo = getattr(bot, "ultimo_error", "") or "sin exito"
+                detalle = _detalle_con_sesion(f"hashtags: {motivo}")
+            return (cuenta.usuario, rol, ok, detalle[:120], url_publicada)
+
+        except Exception as e:
+            logger.error(f"Error en @{cuenta.usuario} (rol {rol}): {e}")
+            detalle = _detalle_con_sesion(f"{type(e).__name__}: {e}")
+            return (cuenta.usuario, rol, False, detalle[:120], url_objetivo)
+
+    def _finalizar_pestana(self, pestana, cuenta, resultado) -> None:
+        """Devuelve o descarta la pestaña segun el resultado (nunca lanza).
+
+        Marca la cuenta suspendida si el bot lo detecto, descarta la pestaña
+        si el driver murio o el detalle es un error transitorio de navegador
+        y, en cualquier otro caso, la libera para que otro worker la reutilice
+        (el `finally` del llamador no necesita hacer nada mas).
+        """
+        exito, detalle = False, ""
+        try:
+            if isinstance(resultado, tuple):
+                if len(resultado) > 2:
+                    exito = bool(resultado[2])
+                if len(resultado) > 3:
+                    detalle = str(resultado[3] or "")
+        except Exception:
+            exito, detalle = False, ""
+        bot = getattr(pestana, "bot", None)
+        try:
+            if getattr(bot, "cuenta_suspendida", False):
+                marcar_cuenta_suspendida(cuenta.usuario)
+                logger.warning(
+                    f"@{cuenta.usuario} marcada como suspendida (desactivada)"
+                )
+        except Exception:
+            pass
+        descartar = bool(_es_error_driver_transitorio(detalle))
+        if not descartar:
+            try:
+                descartar = not bool(bot.esta_vivo())
+            except Exception:
+                descartar = True
+        if descartar:
+            self._descartar_pestana(pestana)
+        else:
+            self._liberar_pestana(pestana, exito)
+
+    def _ejecutar_accion_en_pestana(self, pestana, cuenta, rol: str,
+                                    texto: str, dar_like: bool,
+                                    url_objetivo: str) -> tuple:
+        """Ejecuta la accion del rol en una pestaña prestada del pool.
+
+        Usa `_accion_en_bot` (mismo dispatch del camino clasico) y en el
+        `finally` libera o descarta la pestaña con `_finalizar_pestana`.
+        Nunca lanza: los errores se reportan como fallo.
+        """
+        bot = pestana.bot
+        resultado = (cuenta.usuario, rol, False, "sin exito", url_objetivo)
+        try:
+            resultado = self._accion_en_bot(
+                bot, cuenta, rol, texto, dar_like, url_objetivo
+            )
+        except Exception as e:
+            logger.error(
+                f"Error en @{cuenta.usuario} (rol {rol}, pestaña): {e}"
+            )
+            detalle = _detalle_con_sesion(f"{type(e).__name__}: {e}")
+            resultado = (cuenta.usuario, rol, False, detalle[:120], url_objetivo)
+        finally:
+            self._finalizar_pestana(pestana, cuenta, resultado)
+        return resultado
+
+    def _quote_rt_en_pestana(self, pestana, cuenta, url: str, texto: str,
+                             dar_like: bool) -> tuple:
+        """Quote-RT en una pestaña prestada del pool (tupla de 4).
+
+        Replica exactamente el parseo del camino clasico de
+        `_intentar_quote_rt` y libera/descarta la pestaña en el `finally`.
+        Nunca lanza.
+        """
+        bot = pestana.bot
+        resultado = (cuenta.usuario, False, "sin exito", "")
+        try:
+            res = bot.solo_retwittear(
+                [url],
+                cuenta.usuario,
+                mensaje_cita=texto,
+                dar_like=dar_like,
+            )
+            ok = res.get("exitos", 0) > 0
+            urls_pub = res.get("urls") or []
+            url_publicada = urls_pub[0] if urls_pub else ""
+            if ok:
+                resultado = (cuenta.usuario, True, "ok", url_publicada)
+            else:
+                motivo = getattr(bot, "ultimo_error", "") or "sin exito"
+                detalle = _detalle_con_sesion(motivo) or "sin exito"
+                resultado = (
+                    cuenta.usuario, False, detalle[:120], url_publicada
+                )
+        except Exception as e:
+            logger.error(f"Error en @{cuenta.usuario} (cita, pestaña): {e}")
+            detalle = _detalle_con_sesion(f"{type(e).__name__}: {e}") or str(e)
+            resultado = (cuenta.usuario, False, detalle[:120], "")
+        finally:
+            self._finalizar_pestana(pestana, cuenta, resultado)
+        return resultado
+
     def _intentar_quote_rt(self, cuenta: Cuenta, urls: list[str],
                            texto: str, dar_like: bool) -> tuple:
         """Un intento de quote-RT para UNA cuenta; cierra el bot siempre.
 
         API PRIMERO (mismo criterio que `_intentar_accion_rol`): la cita se
         intenta por HTTP (`accion_rapida("cita", ...)`) antes de abrir Chrome;
-        si la API no puede/falla, se usa Selenium.
+        si la API no puede/falla, se usa Selenium. Con el modo pestaña activo
+        se reutiliza un Chrome del pool (cambio de cuenta en caliente); si no
+        hay pestaña disponible se mantiene el camino clasico (un Chrome por
+        accion que se cierra en el `finally`).
 
         Devuelve una tupla de 4 elementos:
         (usuario, exito, detalle, url_publicada).
@@ -1836,24 +2498,19 @@ class MotorActivacion:
                 return (resultado_api[0], resultado_api[2],
                         resultado_api[3], resultado_api[4])
 
+            # --- Selenium: pestaña persistente del pool si esta disponible. ---
+            pestana = self._adquirir_pestana(cuenta)
+            if pestana is not None and self._cambiar_cuenta_pestana(
+                pestana, cuenta
+            ):
+                return self._quote_rt_en_pestana(
+                    pestana, cuenta, url, texto, dar_like
+                )
+
             bot = TwitterBot(cuenta.usuario)
-            # Sesion rapida por CDP: inyecta las cookies sin navegar. Si no hay
-            # cookies o CDP falla, se cae al login lento de siempre.
-            try:
-                preparar_cdp = getattr(bot, "preparar_sesion_cdp", None)
-                sesion_cdp = bool(preparar_cdp()) if callable(preparar_cdp) else False
-            except Exception as e:
-                logger.debug(f"preparar_sesion_cdp fallo para @{cuenta.usuario}: {e}")
-                sesion_cdp = False
-            if sesion_cdp:
-                logger.debug(f"sesion: CDP para @{cuenta.usuario}")
-            else:
-                logger.debug(f"sesion: login lento para @{cuenta.usuario}")
-                if not bot.login_con_cookies():
-                    motivo = getattr(bot, "ultimo_error", "") or "login fallido"
-                    logger.warning(f"Login fallido para @{cuenta.usuario}: {motivo}")
-                    detalle = _detalle_login_fallido(motivo)
-                    return (cuenta.usuario, False, detalle[:120], "")
+            ok_sesion, detalle_sesion = self._asegurar_sesion(bot, cuenta)
+            if not ok_sesion:
+                return (cuenta.usuario, False, detalle_sesion[:120], "")
 
             res = bot.solo_retwittear(
                 [url],
@@ -2098,96 +2755,31 @@ class MotorActivacion:
                     "like sin soporte por API en este momento", url_objetivo,
                 )
 
-            # --- Selenium (fallback): gate de navegadores. ---
+            # --- Selenium: pestaña persistente del pool si esta disponible. ---
+            # El pool ya limita a `_limite_navegadores` (no se usa el gate de
+            # navegadores aqui para no doble-gatear). Si no hay pestaña, se cae
+            # al camino clasico de abajo.
+            pestana = self._adquirir_pestana(cuenta)
+            if pestana is not None and self._cambiar_cuenta_pestana(
+                pestana, cuenta
+            ):
+                return self._ejecutar_accion_en_pestana(
+                    pestana, cuenta, rol, texto, dar_like, url_objetivo
+                )
+
+            # --- Selenium (fallback clasico): gate de navegadores. ---
             self._adquirir_navegador()
             try:
                 bot = TwitterBot(cuenta.usuario)
-                # Sesion rapida por CDP: inyecta las cookies sin navegar. Si no
-                # hay cookies o CDP falla, se cae al login lento de siempre.
-                try:
-                    preparar_cdp = getattr(bot, "preparar_sesion_cdp", None)
-                    sesion_cdp = bool(preparar_cdp()) if callable(preparar_cdp) else False
-                except Exception as e:
-                    logger.debug(
-                        f"preparar_sesion_cdp fallo para @{cuenta.usuario}: {e}"
+                ok_sesion, detalle_sesion = self._asegurar_sesion(bot, cuenta)
+                if not ok_sesion:
+                    return (
+                        cuenta.usuario, rol, False,
+                        detalle_sesion[:120], url_objetivo,
                     )
-                    sesion_cdp = False
-                if sesion_cdp:
-                    logger.debug(f"sesion: CDP para @{cuenta.usuario}")
-                else:
-                    logger.debug(f"sesion: login lento para @{cuenta.usuario}")
-                    if not bot.login_con_cookies():
-                        motivo = getattr(bot, "ultimo_error", "") or "login fallido"
-                        logger.warning(f"Login fallido para @{cuenta.usuario}: {motivo}")
-                        detalle = _detalle_login_fallido(motivo)
-                        return (cuenta.usuario, rol, False, detalle[:120], url_objetivo)
-
-                if rol == "cita":
-                    res = bot.solo_retwittear(
-                        [url_objetivo],
-                        cuenta.usuario,
-                        mensaje_cita=texto,
-                        dar_like=dar_like,
-                    )
-                    ok = res.get("exitos", 0) > 0
-                    urls_pub = res.get("urls") or []
-                    url_publicada = urls_pub[0] if urls_pub else url_objetivo
-                    detalle = "ok" if ok else (
-                        _detalle_con_sesion(getattr(bot, "ultimo_error", ""))
-                        or "sin exito"
-                    )
-                    return (cuenta.usuario, rol, ok, detalle[:120], url_publicada)
-
-                if rol == "rt":
-                    res = bot.solo_retwittear(
-                        [url_objetivo],
-                        cuenta.usuario,
-                        dar_like=dar_like,
-                    )
-                    ok = res.get("exitos", 0) > 0
-                    urls_pub = res.get("urls") or []
-                    # El RT simple no genera un post propio: `solo_retwittear`
-                    # ya devuelve el perfil de quien retwittea, no el tweet original.
-                    url_publicada = urls_pub[0] if urls_pub else f"https://twitter.com/{cuenta.usuario}"
-                    detalle = "ok" if ok else (
-                        _detalle_con_sesion(getattr(bot, "ultimo_error", ""))
-                        or "sin exito"
-                    )
-                    return (cuenta.usuario, rol, ok, detalle[:120], url_publicada)
-
-                if rol == "comentario":
-                    if not (texto or "").strip():
-                        return (cuenta.usuario, rol, False, "sin texto asignado", url_objetivo)
-                    responder = getattr(bot, "responder_tweet", None)
-                    if responder is None:
-                        return (cuenta.usuario, rol, False, "sin soporte de respuesta", url_objetivo)
-                    ok = bool(responder(url_objetivo, texto))
-                    if ok:
-                        detalle = "comentario publicado"
-                    else:
-                        motivo = getattr(bot, "ultimo_error", "") or "sin exito"
-                        # La sesion caida se reporta sin prefijo, con la accion
-                        # concreta (renovar cookies/login); no es suspension. Las
-                        # respuestas limitadas del tweet ancla se reportan claras.
-                        detalle = _detalle_comentario(motivo)
-                    return (cuenta.usuario, rol, ok, detalle[:120], url_objetivo)
-
-                # rol == "hashtags"
-                res = bot.publicar_tweet(texto, buscar_url=False)
-                ok = bool(res)
-                if isinstance(res, str):
-                    url_publicada = res
-                elif ok:
-                    url_publicada = getattr(bot, "ultima_url_publicada", "") or ""
-                else:
-                    url_publicada = ""
-                if ok:
-                    detalle = "hashtags publicados"
-                else:
-                    motivo = getattr(bot, "ultimo_error", "") or "sin exito"
-                    detalle = _detalle_con_sesion(f"hashtags: {motivo}")
-                return (cuenta.usuario, rol, ok, detalle[:120], url_publicada)
-
+                return self._accion_en_bot(
+                    bot, cuenta, rol, texto, dar_like, url_objetivo
+                )
             finally:
                 self._cerrar_bot(cuenta, bot)
                 self._liberar_navegador()
@@ -2241,6 +2833,45 @@ class MotorActivacion:
         return resultado
 
     def ejecutar(
+        self,
+        urls: list[str],
+        texto_base: str,
+        cantidad_cuentas: int = None,
+        tags: list[str] = None,
+        grupo: str = None,
+        dar_like: bool = False,
+        duracion_min: int = 60,
+        cohortes: int = 4,
+        n_hashtags: int = 2,
+        narrativa: str = "",
+        entrenamiento: str = "",
+        callback=None,
+        hashtags: str = "",
+        solo_con_registro: bool = False,
+        repetir: bool = False,
+        secciones=None,
+        porcentaje_min_ronda=40,
+        porcentaje_max_ronda=90,
+    ) -> dict:
+        """Lanza la campaña completa (wrapper del flujo real).
+
+        Garantiza que TODAS las pestañas persistentes queden cerradas al
+        terminar (exito, salida temprana o excepcion) y agrega al resumen las
+        claves `modo_pestana`, `pestanas_creadas` y `pestanas_recicladas`.
+        La logica vive en `_ejecutar_campana` (misma firma).
+        """
+        try:
+            resumen = self._ejecutar_campana(
+                urls, texto_base, cantidad_cuentas, tags, grupo, dar_like,
+                duracion_min, cohortes, n_hashtags, narrativa, entrenamiento,
+                callback, hashtags, solo_con_registro, repetir, secciones,
+                porcentaje_min_ronda, porcentaje_max_ronda,
+            )
+        finally:
+            self._cerrar_pestanas()
+        return self._con_claves_pestana(resumen)
+
+    def _ejecutar_campana(
         self,
         urls: list[str],
         texto_base: str,
@@ -2548,6 +3179,49 @@ class MotorActivacion:
         return resumen
 
     def ejecutar_por_roles(
+        self,
+        urls: list[str],
+        texto_base: str = "",
+        hashtags: str = "",
+        menciones: str = "",
+        dar_like: bool = False,
+        duracion_min: int = 60,
+        cohortes: int = 4,
+        usuarios: list | None = None,
+        solo_roles: list | None = None,
+        narrativa: str = "",
+        entrenamiento: str = "",
+        callback=None,
+        contexto: str = "",
+        solo_con_registro: bool = False,
+        repetir: bool = False,
+        roles_aleatorios: bool = False,
+        cooldown_min: float = 0,
+        secciones=None,
+        porcentaje_min_ronda=40,
+        porcentaje_max_ronda=90,
+        pausa_comentario_url_seg: float = 15.0,
+    ) -> dict:
+        """Campaña masiva dividida en subcuentas por rol (wrapper del flujo).
+
+        Garantiza que TODAS las pestañas persistentes queden cerradas al
+        terminar (exito, salida temprana o excepcion) y agrega al resumen las
+        claves `modo_pestana`, `pestanas_creadas` y `pestanas_recicladas`.
+        La logica vive en `_ejecutar_por_roles_campana` (misma firma).
+        """
+        try:
+            resumen = self._ejecutar_por_roles_campana(
+                urls, texto_base, hashtags, menciones, dar_like, duracion_min,
+                cohortes, usuarios, solo_roles, narrativa, entrenamiento,
+                callback, contexto, solo_con_registro, repetir, roles_aleatorios,
+                cooldown_min, secciones, porcentaje_min_ronda,
+                porcentaje_max_ronda, pausa_comentario_url_seg,
+            )
+        finally:
+            self._cerrar_pestanas()
+        return self._con_claves_pestana(resumen)
+
+    def _ejecutar_por_roles_campana(
         self,
         urls: list[str],
         texto_base: str = "",
@@ -3100,6 +3774,35 @@ class MotorActivacion:
         return resultados
 
     def ejecutar_campana_3_3_3(
+        self,
+        urls_rt: list[str],
+        urls_comentarios: list[str] | None = None,
+        textos_posts_por_cuenta: dict | None = None,
+        textos_comentarios_por_cuenta: dict | None = None,
+        usuarios: list | None = None,
+        cantidad_cuentas: int = None,
+        tags: list[str] = None,
+        grupo: str = None,
+        dar_like: bool = False,
+        duracion_min: int = 60,
+        cohortes: int = 4,
+        callback=None,
+    ) -> dict:
+        """Campana 3+3+3 (wrapper): cierra pestañas y agrega claves al resumen.
+
+        La logica vive en `_ejecutar_campana_3_3_3_impl` (misma firma).
+        """
+        try:
+            resumen = self._ejecutar_campana_3_3_3_impl(
+                urls_rt, urls_comentarios, textos_posts_por_cuenta,
+                textos_comentarios_por_cuenta, usuarios, cantidad_cuentas,
+                tags, grupo, dar_like, duracion_min, cohortes, callback,
+            )
+        finally:
+            self._cerrar_pestanas()
+        return self._con_claves_pestana(resumen)
+
+    def _ejecutar_campana_3_3_3_impl(
         self,
         urls_rt: list[str],
         urls_comentarios: list[str] | None = None,

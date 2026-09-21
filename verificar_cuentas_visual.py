@@ -51,7 +51,6 @@ def cargar_x(driver, espera_max: float = 45.0) -> bool:
 
 def esperar_carga(driver, segundos: float = 15.0) -> bool:
     """Espera a que el DOM se estabilice sin usar timeouts estrictos."""
-    from selenium.webdriver.common.by import By
     fin = time.time() + segundos
     intentos = 0
     while time.time() < fin:

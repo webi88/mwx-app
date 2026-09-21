@@ -14,7 +14,6 @@ Connection string -> (URI, conexión directa o Session pooler).
 import sys
 
 from sqlalchemy import create_engine, select, func
-from loguru import logger
 
 from core.config import resolver_ruta
 from core.database import Base

@@ -35,10 +35,12 @@ GestorRedes-Telegram-Final/
 │
 ├── plataformas/            # Automatizacion de redes sociales
 │   ├── base.py             # Clase base y factory
+│   ├── chrome_driver.py    # chromedriver compartido + flags de estabilidad/ahorro
 │   ├── twitter/
-│   │   ├── selenium_bot.py # TwitterBot (36 funciones)
+│   │   ├── selenium_bot.py # TwitterBot (publicar, RT, responder, cambio de cuenta en caliente)
 │   │   ├── api_http.py     # TwitterAPI (HTTP directo)
-│   │   └── cookies.py      # Gestion de cookies
+│   │   ├── perfil.py       # Lectura/sincronizacion del perfil real (httpx)
+│   │   └── session_validator.py # Validacion de cookies/sesion
 │   ├── facebook/
 │   │   └── selenium_bot.py # FacebookBot (13 funciones)
 │   ├── instagram/
@@ -65,7 +67,8 @@ GestorRedes-Telegram-Final/
 ├── scheduler/              # Programador de tareas
 │   ├── manager.py          # APScheduler
 │   ├── ejecutor.py         # Ejecuta tareas
-│   └── models.py           # Modelos de tareas
+│   ├── distribucion_horaria.py # Reparto de acciones por hora (funciones puras)
+│   └── standalone.py       # Entry point del scheduler (python -m scheduler.standalone)
 │
 ├── cuentas/                # Creacion de cuentas
 │   ├── grizzly_api.py      # API de Grizzly SMS
@@ -771,9 +774,32 @@ python -m bot.main
 - Verificado: compileall global OK; suite nueva disyuntor/throttle 67/67 (sin red con disyuntor, 422 de validacion = 1 POST, archivo corrupto saneado, 23 features, presupuesto 1s respetado, throttle 4→2 sin reintento, password default/1, login fallido omitido en rondas, workers 12); smoke independiente 13/13; regresion: rt_api 11/11, like 29/29, responder 33/33, timeouts 26/26; los 2 FAIL de `test_plataformas_fixes` y el de `test_rt_api_motor` son expectativas viejas (default `max(6,...)` y detalle `"rt por API"`).
 - ⚠ **Railway debe redeployarse**. Config recomendada: **Navegadores 3** (max 4) y **Trabajadores 12-16**. Si X bloquea la API, el disyuntor evita pagar el costo por cuenta; los comentarios al MISMO tweet siguen limitados por la pausa por URL (usa 2-5 tweets ancla). Los `queryId` de X cambian: la primera accion API por proceso paga ~1.5s de descubrimiento (cache 6h).
 
+### Pestana persistente: un Chrome por campana y cambio de sesion en la misma pestana (2026-09-20)
+- **Motivo**: la app de referencia del jefe (proyecto `GestorTwitter` para Mac) mantiene UN Chrome abierto y por cada cuenta solo inyecta cookies/refresca en la MISMA pestana (flujo de RTs de su `app.py`); con 4 cuentas hizo ~300 acciones. Lo nuestro abria/cerraba Chrome por accion (10-40s + errores en serie). Ahora el fallback Selenium reutiliza Chrome y cambia la sesion en caliente.
+- `utils/forward_proxy.py`: `LocalForwardProxy` ahora acepta `host=None` (modo directo) y `cambiar_upstream(proxy="")` actualiza el upstream EN CALIENTE (parsea `http://user:pass@host:port`, cierra las conexiones activas para que Chrome salga por la IP nueva; `""` = directo). El bloqueo Google, pool acotado, reintentos y `close()` siguen igual en modo proxy.
+- `utils/proxies.py`: `aplicar_a_options(..., dinamico=False)`: con `dinamico=True` SIEMPRE crea el `LocalForwardProxy` (modo directo si la cuenta no tiene proxy) y Chrome queda apuntando a `127.0.0.1` para poder cambiar de IP despues.
+- `plataformas/twitter/selenium_bot.py`:
+  - `iniciar_driver(..., proxy_dinamico=False)`; `esta_vivo()`; `cambiar_cuenta(usuario, proxy="", validar_proxy=False)` que limpia cookies/cache, aplica el UA de la cuenta nueva por CDP, cambia el upstream al proxy sticky de la cuenta nueva e inyecta sus cookies sin navegar (`preparar_sesion_cdp`). `preparar_sesion_cdp`/`cambiar_cuenta` NUNCA navegan.
+  - `navegar_tolerante(url)` + `calentar()`: absorben el interstitial "something went wrong" de X con UN refresh (el error real de Railway al crear pestanas nuevas).
+  - `Network.clearBrowserCache` corre en hilo daemon con tope `CAMBIO_CUENTA_CACHE_TIMEOUT` (3s; 0 = omitir) para que un hipo de Windows/Chrome no frene el cambio; `clearBrowserCookies` sigue sincrono (es rapido y critico). Telemetria `perf @usuario: cambiar_cuenta total=.. (ua=.. limpieza=.. proxy=.. cookies=..)`.
+- `activaciones/motor.py`: pool de **pestanas persistentes** (`_Pestana`) con `MODO_PESTANA=1` (default), `PESTANA_MAX_ACCIONES=40` (reciclado) y `PESTANA_ESPERA_SEG=180`. `_adquirir_pestana` crea el Chrome UNA vez (`iniciar_driver(proxy_dinamico=True)` + sesion + `calentar()`), `_cambiar_cuenta_pestana` cambia de cuenta en la misma pestana, `_liberar_pestana` recicla por acciones/vida del driver y `_cerrar_pestanas` corre en el `finally` de `ejecutar()`, `ejecutar_por_roles()` y 3+3+3 (ningun Chrome huerfano). Los resumenes agregan `modo_pestana`, `pestanas_creadas`, `pestanas_recicladas`. `MODO_PESTANA=0` conserva EXACTO el modo clasico (un Chrome por accion) y si el modulo viejo no tiene `cambiar_cuenta` el motor cae solo al clasico.
+- `web/operaciones/activacion_masiva.py`: checkbox "🪟 Modo pestana persistente" (default ON) + "♻️ Reciclar pestana cada N acciones" (default 40) en ambas pestanas; el checkbox "⚡ Publicar por API" ahora viene **desactivado por defecto** (X bloquea/limita la API: 226 anti-bot, 344 limite diario, 422) porque con pestana persistente Selenium es rapido y confiable. Envs `MODO_PESTANA`/`PESTANA_MAX_ACCIONES` se aplican y restauran siempre.
+- `.env.example`: documentadas `MODO_PESTANA`, `PESTANA_MAX_ACCIONES`, `PESTANA_ESPERA_SEG`, `CAMBIO_CUENTA_CACHE_TIMEOUT`.
+- Verificado: compileall global OK; plataformas 51/51 (pestana/cookies/upstream/UA) + 39/39 (navegar/calentar) + 20/20 (cache no bloqueante); motor 42/42 (reuso de pestanas, reciclado a N acciones, descarte por driver roto, `MODO_PESTANA=0` clasico, `calentar` 1 vez por pestana) con fakes; UI AppTest 33/33 (defaults pestana=ON, reciclar=40, API=OFF; envs aplicadas y restauradas).
+- **Smoke real con Chrome 153 (headless, sin proxy)**: UNA sola pestana/session_id `d745031e...`; entrar como `NeraFarner` (@UnidosMovCDMX), `cambiar_cuenta` a `NenaFelty` (@Barrio_naranja), navegar y volver a `NeraFarner` -> handles correctos, sin muro de login, 0 procesos Chrome/chromedriver huerfanos. `cambiar_cuenta` real ~0.3-1.9s (ua/limpieza/proxy/cookies instrumentados); integracion motor real: pestana creada en 6.0s (incluye `calentar` 2.9s) y reciclada/cerrada al final.
+- ⚠ **Railway debe redeployarse**. Config recomendada: **Navegadores 3** (max 4 con RAM) y **Trabajadores 12-16**; `MAX_BROWSERS=1` era el default conservador del modo viejo, con pestañas persistentes 3-4 rinden mucho mas. Para ~10+ acciones/min basta 1-2 pestanas. Los comentarios al MISMO tweet siguen limitados por la pausa por URL (usa 2-5 tweets ancla). El interstitial inicial de X es transitorio: `calentar()` lo absorbe al crear cada pestana.
+
+### Limpieza de basura y codigo muerto (2026-09-20)
+- **32 GB liberados**: `data/perfiles_chrome/` tenia 339 perfiles Chrome acumulados (271 de pruebas `cuenta_*`); se borraron TODOS excepto `ua_config.txt` (override de UA) y la carpeta `centrosomost` (unica cuenta sin cookies guardadas). Las sesiones viven en `data/cookies/*.pkl` y en `Cuenta.cookies_json`/`auth_token`, asi que los perfiles son descartables (se recrean al vuelo).
+- Borrados 18 `__pycache__` fuera de `.venv` y el contenido de `data/temp/` (`perfiles_test_fwd`).
+- **Codigo muerto eliminado** (nadie los importaba, verificado con AST + grep): `plataformas/twitter/cookies.py` (`CookiesManager`, la logica de cookies vive en `selenium_bot.py`/`session_validator.py`) y `scheduler/models.py` (los schedulers usan `core.models.Tarea` directo; el reparto vive en `distribucion_horaria.py`). `BITACORA.md` (desactualizado, Ago-2026) eliminado: la bitacora viva es este AGENTS.md.
+- Imports sin usar eliminados en `plataformas/twitter/session_validator.py`, `web/operaciones/monitor.py`, `migrar_a_supabase.py` y `verificar_cuentas_visual.py` (compileall + import OK). Se conservaron imports de side-effect (`import core.models  # noqa: F401`) y `from __future__ import annotations`.
+- **Higiene de git** (archivos conservados en disco, solo se destrackearon): `data/bin/chromedriver.exe` (binario ~19 MB), `data/proxies/brasil.txt`, `data/proxies/quemados.txt`, `data/proxy_base.txt` y `data/web_users.json` (credenciales/hashes). `.gitignore` ampliado con `data/proxies/`, `data/proxy_base.txt`, `data/web_users.json` y `data/avatar*/*.png`. ⚠ **El repo tiene remoto GitHub (`webi88/mwx-app`): esas credenciales siguen en el historial; si el repo fue publico/clonado, hay que ROTARLAS** (Smartproxy/Bright Data) y considerar reescribir el historial.
+- Verificado: compileall global OK, imports de motor/selenium/forward_proxy/proxies OK, suites 51/51 + 39/39 + 20/20 + 42/42, 0 procesos Chrome/chromedriver, BD y `.pkl` intactos.
+
 ### Pendiente
 - Probar `ia/contexto_noticias.generar_contexto_desde_links` con `OPENAI_API_KEY` real (hoy verificado con IA simulada; el fallback local ya funciona)
 - Reemplazar tokens placeholder en `.env` por claves reales (Telegram, Gemini, Grizzly)
-- Probar acciones Selenium en VPS (requiere Chrome; local sin Chrome)
+- Probar acciones Selenium en VPS (requiere Chrome; local ya probado con Chrome 153: cambio de sesion A→B→A en la misma pestana)
 - `web_users.json`: cambiar usuario/clave admin por defecto antes de exponer el dashboard
-- Redeploy en Railway para aplicar la capa API-first/`MAX_WORKERS` y probar velocidad real (objetivo ≥20 acciones/min con 8 trabajadores)
+- Redeploy en Railway para aplicar la pestana persistente (`MODO_PESTANA=1`) y medir la velocidad real de campana (objetivo ≥20 acciones/min con 3-4 navegadores y API por defecto OFF)

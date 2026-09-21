@@ -66,12 +66,15 @@ comentarios al MISMO tweet" (anti-spam) y un aviso cuando solo hay 1 URL ancla.
 
 Opciones de velocidad (ambas pestanas de activacion): el expander "⚙️ Opciones
 de velocidad" expone `TWITTER_SIN_PROXY`, `CHROME_SIN_IMAGENES`,
-`API_PRIMERO`/`RT_POR_API`, `MAX_WORKERS` (trabajadores en paralelo, default
-12) y `ACTIVACION_PERMITIR_PASSWORD` (login con password/TOTP en campanas,
-default OFF, lento). Los disyuntores de la API (`API_BREAKER_FALLOS`,
-`API_BREAKER_SEG`) no se editan en la UI: se documentan en un caption y se
-ajustan por env. En Railway NO conviene pasar de 3-4 "Navegadores
-simultaneos": si Chrome crashea, la campana se frena en cascada.
+`MODO_PESTANA`/`PESTANA_MAX_ACCIONES` (pestanas persistentes: 1 Chrome por
+worker que cambia la sesion de cada cuenta en la misma pestana; reciclado tras
+N acciones, default 40), `API_PRIMERO`/`RT_POR_API` (default OFF: X bloquea/
+limita la API con anti-bot 226 / limite diario 344), `MAX_WORKERS` (trabajadores
+en paralelo, default 12) y `ACTIVACION_PERMITIR_PASSWORD` (login con
+password/TOTP en campanas, default OFF, lento). Los disyuntores de la API
+(`API_BREAKER_FALLOS`, `API_BREAKER_SEG`) no se editan en la UI: se documentan
+en un caption y se ajustan por env. En Railway NO conviene pasar de 3-4
+"Navegadores simultaneos": si Chrome crashea, la campana se frena en cascada.
 """
 import os
 import threading
@@ -516,21 +519,32 @@ _VARS_VELOCIDAD = (
     "API_PRIMERO",
     "MAX_WORKERS",
     "ACTIVACION_PERMITIR_PASSWORD",
+    "MODO_PESTANA",
+    "PESTANA_MAX_ACCIONES",
 )
 
 
 def _aplicar_opciones_velocidad(sin_proxy: bool, sin_imagenes: bool,
                                 rt_api: bool, api_primero: bool = None,
                                 max_workers: int = 8,
-                                permitir_password: bool = False) -> dict:
+                                permitir_password: bool = False,
+                                modo_pestana: bool = True,
+                                pestana_max_acciones: int = 40) -> dict:
     """Escribe las env de velocidad y devuelve sus valores PREVIOS.
 
-    Convencion "1"/"0" para los interruptores; `MAX_WORKERS` se escribe como
-    entero. `RT_POR_API` y `API_PRIMERO` son el MISMO interruptor (alias/
-    compatibilidad): si cualquiera de los dos esta activo, ambos van a "1".
-    Si no se pasa `api_primero`, se usa el valor de `rt_api` (llamadas viejas).
+    Convencion "1"/"0" para los interruptores; `MAX_WORKERS` y
+    `PESTANA_MAX_ACCIONES` se escriben como enteros. `RT_POR_API` y
+    `API_PRIMERO` son el MISMO interruptor (alias/compatibilidad): si
+    cualquiera de los dos esta activo, ambos van a "1". Si no se pasa
+    `api_primero`, se usa el valor de `rt_api` (llamadas viejas).
     `permitir_password` (default False = OFF) controla
     `ACTIVACION_PERMITIR_PASSWORD`.
+
+    Pestañas persistentes: `modo_pestana` (default True = ON) controla
+    `MODO_PESTANA` ("1"/"0") y `pestana_max_acciones` (default 40; clamp
+    5..200) el reciclado de la pestaña tras N acciones
+    (`PESTANA_MAX_ACCIONES`). Los kwargs nuevos tienen defaults para no romper
+    llamadas viejas.
 
     Los valores previos (o `None` si la variable no existia) se devuelven para
     poder restaurarlos con `_restaurar_opciones_velocidad` al terminar la
@@ -544,6 +558,11 @@ def _aplicar_opciones_velocidad(sin_proxy: bool, sin_imagenes: bool,
         workers = str(int(max_workers))
     except (TypeError, ValueError):
         workers = "8"
+    try:
+        max_pestana = int(pestana_max_acciones)
+    except (TypeError, ValueError):
+        max_pestana = 40
+    max_pestana = min(200, max(5, max_pestana))
     valores = {
         "TWITTER_SIN_PROXY": "1" if sin_proxy else "0",
         "CHROME_SIN_IMAGENES": "1" if sin_imagenes else "0",
@@ -553,6 +572,8 @@ def _aplicar_opciones_velocidad(sin_proxy: bool, sin_imagenes: bool,
         "ACTIVACION_PERMITIR_PASSWORD": (
             "1" if permitir_password else "0"
         ),
+        "MODO_PESTANA": "1" if modo_pestana else "0",
+        "PESTANA_MAX_ACCIONES": str(max_pestana),
     }
     previos = {clave: os.environ.get(clave) for clave in _VARS_VELOCIDAD}
     for clave, valor in valores.items():
@@ -603,21 +624,26 @@ def _lanzar_con_opciones_velocidad(lanzar, motor, duracion_min: int,
                                    sin_proxy: bool, sin_imagenes: bool,
                                    rt_api: bool, api_primero: bool = None,
                                    max_workers: int = 8,
-                                   permitir_password: bool = False) -> dict:
+                                   permitir_password: bool = False,
+                                   modo_pestana: bool = True,
+                                   pestana_max_acciones: int = 40) -> dict:
     """`_lanzar_con_progreso_o_limpiar` aplicando y restaurando la velocidad.
 
     Las env (`TWITTER_SIN_PROXY`, `CHROME_SIN_IMAGENES`, `RT_POR_API`,
-    `API_PRIMERO`, `MAX_WORKERS` y `ACTIVACION_PERMITIR_PASSWORD`) se escriben
-    ANTES de lanzar (el motor las lee al abrir cada navegador/hacer cada
-    peticion) y se restauran a sus valores previos SIEMPRE al volver: exito,
-    guard de campana unica que devuelve `{}` o excepcion (el `finally` re-lanza
-    el error original tal cual). `api_primero=None` usa el valor de `rt_api`
-    (alias/compat).
+    `API_PRIMERO`, `MAX_WORKERS`, `ACTIVACION_PERMITIR_PASSWORD`,
+    `MODO_PESTANA` y `PESTANA_MAX_ACCIONES`) se escriben ANTES de lanzar (el
+    motor las lee al abrir cada navegador/hacer cada peticion) y se restauran a
+    sus valores previos SIEMPRE al volver: exito, guard de campana unica que
+    devuelve `{}` o excepcion (el `finally` re-lanza el error original tal
+    cual). `api_primero=None` usa el valor de `rt_api` (alias/compat).
+    `modo_pestana`/`pestana_max_acciones` tienen defaults retrocompatibles.
     """
     previos = _aplicar_opciones_velocidad(
         sin_proxy, sin_imagenes, rt_api,
         api_primero=api_primero, max_workers=max_workers,
         permitir_password=permitir_password,
+        modo_pestana=modo_pestana,
+        pestana_max_acciones=pestana_max_acciones,
     )
     try:
         return _lanzar_con_progreso_o_limpiar(
@@ -1160,15 +1186,43 @@ def _cita_masiva():
                 "datos."
             ),
         )
+        modo_pestana = st.checkbox(
+            "🪟 Modo pestaña persistente (reutiliza Chrome y cambia la cuenta "
+            "en la misma pestaña)",
+            value=True,
+            key="act_pestana",
+            help=(
+                "El motor abre un Chrome por worker y lo conserva toda la "
+                "campaña; cada cuenta cambia su sesión (cookies + UA + proxy) "
+                "en la misma pestaña, como la app de referencia (variable "
+                "MODO_PESTANA)."
+            ),
+        )
+        pestana_max_acciones = st.number_input(
+            "♻️ Reciclar pestaña cada N acciones",
+            min_value=5, max_value=200, value=40, step=5,
+            key="act_pestana_max",
+            help=(
+                "Al llegar al límite se cierra y se abre otra; sirve para no "
+                "acumular memoria/caché."
+            ),
+        )
+        st.caption(
+            "🪟 Con pestaña persistente se abre 1 Chrome por worker y se "
+            "conserva toda la campaña; cada cuenta cambia su sesión (cookies + "
+            "UA + proxy) en la misma pestaña, como la app de referencia. "
+            "Recomendado: 3-4 navegadores."
+        )
         rt_api = st.checkbox(
             "⚡ Publicar por API (RT, likes, posts, comentarios y citas)",
-            value=True,
+            value=False,
             key="act_rt_api",
             help=(
-                "Todas las acciones (RT, likes, posts, comentarios y citas) "
-                "se hacen por HTTP con las cookies de la cuenta (~1-3s vs "
-                "~20s con Chrome; variables API_PRIMERO/RT_POR_API). Si la "
-                "API falla, se reintenta automáticamente con Chrome."
+                "X está bloqueando/limitando la API (anti-bot 226 / límite "
+                "344) y puede marcar cuentas; con pestaña persistente Selenium "
+                "es rápido. Actívala solo si tu API responde estable "
+                "(variables API_PRIMERO/RT_POR_API). Si la API falla, se "
+                "reintenta automáticamente con Chrome."
             ),
         )
         permitir_password = st.checkbox(
@@ -1338,6 +1392,8 @@ def _cita_masiva():
             api_primero=bool(rt_api),
             max_workers=int(max_workers),
             permitir_password=bool(permitir_password),
+            modo_pestana=bool(modo_pestana),
+            pestana_max_acciones=int(pestana_max_acciones),
         )
 
         st.markdown("---")
@@ -1673,15 +1729,43 @@ def _por_roles():
                 "datos."
             ),
         )
+        modo_pestana = st.checkbox(
+            "🪟 Modo pestaña persistente (reutiliza Chrome y cambia la cuenta "
+            "en la misma pestaña)",
+            value=True,
+            key="act_roles_pestana",
+            help=(
+                "El motor abre un Chrome por worker y lo conserva toda la "
+                "campaña; cada cuenta cambia su sesión (cookies + UA + proxy) "
+                "en la misma pestaña, como la app de referencia (variable "
+                "MODO_PESTANA)."
+            ),
+        )
+        pestana_max_acciones = st.number_input(
+            "♻️ Reciclar pestaña cada N acciones",
+            min_value=5, max_value=200, value=40, step=5,
+            key="act_roles_pestana_max",
+            help=(
+                "Al llegar al límite se cierra y se abre otra; sirve para no "
+                "acumular memoria/caché."
+            ),
+        )
+        st.caption(
+            "🪟 Con pestaña persistente se abre 1 Chrome por worker y se "
+            "conserva toda la campaña; cada cuenta cambia su sesión (cookies + "
+            "UA + proxy) en la misma pestaña, como la app de referencia. "
+            "Recomendado: 3-4 navegadores."
+        )
         rt_api = st.checkbox(
             "⚡ Publicar por API (RT, likes, posts, comentarios y citas)",
-            value=True,
+            value=False,
             key="act_roles_rt_api",
             help=(
-                "Todas las acciones (RT, likes, posts, comentarios y citas) "
-                "se hacen por HTTP con las cookies de la cuenta (~1-3s vs "
-                "~20s con Chrome; variables API_PRIMERO/RT_POR_API). Si la "
-                "API falla, se reintenta automáticamente con Chrome."
+                "X está bloqueando/limitando la API (anti-bot 226 / límite "
+                "344) y puede marcar cuentas; con pestaña persistente Selenium "
+                "es rápido. Actívala solo si tu API responde estable "
+                "(variables API_PRIMERO/RT_POR_API). Si la API falla, se "
+                "reintenta automáticamente con Chrome."
             ),
         )
         permitir_password = st.checkbox(
@@ -1997,6 +2081,8 @@ def _por_roles():
             api_primero=bool(rt_api),
             max_workers=int(max_workers),
             permitir_password=bool(permitir_password),
+            modo_pestana=bool(modo_pestana),
+            pestana_max_acciones=int(pestana_max_acciones),
         )
         _mostrar_resultados_roles(resultados)
 

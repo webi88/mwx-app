@@ -10,6 +10,10 @@ data/perfiles_chrome/
 data/temp/
 data/logs/
 data/proxies.txt
+data/proxies/
+data/proxy_base.txt
+data/web_users.json
 data/bin/
+data/avatar*/*.png
 .DS_Store
 Thumbs.db

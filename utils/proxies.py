@@ -969,27 +969,54 @@ class ProxyManager:
 
         return ext_dir
 
-    def aplicar_a_options(self, options, proxy: str, tag: str = "perfil"):
+    def aplicar_a_options(self, options, proxy: str, tag: str = "perfil", dinamico: bool = False):
         """Aplica el proxy a un objeto ChromeOptions de undetected_chromedriver.
 
         Chrome 137+ ya no carga --load-extension ni acepta credenciales en
         --proxy-server, asi que se levanta un proxy local (127.0.0.1) que
         inyecta Proxy-Authorization y reenvia al proxy real.
 
+        Firma: `aplicar_a_options(self, options, proxy, tag="perfil", dinamico=False)`.
+
         DEVUELVE el `LocalForwardProxy` creado (o `None` si el proxy no
         requiere auth local / es invalido). El LLAMADOR es su dueno: debe
         guardarlo y cerrarlo al terminar el navegador (`fwd.close()`), porque
         NO se guarda en esta instancia (`self._fwd_proxy`): asi ningun bot
         cierra el proxy de otro por compartir un `ProxyManager`.
+
+        `dinamico=True` (pestaña persistente): si `proxy` viene vacio se crea
+        IGUAL un `LocalForwardProxy` en modo DIRECTO (sin upstream) y se
+        devuelve, para que el llamador pueda cambiar la IP de salida en
+        caliente con `cambiar_upstream()` al cambiar de cuenta. Con `proxy` no
+        vacio el comportamiento no cambia (credenciales => forward proxy;
+        sin credenciales => `--proxy-server=host:port` y devuelve None).
+        `dinamico=False` y `proxy` vacio => devuelve None, como siempre.
         """
         if not proxy:
-            return None
+            if not dinamico:
+                return None
+            fwd = LocalForwardProxy()  # modo directo (sin upstream)
+            puerto_local = fwd.start()
+            options.add_argument(f"--proxy-server=127.0.0.1:{puerto_local}")
+            logger.debug(f"Proxy local directo de {tag} en 127.0.0.1:{puerto_local}")
+            return fwd
 
         proxy = self._colapsar_repeticiones(proxy)
         info = self.analizar(proxy)
         if not info:
             logger.warning(f"Proxy invalido, no se aplicara: {proxy}")
-            return None
+            if not dinamico:
+                return None
+            # Dinamico: Chrome SIEMPRE debe salir por el forwarder local para
+            # poder cambiar de upstream despues; se arranca en modo directo.
+            fwd = LocalForwardProxy()
+            puerto_local = fwd.start()
+            options.add_argument(f"--proxy-server=127.0.0.1:{puerto_local}")
+            logger.debug(
+                f"Proxy local directo de {tag} en 127.0.0.1:{puerto_local} "
+                "(proxy pedido invalido)"
+            )
+            return fwd
 
         if info.get("user"):
             fwd = LocalForwardProxy(
