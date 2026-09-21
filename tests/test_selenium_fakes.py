@@ -1,6 +1,6 @@
 """Suite rapida de regresion de `plataformas/twitter/selenium_bot.py` (sin Chrome).
 
-Version permanente de los 38 checks P0-A/B/C/D y P1 de la sesion de arreglos
+Version permanente de los checks P0-A/B/C/D/E y P1 de la sesion de arreglos
 del pegado de texto en X. Usa FakeDriver/FakeElement para simular, sin red y
 sin Chrome, los casos reales de Railway:
 
@@ -15,6 +15,10 @@ sin Chrome, los casos reales de Railway:
   - `navegar_tolerante` / `_recuperar_interstitial`: hasta DOS refrescos para
     la pagina de error generica de X; NUNCA el refresh adicional para el
     challenge anti-bot (Cloudflare), login o driver roto.
+  - `login_con_cookies` (.pkl): un muro de login (URL `login`/`/i/flow`/
+    `account/access` o formulario VISIBLE) ya NO se declara "Login exitoso":
+    cae a `login_con_cookies_json()` y, si tampoco hay cookies validas,
+    devuelve False con error de sesion expirada y SIN marcar `cuenta_suspendida`.
 
 Uso:
     .venv/Scripts/python.exe tests/run_tests.py
@@ -26,10 +30,12 @@ Determinista: no depende del reloj real (las esperas se neutralizan y
 from __future__ import annotations
 
 import contextlib
+import json
 import sys
 import time
 import types
 from pathlib import Path
+from unittest import mock
 
 # La raiz del repo a sys.path (mismo patron que los scripts del proyecto).
 RAIZ = Path(__file__).resolve().parent.parent
@@ -182,6 +188,7 @@ class FakeDriver:
         self.script_calls = []
         self.get_calls = []
         self.refresh_calls = 0
+        self.cookies_added = []
         self.page_load_timeout = 60
         self.current_url = "https://x.com/home"
         self.title = "X"
@@ -197,12 +204,20 @@ class FakeDriver:
     def refresh(self):
         self.refresh_calls += 1
 
+    def add_cookie(self, cookie):
+        self.cookies_added.append(dict(cookie))
+
+    def get_cookies(self):
+        return [dict(cookie) for cookie in self.cookies_added]
+
     def execute_script(self, script, *args):
         self.js_calls.append((script, args))
         if any(isinstance(a, FakeElement) and a.stale for a in args):
             raise StaleElementReferenceException("stale en JS")
         if self.js_falla:
             raise RuntimeError("JS no disponible (test)")
+        if "document.readyState" in script:
+            return "complete"
         if "elementFromPoint" in script:
             el = args[0]
             return not el.occluded
@@ -294,6 +309,88 @@ def bot_con_driver(driver):
     bot._sesion_cdp = False
     bot.cuenta_suspendida = False
     return bot
+
+
+class CuentaFake:
+    """Cuenta minima para `login_con_cookies_json` (sin SQLAlchemy)."""
+
+    def __init__(self, cookies_json=None, auth_token="", password="", totp_secret=""):
+        self.cookies_json = cookies_json
+        self.auth_token = auth_token
+        self.password = password
+        self.totp_secret = totp_secret
+
+
+class SesionFake:
+    """Context manager minimo que imita `with get_db_session() as db`."""
+
+    def __init__(self, cuenta):
+        self.cuenta = cuenta
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+    def query(self, *args, **kwargs):
+        return self
+
+    def filter(self, *args, **kwargs):
+        return self
+
+    def first(self):
+        return self.cuenta
+
+
+@contextlib.contextmanager
+def _db_falsa(cuenta):
+    """Parchea `core.database.get_db_session` (el bot lo importa en caliente)."""
+    import core.database as core_database
+
+    original = core_database.get_db_session
+    core_database.get_db_session = lambda: SesionFake(cuenta)
+    try:
+        yield
+    finally:
+        core_database.get_db_session = original
+
+
+@contextlib.contextmanager
+def _pkl_falso(cookies):
+    """Simula un `.pkl` existente con `pickle.load` mockeado (sin disco)."""
+    with mock.patch("os.path.exists", return_value=True), mock.patch(
+        "builtins.open", mock.mock_open(read_data=b"pkl")
+    ), mock.patch(
+        "plataformas.twitter.selenium_bot.pickle.load", return_value=list(cookies)
+    ):
+        yield
+
+
+def preparar_bot_login(driver):
+    """Bot con la ruta del `.pkl` y los detectores de pagina mockeados.
+
+    Anti-bot/suspension se mockean a False para aislar el chequeo del muro de
+    login (su precedencia se cubre en el check del anti-bot).
+    """
+    bot = bot_con_driver(driver)
+    bot.base_url = "https://x.com"
+    bot.cookies_path = "data/cookies/twitter/cuenta_test.pkl"
+    bot.es_pagina_anti_bot = lambda: False
+    bot._detectar_cuenta_propia_suspendida = lambda: False
+    bot._hay_challenge_seguridad = lambda: False
+    return bot
+
+
+COOKIES_PKL = [
+    {"name": "auth_token", "value": "pkl_viejo", "domain": ".x.com", "path": "/"}
+]
+
+COOKIES_JSON_VALIDAS = [
+    {"name": "auth_token", "value": "bd_token", "domain": ".x.com", "path": "/"},
+    {"name": "ct0", "value": "bd_ct0", "domain": ".x.com", "path": "/"},
+    {"name": "twid", "value": "u=123", "domain": ".x.com", "path": "/"},
+]
 
 
 def fake_pyperclip(copias, lanzar=False, driver=None):
@@ -688,8 +785,140 @@ def test_recuperar_interstitial(check):
     )
 
 
+# --------------------------------------------------------------------------- #
+# P0-E: `login_con_cookies` (.pkl) NO declara exito si X pide login
+# --------------------------------------------------------------------------- #
+def test_login_pkl_muro_de_login(check):
+    print("P0-E: login_con_cookies (.pkl) detecta el muro de login y delega")
+
+    def _spy_delega(bot):
+        llamadas = []
+        bot.login_con_cookies_json = lambda: (llamadas.append(1), True)[1]
+        return llamadas
+
+    # (a1) .pkl presente y X redirige a /i/flow/login -> delega en cookies_json
+    driver = FakeDriver()
+    driver.current_url = "https://x.com/i/flow/login"
+    bot = preparar_bot_login(driver)
+    delegaciones = _spy_delega(bot)
+    with _pkl_falso(COOKIES_PKL):
+        resultado = bot.login_con_cookies()
+    check(
+        "pkl+login URL: no declara exito con el .pkl (delega)",
+        delegaciones == [1],
+        str(delegaciones),
+    )
+    check(
+        "pkl+login URL: devuelve el resultado del fallback",
+        resultado is True,
+        repr(resultado),
+    )
+
+    # (a2) URL sin "login" pero con formulario de login VISIBLE -> delega
+    driver = FakeDriver()
+    driver.current_url = "https://x.com/home"
+    driver.editores = [FakeElement(driver, contenteditable=False, visible=True)]
+    bot = preparar_bot_login(driver)
+    delegaciones = _spy_delega(bot)
+    with _pkl_falso(COOKIES_PKL):
+        resultado = bot.login_con_cookies()
+    check(
+        "pkl+form visible: no declara exito sin 'login' en la URL",
+        delegaciones == [1],
+        str(delegaciones),
+    )
+    check(
+        "pkl+form visible: devuelve el resultado del fallback",
+        resultado is True,
+        repr(resultado),
+    )
+
+    # (a3) integracion: cookies_json validas -> el fallback recupera la sesion
+    driver = FakeDriver()
+    driver.current_url = "https://x.com/i/flow/login"
+
+    def get_simulado(url):
+        driver.get_calls.append(url)
+        # X sirve la home como visitante (redirige a /i/flow/login) mientras el
+        # .pkl esta vencido; las rutas del fallback ya cargan autenticadas.
+        if url == "https://x.com":
+            driver.current_url = "https://x.com/i/flow/login"
+        else:
+            driver.current_url = url
+
+    driver.get = get_simulado
+    bot = preparar_bot_login(driver)
+    bot._brandear_cuenta = lambda cookies: None
+    cuenta = CuentaFake(cookies_json=json.dumps(COOKIES_JSON_VALIDAS))
+    with _db_falsa(cuenta), _pkl_falso(COOKIES_PKL):
+        resultado = bot.login_con_cookies()
+    check(
+        "pkl vencido + cookies_json validas: recupera la sesion (True)",
+        resultado is True,
+        repr(resultado),
+    )
+    check(
+        "pkl vencido + cookies_json validas: inyecta las cookies de la BD",
+        any(c.get("name") == "ct0" for c in driver.cookies_added),
+        str(driver.cookies_added),
+    )
+
+    # (b) .pkl presente y sin muro -> True sin tocar cookies_json
+    driver = FakeDriver()
+    driver.current_url = "https://x.com/home"
+    driver.editores = []
+    bot = preparar_bot_login(driver)
+    sin_llamadas = _spy_delega(bot)
+    with _pkl_falso(COOKIES_PKL):
+        resultado = bot.login_con_cookies()
+    check("pkl sin muro: devuelve True", resultado is True, repr(resultado))
+    check(
+        "pkl sin muro: NO llama a login_con_cookies_json",
+        sin_llamadas == [],
+        str(sin_llamadas),
+    )
+
+    # (c) .pkl vencido, sin cookies_json ni auth_token -> False y sin suspender
+    driver = FakeDriver()
+    driver.current_url = "https://x.com/i/flow/login"
+    bot = preparar_bot_login(driver)
+    bot._brandear_cuenta = lambda cookies: None
+    cuenta = CuentaFake(cookies_json=None, auth_token="", password="", totp_secret="")
+    with _db_falsa(cuenta), _pkl_falso(COOKIES_PKL):
+        resultado = bot.login_con_cookies()
+    error = (bot.ultimo_error or "").lower()
+    check("pkl vencido: devuelve False", resultado is False, repr(resultado))
+    check(
+        "pkl vencido: ultimo_error menciona sesion expirada/invalida",
+        any(frag in error for frag in ("expirad", "invalid", "inválid")),
+        bot.ultimo_error,
+    )
+    check(
+        "pkl vencido: NO marca la cuenta suspendida",
+        bot.cuenta_suspendida is False,
+    )
+
+    # (d) anti-bot tiene prioridad: NO delega y NO marca suspendida
+    driver = FakeDriver()
+    driver.current_url = "https://x.com/account/access?__cf_chl_rt_tk=x"
+    bot = preparar_bot_login(driver)
+    bot.es_pagina_anti_bot = lambda: True
+    delegaciones = _spy_delega(bot)
+    with _pkl_falso(COOKIES_PKL):
+        resultado = bot.login_con_cookies()
+    check(
+        "anti-bot primero: devuelve False sin delegar",
+        resultado is False and delegaciones == [],
+        str(delegaciones),
+    )
+    check(
+        "anti-bot primero: NO marca la cuenta suspendida",
+        bot.cuenta_suspendida is False,
+    )
+
+
 def run(check):
-    """Ejecuta los 38 checks con el `check` del runner (o del marco local)."""
+    """Ejecuta los checks de este archivo con el `check` del runner."""
     with _sin_esperas():
         test_cdp_wrapper(check)
         test_pyperclip_lanza_y_fallbacks(check)
@@ -700,6 +929,7 @@ def run(check):
         test_cita_prefiere_dialogo(check)
         test_navegar_tolerante_p1(check)
         test_recuperar_interstitial(check)
+        test_login_pkl_muro_de_login(check)
 
 
 if __name__ == "__main__":

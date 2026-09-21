@@ -42,6 +42,7 @@ if str(RAIZ) not in sys.path:
 from core.models import Cuenta, RegistroAccion, Tarea  # noqa: E402
 from core.perfiles import tiene_hashtag  # noqa: E402
 from scheduler import calentamiento  # noqa: E402
+from scheduler import ejecutor as ejecutor_mod  # noqa: E402
 from scheduler import manager as manager_mod  # noqa: E402
 
 _VARS = (
@@ -109,6 +110,9 @@ class _FakeQuery:
 
     def all(self):
         return list(self._filas)
+
+    def first(self):
+        return self._filas[0] if self._filas else None
 
 
 class _FakeDB:
@@ -219,6 +223,11 @@ def _manager(con_calentamiento=None, **valores_env):
 
 
 def _cuenta(id_, usuario, **cambios):
+    # `auth_token="tok_test"` por default: desde el fix de sesion real, un
+    # `cookies_path` SIN archivo en disco ya no cuenta como sesion, asi que el
+    # helper necesitaria que el .pkl exista para ser elegible. Los casos "sin
+    # sesion" se declaran explicitos con `auth_token=""` y `cookies_json=None`
+    # (ver `test_sesion_real` para el comportamiento nuevo del pkl).
     datos = dict(
         id=id_,
         usuario=usuario,
@@ -227,7 +236,7 @@ def _cuenta(id_, usuario, **cambios):
         status="imported",
         cookies_path=f"data/cookies/twitter/{usuario}.pkl",
         cookies_json=None,
-        auth_token="",
+        auth_token="tok_test",
         tipo_cuenta="",
         personalidad="",
         seccion="",
@@ -236,6 +245,42 @@ def _cuenta(id_, usuario, **cambios):
     )
     datos.update(cambios)
     return SimpleNamespace(**datos)
+
+
+class _FakeBot:
+    """Bot minimo para probar `_ejecutar_accion` sin Chrome ni red."""
+
+    def __init__(self, ok=True, ultimo_error="", suspendida=False):
+        self.ok = ok
+        self.ultimo_error = ultimo_error
+        self.cuenta_suspendida = suspendida
+        self.ultima_url_publicada = "https://x.com/u_accion/status/1"
+        self.cerrados = 0
+
+    def login_con_cookies(self):
+        return True
+
+    def publicar_tweet(self, contenido, imagen_path=None):
+        return self.ok
+
+    def cerrar(self):
+        self.cerrados += 1
+
+
+def _tarea(id_=None, **cambios):
+    """Tarea real (SQLAlchemy) con defaults utiles para el manager."""
+    datos = dict(
+        tipo="post",
+        plataforma="twitter",
+        contenido="texto programado #Comunidad",
+        cuentas_ids=json.dumps([1]),
+        estado="pendiente",
+        fecha_hora=datetime.now() - timedelta(minutes=1),
+    )
+    datos.update(cambios)
+    if id_ is not None:
+        datos["id"] = id_
+    return Tarea(**datos)
 
 
 def _texto_de_tarea(tarea) -> str:
@@ -437,6 +482,92 @@ def test_elegir_cuenta(check):
         check(
             "elegir: DB rota -> None sin lanzar",
             calentamiento.elegir_cuenta(_DBRota()) is None,
+        )
+
+
+# --------------------------------------------------------------------------- #
+# (c2) _tiene_sesion: sesion real (pkl en disco, token, cookies_json)
+# --------------------------------------------------------------------------- #
+def test_sesion_real(check):
+    print("(c2) _tiene_sesion: pkl inexistente vs existente, token y cookies_json")
+
+    # (a) pkl inexistente y sin token/json -> NO elegible (bug RedDelAvanza173:
+    # el calentamiento la elegia y gastaba la ventana en login password/TOTP).
+    with tempfile.TemporaryDirectory() as tmp:
+        fantasma = str(Path(tmp) / "no_existe.pkl")
+        with mock.patch.object(calentamiento, "resolver_ruta", lambda rel: fantasma):
+            cuenta_fantasma = _cuenta(
+                60,
+                "pkl_fantasma",
+                cookies_path="data/cookies/twitter/pkl_fantasma.pkl",
+                cookies_json=None,
+                auth_token="",
+            )
+            check(
+                "sesion: pkl inexistente sin token/json NO es sesion",
+                calentamiento._tiene_sesion(cuenta_fantasma) is False,
+                repr(calentamiento._tiene_sesion(cuenta_fantasma)),
+            )
+            db = _FakeDB(cuentas=[cuenta_fantasma])
+            check(
+                "elegir: pkl inexistente -> None (no gasta la ventana)",
+                calentamiento.elegir_cuenta(db) is None,
+            )
+
+        # (b) pkl existente en disco -> sesion valida y elegible.
+        real = Path(tmp) / "real.pkl"
+        real.write_bytes(b"cookies")
+        with mock.patch.object(calentamiento, "resolver_ruta", lambda rel: str(real)):
+            cuenta_real = _cuenta(
+                61,
+                "pkl_real",
+                cookies_path="data/cookies/twitter/real.pkl",
+                cookies_json=None,
+                auth_token="",
+            )
+            check(
+                "sesion: pkl existente en disco SI es sesion",
+                calentamiento._tiene_sesion(cuenta_real) is True,
+            )
+            elegida = calentamiento.elegir_cuenta(_FakeDB(cuentas=[cuenta_real]))
+            check(
+                "elegir: pkl existente -> elegible",
+                elegida is not None and elegida.usuario == "pkl_real",
+                getattr(elegida, "usuario", None),
+            )
+
+        # resolver_ruta que lanza -> False (nunca propaga).
+        with mock.patch.object(
+            calentamiento, "resolver_ruta", side_effect=RuntimeError("boom")
+        ):
+            check(
+                "sesion: resolver_ruta que lanza -> False sin lanzar",
+                calentamiento._tiene_sesion(cuenta_real) is False,
+            )
+
+    # (b2) cookies_json: contenido real vs vacios.
+    casos_json = (
+        (None, False, "None"),
+        ("", False, "cadena vacia"),
+        ("[]", False, "'[]'"),
+        ("{}", False, "'{}'"),
+        ([], False, "lista vacia"),
+        ({}, False, "dict vacio"),
+        ([{"name": "auth_token"}], True, "lista con cookies"),
+        ({"auth_token": "x"}, True, "dict con cookies"),
+    )
+    for valor, esperado, etiqueta in casos_json:
+        cuenta_json = _cuenta(
+            62,
+            f"json_{etiqueta}",
+            cookies_path="",
+            cookies_json=valor,
+            auth_token="",
+        )
+        check(
+            f"sesion: cookies_json {etiqueta} -> {esperado}",
+            calentamiento._tiene_sesion(cuenta_json) is esperado,
+            repr(valor),
         )
 
 
@@ -685,7 +816,17 @@ def test_programar_publicacion(check):
         )
 
         # Sin cuentas elegibles -> None sin lanzar.
-        db5 = _FakeDB(cuentas=[_cuenta(46, "sin_sesion", cookies_path="")])
+        db5 = _FakeDB(
+            cuentas=[
+                _cuenta(
+                    46,
+                    "sin_sesion",
+                    cookies_path="",
+                    cookies_json=None,
+                    auth_token="",
+                )
+            ]
+        )
         with _sesion_de(db5):
             ninguna = calentamiento.programar_publicacion()
         check(
@@ -958,6 +1099,12 @@ def test_verificar_tareas(check):
     db = _FakeDB(tareas=[tarea])
     with _manager() as (obj, sched):
         obj.ejecutor = mock.MagicMock()
+        # El ejecutor devuelve el contrato nuevo (exitos/fallidos/motivos).
+        obj.ejecutor.ejecutar_tarea.return_value = {
+            "exitos": 1,
+            "fallidos": 0,
+            "motivos": [],
+        }
         with _sesion_manager(db), mock.patch.object(
             calentamiento, "campana_activa", lambda: False
         ):
@@ -1048,16 +1195,381 @@ def test_verificar_tareas(check):
         )
 
 
+# --------------------------------------------------------------------------- #
+# (i) EjecutorTareas: reintentables, contrato de retorno, registro y cierre
+# --------------------------------------------------------------------------- #
+def test_reintentables(check):
+    print("(i) _es_error_reintentable: senales seguras vs prohibidas")
+
+    seguras = (
+        "compositor de X no cargo: el editor visible no aparecio",
+        "compositor no disponible (pagina de error de X)",
+        "something went wrong",
+        "no se pudo escribir el texto en el editor de X",
+        "boton Post deshabilitado (300 chars)",
+        "boton de retweet no encontrado",
+        "boton responder no encontrado",
+        "tab crashed",
+        "net::ERR_PROXY_CONNECTION_FAILED",
+        "cannot connect to chrome",
+        "can't start new thread",
+        "connection refused",
+    )
+    for motivo in seguras:
+        check(
+            f"reintentable SI: {motivo[:48]!r}",
+            ejecutor_mod._es_error_reintentable(motivo) is True,
+            repr(motivo),
+        )
+
+    prohibidas = (
+        "X no confirmo la publicacion",
+        "X no confirmó la publicación",
+        "X rechazo el post",
+        "X rechazó el post: Your account may not be allowed to perform this action",
+        "Your account may not be allowed to perform this action",
+        "sesión de X expirada: renueva cookies/login",
+        "login fallido: No se encontro el campo de contraseña",
+        "X pidió verificación anti-bot (Cloudflare)",
+        "el tweet ancla no permite respuestas",
+        "cuenta suspendida",
+    )
+    for motivo in prohibidas:
+        check(
+            f"reintentable NO: {motivo[:48]!r}",
+            ejecutor_mod._es_error_reintentable(motivo) is False,
+            repr(motivo),
+        )
+
+    check(
+        "reintentable: None/vacio no son reintentables",
+        ejecutor_mod._es_error_reintentable(None) is False
+        and ejecutor_mod._es_error_reintentable("") is False,
+    )
+
+
+def test_ejecutor(check):
+    print("(i2) EjecutorTareas: contrato de retorno, motivos, registro y cierre")
+
+    # ejecutar_tarea: agrega los motivos de cada cuenta fallida.
+    ejecutor = ejecutor_mod.EjecutorTareas()
+    tarea = _tarea(cuentas_ids=json.dumps([1, 2]))
+    db = _FakeDB(cuentas=[_cuenta(1, "u_ok"), _cuenta(2, "u_falla")])
+    with mock.patch.object(
+        ejecutor_mod, "get_db_session", lambda: _sesion_falsa(db)
+    ), mock.patch.object(
+        ejecutor,
+        "_ejecutar_accion",
+        side_effect=[
+            (True, ""),
+            (False, "compositor de X no cargo: el editor visible no aparecio"),
+        ],
+    ), _sin_sleep():
+        resultado = ejecutor.ejecutar_tarea(tarea)
+    check(
+        "ejecutor: devuelve exitos/fallidos/motivos",
+        resultado
+        == {
+            "exitos": 1,
+            "fallidos": 1,
+            "motivos": ["compositor de X no cargo: el editor visible no aparecio"],
+        },
+        repr(resultado),
+    )
+
+    # Sin cuentas: contrato completo con motivos vacio.
+    vacia = ejecutor_mod.EjecutorTareas().ejecutar_tarea(_tarea(cuentas_ids="[]"))
+    check(
+        "ejecutor: tarea sin cuentas -> 0/0 con motivos=[]",
+        vacia == {"exitos": 0, "fallidos": 0, "motivos": []},
+        repr(vacia),
+    )
+
+    # Cuenta inactiva/inexistente: fallida con motivo.
+    db_inactiva = _FakeDB(cuentas=[_cuenta(5, "u_off", activa=False)])
+    with mock.patch.object(
+        ejecutor_mod, "get_db_session", lambda: _sesion_falsa(db_inactiva)
+    ), _sin_sleep():
+        resultado = ejecutor_mod.EjecutorTareas().ejecutar_tarea(
+            _tarea(cuentas_ids=json.dumps([5]))
+        )
+    check(
+        "ejecutor: cuenta inactiva -> fallido con motivo",
+        resultado["fallidos"] == 1 and "inactiva" in resultado["motivos"][0],
+        repr(resultado),
+    )
+
+    # _ejecutar_accion exito: registra 'exito' con URL y cierra UNA vez.
+    bot_ok = _FakeBot(ok=True)
+    with mock.patch(
+        "plataformas.base.PlataformaFactory.crear_bot", return_value=bot_ok
+    ), mock.patch.object(ejecutor_mod, "registrar_accion") as registrar, _sin_sleep():
+        ok, motivo = ejecutor_mod.EjecutorTareas()._ejecutar_accion(
+            _tarea(), _cuenta(80, "u_accion")
+        )
+    check(
+        "accion: exito -> (True, '')",
+        ok is True and motivo == "",
+        f"ok={ok!r} motivo={motivo!r}",
+    )
+    check(
+        "accion: exito registra 'exito' con la URL publicada",
+        registrar.call_count == 1
+        and registrar.call_args.args[0] == "u_accion"
+        and registrar.call_args.args[1] == "post"
+        and registrar.call_args.args[2] == "exito"
+        and registrar.call_args.args[3] == "https://x.com/u_accion/status/1",
+        repr(registrar.call_args),
+    )
+    check("accion: exito cierra el bot", bot_ok.cerrados == 1, repr(bot_ok.cerrados))
+
+    # _ejecutar_accion fallo: motivo de bot.ultimo_error y registro 'fallido'.
+    bot_fallo = _FakeBot(
+        ok=False, ultimo_error="compositor de X no cargo: el editor visible no aparecio"
+    )
+    with mock.patch(
+        "plataformas.base.PlataformaFactory.crear_bot", return_value=bot_fallo
+    ), mock.patch.object(ejecutor_mod, "registrar_accion") as registrar2, _sin_sleep():
+        ok, motivo = ejecutor_mod.EjecutorTareas()._ejecutar_accion(
+            _tarea(), _cuenta(81, "u_falla")
+        )
+    check(
+        "accion: fallo -> (False, motivo real de bot.ultimo_error)",
+        ok is False and "compositor de X no cargo" in motivo,
+        f"ok={ok!r} motivo={motivo!r}",
+    )
+    check(
+        "accion: fallo registra 'fallido' con el motivo",
+        registrar2.call_count == 1
+        and registrar2.call_args.args[2] == "fallido"
+        and "compositor de X no cargo" in registrar2.call_args.args[4],
+        repr(registrar2.call_args),
+    )
+    check("accion: fallo tambien cierra el bot", bot_fallo.cerrados == 1)
+
+    # Excepcion durante la accion: el bot se cierra igual (sin Chrome huerfano).
+    class _BotExplosivo(_FakeBot):
+        def publicar_tweet(self, contenido, imagen_path=None):
+            raise RuntimeError("renderer crashed")
+
+    bot_explosivo = _BotExplosivo()
+    with mock.patch(
+        "plataformas.base.PlataformaFactory.crear_bot", return_value=bot_explosivo
+    ), mock.patch.object(ejecutor_mod, "registrar_accion") as registrar3, _sin_sleep():
+        ok, motivo = ejecutor_mod.EjecutorTareas()._ejecutar_accion(
+            _tarea(), _cuenta(82, "u_explota")
+        )
+    check(
+        "accion: excepcion -> (False, 'RuntimeError: renderer crashed')",
+        ok is False and motivo == "RuntimeError: renderer crashed",
+        f"ok={ok!r} motivo={motivo!r}",
+    )
+    check(
+        "accion: excepcion registra 'fallido' y cierra el bot",
+        registrar3.call_count == 1
+        and registrar3.call_args.args[2] == "fallido"
+        and bot_explosivo.cerrados == 1,
+        f"calls={registrar3.call_count} cerrados={bot_explosivo.cerrados}",
+    )
+
+    # Login fallido: motivo con 'login fallido' + registro y cierre.
+    bot_login = _FakeBot(ok=False)
+    bot_login.login_con_cookies = lambda: False
+    bot_login.ultimo_error = "No se encontro el campo de contraseña"
+    with mock.patch(
+        "plataformas.base.PlataformaFactory.crear_bot", return_value=bot_login
+    ), mock.patch.object(ejecutor_mod, "registrar_accion") as registrar4, _sin_sleep():
+        ok, motivo = ejecutor_mod.EjecutorTareas()._ejecutar_accion(
+            _tarea(), _cuenta(83, "u_login")
+        )
+    check(
+        "accion: login fallido -> motivo con 'login fallido' (NO reintentable)",
+        ok is False
+        and "login fallido" in motivo
+        and ejecutor_mod._es_error_reintentable(motivo) is False,
+        repr(motivo),
+    )
+    check(
+        "accion: login fallido registra y cierra el bot",
+        registrar4.call_count == 1 and bot_login.cerrados == 1,
+        f"calls={registrar4.call_count} cerrados={bot_login.cerrados}",
+    )
+
+
+# --------------------------------------------------------------------------- #
+# (i3) _verificar_tareas: reintento transitorio con tope 2, sin duplicar
+# --------------------------------------------------------------------------- #
+def test_manager_reintentos(check):
+    print("(i3) _verificar_tareas: reintento transitorio, tope 2 y nunca duro")
+
+    def _correr(tarea, resultado_fake):
+        db = _FakeDB(tareas=[tarea])
+        with _manager() as (obj, sched):
+            obj.ejecutor = mock.MagicMock()
+            obj.ejecutor.ejecutar_tarea.return_value = resultado_fake
+            with _sesion_manager(db), mock.patch.object(
+                calentamiento, "campana_activa", lambda: False
+            ):
+                obj._verificar_tareas()
+        return tarea
+
+    # (c) motivo transitorio -> se reprograma con intentos=1 y +10 min.
+    tarea = _tarea()
+    ahora = datetime.now()
+    _correr(
+        tarea,
+        {
+            "exitos": 0,
+            "fallidos": 1,
+            "motivos": [
+                "compositor de X no cargo: el editor visible no aparecio"
+            ],
+        },
+    )
+    check(
+        "manager: fallo transitorio -> sigue 'pendiente' (se reintenta)",
+        tarea.estado == "pendiente",
+        repr(tarea.estado),
+    )
+    check(
+        "manager: persiste opciones['intentos'] = 1",
+        (tarea.opciones or {}).get("intentos") == 1,
+        repr(tarea.opciones),
+    )
+    check(
+        "manager: resultado = 'reintento 1/2: <motivo>'",
+        (tarea.resultado or "").startswith("reintento 1/2:")
+        and "compositor de X no cargo" in (tarea.resultado or ""),
+        repr(tarea.resultado),
+    )
+    check(
+        "manager: fecha_hora reprogramada ~+10 min",
+        timedelta(minutes=9, seconds=30)
+        <= (tarea.fecha_hora - ahora)
+        <= timedelta(minutes=10, seconds=30),
+        repr(tarea.fecha_hora),
+    )
+
+    # Segundo fallo transitorio: intentos=2 y todavia se reprograma.
+    _correr(
+        tarea,
+        {"exitos": 0, "fallidos": 1, "motivos": ["compositor de X no cargo"]},
+    )
+    check(
+        "manager: segundo fallo transitorio -> intentos=2 y 'reintento 2/2'",
+        tarea.estado == "pendiente"
+        and (tarea.opciones or {}).get("intentos") == 2
+        and (tarea.resultado or "").startswith("reintento 2/2:"),
+        f"estado={tarea.estado!r} opciones={tarea.opciones!r} resultado={tarea.resultado!r}",
+    )
+
+    # Tercer fallo: tope alcanzado -> 'fallida' con el detalle persistido.
+    _correr(
+        tarea,
+        {"exitos": 0, "fallidos": 1, "motivos": ["compositor de X no cargo"]},
+    )
+    check(
+        "manager: tercer fallo (intentos=2) -> 'fallida' sin reintentar",
+        tarea.estado == "fallida" and (tarea.opciones or {}).get("intentos") == 2,
+        f"estado={tarea.estado!r} opciones={tarea.opciones!r}",
+    )
+    check(
+        "manager: resultado final '0 exitos, 1 fallidos | motivo'",
+        (tarea.resultado or "").startswith("0 exitos, 1 fallidos")
+        and "compositor de X no cargo" in (tarea.resultado or ""),
+        repr(tarea.resultado),
+    )
+
+    # (d) motivos que NUNCA se reintentan.
+    no_reintentables = (
+        "sesión de X expirada: renueva cookies/login",
+        "X rechazó el post: Your account may not be allowed to perform this action",
+        "login fallido: No se encontro el campo de contraseña",
+        "X pidió verificación anti-bot (Cloudflare); sesión no confirmada",
+        "el tweet ancla no permite respuestas",
+    )
+    for motivo in no_reintentables:
+        tarea_nr = _tarea()
+        _correr(tarea_nr, {"exitos": 0, "fallidos": 1, "motivos": [motivo]})
+        check(
+            f"manager: NO reintenta {motivo[:40]!r}",
+            tarea_nr.estado == "fallida"
+            and (tarea_nr.opciones or {}).get("intentos") in (None, 0),
+            f"estado={tarea_nr.estado!r} opciones={tarea_nr.opciones!r}",
+        )
+
+    # Motivos mezclados: uno reintentable y otro no -> NO se reintenta.
+    tarea_mix = _tarea()
+    _correr(
+        tarea_mix,
+        {
+            "exitos": 0,
+            "fallidos": 2,
+            "motivos": ["compositor de X no cargo", "sesión de X expirada"],
+        },
+    )
+    check(
+        "manager: motivos mezclados (uno no reintentable) -> NO reintenta",
+        tarea_mix.estado == "fallida",
+        repr(tarea_mix.estado),
+    )
+
+    # (e) fallida con 0 exitos y completada con >=1 exito (guardando resultado).
+    tarea_f = _tarea()
+    _correr(tarea_f, {"exitos": 0, "fallidos": 1, "motivos": ["sin detalle"]})
+    check(
+        "manager: 0 exitos sin motivo reintentable -> 'fallida'",
+        tarea_f.estado == "fallida"
+        and (tarea_f.resultado or "").startswith("0 exitos, 1 fallidos"),
+        f"estado={tarea_f.estado!r} resultado={tarea_f.resultado!r}",
+    )
+
+    tarea_c = _tarea()
+    _correr(tarea_c, {"exitos": 1, "fallidos": 0, "motivos": []})
+    check(
+        "manager: >=1 exito -> 'completada' con resultado",
+        tarea_c.estado == "completada"
+        and (tarea_c.resultado or "").startswith("1 exitos, 0 fallidos"),
+        f"estado={tarea_c.estado!r} resultado={tarea_c.resultado!r}",
+    )
+
+    # Exito parcial con fallo reintentable -> 'completada' (nunca reintenta una
+    # tarea que ya publico en otra cuenta: duplicaria el contenido).
+    tarea_p = _tarea(cuentas_ids=json.dumps([1, 2]))
+    _correr(
+        tarea_p,
+        {"exitos": 1, "fallidos": 1, "motivos": ["compositor de X no cargo"]},
+    )
+    check(
+        "manager: exito parcial -> 'completada' (nunca duplica)",
+        tarea_p.estado == "completada",
+        repr(tarea_p.estado),
+    )
+
+    # Ejecutor legado sin 'motivos' -> fallida (no se inventa un reintento).
+    tarea_le = _tarea()
+    _correr(tarea_le, {"exitos": 0, "fallidos": 1})
+    check(
+        "manager: ejecutor sin 'motivos' -> 'fallida' sin reintento",
+        tarea_le.estado == "fallida",
+        repr(tarea_le.estado),
+    )
+
+
 def run(check):
     """Ejecuta los checks con el `check` del runner (o del marco local)."""
     test_config(check)
     test_campana_activa(check)
     test_elegir_cuenta(check)
+    test_sesion_real(check)
     test_generar_texto(check)
     test_programar_publicacion(check)
     test_ejecutar_tanda(check)
     test_manager_gate(check)
     test_verificar_tareas(check)
+    test_reintentables(check)
+    test_ejecutor(check)
+    test_manager_reintentos(check)
 
 
 if __name__ == "__main__":

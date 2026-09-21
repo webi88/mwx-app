@@ -722,15 +722,41 @@ class TwitterBot:
                 )
                 return False
 
-            if "login" in self.driver.current_url.lower():
+            # FALSO "Login exitoso" arreglado (log real de Railway
+            # 2026-09-21): un .pkl vencido puede servir la home como visitante
+            # SIN "login" en la URL; X recien pide login al abrir
+            # `/compose/post` y se perdian hasta 38s de compositor. Ahora se
+            # usa `_hay_muro_login()`, que ademas de la URL detecta los
+            # formularios VISIBLES de login (username, loginButton,
+            # ocfEnterTextTextInput, password).
+            if self._hay_muro_login():
                 logger.warning(
-                    f"Sesion .pkl expirada para {self.usuario}; "
+                    f"Sesion .pkl invalida para {self.usuario}; "
                     "probando cookies completas de la BD (cookies_json)"
                 )
                 # El .pkl puede estar vencido o tener solo auth_token: antes de
                 # rendirse usa TODAS las cookies de la BD (auth_token, ct0,
                 # twid, ...) reutilizando el driver ya abierto.
-                return self.login_con_cookies_json()
+                if self.login_con_cookies_json():
+                    return True
+                # Sin cookies validas: deja un error de sesion expirada. Si el
+                # fallback ya explico otra causa (anti-bot, suspendida o el
+                # propio auth_token) ese mensaje se conserva.
+                error = (self.ultimo_error or "").lower()
+                if not any(
+                    frag in error
+                    for frag in (
+                        "expirad",
+                        "invalid",
+                        "inválid",
+                        "anti-bot",
+                        "suspend",
+                    )
+                ):
+                    self.ultimo_error = "sesión expirada (.pkl inválido): " + (
+                        self.ultimo_error or "sin cookies_json ni auth_token"
+                    )
+                return False
 
             logger.info(f"Login exitoso para {self.usuario}")
             return True

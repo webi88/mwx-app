@@ -3,7 +3,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 from core.database import get_db_session
 from core.models import Tarea
 from scheduler import calentamiento
-from scheduler.ejecutor import EjecutorTareas
+from scheduler.ejecutor import EjecutorTareas, _es_error_reintentable
 from loguru import logger
 
 
@@ -81,7 +81,7 @@ class SchedulerManager:
                 )
                 return
 
-            from datetime import datetime
+            from datetime import datetime, timedelta
             
             with get_db_session() as db:
                 tareas_pendientes = db.query(Tarea).filter(
@@ -94,9 +94,45 @@ class SchedulerManager:
                         tarea.estado = "ejecutando"
                         db.commit()
                         
-                        self.ejecutor.ejecutar_tarea(tarea)
+                        resultado = self.ejecutor.ejecutar_tarea(tarea)
+                        exitos, fallidos, motivos = self._leer_resultado(resultado)
                         
-                        tarea.estado = "completada"
+                        opciones = getattr(tarea, "opciones", None)
+                        if not isinstance(opciones, dict):
+                            opciones = {}
+                        try:
+                            intentos = int(opciones.get("intentos", 0) or 0)
+                        except (TypeError, ValueError):
+                            intentos = 0
+                        
+                        # Fallo SEGURO (nada se publico): reprogramar la MISMA
+                        # tarea, maximo 2 reintentos, con un motivo persistido
+                        # en `resultado` para poder auditar por que se repitio.
+                        if (
+                            exitos == 0
+                            and fallidos > 0
+                            and motivos
+                            and all(_es_error_reintentable(m) for m in motivos)
+                            and intentos < 2
+                        ):
+                            tarea.estado = "pendiente"
+                            tarea.fecha_hora = datetime.now() + timedelta(minutes=10)
+                            tarea.opciones = {**opciones, "intentos": intentos + 1}
+                            tarea.resultado = (
+                                f"reintento {intentos + 1}/2: {motivos[0][:180]}"
+                            )
+                            db.commit()
+                            logger.info(
+                                f"Tarea {tarea.id}: fallo reintentable, se reprograma "
+                                f"(intento {intentos + 1}/2, {tarea.fecha_hora})"
+                            )
+                            continue
+                        
+                        tarea.estado = "completada" if exitos > 0 else "fallida"
+                        detalle = f"{exitos} exitos, {fallidos} fallidos"
+                        if motivos:
+                            detalle += " | " + " | ".join(motivos[:3])
+                        tarea.resultado = detalle[:300]
                         db.commit()
                     
                     except Exception as e:
@@ -107,6 +143,27 @@ class SchedulerManager:
         
         except Exception as e:
             logger.error(f"Error en _verificar_tareas: {e}")
+
+    @staticmethod
+    def _leer_resultado(resultado) -> tuple:
+        """Normaliza el dict del ejecutor a `(exitos, fallidos, motivos)`.
+
+        Tolera ejecutores viejos (sin "motivos") y resultados raros/
+        no-dict (tests con fakes): en esos casos devuelve 0/0/[] sin lanzar.
+        """
+        try:
+            datos = resultado if isinstance(resultado, dict) else {}
+            exitos = int(datos.get("exitos", 0) or 0)
+            fallidos = int(datos.get("fallidos", 0) or 0)
+            crudos = datos.get("motivos") or []
+            if isinstance(crudos, (list, tuple)):
+                motivos = [str(m).strip() for m in crudos if str(m or "").strip()]
+            else:
+                texto = str(crudos).strip()
+                motivos = [texto] if texto else []
+            return exitos, fallidos, motivos
+        except Exception:  # noqa: BLE001
+            return 0, 0, []
     
     def programar_tarea(self, tarea: Tarea) -> bool:
         try:

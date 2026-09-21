@@ -175,11 +175,57 @@ def _usuarios_con_registro_reciente(db, gap_horas) -> set:
     return usuarios
 
 
+def _cookies_json_con_contenido(cookies_json) -> bool:
+    """True si `cookies_json` trae cookies reales (no None/""/[]/{}).
+
+    `cookies_json` puede llegar como lista/dict (columna JSON de SQLAlchemy) o
+    como cadena JSON cruda. Nunca lanza.
+    """
+    try:
+        if cookies_json is None:
+            return False
+        if isinstance(cookies_json, str):
+            crudo = cookies_json.strip()
+            if not crudo or crudo.lower() in ("[]", "{}", "null", "none"):
+                return False
+            try:
+                return bool(json.loads(crudo))
+            except (TypeError, ValueError):
+                # Cadena no-JSON con contenido: se asume que algo trae.
+                return True
+        return bool(cookies_json)
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _tiene_sesion(cuenta) -> bool:
-    """True si la cuenta tiene cookies (path/JSON) o `auth_token`."""
-    cookies_path = str(getattr(cuenta, "cookies_path", "") or "").strip()
-    auth_token = str(getattr(cuenta, "auth_token", "") or "").strip()
-    return bool(cookies_path or auth_token or getattr(cuenta, "cookies_json", None))
+    """True si la cuenta tiene una sesion REALMENTE utilizable.
+
+    Criterios (en orden):
+      1. `auth_token` no vacio;
+      2. `cookies_json` con contenido (distinto de None/""/[]/{});
+      3. `cookies_path` no vacio Y el archivo existe de verdad en disco
+         (`os.path.isfile(resolver_ruta(cookies_path))`).
+
+    Antes bastaba con que `cookies_path` no estuviera vacio: se elegian
+    cuentas con el `.pkl` borrado (p.ej. RedDelAvanza173) y la ventana se
+    gastaba en `login_con_password`/TOTP hasta terminar en "Login fallido".
+    Nunca lanza: cualquier error -> False.
+    """
+    try:
+        auth_token = str(getattr(cuenta, "auth_token", "") or "").strip()
+        if auth_token:
+            return True
+
+        if _cookies_json_con_contenido(getattr(cuenta, "cookies_json", None)):
+            return True
+
+        cookies_path = str(getattr(cuenta, "cookies_path", "") or "").strip()
+        if not cookies_path:
+            return False
+        return os.path.isfile(resolver_ruta(cookies_path))
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def _es_elegible(cuenta, recientes: set, excluidos: set) -> bool:
@@ -208,11 +254,11 @@ def _es_elegible(cuenta, recientes: set, excluidos: set) -> bool:
 def elegir_cuenta(db, gap_horas=None, excluir_ids=None):
     """Devuelve una cuenta al azar apta para calentar (o None).
 
-    Aptas: `activa=True`, `plataforma="twitter"`, con sesion (`cookies_path`,
-    `cookies_json` o `auth_token`), `status != "suspended"` y SIN
-    `RegistroAccion` en las ultimas `gap_horas` (default: config). Las cuentas
-    de `excluir_ids` (p.ej. con una tarea de post pendiente) se omiten.
-    Nunca lanza.
+    Aptas: `activa=True`, `plataforma="twitter"`, con sesion real
+    (`auth_token`, `cookies_json` con contenido o `cookies_path` cuyo archivo
+    existe), `status != "suspended"` y SIN `RegistroAccion` en las ultimas
+    `gap_horas` (default: config). Las cuentas de `excluir_ids` (p.ej. con una
+    tarea de post pendiente) se omiten. Nunca lanza.
     """
     try:
         if gap_horas is None:
