@@ -877,6 +877,15 @@ python -m bot.main
 - `data/proxies/` esta en `.gitignore` (no viaja en la imagen) y el `RUN` del seed hacia `cp -r /app/data/proxies /app/seed/proxies` SIN fallback -> `cp: cannot stat '/app/data/proxies': No such file or directory` al hacer `railway up`. Ahora la linea lleva `2>/dev/null || true` como el resto de la cadena (linea 44), sin romper la concatenacion con `&&` de las lineas siguientes.
 - Verificado con simulacion bash del `RUN` con `data/proxies` ausente: la version vieja sale con exit 1; la nueva sale 0 y `proxy_base.txt` / `web_users.json` / `config/` se siguen copiando al seed.
 
+### Formato vendedor de 7 campos (ct0 + auth_token) en el importador (2026-09-21)
+- **Problema**: el vendedor entrega `usuario:password:totp:email:email_pass:ct0:auth_token`. El importador mapeaba el índice 5 a `auth_token` y trataba el índice 6 como cookies base64 -> `utf-8 codec can't decode byte` y línea rechazada.
+- `cuentas/importador.py`:
+  - `_parsear_linea_impl`: con exactamente 7 campos y 7º campo PLANO (`^[A-Za-z0-9]+$`, sin corchetes/llaves/espacios/`+`/`/`/`=`) que NO decodifica como cookies, aplica el formato vendedor: `auth_token` = 7º campo y `cookies` manual = `[{"name":"ct0","value":<6º>,"domain":".x.com","path":"/"},{"name":"auth_token","value":<7º>,"domain":".x.com","path":"/"}]` (si el ct0 viene vacío se omite solo esa entrada). El formato clásico (base64/JSON) tiene prioridad y se sondea primero.
+  - `decodificar_cookies(..., silencioso=False)` (retrocompatible; la UI sigue llamándola igual) para que las líneas vendedoras válidas no ensucien el log con warnings de base64/UTF-8.
+  - La extracción previa de JSON/UA quedó intacta y el contrato de claves de `parsear_linea` no cambió.
+- `tests/test_importador.py`: 85 -> 122 checks (vendedor típico, +UA posicional, +`ua=`, desambiguación con base64 clásico, 7º no plano -> None, ct0 vacío, persistencia en `importar_una`).
+- Verificado: compileall + imports OK; `tests/run_tests.py` **455/455**; lote REAL del vendedor (25 líneas) verificado por el coordinador con script temporal fuera del repo: **25/25** con `auth_token` = campo 7, cookies `[ct0, auth_token]` exactas y 0 warnings; 0 credenciales reales en el repo (grep).
+
 ### Pendiente
 - **Redeploy en Railway** para aplicar los fixes del scheduler/calentamiento (reintentos seguros, filtro de sesion real, login .pkl) y el cambio masivo de nombres con IA; probar el lote de nombres con 5-10 cuentas antes de escalar (el @ solo cambia si la cuenta tiene contraseña)
 - **Commit + push** de todos los cambios (incluye `Dockerfile` con xclip/xsel: Railway necesita REBUILD, no solo redeploy) y fijar en el panel de Railway: `MAX_BROWSERS=2`, `MAX_WORKERS=12`, `CHROME_SIN_IMAGENES=true`, `API_PRIMERO=0`/`RT_POR_API=0`, `MODO_PESTANA=1`, `PESTANA_MAX_ACCIONES=40`
@@ -886,4 +895,4 @@ python -m bot.main
 - Probar `ia/contexto_noticias.generar_contexto_desde_links` con `OPENAI_API_KEY` real (hoy verificado con IA simulada; el fallback local ya funciona)
 - Reemplazar tokens placeholder en `.env` por claves reales (Telegram, Gemini, Grizzly)
 - Probar acciones Selenium en VPS (requiere Chrome; local ya probado con Chrome 153: cambio de sesion A→B→A en la misma pestana)
-- Probar un lote real de cuentas "Aged" (JSON de cookies + UA en la misma linea) desde Cuentas -> Importar; el formato aceptado quedo documentado en el docstring de `cuentas/importador.py`
+- Importar el lote vendedor real de 25 cuentas (formato `...:ct0:auth_token`, parseo ya verificado 25/25) desde Cuentas -> Importar y asignarle seccion/tipo; el formato aceptado quedo documentado en el docstring de `cuentas/importador.py` (el importador de JSON+UA "Aged" ya quedo probado con sinteticos)

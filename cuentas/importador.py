@@ -11,6 +11,14 @@ Formato de cada línea (campos separados por `:`):
   con la LISTA de cookies nativas de X (objetos con claves `name`, `value`,
   `domain`, `path`, `secure`, etc.). Si el 7º campo empieza con `Mozilla/` es
   en realidad el User-Agent con las cookies vacías.
+* Formato vendedor de 7 campos
+  (`usuario:password:totp:email:email_pass:ct0:auth_token`): cuando el 7º campo
+  NO decodifica como cookies (ni base64 ni JSON) pero es un token plano (solo
+  letras/números, p. ej. el `auth_token` hexadecimal), el 6º campo es la cookie
+  `ct0` y el 7º el `auth_token`; las cookies se construyen manualmente con esas
+  dos entradas (`.x.com`, `/`). El formato clásico de cookies SIEMPRE tiene
+  prioridad: si el 7º campo decodifica, se usa como cookies y el `auth_token`
+  sigue saliendo del 6º campo.
 * 8 campos: el 7º son las `cookies` y el 8º (último) el `user_agent`, que se
   guarda tal cual para que Chrome use el mismo agente que cuando se creó.
 * El User-Agent también puede venir con clave `user_agent=`, `useragent=` o
@@ -30,6 +38,7 @@ directamente a la base de datos.
 import base64
 import binascii
 import json
+import re
 from datetime import datetime
 from typing import Optional
 
@@ -84,7 +93,7 @@ def _extraer_lista_cookies(datos) -> Optional[list]:
     return cookies
 
 
-def decodificar_cookies(valor: str) -> Optional[list]:
+def decodificar_cookies(valor: str, silencioso: bool = False) -> Optional[list]:
     """Convierte el campo de cookies a una lista de cookies (JSON).
 
     Acepta:
@@ -94,19 +103,28 @@ def decodificar_cookies(valor: str) -> Optional[list]:
     * Base64 (comportamiento original): se decodifica y el JSON resultante
       debe ser una lista (o un objeto `{"cookies": [...]}`).
 
+    `silencioso=True` suprime los `logger.warning` internos: se usa para
+    SONDEAR campos que pueden ser válidos por otra vía (p. ej. un `auth_token`
+    plano del formato vendedor) sin ensuciar el log. El valor por defecto
+    (`False`) mantiene intacto el comportamiento público.
+
     Devuelve la lista de cookies tal como viene (SIN normalizar; la
     normalización para Selenium vive en `utils/anti_detection.py`) o `None`
     si el JSON/base64 es inválido. Nunca lanza excepciones: es tolerante con
     padding de base64 incompleto, `binascii.Error`, `json.JSONDecodeError` y
     `UnicodeDecodeError`.
     """
+    def _aviso(mensaje: str) -> None:
+        if not silencioso:
+            logger.warning(mensaje)
+
     if not valor:
-        logger.warning("Cookies vacías")
+        _aviso("Cookies vacías")
         return None
 
     raw = valor.strip()
     if not raw:
-        logger.warning("Cookies vacías")
+        _aviso("Cookies vacías")
         return None
 
     # JSON crudo (lotes de vendedores que pegan el JSON directamente).
@@ -114,8 +132,10 @@ def decodificar_cookies(valor: str) -> Optional[list]:
         try:
             datos = json.loads(raw)
         except json.JSONDecodeError as e:
-            logger.warning(f"JSON inválido en cookies: {e}")
+            _aviso(f"JSON inválido en cookies: {e}")
             return None
+        if silencioso:
+            return _lista_cookies_de_datos(datos)
         return _extraer_lista_cookies(datos)
 
     # Base64: agregar padding `=` si hace falta (múltiplo de 4).
@@ -126,21 +146,23 @@ def decodificar_cookies(valor: str) -> Optional[list]:
     try:
         datos = base64.b64decode(raw)
     except (binascii.Error, ValueError) as e:
-        logger.warning(f"Base64 inválido al decodificar cookies: {e}")
+        _aviso(f"Base64 inválido al decodificar cookies: {e}")
         return None
 
     try:
         texto = datos.decode("utf-8")
     except UnicodeDecodeError as e:
-        logger.warning(f"Las cookies no son UTF-8 válido: {e}")
+        _aviso(f"Las cookies no son UTF-8 válido: {e}")
         return None
 
     try:
         cookies = json.loads(texto)
     except json.JSONDecodeError as e:
-        logger.warning(f"JSON inválido en cookies: {e}")
+        _aviso(f"JSON inválido en cookies: {e}")
         return None
 
+    if silencioso:
+        return _lista_cookies_de_datos(cookies)
     return _extraer_lista_cookies(cookies)
 
 
@@ -302,6 +324,35 @@ def _extraer_user_agent(linea: str, user_agent: str = ""):
     return linea, user_agent
 
 
+# Formato vendedor de 7 campos (`...:ct0:auth_token`): el 7º campo es un token
+# PLANO (alfanumérico/hexadecimal), sin corchetes, llaves, espacios, `+`, `/`,
+# `=` ni `:`. OJO: un base64 alfanumérico también cae aquí, por eso el llamador
+# prueba primero `decodificar_cookies` (el formato clásico de cookies gana).
+_RE_TOKEN_PLANO = re.compile(r"^[A-Za-z0-9]+$")
+
+
+def _es_token_plano(valor: str) -> bool:
+    """True si el campo parece un token plano (alfanumérico/hexadecimal)."""
+    return bool(_RE_TOKEN_PLANO.fullmatch(valor or ""))
+
+
+def _cookies_formato_vendedor(ct0: str, auth_token: str) -> list:
+    """Construye las cookies del formato vendedor (`ct0` + `auth_token`).
+
+    El lote solo trae esos dos tokens, así que se arma la lista con la MISMA
+    estructura que usan las cookies nativas de X (claves `name`, `value`,
+    `domain` y `path`, en ese orden). Si `ct0` viniera vacío se omite SOLO esa
+    entrada; el `auth_token` va siempre.
+    """
+    cookies = []
+    if ct0:
+        cookies.append({"name": "ct0", "value": ct0, "domain": ".x.com", "path": "/"})
+    cookies.append(
+        {"name": "auth_token", "value": auth_token, "domain": ".x.com", "path": "/"}
+    )
+    return cookies
+
+
 def _parsear_linea_impl(linea: str) -> Optional[dict]:
     """Implementación de `parsear_linea` (el wrapper solo agrega el try/except)."""
     original = linea
@@ -310,6 +361,7 @@ def _parsear_linea_impl(linea: str) -> Optional[dict]:
         return None
 
     cookies = None
+    auth_token_vendedor = None
     user_agent = ""
 
     # 1) JSON de cookies: se extrae ANTES de cualquier `split(":")` porque el
@@ -354,17 +406,31 @@ def _parsear_linea_impl(linea: str) -> Optional[dict]:
                     f"Línea malformada (dos campos de cookies): {original[:40]}"
                 )
                 return None
-            cookies = decodificar_cookies(septimo)
+            # 1) Formato clásico (tiene prioridad): cookies en base64 o JSON
+            #    crudo. Se sondea en silencio porque un token plano del formato
+            #    vendedor también llega hasta aquí y es válido (no debe ensuciar
+            #    el log con warnings de base64/UTF-8/JSON).
+            cookies = decodificar_cookies(septimo, silencioso=True)
             if cookies is None:
-                logger.warning(
-                    f"Línea malformada (cookies inválidas): {original[:40]}"
-                )
-                return None
+                if len(partes) == 7 and _es_token_plano(septimo):
+                    # 2) Formato vendedor de 7 campos: ...:ct0:auth_token. El 7º
+                    #    campo es el auth_token y el 6º (índice 5) la cookie ct0.
+                    cookies = _cookies_formato_vendedor(partes[5], septimo)
+                    auth_token_vendedor = septimo
+                else:
+                    logger.warning(
+                        f"Línea malformada (cookies inválidas): {original[:40]}"
+                    )
+                    return None
 
     if len(partes) > 7 and partes[7] and not user_agent:
         user_agent = partes[7]
 
     username, password, totp_secret, email, email_password, auth_token = partes[:6]
+
+    # El formato vendedor define el auth_token en el 7º campo (no en el 6º).
+    if auth_token_vendedor is not None:
+        auth_token = auth_token_vendedor
 
     return {
         "username": username,
@@ -388,6 +454,14 @@ def parsear_linea(linea: str) -> Optional[dict]:
     * 6 campos: sin cookies ni User-Agent.
     * 7 campos: el último son las cookies (base64 o JSON crudo). Si el último
       campo empieza con `Mozilla/` es el User-Agent y las cookies vienen vacías.
+    * Formato vendedor de 7 campos: si el 7º campo NO decodifica como cookies
+      (ni base64 ni JSON) pero es un token plano (solo letras/números, p. ej.
+      un `auth_token` hexadecimal), la línea se interpreta como
+      `usuario:password:totp:email:email_pass:ct0:auth_token`: el 6º campo es
+      la cookie `ct0` y el 7º el `auth_token`, y las cookies se construyen
+      manualmente con ambas entradas (`.x.com`, `/`). El formato clásico de
+      cookies tiene prioridad: si el 7º campo decodifica, se usa como cookies
+      y el `auth_token` sigue saliendo del 6º campo.
     * 8 campos: 7º cookies, 8º User-Agent.
     * El User-Agent también se acepta con clave `user_agent=`, `useragent=` o
       `ua=` en cualquier posición; ese campo se extrae (solo el texto posterior

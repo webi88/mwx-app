@@ -21,6 +21,11 @@ bloques se extraen de forma segura (escaner balanceado + `json.loads` + patron
          `cookies_json`/`user_agent` al crear y NO pisa los de una existente
          con una linea de 6 campos.
   (16)   `decodificar_cookies` (JSON crudo lista/envuelto + base64 + basura).
+  (17-18) Formato vendedor de 7 campos (`usuario:pass:totp:email:mailpass:ct0:auth_token`)
+         con y sin User-Agent (posicional y etiquetado).
+  (19-21) Desambiguacion: el formato clasico de cookies gana; 7º campo no plano
+         -> None (con warning) y vendedor con ct0 vacio.
+  (22)   Persistencia del formato vendedor en `importar_una` (sesion falsa).
 
 Uso:
     .venv/Scripts/python.exe tests/run_tests.py
@@ -83,6 +88,34 @@ CLAVES_CONTRATO = {
     "cookies",
     "user_agent",
 }
+
+# --------------------------------------------------------------------------- #
+# Formato vendedor de 7 campos (`...:ct0:auth_token`). TODOS los datos son
+# SINTETICOS (nunca credenciales reales del vendedor).
+# --------------------------------------------------------------------------- #
+CT0_VENDEDOR = "0f1e2d3c4b5a69788796a5b4c3d2e1f0" * 2  # 64 chars hex
+TOKEN_VENDEDOR = "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d"  # 40 chars hex
+VENDEDOR_BASE = "vend_user:vpass:VTOTP:vcorreo@x.com:vmailpass"
+VENDEDOR = f"{VENDEDOR_BASE}:{CT0_VENDEDOR}:{TOKEN_VENDEDOR}"
+VENDEDOR_CAMPOS = (
+    "vend_user",
+    "vpass",
+    "VTOTP",
+    "vcorreo@x.com",
+    "vmailpass",
+    TOKEN_VENDEDOR,
+)
+COOKIES_VENDEDOR = [
+    {"name": "ct0", "value": CT0_VENDEDOR, "domain": ".x.com", "path": "/"},
+    {"name": "auth_token", "value": TOKEN_VENDEDOR, "domain": ".x.com", "path": "/"},
+]
+# base64 100% alfanumerico (sin `+`, `/` ni `=`) de una lista de cookies valida:
+# es "plano" para el regex del formato vendedor, pero decodifica a cookies, asi
+# que gana la interpretacion clasica (el auth_token sale del 6º campo).
+JSON_PLANO_B64 = (
+    "W3sibmFtZSI6ICJjdDAiLCAidmFsdWUiOiAiNjUxMzI3MjY5ZTBkMzdmMmE3NGRlNDUyZTZiNDM4In1d"
+)
+COOKIES_PLANO = [{"name": "ct0", "value": "651327269e0d37f2a74de452e6b438"}]
 
 
 def _campos_base(fields: dict) -> tuple:
@@ -382,6 +415,128 @@ def test_decodificar_cookies(check):
     check("decodificar numero JSON -> None", decodificar_cookies("123") is None)
 
 
+# --------------------------------------------------------------------------- #
+# (17-18) Formato vendedor de 7 campos: ct0 + auth_token, con y sin UA
+# --------------------------------------------------------------------------- #
+def test_formato_vendedor(check):
+    print("(17-18) formato vendedor 7 campos (ct0 + auth_token) con y sin UA")
+    fields = parsear_linea(VENDEDOR)
+    check("vendedor: no devuelve None", fields is not None)
+    check("vendedor: campos base (auth_token == 7º campo)", _campos_base(fields) == VENDEDOR_CAMPOS)
+    check("vendedor: email == 4º campo", fields.get("email") == "vcorreo@x.com")
+    check("vendedor: email_password == 5º campo", fields.get("email_password") == "vmailpass")
+    check("vendedor: totp_secret == 3er campo", fields.get("totp_secret") == "VTOTP")
+    check("vendedor: cookies == 2 entradas exactas (orden y claves)", fields.get("cookies") == COOKIES_VENDEDOR)
+    check(
+        "vendedor: cookies[0]=ct0 (6º campo) y cookies[1]=auth_token (7º campo)",
+        fields["cookies"][0]["value"] == CT0_VENDEDOR
+        and fields["cookies"][1]["value"] == TOKEN_VENDEDOR,
+    )
+    check(
+        "vendedor: cada cookie trae SOLO name/value/domain/path",
+        all(set(cookie) == {"name", "value", "domain", "path"} for cookie in fields["cookies"]),
+    )
+    check("vendedor: user_agent vacio", fields.get("user_agent") == "")
+    check("vendedor: contrato exacto de claves", set(fields) == CLAVES_CONTRATO)
+
+    con_ua = parsear_linea(f"{VENDEDOR}:{UA}")
+    check("vendedor+UA posicional: no devuelve None", con_ua is not None)
+    check("vendedor+UA posicional: campos base intactos", _campos_base(con_ua) == VENDEDOR_CAMPOS)
+    check("vendedor+UA posicional: cookies == vendedor", con_ua.get("cookies") == COOKIES_VENDEDOR)
+    check("vendedor+UA posicional: user_agent extraido antes", con_ua.get("user_agent") == UA)
+
+    con_ua_eq = parsear_linea(f"{VENDEDOR}:ua={UA}")
+    check("vendedor+ua=: campos base intactos", _campos_base(con_ua_eq) == VENDEDOR_CAMPOS)
+    check(
+        "vendedor+ua=: cookies y user_agent",
+        con_ua_eq.get("cookies") == COOKIES_VENDEDOR and con_ua_eq.get("user_agent") == UA,
+    )
+
+    ua_antes = parsear_linea(f"user_agent={UA}:{VENDEDOR}")
+    check(
+        "user_agent= antes del vendedor: cookies/auth_token/UA",
+        ua_antes.get("cookies") == COOKIES_VENDEDOR
+        and ua_antes.get("auth_token") == TOKEN_VENDEDOR
+        and ua_antes.get("user_agent") == UA,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# (19-21) Desambiguacion: el clasico gana; invalidos y ct0 vacio
+# --------------------------------------------------------------------------- #
+def test_vendedor_desambiguacion(check):
+    print("(19-21) clasico gana, 7º no plano -> None y vendedor con ct0 vacio")
+    b64 = parsear_linea(f"{BASE}:{B64}")
+    check("7 base64 clasico (no regresion): cookies", b64.get("cookies") == COOKIES)
+    check("7 base64 clasico (no regresion): auth_token = 6º campo", b64.get("auth_token") == "tok123")
+
+    plano = parsear_linea(f"{BASE}:{JSON_PLANO_B64}")
+    check(
+        "7 plano que decodifica a cookies: gana el clasico",
+        plano is not None and plano.get("cookies") == COOKIES_PLANO,
+    )
+    check("7 plano que decodifica a cookies: auth_token = 6º campo", plano.get("auth_token") == "tok123")
+
+    check("7º no plano ('!!!no-valido!!!'): None", parsear_linea(f"{BASE}:!!!no-valido!!!") is None)
+    check("7º no plano ('a=b=c'): None", parsear_linea(f"{BASE}:a=b=c") is None)
+    check("7º no plano ('YWJj+ZGVm'): None", parsear_linea(f"{BASE}:YWJj+ZGVm") is None)
+
+    vacio = parsear_linea(f"{VENDEDOR_BASE}::{TOKEN_VENDEDOR}")
+    check("vendedor sin ct0: no devuelve None", vacio is not None)
+    check("vendedor sin ct0: auth_token == 7º campo", vacio.get("auth_token") == TOKEN_VENDEDOR)
+    check(
+        "vendedor sin ct0: cookies solo con auth_token",
+        vacio.get("cookies")
+        == [{"name": "auth_token", "value": TOKEN_VENDEDOR, "domain": ".x.com", "path": "/"}],
+    )
+
+
+# --------------------------------------------------------------------------- #
+# (22) Persistencia del formato vendedor en importar_una (sesion falsa)
+# --------------------------------------------------------------------------- #
+def test_vendedor_persistencia(check):
+    print("(22) persistencia del formato vendedor en importar_una")
+    fields = parsear_linea(VENDEDOR)
+    sesion = _FakeDB(None)
+    with mock.patch.object(importador, "get_db_session", lambda: _sesion_con(sesion)):
+        resultado = importador.importar_una(fields)
+
+    check("vendedor nueva: resultado 'nueva'", resultado == "nueva")
+    check("vendedor nueva: se agrego 1 cuenta", len(sesion.agregadas) == 1)
+    agregada = sesion.agregadas[0]
+    check("vendedor nueva: cookies_json == 2 entradas", agregada.cookies_json == COOKIES_VENDEDOR)
+    check("vendedor nueva: auth_token == 7º campo", agregada.auth_token == TOKEN_VENDEDOR)
+    check(
+        "vendedor nueva: email/email_password persistidos",
+        agregada.email == "vcorreo@x.com" and agregada.email_password == "vmailpass",
+    )
+
+    cuenta = _cuenta_existente(
+        usuario="vend_user",
+        auth_token="tok_viejo",
+        cookies_json=[{"name": "vieja", "value": "1"}],
+    )
+    with mock.patch.object(importador, "get_db_session", lambda: _sesion_con(_FakeDB(cuenta))):
+        resultado2 = importador.importar_una(fields)
+
+    check("vendedor existente: resultado 'actualizada'", resultado2 == "actualizada")
+    check("vendedor existente: pisa cookies_json", cuenta.cookies_json == COOKIES_VENDEDOR)
+    check("vendedor existente: pisa auth_token", cuenta.auth_token == TOKEN_VENDEDOR)
+
+    # Re-importar 6 campos con auth_token vacio NO pisa la sesion (semantica actual).
+    with mock.patch.object(importador, "get_db_session", lambda: _sesion_con(_FakeDB(cuenta))):
+        importador.importar_una(parsear_linea(f"{VENDEDOR_BASE}:"))
+
+    check(
+        "vendedor + 6 campos con auth_token vacio: NO pisa auth_token",
+        cuenta.auth_token == TOKEN_VENDEDOR,
+    )
+    check(
+        "vendedor + 6 campos con auth_token vacio: NO pisa cookies_json",
+        cuenta.cookies_json == COOKIES_VENDEDOR,
+    )
+
+
 def run(check):
     """Ejecuta los checks con el `check` del runner (o del marco local)."""
     test_clasicos(check)
@@ -393,6 +548,9 @@ def run(check):
     test_invalidas(check)
     test_persistencia(check)
     test_decodificar_cookies(check)
+    test_formato_vendedor(check)
+    test_vendedor_desambiguacion(check)
+    test_vendedor_persistencia(check)
 
 
 if __name__ == "__main__":
