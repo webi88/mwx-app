@@ -41,7 +41,7 @@ COPY . .
 # persistente en el primer arranque (el volumen montado en /app/data oculta
 # el contenido de la imagen, así que los guardamos aparte en /app/seed).
 RUN mkdir -p /app/seed \
-    && cp -r /app/data/proxies /app/seed/proxies \
+    && cp -r /app/data/proxies /app/seed/proxies 2>/dev/null || true \
     && cp /app/data/proxy_base.txt /app/seed/proxy_base.txt 2>/dev/null || true \
     && cp /app/data/web_users.json /app/seed/web_users.json 2>/dev/null || true \
     && cp -r /app/config /app/seed/config 2>/dev/null || true

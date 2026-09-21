@@ -873,6 +873,10 @@ python -m bot.main
 - `tests/test_importador.py` (nuevo): 85 checks deterministas (Aged JSON+UA, `:` en values/expiry, JSON tras el totp, campos faltantes, extras >8, persistencia fake y `decodificar_cookies`).
 - Verificado: compileall + imports OK; `tests/run_tests.py` **418/418** (333 previos + 85 nuevos); comprobacion independiente del coordinador con Aged realista (JSON+UA en ambos ordenes, `:` en values, 6 campos clasicos) OK.
 
+### Dockerfile: fallback al copiar data/proxies al seed (2026-09-21)
+- `data/proxies/` esta en `.gitignore` (no viaja en la imagen) y el `RUN` del seed hacia `cp -r /app/data/proxies /app/seed/proxies` SIN fallback -> `cp: cannot stat '/app/data/proxies': No such file or directory` al hacer `railway up`. Ahora la linea lleva `2>/dev/null || true` como el resto de la cadena (linea 44), sin romper la concatenacion con `&&` de las lineas siguientes.
+- Verificado con simulacion bash del `RUN` con `data/proxies` ausente: la version vieja sale con exit 1; la nueva sale 0 y `proxy_base.txt` / `web_users.json` / `config/` se siguen copiando al seed.
+
 ### Pendiente
 - **Redeploy en Railway** para aplicar los fixes del scheduler/calentamiento (reintentos seguros, filtro de sesion real, login .pkl) y el cambio masivo de nombres con IA; probar el lote de nombres con 5-10 cuentas antes de escalar (el @ solo cambia si la cuenta tiene contraseña)
 - **Commit + push** de todos los cambios (incluye `Dockerfile` con xclip/xsel: Railway necesita REBUILD, no solo redeploy) y fijar en el panel de Railway: `MAX_BROWSERS=2`, `MAX_WORKERS=12`, `CHROME_SIN_IMAGENES=true`, `API_PRIMERO=0`/`RT_POR_API=0`, `MODO_PESTANA=1`, `PESTANA_MAX_ACCIONES=40`
