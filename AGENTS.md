@@ -862,6 +862,17 @@ python -m bot.main
 - Verificado: compileall + imports OK; `tests/run_tests.py` **333/333** (`tests/test_identidades.py` nuevo: 89 checks); prueba real con 14 cuentas de la BD (`dry_run`): 7 persona / 7 partido, `origen_ia=True`, handles unicos; AppTest de la pestaña Nombres 0 excepciones con los widgets nuevos.
 - ⚠ Al aplicar el cambio masivo real: 2-3 "Navegadores simultaneos" en Railway, el @ solo se puede cambiar si la cuenta tiene contraseña (o se pasa en el flujo individual) y X puede pedir verificacion; editar la tabla de propuestas antes de aplicar si un @ parece muy generico.
 
+### Importador Aged: extraccion de JSON de cookies y UA ANTES del split (2026-09-21)
+- **Pedido del dueño**: importar lotes "Aged" que traen el User-Agent y el JSON de cookies en la MISMA linea; los `:` del JSON rompian el `.split(':')` (la heuristica vieja solo recompopia si el JSON empezaba exactamente en el campo 7 y el UA posicional solo si era el ultimo campo).
+- `cuentas/importador.py` — `parsear_linea` rediseñado en 3 fases, ANTES de dividir por `:`:
+  - **Extraccion segura del JSON**: `_buscar_bloque_json_cookies` recorre cada `[`/`{` con `_escanear_bloque_balanceado` (pila + respeta strings/escapes `\"`) y valida con `json.loads` + lista/`{"cookies":[...]}`; acepta el JSON en CUALQUIER posicion, incluso con `:` dentro de los valores. `_eliminar_bloque` borra el bloque + UN separador `:` adyacente (sin dejar `::` ni desalinear).
+  - **Extraccion segura del UA**: `_extraer_user_agent` saca el UA etiquetado (`user_agent=`/`useragent=`/`ua=`, en cualquier posicion) o posicional (`Mozilla/5.0...`, termina en `:` o fin de linea) y lo elimina de la linea de trabajo.
+  - **Parseo estandar**: recien entonces `split(':')` mapea los 6 campos base (`usuario, password, totp, email, email_pass, auth_token`); los faltantes se rellenan con `""`; 7º = cookies base64/JSON y 8º = UA; 7º/8º vacios se ignoran y un valor no vacio tras el 8º es linea malformada. `parsear_linea` quedo blindada con try/except (nunca lanza) y mantiene el contrato de claves (`username, password, totp_secret, email, email_password, auth_token, cookies, user_agent`).
+- **Persistencia**: `importar_una` ya inyectaba la lista en `Cuenta.cookies_json` (columna JSON) y el UA en `Cuenta.user_agent`; sin cambios, verificado con test de persistencia (y con la semantica de no pisar con vacios).
+- Compatibilidad: 6 campos clasicos, 7 con base64 o UA, 8 cookies+UA, UA etiquetado en cualquier posicion y orden JSON↔UA invertido.
+- `tests/test_importador.py` (nuevo): 85 checks deterministas (Aged JSON+UA, `:` en values/expiry, JSON tras el totp, campos faltantes, extras >8, persistencia fake y `decodificar_cookies`).
+- Verificado: compileall + imports OK; `tests/run_tests.py` **418/418** (333 previos + 85 nuevos); comprobacion independiente del coordinador con Aged realista (JSON+UA en ambos ordenes, `:` en values, 6 campos clasicos) OK.
+
 ### Pendiente
 - **Redeploy en Railway** para aplicar los fixes del scheduler/calentamiento (reintentos seguros, filtro de sesion real, login .pkl) y el cambio masivo de nombres con IA; probar el lote de nombres con 5-10 cuentas antes de escalar (el @ solo cambia si la cuenta tiene contraseña)
 - **Commit + push** de todos los cambios (incluye `Dockerfile` con xclip/xsel: Railway necesita REBUILD, no solo redeploy) y fijar en el panel de Railway: `MAX_BROWSERS=2`, `MAX_WORKERS=12`, `CHROME_SIN_IMAGENES=true`, `API_PRIMERO=0`/`RT_POR_API=0`, `MODO_PESTANA=1`, `PESTANA_MAX_ACCIONES=40`
@@ -871,3 +882,4 @@ python -m bot.main
 - Probar `ia/contexto_noticias.generar_contexto_desde_links` con `OPENAI_API_KEY` real (hoy verificado con IA simulada; el fallback local ya funciona)
 - Reemplazar tokens placeholder en `.env` por claves reales (Telegram, Gemini, Grizzly)
 - Probar acciones Selenium en VPS (requiere Chrome; local ya probado con Chrome 153: cambio de sesion A→B→A en la misma pestana)
+- Probar un lote real de cuentas "Aged" (JSON de cookies + UA en la misma linea) desde Cuentas -> Importar; el formato aceptado quedo documentado en el docstring de `cuentas/importador.py`

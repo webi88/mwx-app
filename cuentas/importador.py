@@ -16,6 +16,11 @@ Formato de cada línea (campos separados por `:`):
 * El User-Agent también puede venir con clave `user_agent=`, `useragent=` o
   `ua=` en CUALQUIER posición: se extrae su valor (solo el texto posterior al
   `=`) y el campo se elimina del listado.
+* Los lotes "Aged" traen el JSON de cookies y el User-Agent en la MISMA línea
+  y en cualquier orden (incluso con `:` dentro de los valores del JSON). Por eso
+  `parsear_linea` EXTRAE ambos bloques de la línea ANTES de hacer `split(":")`:
+  el JSON se localiza con un escáner balanceado y se valida con `json.loads`, y
+  el UA (`Mozilla/...`) termina en `:` o fin de línea.
 
 Este módulo reemplaza el flujo obsoleto de `cargar_cuenta.py` (login con
 contraseña para extraer la cookie): ahora las credenciales, las cookies
@@ -46,22 +51,37 @@ except Exception:  # pragma: no cover - defensivo si falta core/registros.py
         return ""
 
 
-def _extraer_lista_cookies(datos) -> Optional[list]:
-    """Extrae la lista de cookies de un JSON ya parseado.
+def _lista_cookies_de_datos(datos) -> Optional[list]:
+    """Extrae la lista de cookies de un JSON ya parseado, SIN warnings.
 
     Acepta directamente una lista o un objeto `{"cookies": [...]}` (algunos
-    exportadores envuelven la lista). Devuelve `None` con warning si la forma
-    no es reconocida. NO normaliza las cookies: se guardan tal cual vienen.
+    exportadores envuelven la lista). Devuelve `None` si la forma no es
+    reconocida. Se usa en el escaneo de candidatos de `parsear_linea` (donde
+    muchos bloques se descartan antes de dar con el JSON real) y
+    `_extraer_lista_cookies` la envuelve con el warning para el resto de los
+    flujos. NO normaliza las cookies: se guardan tal cual vienen.
     """
     if isinstance(datos, list):
         return datos
     if isinstance(datos, dict) and isinstance(datos.get("cookies"), list):
         return datos["cookies"]
-    logger.warning(
-        f"El JSON de cookies no es una lista ni {{'cookies': [...]}} "
-        f"(es {type(datos).__name__})"
-    )
     return None
+
+
+def _extraer_lista_cookies(datos) -> Optional[list]:
+    """Extrae la lista de cookies de un JSON ya parseado (con warning).
+
+    Acepta directamente una lista o un objeto `{"cookies": [...]}` (algunos
+    exportadores envuelven la lista). Devuelve `None` con warning si la forma
+    no es reconocida. NO normaliza las cookies: se guardan tal cual vienen.
+    """
+    cookies = _lista_cookies_de_datos(datos)
+    if cookies is None:
+        logger.warning(
+            f"El JSON de cookies no es una lista ni {{'cookies': [...]}} "
+            f"(es {type(datos).__name__})"
+        )
+    return cookies
 
 
 def decodificar_cookies(valor: str) -> Optional[list]:
@@ -129,95 +149,222 @@ def decodificar_cookies(valor: str) -> Optional[list]:
 _CLAVES_USER_AGENT = ("user_agent", "useragent", "ua")
 
 
-def parsear_linea(linea: str) -> Optional[dict]:
-    """Convierte una línea del lote en un dict con credenciales, cookies y UA.
+def _escanear_bloque_balanceado(texto: str, inicio: int) -> Optional[str]:
+    """Devuelve el bloque `[...]` / `{...}` balanceado que empieza en `inicio`.
 
-    Formatos aceptados (campos separados por `:`):
-
-        user:pass:totp:email:email_pass:auth_token[:cookies][:user_agent]
-
-    * 6 campos: sin cookies ni User-Agent.
-    * 7 campos: el último son las cookies (base64 o JSON crudo). Si el último
-      campo empieza con `Mozilla/` es el User-Agent y las cookies vienen
-      vacías.
-    * 8 campos: 7º cookies, 8º User-Agent.
-    * El User-Agent también se acepta con clave `user_agent=`, `useragent=` o
-      `ua=` en cualquier posición; ese campo se extrae (solo el texto posterior
-      al primer `=`) y se elimina del listado.
-    * Las cookies pueden ser JSON crudo; como el JSON contiene `:`, si el 7º
-      campo empieza con `[` o `{` se re-une el resto de la línea como un solo
-      campo de cookies (si al final viene un User-Agent posicional que empieza
-      con `Mozilla/`, se separa antes de re-unir).
-
-    Devuelve `None` si la línea está vacía, es un comentario (`#`) o está
-    malformada. Registra con `logger.warning` el motivo del fallo (incluyendo
-    los primeros 40 caracteres de la línea).
+    Respeta las cadenas (`"..."`, con `\\"` escapado) para no contar los
+    `[`/`{`/`]`/`}` que viven dentro de un valor (p. ej. `"value":"a[b:c"`) y
+    anida `[]`/`{}` con una pila. Devuelve `None` si no encuentra el cierre o si
+    los delimitadores se cruzan (`[}`). Pensado para localizar bloques JSON
+    dentro de una línea con más campos.
     """
+    if inicio < 0 or inicio >= len(texto) or texto[inicio] not in "[{":
+        return None
+
+    pila = []
+    en_cadena = False
+    escape = False
+    for i in range(inicio, len(texto)):
+        caracter = texto[i]
+        if en_cadena:
+            if escape:
+                escape = False
+            elif caracter == "\\":
+                escape = True
+            elif caracter == '"':
+                en_cadena = False
+            continue
+        if caracter == '"':
+            en_cadena = True
+        elif caracter in "[{":
+            pila.append(caracter)
+        elif caracter in "]}":
+            if not pila:
+                return None
+            apertura = pila.pop()
+            if (apertura, caracter) not in (("[", "]"), ("{", "}")):
+                return None
+            if not pila:
+                return texto[inicio : i + 1]
+    return None
+
+
+def _buscar_bloque_json_cookies(linea: str):
+    """Busca el primer bloque JSON de cookies válido dentro de `linea`.
+
+    Recorre la línea desde cada `[`/`{` con `_escanear_bloque_balanceado` y
+    valida cada candidato con `json.loads` + `_lista_cookies_de_datos` (una
+    lista o un objeto `{"cookies": [...]}`). El bloque puede estar en CUALQUIER
+    posición de la línea (no solo al final).
+
+    Devuelve `(inicio, largo, cookies)` —con `cookies` ya como lista— o `None`
+    si ningún candidato es un JSON de cookies válido. Nunca lanza.
+    """
+    posicion = 0
+    while posicion < len(linea):
+        candidatos = [
+            p
+            for p in (linea.find("[", posicion), linea.find("{", posicion))
+            if p != -1
+        ]
+        if not candidatos:
+            return None
+        inicio = min(candidatos)
+        bloque = _escanear_bloque_balanceado(linea, inicio)
+        if bloque is not None:
+            try:
+                datos = json.loads(bloque)
+            except (ValueError, TypeError, RecursionError):
+                datos = None
+            if datos is not None:
+                cookies = _lista_cookies_de_datos(datos)
+                if cookies is not None:
+                    return inicio, len(bloque), cookies
+        # El candidato no sirvió (no era JSON o no era de cookies): sigue
+        # buscando desde el carácter siguiente.
+        posicion = inicio + 1
+    return None
+
+
+def _eliminar_bloque(linea: str, inicio: int, largo: int) -> str:
+    """Quita `linea[inicio:inicio+largo]` y UN separador `:` adyacente.
+
+    Los campos base van separados por `:`, así que al quitar un bloque (JSON o
+    UA) también se quita el `:` que lo separaba, para no dejar `::` ni
+    desalinear los campos. Prefiere el separador ANTERIOR al bloque (ignorando
+    espacios); si no existe, el POSTERIOR; si tampoco, solo el bloque.
+    """
+    fin = inicio + largo
+
+    anterior = inicio - 1
+    while anterior >= 0 and linea[anterior] in " \t":
+        anterior -= 1
+    if anterior >= 0 and linea[anterior] == ":":
+        return linea[:anterior] + linea[fin:]
+
+    posterior = fin
+    while posterior < len(linea) and linea[posterior] in " \t":
+        posterior += 1
+    if posterior < len(linea) and linea[posterior] == ":":
+        return linea[:inicio] + linea[posterior + 1 :]
+
+    return linea[:inicio] + linea[fin:]
+
+
+def _es_inicio_campo(linea: str, posicion: int) -> bool:
+    """True si `posicion` empieza un campo (inicio de línea o tras un `:`)."""
+    anterior = posicion - 1
+    while anterior >= 0 and linea[anterior] in " \t":
+        anterior -= 1
+    return anterior < 0 or linea[anterior] == ":"
+
+
+def _parece_user_agent(valor: str) -> bool:
+    """True si el campo (sin espacios) parece un User-Agent de navegador."""
+    return valor.strip().lower().startswith("mozilla/")
+
+
+def _extraer_user_agent(linea: str, user_agent: str = ""):
+    """Extrae el User-Agent de `linea` (etiquetado o posicional) y lo elimina.
+
+    * Etiquetado: los segmentos `user_agent=`, `useragent=` o `ua=` en
+      cualquier posición se eliminan SIEMPRE (aunque ya haya un UA) y se guarda
+      el primer valor no vacío.
+    * Posicional: un `Mozilla/...` que empieza un campo y termina en `:` o fin
+      de línea (el UA no contiene `:` en la práctica); se elimina junto con UN
+      separador adyacente.
+
+    Devuelve `(linea_restante, user_agent)`.
+    """
+    restantes = []
+    for parte in linea.split(":"):
+        clave, separador, valor = parte.partition("=")
+        if separador and clave.strip().lower() in _CLAVES_USER_AGENT:
+            valor = valor.strip()
+            if valor and not user_agent:
+                user_agent = valor
+        else:
+            restantes.append(parte)
+    linea = ":".join(restantes)
+
+    if user_agent:
+        return linea, user_agent
+
+    posicion = linea.lower().find("mozilla/")
+    while posicion != -1:
+        if _es_inicio_campo(linea, posicion):
+            fin = linea.find(":", posicion)
+            if fin == -1:
+                fin = len(linea)
+            user_agent = linea[posicion:fin].strip()
+            return _eliminar_bloque(linea, posicion, fin - posicion), user_agent
+        posicion = linea.lower().find("mozilla/", posicion + 1)
+    return linea, user_agent
+
+
+def _parsear_linea_impl(linea: str) -> Optional[dict]:
+    """Implementación de `parsear_linea` (el wrapper solo agrega el try/except)."""
+    original = linea
     linea = (linea or "").strip()
     if not linea or linea.startswith("#"):
         return None
 
-    partes = linea.split(":")
-
-    # 1) Extraer el User-Agent etiquetado (`ua=Mozilla/...`) de cualquier
-    #    posición. El UA no contiene `:`, así que basta con el fragmento.
+    cookies = None
     user_agent = ""
-    restantes = []
-    for parte in partes:
-        clave, sep, valor = parte.partition("=")
-        if sep and clave.strip().lower() in _CLAVES_USER_AGENT:
-            if not user_agent:
-                user_agent = valor.strip()
-        else:
-            restantes.append(parte)
-    partes = restantes
 
-    # 2) Cookies en JSON crudo: el JSON trae `:` propios, por lo que el split
-    #    simple lo fragmenta. Si el 7º campo empieza con `[` o `{`, se re-une
-    #    todo el resto de la línea como el campo de cookies. Un User-Agent
-    #    posicional (sin clave, empieza con `Mozilla/`) al final se separa
-    #    antes de re-unir, porque si no quedaría dentro del JSON.
-    if len(partes) > 7 and partes[6].strip().startswith(("[", "{")):
-        if not user_agent and partes[-1].strip().startswith("Mozilla/"):
-            user_agent = partes[-1].strip()
-            partes = partes[:6] + [":".join(partes[6:-1])]
-        else:
-            partes = partes[:6] + [":".join(partes[6:])]
+    # 1) JSON de cookies: se extrae ANTES de cualquier `split(":")` porque el
+    #    JSON trae `:` en sus valores y desalinearía los campos base.
+    bloque = _buscar_bloque_json_cookies(linea)
+    if bloque is not None:
+        inicio, largo, cookies = bloque
+        linea = _eliminar_bloque(linea, inicio, largo)
 
-    # Acepta 6 campos (sin cookies), 7 (con cookies o con UA) u 8 (cookies+UA).
-    if len(partes) == 6:
-        cookies_b64 = ""
-    elif len(partes) == 7:
-        ultimo = partes[6].strip()
-        if ultimo.startswith("Mozilla/"):
-            # 7º campo = User-Agent (las cookies vienen vacías).
-            cookies_b64 = ""
-            if not user_agent:
-                user_agent = ultimo
-        else:
-            cookies_b64 = partes[6]
-    elif len(partes) == 8:
-        cookies_b64 = partes[6]
-        ua_posicional = partes[7].strip()
-        if ua_posicional and not user_agent:
-            user_agent = ua_posicional
-    else:
+    # 2) User-Agent (etiquetado o posicional), también antes del split.
+    linea, user_agent = _extraer_user_agent(linea, user_agent)
+
+    # 3) Campos base: usuario, password, totp, email, email_password, auth_token.
+    partes = [parte.strip() for parte in linea.split(":")]
+    if not any(partes):
+        logger.warning(f"Línea malformada (sin campos): {original[:40]}")
+        return None
+
+    # Los campos faltantes se rellenan con "" (no se descarta la línea).
+    if len(partes) < 6:
+        partes += [""] * (6 - len(partes))
+
+    # 4) Campos extra: 7º = cookies (base64/JSON crudo), 8º = User-Agent. Los
+    #    campos 7º/8º vacíos se ignoran; cualquier valor no vacío DESPUÉS del
+    #    8º campo es línea malformada.
+    if len(partes) > 8 and any(partes[8:]):
         logger.warning(
             f"Línea malformada (se esperaban 6, 7 u 8 campos, se obtuvieron "
-            f"{len(partes)}): {linea[:40]}"
+            f"{len(partes)}): {original[:40]}"
         )
         return None
 
-    username, password, totp_secret, email, email_password, auth_token = partes[:6]
+    if len(partes) > 6 and partes[6]:
+        septimo = partes[6]
+        if _parece_user_agent(septimo):
+            # 7º campo = User-Agent posicional (las cookies vienen vacías).
+            if not user_agent:
+                user_agent = septimo
+        else:
+            if cookies is not None:
+                logger.warning(
+                    f"Línea malformada (dos campos de cookies): {original[:40]}"
+                )
+                return None
+            cookies = decodificar_cookies(septimo)
+            if cookies is None:
+                logger.warning(
+                    f"Línea malformada (cookies inválidas): {original[:40]}"
+                )
+                return None
 
-    # Las cookies son OPCIONALES: si no vienen, la cuenta se importa igual y el
-    # validador obtiene el ct0 a partir del auth_token.
-    cookies = None
-    if cookies_b64.strip():
-        cookies = decodificar_cookies(cookies_b64)
-        if cookies is None:
-            logger.warning(f"Línea malformada (cookies inválidas): {linea[:40]}")
-            return None
+    if len(partes) > 7 and partes[7] and not user_agent:
+        user_agent = partes[7]
+
+    username, password, totp_secret, email, email_password, auth_token = partes[:6]
 
     return {
         "username": username,
@@ -229,6 +376,39 @@ def parsear_linea(linea: str) -> Optional[dict]:
         "cookies": cookies,
         "user_agent": user_agent,
     }
+
+
+def parsear_linea(linea: str) -> Optional[dict]:
+    """Convierte una línea del lote en un dict con credenciales, cookies y UA.
+
+    Formatos aceptados (campos separados por `:`):
+
+        user:pass:totp:email:email_pass:auth_token[:cookies][:user_agent]
+
+    * 6 campos: sin cookies ni User-Agent.
+    * 7 campos: el último son las cookies (base64 o JSON crudo). Si el último
+      campo empieza con `Mozilla/` es el User-Agent y las cookies vienen vacías.
+    * 8 campos: 7º cookies, 8º User-Agent.
+    * El User-Agent también se acepta con clave `user_agent=`, `useragent=` o
+      `ua=` en cualquier posición; ese campo se extrae (solo el texto posterior
+      al primer `=`) y se elimina del listado.
+    * Los lotes "Aged" traen el JSON de cookies (`[...]` o `{"cookies": [...]}`)
+      y el User-Agent en la MISMA línea, en cualquier orden y con `:` dentro de
+      los valores del JSON: ambos se extraen (escáner balanceado + `json.loads`)
+      ANTES de dividir por `:`, quitando también el separador adyacente. Si
+      faltan campos base, se rellenan con `""`.
+    * Los campos 7º/8º vacíos (`...:tok::`) se ignoran sin error; un valor no
+      vacío después del 8º campo es línea malformada.
+
+    Devuelve `None` si la línea está vacía, es un comentario (`#`) o está
+    malformada. Registra con `logger.warning` el motivo del fallo (incluyendo
+    los primeros 40 caracteres de la línea). Nunca lanza excepciones.
+    """
+    try:
+        return _parsear_linea_impl(linea)
+    except Exception as e:  # noqa: BLE001 - el importador nunca debe tumbar el lote
+        logger.warning(f"Línea malformada (error de parseo: {e}): {str(linea)[:40]}")
+        return None
 
 
 def _valor_informado(valor) -> bool:
