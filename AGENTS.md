@@ -931,12 +931,23 @@ python -m bot.main
 - `tests/test_eliminador.py` (99 checks con fakes) + 6 checks de AppTest de la pestana; suite **855/855**.
 - Operacion real aplicada sobre la BD de Supabase/Railway (via DATABASE_URL de Railway): las 25 cuentas vendedoras (`GoodWinsnvn`, `Katiaforbx7m`, ..., `khawajaGjdgi`) eliminadas 25/25; respaldo `data/backups/eliminacion_cuentas_20260922_112839.json` (25 cuentas x 34 columnas + 21 tareas); Supabase quedo con 200 cuentas (todas activas) y 0 de las 25 presentes.
 
+### Escritura humana anti-Ghostban: sin CDP/execCommand + mask destruida + send_keys real (2026-09-22)
+- **Motivo**: X (Ghostban/Shadowban) oculta los posts de las cuentas que insertan texto de forma silenciosa: CDP `Input.insertText` y `document.execCommand('insertText')` NO generan eventos reales de teclado.
+- `plataformas/twitter/selenium_bot.py::_pegar_texto` reescrito (L4172):
+  * Al INICIO destruye la capa del modal con `document.querySelectorAll('[data-testid="mask"]').forEach(e => e.remove());` (JS en try/except; si falla, el pegado continua con la red de seguridad de `_esperar_mask_desaparezca`/`ElementClickInterceptedException`).
+  * Eliminados por completo `_cdp_inserttext` (`Input.insertText`), `_execcommand` (`document.execCommand`) y el metodo de portapapeles (pyperclip).
+  * Nuevo orden de escritura: (1) `editor.click()` en try/except (si el clic falla NO se aborta) + `editor.send_keys(texto)` en UNA sola llamada; (2) fallback `ActionChains(driver).send_keys(texto)` sobre el editable real enfocado por JS (`_enfocar_editable`, solo foco). Ambos generan keydown/keypress/input/keyup reales.
+  * Conservados sin cambios: `_limpiar_editor_x` (borrador restaurado por X), `_verificar_texto_en_editor`, `_editor_con_restos`, re-localizacion de elementos stale y los 3 mensajes exactos que el motor usa para reintentos seguros.
+- **Pausa humana** `time.sleep(random.uniform(1.8, 3.5))` (releer antes de enviar), tras escribir/subir imagen y antes de buscar/clicar el boton: `publicar_tweet` (L2033), `responder_tweet` (L3744) y rama de cita de `solo_retwittear` (L4784). El RT simple y `publicar_hilo` no cambian.
+- Verificado: compileall global OK; `tests/run_tests.py` **879/879** (`tests/test_selenium_fakes.py` 75/75: mask-primero, cero metodos silenciosos, fallback ActionChains, limpieza/stale y las 3 pausas); smoke Chrome 153 real `tests/smoke_chrome_cdp.py` **10/10** (mask fuera del DOM, `send_keys` reemplaza el borrador con keydown=43/input=23 reales; fallback ActionChains sobre wrapper no interactuable); import del modulo OK.
+- ⚠ **Railway debe redeployarse**. El pegado por eventos reales es algo mas lento que `insertText` (un evento por caracter, en un solo comando Selenium) pero es el que X espera; si el borrador de X se pierde por el cambio, `_limpiar_editor_x`/`_editor_con_restos` siguen cubriendolo. `Dockerfile` conserva xclip/xsel (ya no se usan para pegar).
+
 ### Pendiente
 - **Redeploy en Railway** para aplicar tambien el limite de 100 caracteres (posts/citas), la fila vacia + Excel de Reportes y el reparto de roles por porcentajes; probar el reparto en «🗂️ Por roles» con 5-10 cuentas
 - **Redeploy en Railway** para aplicar los fixes del scheduler/calentamiento (reintentos seguros, filtro de sesion real, login .pkl), el cambio masivo de nombres con IA y las **cuotas horarias** (`LIMITE_POSTS_HORA=5`, `LIMITE_CITAS_HORA=5`, `LIMITE_RTS_HORA=7`, `LIMITE_COMENTARIOS_HORA=3`, `CUOTAS_HORARIAS_ACTIVO=1`); correr una campaña de prueba de 5-10 cuentas y medir acciones/hora antes de escalar
 - **Commit + push** de todos los cambios (incluye `Dockerfile` con xclip/xsel: Railway necesita REBUILD, no solo redeploy) y fijar en el panel de Railway: `MAX_BROWSERS=2`, `MAX_WORKERS=12`, `CHROME_SIN_IMAGENES=true`, `API_PRIMERO=0`/`RT_POR_API=0`, `MODO_PESTANA=1`, `PESTANA_MAX_ACCIONES=40`
 - **Seguridad**: rotar credenciales de Smartproxy (estan en el historial publico del repo), repo privado o reescribir historial, cambiar admin/admin de `data/web_users.json` y rotar `SECRET_KEY` antes de exponer el dashboard
-- Medir la campana con el pegado por CDP: esperado fin de los `no se pudo escribir el texto en el editor de X` en comentarios/citas
+- Medir la campana con el pegado por `send_keys` (eventos reales anti-Ghostban): esperado fin de los `no se pudo escribir el texto en el editor de X` en comentarios/citas
 - Reactivar cuentas desactivadas por el falso positivo anti-bot (Cuentas -> Estado) y correr una campana de prueba de 5-10 cuentas antes de escalar
 - Probar `ia/contexto_noticias.generar_contexto_desde_links` con `OPENAI_API_KEY` real (hoy verificado con IA simulada; el fallback local ya funciona)
 - Reemplazar tokens placeholder en `.env` por claves reales (Telegram, Gemini, Grizzly)

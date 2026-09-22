@@ -1,17 +1,23 @@
 """Suite rapida de regresion de `plataformas/twitter/selenium_bot.py` (sin Chrome).
 
-Version permanente de los checks P0-A/B/C/D/E y P1 de la sesion de arreglos
-del pegado de texto en X. Usa FakeDriver/FakeElement para simular, sin red y
+Version permanente de los checks anti-Ghostban del pegado de texto en X y de los
+arreglos de navegacion/login. Usa FakeDriver/FakeElement para simular, sin red y
 sin Chrome, los casos reales de Railway:
 
-  - `_pegar_texto`: CDP `Input.insertText` (wrapper no editable con descendiente
-    contenteditable), portapapeles sin `el.click()` pese al `data-testid=mask`
-    del modal, `execCommand` no-op, `send_keys` como ultimo recurso,
-    verificacion del texto y re-localizacion de elementos stale (React), y el
-    mensaje final exacto si TODOS los metodos fallan.
+  - `_pegar_texto`: DESTRUYE la capa `[data-testid="mask"]` antes de limpiar/
+    escribir; el metodo primario es `editor.click()` (best effort) +
+    `editor.send_keys(texto)` en UNA sola llamada (eventos REALES de teclado) y
+    el fallback es `ActionChains(driver).send_keys(texto)` sobre el editable real
+    enfocado por JS. NO usa CDP `Input.insertText` ni `execCommand` ni el
+    portapapeles (X oculta los posts de la insercion silenciosa). Verifica el
+    texto, re-localiza elementos stale (React) y conserva el mensaje final
+    exacto si TODOS los metodos fallan.
+  - Limpieza de borrador: `_limpiar_editor_x` / `_editor_con_restos` (X restaura
+    el borrador del composer y el pegado lo acumulaba).
+  - Pausa humana de 1.8-3.5s entre escribir y publicar en `publicar_tweet`,
+    `responder_tweet` y la rama de CITA de `solo_retwittear`.
   - `_primer_editor_visible`: prefiere el editor NO ocluido por el mask y el
     editor del dialogo cuando `preferir_dialogo=True`.
-  - `solo_retwittear` (cita): usa `preferir_dialogo=True` al pedir el editor.
   - `navegar_tolerante` / `_recuperar_interstitial`: hasta DOS refrescos para
     la pagina de error generica de X; NUNCA el refresh adicional para el
     challenge anti-bot (Cloudflare), login o driver roto.
@@ -44,8 +50,10 @@ if str(RAIZ) not in sys.path:
 
 from selenium.common.exceptions import (  # noqa: E402
     ElementClickInterceptedException,
+    ElementNotInteractableException,
     InvalidSessionIdException,
     StaleElementReferenceException,
+    WebDriverException,
 )
 from selenium.webdriver.common.by import By  # noqa: E402
 from selenium.webdriver.common.keys import Keys  # noqa: E402
@@ -90,6 +98,7 @@ class FakeElement:
         stale=False,
         occluded=False,
         visible=True,
+        click_falla=False,
     ):
         self.driver = driver
         self.tag = tag
@@ -98,19 +107,24 @@ class FakeElement:
         self.stale = stale
         self.occluded = occluded
         self.visible = visible
+        self.click_falla = click_falla
         self.hijos = []
         self.seleccionado = False
         self.click_count = 0
 
     # --- API Selenium usada por el bot ---
     def resolver_editable(self):
-        if self.tag in ("textarea", "input") or self.contenteditable:
+        if self.es_editable():
             return self
         for h in self.hijos:
             r = h.resolver_editable()
             if r is not None:
                 return r
         return None
+
+    def es_editable(self):
+        """True si el elemento acepta teclado (input/textarea/contenteditable)."""
+        return self.tag in ("textarea", "input") or self.contenteditable
 
     def is_displayed(self):
         if self.stale:
@@ -146,6 +160,9 @@ class FakeElement:
         if self.stale:
             raise StaleElementReferenceException("stale")
         self.click_count += 1
+        self.driver.eventos.append(("click", self))
+        if self.click_falla:
+            raise WebDriverException("click roto (test)")
         if self.driver.mask_presente:
             raise ElementClickInterceptedException(
                 "mask intercepta el clic (test)"
@@ -156,11 +173,18 @@ class FakeElement:
             raise StaleElementReferenceException("stale")
         if args and args[0] in (Keys.CONTROL, Keys.COMMAND):
             tecla = args[-1]
+            self.driver.eventos.append(("atajo", tecla))
             if tecla == "a":
                 self.seleccionado = True
-            elif tecla == "v" and self.driver.send_keys_escribe:
-                self.set_contenido(self.driver.clipboard, reemplazar=True)
             return
+        self.driver.eventos.append(("send_keys", tuple(args)))
+        if self.driver.send_keys_lanza:
+            raise WebDriverException("send_keys roto (test)")
+        if not self.es_editable():
+            # Realista: `element.send_keys` en un wrapper no interactuable
+            # falla; el bot debe caer al fallback ActionChains enfocando el
+            # editable real por JS.
+            raise ElementNotInteractableException("no interactuable (test)")
         if args and self.driver.send_keys_escribe:
             self.set_contenido(str(args[0]), reemplazar=True)
 
@@ -178,11 +202,15 @@ class FakeDriver:
         self.masks = []
         self.mask_presente = False
         self.js_falla = False
-        self.cdp_escribe = True
-        self.exec_command_escribe = False
         self.send_keys_escribe = True
-        self.clipboard = ""
+        self.send_keys_lanza = False
+        self.actionchains_escribe = True
         self.focused = None
+        self._ctrl_a = False
+        # Orden cronologico de lo que pasa durante el pegado: permite verificar
+        # que el mask se destruye ANTES de cualquier escritura y que la pausa
+        # humana cae entre escribir y publicar.
+        self.eventos = []
         self.cdp_calls = []
         self.js_calls = []
         self.script_calls = []
@@ -218,6 +246,12 @@ class FakeDriver:
             raise RuntimeError("JS no disponible (test)")
         if "document.readyState" in script:
             return "complete"
+        if "data-testid" in script and ".remove()" in script:
+            # JS exacto de `_pegar_texto`: destruye la capa `data-testid="mask"`.
+            self.eventos.append(("destruir_mask",))
+            self.masks = []
+            self.mask_presente = False
+            return None
         if "elementFromPoint" in script:
             el = args[0]
             return not el.occluded
@@ -230,18 +264,29 @@ class FakeDriver:
             if len(args) > 1 and args[1]:
                 objetivo.seleccionado = True
             return True
-        if "execCommand" in script:
-            el = args[0]
-            if self.exec_command_escribe:
-                el.set_contenido(str(args[1]), reemplazar=True)
-            return None
         self.script_calls.append((script, args))
         return None
 
     def execute_cdp_cmd(self, cmd, params):
         self.cdp_calls.append((cmd, params))
-        if cmd == "Input.insertText" and self.cdp_escribe and self.focused is not None:
-            self.focused.set_contenido(params.get("text", ""), reemplazar=True)
+        if cmd == "Input.dispatchKeyEvent":
+            key = params.get("key")
+            self.eventos.append(("cdp_tecla", key))
+            if (
+                params.get("type") == "rawKeyDown"
+                and key == "a"
+                and params.get("modifiers") == 2
+            ):
+                self._ctrl_a = True
+            elif (
+                params.get("type") == "rawKeyDown"
+                and key == "Delete"
+                and self._ctrl_a
+                and self.focused is not None
+            ):
+                # Simula Ctrl+A + Delete: vacia el editable enfocado real.
+                self.focused.set_contenido("", reemplazar=True)
+                self._ctrl_a = False
         return {}
 
     def find_elements(self, by, sel):
@@ -250,6 +295,40 @@ class FakeDriver:
         if sel == "div[role='dialog']":
             return list(self.dialogos)
         return list(self.editores)
+
+
+class FakeActionChains:
+    """Reemplazo de `ActionChains` que registra la llamada (fallback W3C).
+
+    Se parchea `plataformas.twitter.selenium_bot.ActionChains` SOLO en los tests
+    de fallback: asi se verifica que el bot cae a
+    `ActionChains(driver).send_keys(texto)` (eventos reales de teclado a nivel
+    W3C) sin abrir Chrome, y que el texto llega al editable enfocado por JS.
+    """
+
+    def __init__(self, driver):
+        self.driver = driver
+        self._teclas = []
+
+    def send_keys(self, *teclas):
+        self._teclas.extend(teclas)
+        return self
+
+    def perform(self):
+        texto = "".join(str(t) for t in self._teclas)
+        self.driver.eventos.append(("actionchains", texto))
+        if self.driver.actionchains_escribe and self.driver.focused is not None:
+            self.driver.focused.set_contenido(texto, reemplazar=True)
+
+
+@contextlib.contextmanager
+def _actionchains_falso(driver, escribir=True):
+    """Parchea `ActionChains` del bot por `FakeActionChains` durante el bloque."""
+    driver.actionchains_escribe = escribir
+    with mock.patch(
+        "plataformas.twitter.selenium_bot.ActionChains", FakeActionChains
+    ):
+        yield
 
 
 class FakeBoton:
@@ -427,83 +506,276 @@ def _pyperclip_falso(copias, lanzar=False, driver=None):
 
 
 # --------------------------------------------------------------------------- #
-# P0-A/B: `_pegar_texto`
+# Ghostban: `_pegar_texto` con eventos REALES de teclado
 # --------------------------------------------------------------------------- #
-def test_cdp_wrapper(check):
-    print("P0-A: CDP Input.insertText con wrapper no editable")
-    driver = FakeDriver()
-    wrapper = FakeElement(driver, contenteditable=False)
-    hijo = FakeElement(driver, contenteditable=True)
-    wrapper.hijos = [hijo]
-    driver.editores = [wrapper]
-    bot = bot_con_driver(driver)
-    bot._pegar_texto(wrapper, "Hola CDP desde wrapper")
+class GrabadorSleep:
+    """`time.sleep` falso que registra los valores en la lista `eventos`."""
+
+    def __init__(self, eventos):
+        self.eventos = eventos
+
+    def __call__(self, segundos):
+        self.eventos.append(("sleep", round(float(segundos), 2)))
+
+
+def _uniform_stub(registro):
+    """`random.uniform` determinista: la pausa humana siempre vale 2.5s."""
+
+    def stub(a, b):
+        registro.append((float(a), float(b)))
+        if (float(a), float(b)) == (1.8, 3.5):
+            return 2.5
+        return (float(a) + float(b)) / 2
+
+    return stub
+
+
+def _comprobar_pausa_humana(check, nombre, eventos, uniformes):
+    """Verifica que la pausa 1.8-3.5s cae entre 'pegar' y 'boton'."""
     check(
-        "CDP: el texto queda en el descendiente contenteditable",
-        hijo._texto == "Hola CDP desde wrapper",
-        repr(hijo._texto),
+        f"{nombre}: se pidio random.uniform(1.8, 3.5)",
+        (1.8, 3.5) in uniformes,
+        str(uniformes),
+    )
+    marcas = [e[0] for e in eventos]
+    idx_pausa = next(
+        (i for i, e in enumerate(eventos) if e == ("sleep", 2.5)), None
     )
     check(
-        "CDP: se uso Input.insertText por execute_cdp_cmd",
-        driver.cdp_calls and driver.cdp_calls[0][0] == "Input.insertText",
-    )
-    check(
-        "CDP: se enfoco y selecciono el editable por JS",
-        hijo.seleccionado is True,
-    )
-    check(
-        "CDP: una sola pasada (sin portapapeles)",
-        len(driver.cdp_calls) == 1,
+        f"{nombre}: la pausa humana ocurre entre escribir y publicar",
+        idx_pausa is not None
+        and marcas.index("pegar") < idx_pausa < marcas.index("boton"),
+        str(eventos),
     )
 
 
-def test_pyperclip_lanza_y_fallbacks(check):
-    print("P0-A/B: CDP no-op + pyperclip lanza + execCommand no-op -> send_keys")
+def test_mask_primero_y_send_keys(check):
+    print("Ghostban: mask destruido antes de escribir + click/send_keys")
     driver = FakeDriver()
-    driver.cdp_escribe = False
-    driver.exec_command_escribe = False
-    editor = FakeElement(driver, contenteditable=True, texto="")
+    driver.mask_presente = True
+    driver.masks = [object()]
+    editor = FakeElement(driver, contenteditable=True)
     driver.editores = [editor]
-    copias = []
-    with _pyperclip_falso(copias, lanzar=True):
-        bot = bot_con_driver(driver)
-        bot._pegar_texto(editor, "Texto por send_keys")
+    bot = bot_con_driver(driver)
+    bot._pegar_texto(editor, "Texto con teclado real")
     check(
-        "fallback: el texto final entra por send_keys",
-        editor._texto == "Texto por send_keys",
+        "send_keys: el texto quedo en el editor",
+        editor._texto == "Texto con teclado real",
         repr(editor._texto),
     )
-    check("fallback: pyperclip no copio (sin xclip)", copias == [])
     check(
-        "fallback: se intento execCommand antes de send_keys",
-        any("execCommand" in s for s, _ in driver.js_calls),
+        "mask: se elimino la capa [data-testid='mask']",
+        driver.mask_presente is False and driver.masks == [],
     )
-    check("fallback: el click de send_keys si corrio", editor.click_count >= 1)
+    js_exacto = (
+        "document.querySelectorAll('[data-testid=\"mask\"]')"
+        ".forEach(e => e.remove());"
+    )
+    check(
+        "mask: se ejecuto el JS exacto de destruccion",
+        any(script == js_exacto for script, _ in driver.js_calls),
+        str([s for s, _ in driver.js_calls]),
+    )
+    marcas = [e[0] for e in driver.eventos]
+    check(
+        "mask: destruido ANTES del click y del send_keys",
+        marcas.index("destruir_mask") < marcas.index("click")
+        and marcas.index("destruir_mask") < marcas.index("send_keys"),
+        str(driver.eventos),
+    )
+    check(
+        "send_keys: hubo click previo en el editor",
+        editor.click_count >= 1,
+        f"clicks={editor.click_count}",
+    )
+    check(
+        "send_keys: el texto se envio en UNA sola llamada",
+        ("send_keys", ("Texto con teclado real",)) in driver.eventos,
+        str(driver.eventos),
+    )
 
 
-def test_portapapeles_sin_click_con_mask(check):
-    print("P0-B: portapapeles sin el.click() pese al mask")
+def test_sin_metodos_silenciosos(check):
+    print("Ghostban: ni CDP insertText, ni execCommand, ni pyperclip")
     driver = FakeDriver()
-    driver.cdp_escribe = False  # forzar la ruta del portapapeles
     driver.mask_presente = True
+    driver.masks = [object()]
     editor = FakeElement(driver, contenteditable=True)
     driver.editores = [editor]
     copias = []
     with _pyperclip_falso(copias, lanzar=False, driver=driver):
         bot = bot_con_driver(driver)
-        bot._pegar_texto(editor, "Pegado sin click")
-    check("mask: el texto queda pegado", editor._texto == "Pegado sin click", repr(editor._texto))
-    check("mask: pyperclip copio el texto", copias == ["Pegado sin click"])
+        bot._pegar_texto(editor, "Primario sin silenciosos")
     check(
-        "mask: ningun el.click() (mask intacto)",
-        editor.click_count == 0,
-        f"clicks={editor.click_count}",
+        "silenciosos: sin Input.insertText en el camino primario",
+        all(cmd != "Input.insertText" for cmd, _ in driver.cdp_calls),
+        str(driver.cdp_calls),
     )
-    check("mask: se enfoco el editor por JS", driver.focused is editor)
+    check(
+        "silenciosos: sin document.execCommand en el camino primario",
+        all("execCommand" not in script for script, _ in driver.js_calls),
+    )
+    check("silenciosos: pyperclip nunca se uso (primario)", copias == [])
+
+    # Camino de FALLBACK (send_keys roto): tampoco usa metodos silenciosos.
+    driver2 = FakeDriver()
+    driver2.send_keys_lanza = True
+    editor2 = FakeElement(driver2, contenteditable=True)
+    driver2.editores = [editor2]
+    copias2 = []
+    with _pyperclip_falso(copias2, lanzar=False, driver=driver2), _actionchains_falso(
+        driver2
+    ):
+        bot2 = bot_con_driver(driver2)
+        bot2._pegar_texto(editor2, "Fallback sin silenciosos")
+    check(
+        "silenciosos: sin Input.insertText en el fallback",
+        all(cmd != "Input.insertText" for cmd, _ in driver2.cdp_calls),
+    )
+    check(
+        "silenciosos: sin document.execCommand en el fallback",
+        all("execCommand" not in script for script, _ in driver2.js_calls),
+    )
+    check("silenciosos: pyperclip nunca se uso (fallback)", copias2 == [])
+    check(
+        "silenciosos: el fallback escribio el texto",
+        editor2._texto == "Fallback sin silenciosos",
+        repr(editor2._texto),
+    )
+
+
+def test_click_falla_sigue_con_send_keys(check):
+    print("Ghostban: si el click falla NO se aborta (send_keys enfoca por W3C)")
+    driver = FakeDriver()
+    editor = FakeElement(driver, contenteditable=True, click_falla=True)
+    driver.editores = [editor]
+    bot = bot_con_driver(driver)
+    bot._pegar_texto(editor, "Texto pese al click roto")
+    check(
+        "click roto: el texto quedo en el editor",
+        editor._texto == "Texto pese al click roto",
+        repr(editor._texto),
+    )
+    marcas = [e[0] for e in driver.eventos]
+    check(
+        "click roto: se intento el click antes del send_keys",
+        marcas.index("click") < marcas.index("send_keys"),
+        str(driver.eventos),
+    )
+    check(
+        "click roto: NO hizo falta el fallback ActionChains",
+        "actionchains" not in marcas,
+        str(driver.eventos),
+    )
+
+
+def test_fallback_actionchains(check):
+    print("Ghostban: fallback ActionChains (send_keys roto y wrapper no editable)")
+    # (a) send_keys roto en un contenteditable directo.
+    driver = FakeDriver()
+    driver.send_keys_lanza = True
+    editor = FakeElement(driver, contenteditable=True)
+    driver.editores = [editor]
+    with _actionchains_falso(driver):
+        bot = bot_con_driver(driver)
+        bot._pegar_texto(editor, "Texto por ActionChains")
+    check(
+        "actionchains: el texto quedo",
+        editor._texto == "Texto por ActionChains",
+        repr(editor._texto),
+    )
+    marcas = [e[0] for e in driver.eventos]
+    check(
+        "actionchains: se uso ActionChains(driver).send_keys",
+        ("actionchains", "Texto por ActionChains") in driver.eventos,
+        str(driver.eventos),
+    )
+    check(
+        "actionchains: fue el ULTIMO metodo (tras el send_keys primario)",
+        "send_keys" in marcas and marcas.index("send_keys") < marcas.index("actionchains"),
+        str(driver.eventos),
+    )
+
+    # (b) wrapper no editable con descendiente contenteditable (variante de X).
+    driver2 = FakeDriver()
+    wrapper = FakeElement(driver2, contenteditable=False)
+    hijo = FakeElement(driver2, contenteditable=True)
+    wrapper.hijos = [hijo]
+    driver2.editores = [wrapper]
+    with _actionchains_falso(driver2):
+        bot2 = bot_con_driver(driver2)
+        bot2._pegar_texto(wrapper, "Wrapper por ActionChains")
+    check(
+        "actionchains/wrapper: el texto queda en el descendiente contenteditable",
+        hijo._texto == "Wrapper por ActionChains",
+        repr(hijo._texto),
+    )
+    check(
+        "actionchains/wrapper: se enfoco el editable real por JS",
+        driver2.focused is hijo,
+    )
+
+
+def test_mask_js_falla_no_aborta(check):
+    print("Ghostban: si el JS del mask falla el pegado continua")
+    driver = FakeDriver()
+    driver.js_falla = True
+    driver.mask_presente = True
+    driver.masks = [object()]
+    editor = FakeElement(driver, contenteditable=True)
+    driver.editores = [editor]
+    bot = bot_con_driver(driver)
+    bot._pegar_texto(editor, "Texto sin JS de mask")
+    check(
+        "mask JS roto: el texto igual quedo (send_keys)",
+        editor._texto == "Texto sin JS de mask",
+        repr(editor._texto),
+    )
+    check(
+        "mask JS roto: el fallo no tumbo el pegado (mask sigue montado)",
+        driver.mask_presente is True,
+    )
+
+
+def test_limpieza_borrador(check):
+    print("Ghostban: borrador restaurado por X se limpia antes de escribir")
+    driver = FakeDriver()
+    borrador = (
+        "BORRADOR VIEJO QUE X RESTAURO EN EL COMPOSITOR Y QUE SE QUEDO PEGADO "
+        "ENTRE INTENTOS DE LA MISMA CUENTA"
+    )
+    editor = FakeElement(driver, contenteditable=True, texto=borrador)
+    driver.editores = [editor]
+    bot = bot_con_driver(driver)
+    check(
+        "borrador: _editor_con_restos detecta el exceso",
+        bot._editor_con_restos(editor, "Texto nuevo") > 0,
+    )
+    bot._pegar_texto(editor, "Texto nuevo")
+    check(
+        "borrador: el editor queda SOLO con el texto nuevo",
+        editor._texto == "Texto nuevo",
+        repr(editor._texto),
+    )
+    marcas = [e[0] for e in driver.eventos]
+    check(
+        "borrador: se uso la limpieza CDP (Ctrl+A/Delete) antes de escribir",
+        ("cdp_tecla", "Delete") in driver.eventos,
+        str(driver.eventos),
+    )
+    check(
+        "borrador: la limpieza ocurre despues de destruir el mask",
+        marcas.index("destruir_mask") < marcas.index("cdp_tecla"),
+        str(driver.eventos),
+    )
+    check(
+        "borrador: _editor_con_restos queda en 0 tras escribir",
+        bot._editor_con_restos(editor, "Texto nuevo") == 0,
+    )
 
 
 def test_stale_relocaliza(check):
-    print("P0-A: stale element -> re-localizacion y reintento")
+    print("Ghostban: stale element -> re-localizacion y reintento")
     driver = FakeDriver()
     viejo = FakeElement(driver, contenteditable=True, stale=True)
     fresco = FakeElement(driver, contenteditable=True)
@@ -515,18 +787,20 @@ def test_stale_relocaliza(check):
         fresco._texto == "Texto tras relocalizar",
         repr(fresco._texto),
     )
-    check("stale: se re-localizo y se uso CDP con el fresco", len(driver.cdp_calls) >= 1)
+    check(
+        "stale: se re-localizo y se escribio en el fresco",
+        ("send_keys", ("Texto tras relocalizar",)) in driver.eventos,
+        str(driver.eventos),
+    )
 
 
 def test_mensaje_final_exacto(check):
-    print("P0-A: mensaje final exacto si TODO falla")
+    print("Ghostban: mensaje final exacto si TODO falla")
     driver = FakeDriver()
-    driver.cdp_escribe = False
-    driver.exec_command_escribe = False
     driver.send_keys_escribe = False
     editor = FakeElement(driver, contenteditable=True)
     driver.editores = [editor]
-    with _pyperclip_falso([], lanzar=True):
+    with _actionchains_falso(driver, escribir=False), _pyperclip_falso([], lanzar=True):
         bot = bot_con_driver(driver)
         try:
             bot._pegar_texto(editor, "nada")
@@ -538,6 +812,76 @@ def test_mensaje_final_exacto(check):
         error == "no se pudo escribir el texto en el editor de X",
         repr(error),
     )
+
+
+# --------------------------------------------------------------------------- #
+# Pausa humana: relevo del tuit antes de publicar (1.8-3.5s)
+# --------------------------------------------------------------------------- #
+def test_pausa_humana_publicar_tweet(check):
+    print("Pausa humana: publicar_tweet relee antes de buscar el boton")
+    driver = FakeDriver()
+    bot = bot_con_driver(driver)
+    eventos = []
+    uniformes = []
+    bot._detectar_limite_cuenta = lambda: False
+    bot._abrir_compositor = lambda: FakeElement(driver)
+    bot._pegar_texto = lambda editor, texto: eventos.append(("pegar", texto))
+    bot._verificar_publicacion = lambda: True
+    bot._obtener_ultimo_enlace = lambda usuario: ""
+
+    def spy_boton(timeout=10, texto=""):
+        eventos.append(("boton",))
+        return FakeBoton()
+
+    bot._esperar_boton_post_habilitado = spy_boton
+    with mock.patch("time.sleep", GrabadorSleep(eventos)), mock.patch(
+        "plataformas.twitter.selenium_bot.random.uniform",
+        side_effect=_uniform_stub(uniformes),
+    ):
+        resultado = bot.publicar_tweet("Texto de prueba")
+    check(
+        "pausa publicar_tweet: publicacion simulada OK",
+        resultado is True,
+        repr(resultado),
+    )
+    _comprobar_pausa_humana(check, "pausa publicar_tweet", eventos, uniformes)
+
+
+def test_pausa_humana_responder_tweet(check):
+    print("Pausa humana: responder_tweet relee antes de buscar el boton")
+    driver = FakeDriver()
+    bot = bot_con_driver(driver)
+    eventos = []
+    uniformes = []
+    bot._recuperar_interstitial = lambda url: "ok"
+    bot._hay_muro_login = lambda: False
+    bot._asegurar_pagina_tweet = lambda url: None
+    bot._detectar_limite_cuenta = lambda: False
+    bot._esperar_article_tweet = lambda timeout=10: None
+    bot._buscar_boton_responder = lambda timeout=12: FakeBoton()
+    bot._esperar_editor_visible = lambda preferir_dialogo=False, **kw: FakeElement(driver)
+    bot._pegar_texto = lambda editor, texto: eventos.append(("pegar", texto))
+    bot._verificar_publicacion = lambda: True
+    bot._obtener_url_respuesta = lambda url: ""
+
+    def spy_boton(timeout=10, texto=""):
+        eventos.append(("boton",))
+        return FakeBoton()
+
+    bot._esperar_boton_post_habilitado = spy_boton
+    with mock.patch("time.sleep", GrabadorSleep(eventos)), mock.patch(
+        "plataformas.twitter.selenium_bot.random.uniform",
+        side_effect=_uniform_stub(uniformes),
+    ):
+        resultado = bot.responder_tweet(
+            "https://x.com/a/status/1", "Comentario de prueba"
+        )
+    check(
+        "pausa responder_tweet: respuesta simulada OK",
+        resultado is True,
+        repr(resultado),
+    )
+    _comprobar_pausa_humana(check, "pausa responder_tweet", eventos, uniformes)
 
 
 # --------------------------------------------------------------------------- #
@@ -602,13 +946,15 @@ def test_primer_editor_ocluido(check):
 
 
 # --------------------------------------------------------------------------- #
-# P0-D: `solo_retwittear` (rama cita) usa preferir_dialogo=True
+# P0-D: `solo_retwittear` (rama cita) usa preferir_dialogo=True + pausa humana
 # --------------------------------------------------------------------------- #
 def test_cita_prefiere_dialogo(check):
-    print("P0-D: la cita pide el editor del dialogo")
+    print("P0-D: la cita pide el editor del dialogo y relee antes de publicar")
     driver = FakeDriver()
     bot = bot_con_driver(driver)
 
+    eventos = []
+    uniformes = []
     llamadas = {}
 
     def spy_editor(*args, **kwargs):
@@ -622,24 +968,37 @@ def test_cita_prefiere_dialogo(check):
     bot._buscar_boton_retweet = lambda: FakeBoton()
     bot._buscar_opcion_quote = lambda: FakeBoton()
     bot._esperar_editor_visible = spy_editor
-    pegados = []
-    bot._pegar_texto = lambda editor, texto: pegados.append(texto)
-    bot._buscar_boton_post = lambda: FakeBoton()
+    bot._pegar_texto = lambda editor, texto: eventos.append(("pegar", texto))
     bot._verificar_publicacion = lambda: True
     bot._obtener_ultimo_enlace = lambda usuario: ""
 
-    resultado = bot.solo_retwittear(
-        ["https://x.com/alguien/status/1"],
-        "cuenta_test",
-        mensaje_cita="Comentario de cita",
-    )
+    def spy_boton_post():
+        eventos.append(("boton",))
+        return FakeBoton()
+
+    bot._buscar_boton_post = spy_boton_post
+
+    with mock.patch("time.sleep", GrabadorSleep(eventos)), mock.patch(
+        "plataformas.twitter.selenium_bot.random.uniform",
+        side_effect=_uniform_stub(uniformes),
+    ):
+        resultado = bot.solo_retwittear(
+            ["https://x.com/alguien/status/1"],
+            "cuenta_test",
+            mensaje_cita="Comentario de cita",
+        )
     check("cita: RT con cita reportado como exitoso", resultado.get("exitos") == 1, str(resultado))
     check(
         "cita: pide el editor del dialogo (preferir_dialogo=True)",
         llamadas.get("preferir_dialogo") is True,
         str(llamadas),
     )
-    check("cita: pega el mensaje de la cita", pegados == ["Comentario de cita"], str(pegados))
+    check(
+        "cita: pega el mensaje de la cita",
+        ("pegar", "Comentario de cita") in eventos,
+        str(eventos),
+    )
+    _comprobar_pausa_humana(check, "pausa cita", eventos, uniformes)
 
 
 # --------------------------------------------------------------------------- #
@@ -920,11 +1279,16 @@ def test_login_pkl_muro_de_login(check):
 def run(check):
     """Ejecuta los checks de este archivo con el `check` del runner."""
     with _sin_esperas():
-        test_cdp_wrapper(check)
-        test_pyperclip_lanza_y_fallbacks(check)
-        test_portapapeles_sin_click_con_mask(check)
+        test_mask_primero_y_send_keys(check)
+        test_sin_metodos_silenciosos(check)
+        test_click_falla_sigue_con_send_keys(check)
+        test_fallback_actionchains(check)
+        test_mask_js_falla_no_aborta(check)
+        test_limpieza_borrador(check)
         test_stale_relocaliza(check)
         test_mensaje_final_exacto(check)
+        test_pausa_humana_publicar_tweet(check)
+        test_pausa_humana_responder_tweet(check)
         test_primer_editor_ocluido(check)
         test_cita_prefiere_dialogo(check)
         test_navegar_tolerante_p1(check)

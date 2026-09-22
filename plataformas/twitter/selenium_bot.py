@@ -2023,7 +2023,15 @@ class TwitterBot:
             
             time.sleep(random.uniform(0.15, 0.35))
             t_escribir = self._ahora()
-            
+
+            # Pausa humana: el tiempo que una persona tarda en releer el tuit
+            # antes de enviarlo. Ademas, da margen a que X procese los eventos
+            # reales de teclado que escribio `_pegar_texto`.
+            logger.debug(
+                f"pausa humana antes de publicar @{self.usuario} (1.8-3.5s)"
+            )
+            time.sleep(random.uniform(1.8, 3.5))
+
             # Esperar a que el boton "Post" se HABILITE: X lo mantiene
             # deshabilitado hasta que el editor registra el texto. Si en 10s no
             # se habilita, el texto no quedo en el editor y hay que cortar aqui
@@ -3728,6 +3736,13 @@ try {
                 self._subir_imagen(imagen_path)
                 time.sleep(0.5)
 
+            # Pausa humana: releer la respuesta antes de enviarla (mismo patron
+            # que publicar_tweet).
+            logger.debug(
+                f"pausa humana antes de publicar la respuesta @{self.usuario} (1.8-3.5s)"
+            )
+            time.sleep(random.uniform(1.8, 3.5))
+
             # No clicar a ciegas: X mantiene el boton Responder deshabilitado
             # hasta que el editor registra el texto. Si no se habilita, el
             # reply NO se publico y hay que cortar aqui (el motor lo reintenta
@@ -4155,32 +4170,32 @@ try {
         )
 
     def _pegar_texto(self, elemento, texto: str):
-        """Escribe `texto` en el editor verificando que REALMENTE quedo.
+        """Escribe `texto` en el editor con EVENTOS REALES de teclado.
 
-        Metodos en orden, cada uno verificado leyendo el contenido del editor:
-          1. CDP `Input.insertText`: escribe en el elemento ENFOCADO sin clic ni
-             portapapeles, asi que funciona aunque el `data-testid="mask"` del
-             modal tape el editor (bug real de Railway: el clic de `send_keys`
-             interceptado y el portapapeles sin xclip). Antes de insertar se
-             resuelve el editable real (X monta `tweetTextarea_0` como wrapper
-             en algunas variantes) y se enfoca/selecciona todo con JS.
-          2. Portapapeles (`pyperclip.copy` + Ctrl/Cmd+V) SIN `el.click()`
-             (el mask lo intercepta): se enfoca por JS y se pega en el
-             `active_element`.
-          3. `document.execCommand('insertText')` via JS: NO necesita clic ni
-             foco por Selenium (hace `arguments[0].focus()` en JS).
-          4. `send_keys(texto)` en UNA sola llamada como ULTIMO recurso (nada de
-             bucle char por char: miles de comandos al renderer son los que
-             provocan los `Timed out receiving message from renderer` en el
-             contenedor).
+        X (Ghostban/Shadowban) oculta los posts de las cuentas que insertan
+        texto de forma silenciosa: por eso YA NO se usa CDP `Input.insertText`,
+        ni `document.execCommand('insertText')`, ni el portapapeles. El flujo es:
+          0. Se DESTRUYE la capa `[data-testid="mask"]` del modal con JS: era la
+             que interceptaba el clic y obligaba a los metodos silenciosos. Si
+             el JS falla (driver raro) NO se aborta el pegado:
+             `_esperar_mask_desaparezca` y el manejo de
+             `ElementClickInterceptedException` quedan como red de seguridad.
+          1. Se VACIA el editor (`_limpiar_editor_x`): X restaura el borrador del
+             composer entre intentos de la misma cuenta y el pegado lo ACUMULABA
+             (1800-2600 chars, > 280: boton Post deshabilitado para siempre).
+          2. Metodo PRIMARIO: `editor.click()` envuelto en try/except (si el
+             clic falla NO se aborta: `send_keys` enfoca por W3C) +
+             `editor.send_keys(texto)` en UNA sola llamada: Chrome simula los
+             eventos reales de teclado (nada de bucle char por char, que satura
+             el renderer en Railway).
+          3. FALLBACK: `ActionChains(driver).send_keys(texto)` (los mismos
+             eventos de teclado a nivel W3C) sobre el editable REAL enfocado por
+             JS (`_enfocar_editable`, solo foco, sin inyectar texto).
 
-        Antes de escribir se VACIA el editor (`_limpiar_editor_x`): X restaura
-        el borrador del composer entre intentos de la misma cuenta y el pegado
-        lo ACUMULABA (1800-2600 chars, > 280: boton Post deshabilitado para
-        siempre). Despues de escribir se valida el largo: si el editor quedo
-        con restos (`_editor_con_restos`), se limpia y escribe UNA vez mas; si
-        sigue sucio se lanza `"editor de X con borrador que no se pudo limpiar
-        (N chars)"` (nada se publico: fallo seguro para el motor).
+        Despues de escribir se valida el largo: si el editor quedo con restos
+        (`_editor_con_restos`), se limpia y escribe UNA vez mas; si sigue sucio
+        se lanza `"editor de X con borrador que no se pudo limpiar (N chars)"`
+        (nada se publico: fallo seguro para el motor).
 
         El DOM de X (React) se re-renderiza y el `WebElement` guardado puede
         quedar viejo (`StaleElementReferenceException`), perdiendo el intento:
@@ -4196,6 +4211,21 @@ try {
         texto = texto or ""
         if not texto:
             return
+
+        # Ghostban: la capa `data-testid="mask"` del modal interceptaba el clic
+        # de `send_keys` y obligaba a usar insercion silenciosa por CDP/JS, que
+        # X SI detecta como automatizacion (oculta los posts). Se destruye
+        # ANTES de limpiar/escribir; si el JS falla, el pegado continua con la
+        # red de seguridad de `_intentar`/`_esperar_mask_desaparezca`.
+        try:
+            self.driver.execute_script(
+                "document.querySelectorAll('[data-testid=\"mask\"]').forEach(e => e.remove());"
+            )
+        except Exception as e:
+            logger.debug(
+                f"No se pudo destruir la capa mask del modal "
+                f"({type(e).__name__}: {e}); se continua con el pegado"
+            )
 
         estado = {"elemento": elemento}
 
@@ -4324,63 +4354,36 @@ try {
                 return False
             return False
 
-        # 1) P0-A: CDP `Input.insertText` escribe en el elemento ENFOCADO: sin
-        #    clic (el `mask` del modal lo intercepta) y sin portapapeles (en
-        #    Railway no hay xclip). `_enfocar_editable` resuelve el editable
-        #    real del wrapper (`tweetTextarea_0`) y selecciona todo para que la
-        #    insercion REEMPLACE lo que hubiera.
-        def _cdp_inserttext(el):
-            if not self._enfocar_editable(el, seleccionar=True):
-                raise InvalidElementStateException(
-                    "no hay un editable enfocable dentro del editor"
-                )
-            self.driver.execute_cdp_cmd("Input.insertText", {"text": texto})
-
-        # 2) Portapapeles (`pyperclip.copy` + Ctrl/Cmd+V) SIN `el.click()`: el
-        #    `data-testid='mask'` del modal intercepta el clic y tiraba el
-        #    intento. Se enfoca el editable real por JS y se pega sobre el
-        #    `active_element`. Si pyperclip falla (sin xclip en Railway), la
-        #    PyperclipException se propaga y se pasa al siguiente metodo.
-        def _portapapeles(el):
-            import pyperclip
-
-            self._enfocar_editable(el, seleccionar=True)
-            pyperclip.copy(texto)
-            modifier = Keys.COMMAND if os.name == "posix" else Keys.CONTROL
-            try:
-                activo = self.driver.switch_to.active_element
-            except Exception:
-                activo = None
-            if activo is not None:
-                activo.send_keys(modifier, "a")
-                activo.send_keys(modifier, "v")
-            else:
-                # El foco ya quedo puesto por JS: ActionChains manda las teclas
-                # al elemento activo del documento.
-                ActionChains(self.driver).key_down(modifier).send_keys("a").key_up(modifier).perform()
-                ActionChains(self.driver).key_down(modifier).send_keys("v").key_up(modifier).perform()
-
-        # 3) JS: insertText sobre el elemento (focus en JS, sin clic de Selenium:
-        #    el `mask` del modal de X intercepta el clic y tiraba el intento).
-        def _execcommand(el):
-            self.driver.execute_script(
-                "arguments[0].focus(); document.execCommand('insertText', false, arguments[1]);",
-                el,
-                texto,
-            )
-
-        # 4) Ultimo recurso: send_keys en UNA sola llamada.
+        # 1) PRIMARIO: `editor.click()` fuerza el foco (envuelto en try/except:
+        #    si el clic falla NO se aborta, `send_keys` enfoca por W3C) y
+        #    `send_keys(texto)` en UNA sola llamada genera los eventos REALES de
+        #    teclado (keydown/keypress/input/keyup) que X exige para no marcar la
+        #    cuenta como bot (Ghostban/Shadowban). Sin bucle char por char: miles
+        #    de comandos al renderer son los que provocaban los `Timed out
+        #    receiving message from renderer` en Railway.
         def _send_keys(el):
-            el.click()
+            try:
+                el.click()
+            except Exception as e:
+                logger.debug(
+                    f"click sobre el editor fallo ({type(e).__name__}: {e}); "
+                    f"se continua con send_keys (enfoca por W3C)"
+                )
             el.send_keys(texto)
 
+        # 2) FALLBACK: los mismos eventos reales de teclado a nivel W3C, sobre
+        #    el editable REAL enfocado por JS (`_enfocar_editable` solo enfoca,
+        #    no inyecta texto): cubre los wrappers donde `tweetTextarea_0` no es
+        #    el contenteditable.
+        def _actionchains(el):
+            self._enfocar_editable(el, seleccionar=False)
+            ActionChains(self.driver).send_keys(texto).perform()
+
         def _escribir_con_metodos() -> bool:
-            """Recorre los 4 metodos de pegado (mismo orden) hasta que el texto quede."""
+            """Recorre los 2 metodos de escritura (mismo orden) hasta que el texto quede."""
             for nombre, metodo in (
-                ("cdp_insertText", _cdp_inserttext),
-                ("portapapeles", _portapapeles),
-                ("execCommand", _execcommand),
                 ("send_keys", _send_keys),
+                ("actionchains", _actionchains),
             ):
                 if _intentar(nombre, metodo):
                     return True
@@ -4773,6 +4776,13 @@ try {
                         self._subir_imagen(imagen_path)
                         time.sleep(0.5)
                     
+                    # Pausa humana: releer la cita antes de publicarla (solo la
+                    # rama de CITA; el RT simple no escribe texto).
+                    logger.debug(
+                        f"pausa humana antes de publicar la cita @{self.usuario} (1.8-3.5s)"
+                    )
+                    time.sleep(random.uniform(1.8, 3.5))
+
                     publicar_btn = self._buscar_boton_post()
                     self.driver.execute_script("arguments[0].click();", publicar_btn)
                     
