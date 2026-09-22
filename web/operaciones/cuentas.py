@@ -56,6 +56,7 @@ TABS = [
     "🎨 Perfiles",
     "🏷️ Nombres",
     "⏸️ Estado",
+    "🗑️ Eliminar",
     "📷 Fotos",
     "🛡️ Anti-detección",
     "🔄 Sincronizar desde X",
@@ -74,6 +75,7 @@ MODOS_TABS = {
         "📥 Importar",
         "🔎 Validar",
         "⏸️ Estado",
+        "🗑️ Eliminar",
         "📋 Inventario",
         "📤 Exportar",
     ],
@@ -2347,6 +2349,211 @@ def _tab_estado():
                 st.error(f"No se pudieron eliminar las cuentas: {e}")
 
 
+def _tab_eliminar():
+    """Borrado definitivo por lista pegada, con autoselección de coincidencias.
+
+    Reutiliza `cuentas/eliminador.py` (búsqueda case-insensitive, respaldo JSON
+    previo, borrado de cookies/avatares locales y cancelación de tareas
+    huérfanas). El botón de borrar queda deshabilitado hasta que haya cuentas
+    seleccionadas Y la confirmación esté marcada."""
+    st.markdown("### 🗑️ Eliminar cuentas por lista")
+    st.caption(
+        "Borra cuentas de forma **DEFINITIVA** pegando una lista (una por "
+        "línea): `usuario`, `@usuario` o la línea completa del vendedor "
+        "(`usuario:password:totp:...`). Se ignoran las líneas vacías y los "
+        "comentarios que empiezan con `#`.\n"
+        "Para cuentas suspendidas que el sistema ya detectó y listó, la "
+        "pestaña **⏸️ Estado** tiene su propio botón de borrado."
+    )
+
+    # Limpieza diferida programada por un borrado exitoso: en ese run los
+    # widgets ya estaban instanciados, así que el `pop` se aplica aquí, antes
+    # de volver a crearlos.
+    if st.session_state.pop("elim_limpiar_pendiente", False):
+        for clave in ("elim_texto", "elim_seleccion", "elim_confirmar"):
+            st.session_state.pop(clave, None)
+
+    texto = st.text_area(
+        "Pega aquí la lista de cuentas a eliminar (una por línea)",
+        height=220,
+        key="elim_texto",
+    )
+
+    if st.button(
+        "🔍 Buscar coincidencias",
+        use_container_width=True,
+        key="btn_elim_buscar",
+    ):
+        from cuentas.eliminador import buscar_cuentas, parsear_lista_usuarios
+
+        usuarios = parsear_lista_usuarios(texto or "")
+        if not usuarios:
+            st.session_state.pop("elim_resultado", None)
+            st.warning(
+                "No se detectó ningún usuario válido en el texto pegado. Pega "
+                "una cuenta por línea (`usuario`, `@usuario` o la línea "
+                "completa del vendedor)."
+            )
+        else:
+            with st.spinner(f"Buscando {len(usuarios)} cuenta(s)…"):
+                resultado = buscar_cuentas(usuarios)
+            st.session_state["elim_resultado"] = resultado
+            # Búsqueda nueva: se descartan la selección y la confirmación
+            # anteriores para que el multiselect arranque con TODAS las
+            # encontradas (los widgets aún no se crearon en este run).
+            st.session_state.pop("elim_seleccion", None)
+            st.session_state.pop("elim_confirmar", None)
+
+    resultado = st.session_state.get("elim_resultado") or {}
+    if not resultado:
+        return
+
+    error = resultado.get("error") or ""
+    if error:
+        st.error(f"No se pudo buscar en la base de datos: {error}")
+        return
+
+    encontradas = resultado.get("encontradas") or []
+    no_encontradas = resultado.get("no_encontradas") or []
+
+    st.markdown("#### 🔍 Resultado de la búsqueda")
+    c1, c2 = st.columns(2)
+    c1.metric("Encontradas", len(encontradas))
+    c2.metric("No encontradas", len(no_encontradas))
+
+    if encontradas:
+        st.dataframe(
+            [
+                {
+                    "usuario": f.get("usuario", ""),
+                    "activa": "Sí" if f.get("activa") else "No",
+                    "status": f.get("status", ""),
+                    "nombre_mostrado": f.get("nombre_mostrado", ""),
+                    "handle_actual": f.get("handle_actual", ""),
+                }
+                for f in encontradas
+            ],
+            use_container_width=True,
+        )
+    else:
+        st.warning(
+            "Ninguna de las cuentas pegadas existe en la base de datos "
+            "(plataforma Twitter)."
+        )
+
+    if no_encontradas:
+        st.warning(
+            "No se encontraron en la base de datos: "
+            + ", ".join(f"@{u}" for u in no_encontradas)
+        )
+
+    if not encontradas:
+        return
+
+    opciones_por_etiqueta = {
+        f"@{f.get('usuario', '')}": f.get("usuario", "") for f in encontradas
+    }
+    elegidas = st.multiselect(
+        "Cuentas a eliminar",
+        list(opciones_por_etiqueta),
+        default=list(opciones_por_etiqueta),
+        key="elim_seleccion",
+        help=(
+            "Todas las encontradas vienen seleccionadas; desmarca las que "
+            "quieras conservar."
+        ),
+    )
+
+    st.markdown("#### ⚙️ Opciones")
+    respaldar = st.checkbox(
+        "💾 Guardar respaldo JSON antes de borrar",
+        value=True,
+        key="elim_respaldar",
+        help=(
+            "Escribe `data/backups/eliminacion_cuentas_*.json` con todas las "
+            "columnas de las cuentas y sus tareas. Si el respaldo falla, no se "
+            "borra nada; el JSON se puede reponer con `restaurar_cuentas.py`."
+        ),
+    )
+    borrar_cookies = st.checkbox(
+        "🍪 Borrar también cookies/avatares locales (.pkl e imágenes)",
+        value=True,
+        key="elim_cookies",
+        help=(
+            "Elimina `data/cookies/twitter/<usuario>.pkl` y las imágenes de "
+            "avatar/portada que estén dentro de `data/avatares` y "
+            "`data/portadas`."
+        ),
+    )
+    cancelar_tareas = st.checkbox(
+        "🧹 Cancelar tareas pendientes de esas cuentas",
+        value=True,
+        key="elim_tareas",
+        help=(
+            "Cancela las tareas programadas que dependían SOLO de las cuentas "
+            "eliminadas; las que aún usan cuentas vivas quedan intactas."
+        ),
+    )
+
+    st.error(
+        "Esta acción es DEFINITIVA e irreversible: se borran las cuentas de la "
+        "base de datos (historial, cookies y configuración incluidos)."
+    )
+    confirmar = st.checkbox(
+        "Confirmo que quiero eliminar definitivamente estas cuentas",
+        key="elim_confirmar",
+    )
+
+    if st.button(
+        f"🗑️ Eliminar definitivamente ({len(elegidas)})",
+        type="primary",
+        use_container_width=True,
+        disabled=not elegidas or not confirmar,
+        key="btn_elim_ejecutar",
+    ):
+        from cuentas.eliminador import eliminar_usuarios
+
+        usuarios_borrar = [
+            opciones_por_etiqueta[etiqueta]
+            for etiqueta in elegidas
+            if opciones_por_etiqueta.get(etiqueta)
+        ]
+        with st.spinner(f"Eliminando {len(usuarios_borrar)} cuenta(s)…"):
+            res = eliminar_usuarios(
+                usuarios_borrar,
+                plataforma="twitter",
+                borrar_cookies=borrar_cookies,
+                cancelar_tareas=cancelar_tareas,
+                respaldar=respaldar,
+            )
+
+        if res.get("error"):
+            st.error(f"No se pudieron eliminar las cuentas: {res['error']}")
+        else:
+            _listar_cuentas.clear()
+            st.session_state.pop("elim_resultado", None)
+            st.session_state["elim_limpiar_pendiente"] = True
+
+            eliminadas = res.get("eliminadas") or []
+            restantes = res.get("no_encontradas") or []
+            resumen = (
+                f"Cuentas eliminadas: {len(eliminadas)}. "
+                f"Archivos borrados: {int(res.get('archivos_borrados') or 0)}. "
+                f"Tareas canceladas: {int(res.get('tareas_canceladas') or 0)}."
+            )
+            respaldo = (res.get("respaldo") or "").strip()
+            if respaldo:
+                resumen += f" Respaldo: {respaldo}."
+            if restantes:
+                resumen += (
+                    " No estaban en la base de datos: "
+                    + ", ".join(f"@{u}" for u in restantes)
+                    + "."
+                )
+            _flash(resumen)
+            st.rerun()
+
+
 def _tab_fotos():
     st.markdown("### 📷 Fotos de perfil y portada (IA)")
     st.caption(
@@ -4293,6 +4500,7 @@ def render(usuario):
         "🎨 Perfiles": _tab_perfiles,
         "🏷️ Nombres": _tab_nombres,
         "⏸️ Estado": _tab_estado,
+        "🗑️ Eliminar": _tab_eliminar,
         "📷 Fotos": _tab_fotos,
         "🛡️ Anti-detección": _tab_anti_deteccion,
         "🔄 Sincronizar desde X": _tab_sincronizar,
@@ -4331,9 +4539,9 @@ def render(usuario):
         horizontal=True,
         on_change=_on_cambio_modo,
         help=(
-            "Cuentas: importar/validar/inventario · Identidad: secciones, "
-            "registro, perfiles, nombres y fotos · Avanzado: anti-detección, "
-            "sincronización y cambios de perfil en X."
+            "Cuentas: importar/validar/estado/eliminar/inventario · Identidad: "
+            "secciones, registro, perfiles, nombres y fotos · Avanzado: "
+            "anti-detección, sincronización y cambios de perfil en X."
         ),
     )
     tabs_modo = MODOS_TABS.get(modo) or TABS

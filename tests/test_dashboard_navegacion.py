@@ -6,7 +6,7 @@ Verifica (sin Chrome y sin Streamlit runtime) que:
     (Alertas) sigue existiendo.
   - Las 3 operaciones ocultas (Blogs Web, Visualizaciones, Follows) NO estan
     en el menu, pero conservan su branch de despacho (reactivables en 1 linea).
-  - `web/operaciones/cuentas.py` agrupa sus 15 pestanas en 3 modos (sin
+  - `web/operaciones/cuentas.py` agrupa sus 16 pestanas en 3 modos (sin
     perder ni repetir ninguna) y `TABS` sigue completo.
   - El "🎨 Generar Imagen" del sidebar esta oculto (su funcion sigue viva).
   - El default recomendado de "Navegadores simultaneos" de Activacion Masiva
@@ -22,6 +22,11 @@ Verifica (sin Chrome y sin Streamlit runtime) que:
   - La pestana "Nombres" de Cuentas renderiza con `AppTest` y expone el flujo
     masivo con IA: tipos partido/mixto, contexto para la IA, "aplicar a
     TODAS", navegadores simultaneos y renombrar la clave interna.
+  - La pestana "Eliminar" de Cuentas (borrado definitivo por lista pegada) esta
+    registrada en TABS/MODOS_TABS/render y renderiza con `AppTest` el
+    text_area, el boton de busqueda, el multiselect autoseleccionado y el
+    boton de borrado deshabilitado sin confirmacion. NUNCA se pulsa el boton
+    de borrar (jamas se ejecuta una eliminacion real).
 
 El recorrido completo de operaciones visibles con `AppTest` se corre aparte
 (script temporal del agente) porque es lento para la suite rapida.
@@ -466,6 +471,142 @@ def _fuente_activacion() -> str:
     )
 
 
+def _fuente_cuentas() -> str:
+    """Fuente de `web/operaciones/cuentas.py` (checks de widgets/pestanas)."""
+    return (RAIZ / "web" / "operaciones" / "cuentas.py").read_text(encoding="utf-8")
+
+
+def _paginas_render_cuentas() -> dict:
+    """Dict `paginas` de `render()` en `cuentas.py`: pestana -> nombre funcion."""
+    fuente = _fuente_cuentas()
+    arbol = ast.parse(fuente)
+    for nodo in ast.walk(arbol):
+        if isinstance(nodo, ast.FunctionDef) and nodo.name == "render":
+            for sub in ast.walk(nodo):
+                if isinstance(sub, ast.Assign):
+                    for objetivo in sub.targets:
+                        if (
+                            isinstance(objetivo, ast.Name)
+                            and objetivo.id == "paginas"
+                            and isinstance(sub.value, ast.Dict)
+                        ):
+                            mapa = {}
+                            for clave, valor in zip(
+                                sub.value.keys, sub.value.values
+                            ):
+                                try:
+                                    nombre = ast.literal_eval(clave)
+                                except Exception:
+                                    continue
+                                mapa[nombre] = (
+                                    valor.id if isinstance(valor, ast.Name) else ""
+                                )
+                            return mapa
+    return {}
+
+
+def _app_eliminar():
+    """Script de AppTest: ABRE la pestana Eliminar via `render()` con una
+    busqueda simulada (nunca pulsa el boton de borrar).
+
+    Solo ASCII: `AppTest.from_function` escribe el script temporal con la
+    codificacion local de Windows y los acentos/emojis lo rompen en silencio;
+    por eso los nombres de modo/pestana se derivan de `cuentas.MODOS_TABS`/
+    `TABS` en runtime y nunca se escriben como literal."""
+    import streamlit as st
+
+    from web.operaciones import cuentas
+
+    tab = [t for t in cuentas.TABS if "Eliminar" in t][0]
+    st.session_state["cuentas_modo_selector"] = cuentas._modo_de_tab(tab)
+    st.session_state["cuentas_pestana_selector"] = tab
+    st.session_state["elim_resultado"] = {
+        "encontradas": [
+            {
+                "usuario": "cuenta_uno",
+                "activa": True,
+                "status": "active",
+                "nombre_mostrado": "Cuenta Uno",
+                "handle_actual": "cuenta_uno",
+            },
+            {
+                "usuario": "cuenta_dos",
+                "activa": False,
+                "status": "suspended",
+                "nombre_mostrado": "",
+                "handle_actual": "",
+            },
+        ],
+        "no_encontradas": ["cuenta_fantasma"],
+        "error": "",
+    }
+    cuentas.render({})
+
+
+def _app_test_eliminar() -> tuple[bool, str, dict]:
+    """Corre la pestana Eliminar con `AppTest` y reporta sus widgets.
+
+    Solo lectura/render: marca la confirmacion para comprobar que el boton se
+    habilita, pero JAMAS pulsa `btn_elim_ejecutar` (no se elimina nada)."""
+    from streamlit.testing.v1 import AppTest
+
+    resultado = {
+        "sin_excepciones": False,
+        "text_area": False,
+        "btn_buscar": False,
+        "multiselect": False,
+        "default_todas": False,
+        "btn_eliminar": False,
+        "deshabilitado": False,
+        "opciones_default": False,
+        "confirma_habilita": False,
+    }
+    try:
+        at = AppTest.from_function(_app_eliminar, default_timeout=60)
+        at.run()
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}", resultado
+
+    if at.exception:
+        return False, str(at.exception[0].value)[:200], resultado
+    resultado["sin_excepciones"] = True
+
+    resultado["text_area"] = any(t.key == "elim_texto" for t in at.text_area)
+    resultado["btn_buscar"] = any(b.key == "btn_elim_buscar" for b in at.button)
+    resultado["multiselect"] = any(
+        m.key == "elim_seleccion" for m in at.multiselect
+    )
+    try:
+        seleccion = list(at.multiselect(key="elim_seleccion").value)
+    except KeyError:
+        seleccion = []
+    resultado["default_todas"] = seleccion == ["@cuenta_uno", "@cuenta_dos"]
+
+    claves_botones = {b.key for b in at.button}
+    resultado["btn_eliminar"] = "btn_elim_ejecutar" in claves_botones
+    if resultado["btn_eliminar"]:
+        resultado["deshabilitado"] = bool(
+            at.button(key="btn_elim_ejecutar").disabled
+        )
+
+    claves_opciones = {"elim_respaldar", "elim_cookies", "elim_tareas"}
+    valores = {c.key: c.value for c in at.checkbox}
+    resultado["opciones_default"] = claves_opciones <= set(valores) and all(
+        valores[clave] for clave in claves_opciones
+    )
+
+    # Con la confirmacion marcada el boton se habilita (sin pulsarlo).
+    try:
+        at2 = at.checkbox(key="elim_confirmar").check().run()
+        resultado["confirma_habilita"] = not at2.button(
+            key="btn_elim_ejecutar"
+        ).disabled
+    except Exception:
+        resultado["confirma_habilita"] = False
+
+    return True, "", resultado
+
+
 def _app_por_roles():
     """Script de AppTest: pestana Por roles con cuentas simuladas.
 
@@ -607,7 +748,7 @@ def run(check):
 
     tabs_modos = [tab for modos in MODOS_TABS.values() for tab in modos]
     check(
-        "cuentas: los 3 modos cubren las 15 pestanas sin perder ninguna",
+        "cuentas: los 3 modos cubren todas las pestanas sin perder ninguna",
         len(MODOS_TABS) == 3 and sorted(tabs_modos) == sorted(TABS),
         f"({len(MODOS_TABS)} modos, {len(tabs_modos)} pestanas)",
     )
@@ -620,6 +761,57 @@ def run(check):
         _modo_de_tab("🏷️ Renombrar usuario") == "🛡️ Avanzado"
         and _modo_de_tab("🎨 Perfiles") == "🎭 Identidad"
         and _modo_de_tab("pestana-inexistente") in MODOS_TABS,
+    )
+
+    # ---------------- Pestana Eliminar: borrado definitivo por lista --------
+    check(
+        "cuentas eliminar: TABS la ubica despues de Estado",
+        TABS.index("🗑️ Eliminar") == TABS.index("⏸️ Estado") + 1,
+    )
+    check(
+        "cuentas eliminar: el modo Cuentas la ubica despues de Estado",
+        MODOS_TABS["🗂️ Cuentas"].index("🗑️ Eliminar")
+        == MODOS_TABS["🗂️ Cuentas"].index("⏸️ Estado") + 1,
+    )
+    paginas_render = _paginas_render_cuentas()
+    check(
+        "cuentas eliminar: render() la mapea a _tab_eliminar y cubre TABS",
+        paginas_render.get("🗑️ Eliminar") == "_tab_eliminar"
+        and set(paginas_render) == set(TABS),
+        f"({len(paginas_render)} paginas)",
+    )
+    from web.operaciones import cuentas as cuentas_elim
+
+    fuente_cuentas = _fuente_cuentas()
+    check(
+        "cuentas eliminar: usa cuentas/eliminador y el boton exige seleccion + "
+        "confirmacion",
+        callable(getattr(cuentas_elim, "_tab_eliminar", None))
+        and "from cuentas.eliminador import buscar_cuentas, parsear_lista_usuarios"
+        in fuente_cuentas
+        and "from cuentas.eliminador import eliminar_usuarios" in fuente_cuentas
+        and "disabled=not elegidas or not confirmar" in fuente_cuentas,
+    )
+
+    app_ok, app_detalle, app_widgets = _app_test_eliminar()
+    check(
+        "cuentas eliminar: la pestana Eliminar renderiza sin excepciones (AppTest)",
+        app_ok,
+        app_detalle,
+    )
+    check(
+        "cuentas eliminar: text_area, busqueda, multiselect con todo "
+        "autoseleccionado y boton de borrado deshabilitado (AppTest)",
+        app_widgets["sin_excepciones"]
+        and app_widgets["text_area"]
+        and app_widgets["btn_buscar"]
+        and app_widgets["multiselect"]
+        and app_widgets["default_todas"]
+        and app_widgets["btn_eliminar"]
+        and app_widgets["deshabilitado"]
+        and app_widgets["opciones_default"]
+        and app_widgets["confirma_habilita"],
+        str({k: v for k, v in app_widgets.items() if not v}) or "todos presentes",
     )
 
     llamadas_sidebar, definidas_sidebar = _llamadas_y_definiciones_sidebar()
