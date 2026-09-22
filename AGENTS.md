@@ -97,25 +97,24 @@ GestorRedes-Telegram-Final/
 │   ├── app.py             # Entry point: login + navegacion de 17 operaciones
 │   ├── auth.py            # Autenticacion web (data/web_users.json, SHA256)
 │   ├── ui.py              # Componentes visuales (cabecera, tarjetas, stats)
-│   ├── sidebar.py         # Sidebar: clientes, asistente IA, multimedia, inventario
+│   ├── sidebar.py         # Sidebar: clientes, asistente IA, inventario
 │   └── operaciones/       # ★ Paginas de operaciones (NO llamarla "pages" -> Streamlit la tomaria como multipagina automatica y rompe)
 │       ├── _helpers.py    # Utilidades compartidas de las paginas
 │       ├── alertas.py     # ★ DASHBOARD DE ALERTAS (por cliente, fuente, menciones, resumenes) - landing por defecto
 │       ├── posts.py       # Publicar texto, hilos, contenido IA
 │       ├── rts.py         # RT masivo, RT con cita, likes, calentamiento
+│       ├── reparto_hora.py# Reparto de acciones por hora (posts/comentarios/RT)
 │       ├── resumenes.py   # Resumenes ejecutivos / mananeras
 │       ├── grupos.py      # Enviar a grupos, reciprocidad
 │       ├── crisis.py      # Respuestas a tweets
-│       ├── visualizaciones.py
 │       ├── change.py      # Change.org
-│       ├── blogs.py       # Blogs WordPress
 │       ├── likes.py       # Likes masivos multi-plataforma
-│       ├── follows.py     # Follows masivos
 │       ├── reportar.py    # Reportar posts
 │       ├── calendario.py  # Programacion de tareas
 │       ├── reportes.py    # Estadisticas generales
 │       ├── monitor.py     # Monitor de actividad
 │       ├── multimedia.py  # Generacion de imagenes IA + texto sobre imagen
+│       ├── activacion_masiva.py # Activaciones por roles/porcentajes
 │       └── admin.py       # Gestion de usuarios web
 │
 ├── .streamlit/
@@ -337,19 +336,18 @@ web/
     ├── alertas.py   # ★ DASHBOARD DE ALERTAS (por cliente, fuente, menciones, resumenes) - es la pagina por defecto
     ├── posts.py     # Publicar texto, hilos, contenido IA
     ├── rts.py       # RT masivo, RT con cita, likes, calentamiento
+    ├── reparto_hora.py # Reparto de acciones por hora
     ├── resumenes.py # Resumenes ejecutivos / mananeras
     ├── grupos.py    # Enviar a grupos, reciprocidad
     ├── crisis.py    # Respuestas a tweets
-    ├── visualizaciones.py
     ├── change.py    # Change.org
-    ├── blogs.py     # Blogs WordPress
     ├── likes.py     # Likes masivos multi-plataforma
-    ├── follows.py   # Follows masivos
     ├── reportar.py  # Reportar posts
     ├── calendario.py# Programacion de tareas
     ├── reportes.py  # Estadisticas generales
     ├── monitor.py   # Monitor de actividad
     ├── multimedia.py# Generacion de imagenes IA + texto sobre imagen
+    ├── activacion_masiva.py # Activaciones por roles/porcentajes
     └── admin.py     # Gestion de usuarios web
 ```
 
@@ -392,7 +390,7 @@ python -m bot.main
 - `bot/main.py`: registrados `/ayuda` y `/cuentas_verificar`
 
 ### Dashboard Web (Streamlit)
-- Creadas 17 operaciones en `web/operaciones/`: alertas (7 pestañas, landing), posts, rts, resumenes, grupos, crisis, visualizaciones, change, blogs, likes, follows, reportar, calendario, reportes, monitor, multimedia, admin
+- Creadas las operaciones base en `web/operaciones/`: alertas (7 pestañas, landing), posts, rts, resumenes, grupos, crisis, change, likes, reportar, calendario, reportes, monitor, multimedia, admin (visualizaciones/blogs/follows se eliminaron definitivamente el 2026-09-22; ver "Limpieza profunda definitiva")
 - Login web en `web/auth.py` (usuarios en `data/web_users.json`, hash SHA256, default admin/admin)
 - Tema oscuro MW en `.streamlit/config.toml` + `web/ui.py`
 - `iniciar_dashboard.py` lanzador con mensaje amigable
@@ -821,7 +819,7 @@ python -m bot.main
 
 ### Dashboard consolidado + respaldos + tests fijos + limpieza final (2026-09-21)
 - **Dashboard con menos botones** (peticion del usuario): navegacion en 2 niveles (categoria -> operacion) en `web/app.py`; quedan **17 operaciones visibles** (admin) / 15 (operador) y la URL sigue restaurando `?op=`/`?s=`/`?tab=`. Categorias: Publicar y programar / Automatizacion Twitter / Monitoreo y respuesta / Datos y cuentas. `web/operaciones/cuentas.py` agrupa sus 15 pestanas en 3 modos (Cuentas / Identidad / Avanzado) sin perder ninguna. `activacion_masiva.py`, `posts.py`, `rts.py`, `calendario.py`: lo avanzado quedo en expanders y los defaults quedaron FIJOS (Navegadores=2, Trabajadores=12, API=OFF, Repetir=ON, Sin proxy=OFF, No imagenes=ON, Pestana=ON, reciclar=40, pausa comentarios=15, %ronda=40/90).
-- **Paginas muertas ocultas** (archivos intactos, reactivables descomentando 1 linea): Blogs Web (sin backend WordPress), Visualizaciones y Follows (TwitterBot no tiene esos metodos; la flota es 100% Twitter). Sidebar: se oculto "Generar Imagen" (2 pasos y no generaba).
+- **Paginas muertas ocultas** (archivos intactos, reactivables descomentando 1 linea): Blogs Web (sin backend WordPress), Visualizaciones y Follows (TwitterBot no tiene esos metodos; la flota es 100% Twitter). Sidebar: se oculto "Generar Imagen" (2 pasos y no generaba). **SUPERADO 2026-09-22**: las 3 paginas se borraron fisicamente y se quitaron todos los comentarios/menus ocultos (ver "Limpieza profunda definitiva").
 - **Bugs preexistentes arreglados**: `web/operaciones/resumenes.py` nunca generaba porque llamaba `FiltrosAlertas().resumir(...)`, metodo inexistente -> nuevo `resumir(titulares)` en `ia/filtros_alertas.py` + `get_prompt_resumen_ejecutivo()` en `ia/prompts.py` + fallback local sin IA; `web/operaciones/change.py` borraba `builtins.input` de TODO el proceso en el `finally` -> ahora restaura el original; `iniciar_dashboard.py` ejecutaba Streamlit al importarse -> guard `__main__`; `grupos.py` `height=60` en un `text_area` (minimo 68) crasheaba la pagina -> 80.
 - **`backup_datos.py`** (nuevo): zip con DB + cookies + web_users + config + avatares/portadas (`--con-reportes` opcional, `--destino`); NUNCA incluye `.env`.
 - **`tests/`** (nuevo, sin dependencias): `tests/run_tests.py` + 72 checks deterministas en verde (`test_selenium_fakes.py` 38, `test_dashboard_navegacion.py` 17, `test_ia_resumen.py` 17) + `tests/smoke_chrome_cdp.py` (Chrome real 4/4).
@@ -941,6 +939,14 @@ python -m bot.main
 - **Pausa humana** `time.sleep(random.uniform(1.8, 3.5))` (releer antes de enviar), tras escribir/subir imagen y antes de buscar/clicar el boton: `publicar_tweet` (L2033), `responder_tweet` (L3744) y rama de cita de `solo_retwittear` (L4784). El RT simple y `publicar_hilo` no cambian.
 - Verificado: compileall global OK; `tests/run_tests.py` **879/879** (`tests/test_selenium_fakes.py` 75/75: mask-primero, cero metodos silenciosos, fallback ActionChains, limpieza/stale y las 3 pausas); smoke Chrome 153 real `tests/smoke_chrome_cdp.py` **10/10** (mask fuera del DOM, `send_keys` reemplaza el borrador con keydown=43/input=23 reales; fallback ActionChains sobre wrapper no interactuable); import del modulo OK.
 - ⚠ **Railway debe redeployarse**. El pegado por eventos reales es algo mas lento que `insertText` (un evento por caracter, en un solo comando Selenium) pero es el que X espera; si el borrador de X se pierde por el cambio, `_limpiar_editor_x`/`_editor_con_restos` siguen cubriendolo. `Dockerfile` conserva xclip/xsel (ya no se usan para pegar).
+
+### Limpieza profunda definitiva: paginas muertas borradas + cero lineas ocultas (2026-09-22)
+- **Borrados fisicos** (`git rm`, ya no existen en disco): `web/operaciones/blogs.py`, `web/operaciones/visualizaciones.py` y `web/operaciones/follows.py` (+ sus `.pyc`). Eran paginas sin backend/soporte real que solo estaban ocultas.
+- `web/app.py`: eliminadas por completo las entradas comentadas y los comentarios `# OCULTO (...)` de `OPCIONES` y `CATEGORIAS` (Follows/Visualizaciones/Blogs Web) y las 3 ramas muertas del dispatch (`👁️`, `🌐`, `🚀`) con sus imports; la cadena `if/elif` quedo reencadenada sin huecos. Cero ocurrencias de `OCULTO` o lineas `# "`.
+- `web/sidebar.py`: eliminado el bloque comentado de "Generar Imagen" y la funcion huerfana `_seccion_multimedia`; `web/operaciones/multimedia.py` conserva la operacion real (boton `🎨 Generar Imagen` y texto sobre imagen) y solo se limpiaron las ramas muertas de `session_state["web_generar_imagen"]` (el sidebar ya no las alimenta).
+- **Activacion**: confirmado con AST+grep que `_repartir_trending`, `_aplicar_preset_trending`, `PESOS_TRENDING`, `PRESET_TRENDING` y `_repartir_tercios` NO existen en codigo (solo quedan como strings anti-regresion en los tests y en el historial). Se elimino el helper huerfano `_campana_en_curso`; se conservan `_repartir_por_porcentajes` (funcionalidad actual), el guard `_CAMPANA_ACTIVA` y el soporte `roles_aleatorios` de `MotorActivacion`.
+- `tests/test_dashboard_navegacion.py`: quitado `OPS_OCULTAS` y los checks de paginas ocultas; nuevos checks de que no queden lineas comentadas de ocultamiento, de que todo prefijo despachado tenga operacion y de que cada modulo importado por el dispatch exista en disco. `README.md`/`tests/README.md` no mencionaban esas paginas.
+- Verificado: `compileall` global OK + AST de `web/app.py`/`web/sidebar.py` OK; grep repo-wide sin referencias a los modulos borrados; `tests/run_tests.py` **880/880** (`test_dashboard_navegacion` 45/45; AppTest 17/17 operaciones admin y 15/15 operador con 0 excepciones).
 
 ### Pendiente
 - **Redeploy en Railway** para aplicar tambien el limite de 100 caracteres (posts/citas), la fila vacia + Excel de Reportes y el reparto de roles por porcentajes; probar el reparto en «🗂️ Por roles» con 5-10 cuentas

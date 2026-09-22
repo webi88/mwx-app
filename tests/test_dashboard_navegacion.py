@@ -4,11 +4,13 @@ Verifica (sin Chrome y sin Streamlit runtime) que:
   - La navegacion de `web/app.py` tiene 4 categorias que cubren TODAS las
     operaciones visibles, sin duplicados, y que la operacion por defecto
     (Alertas) sigue existiendo.
-  - Las 3 operaciones ocultas (Blogs Web, Visualizaciones, Follows) NO estan
-    en el menu, pero conservan su branch de despacho (reactivables en 1 linea).
+  - No quedan lineas ocultas ni branches de despacho huerfanos: cada modulo
+    importado por el dispatch existe en disco y todo prefijo despachado tiene
+    una operacion visible.
   - `web/operaciones/cuentas.py` agrupa sus 16 pestanas en 3 modos (sin
     perder ni repetir ninguna) y `TABS` sigue completo.
-  - El "🎨 Generar Imagen" del sidebar esta oculto (su funcion sigue viva).
+  - El bloque multimedia huerfano del sidebar se elimino: la operacion
+    Multimedia y su boton generador viven en `web/operaciones/multimedia.py`.
   - El default recomendado de "Navegadores simultaneos" de Activacion Masiva
     es 2.
   - `iniciar_dashboard` se importa sin arrancar Streamlit (def main + guard) y
@@ -41,9 +43,6 @@ from pathlib import Path
 
 RAIZ = Path(__file__).resolve().parent.parent
 
-# Operaciones retiradas de la navegacion (los archivos siguen existiendo).
-OPS_OCULTAS = ["🚀 Impulso: Follows", "👁️ Visualizaciones", "🌐 Blogs Web"]
-
 
 def _leer_constantes_app() -> dict:
     """Extrae las constantes de nivel de modulo de `web/app.py` con AST.
@@ -67,8 +66,8 @@ def _leer_constantes_app() -> dict:
 def _prefijos_despacho_app() -> set:
     """Prefijos string usados en llamadas `...startswith("...")` de app.py.
 
-    Con ellos se comprueba que cada operacion (visible u oculta) conserva su
-    branch `if/elif` de despacho."""
+    Con ellos se comprueba que cada operacion visible conserva su branch
+    `if/elif` de despacho y que ningun prefijo quedo sin operacion."""
     fuente = (RAIZ / "web" / "app.py").read_text(encoding="utf-8")
     arbol = ast.parse(fuente)
     prefijos = set()
@@ -83,6 +82,21 @@ def _prefijos_despacho_app() -> set:
         ):
             prefijos.add(nodo.args[0].value)
     return prefijos
+
+
+def _modulos_operaciones_importados_app() -> set:
+    """Modulos `web.operaciones.X` importados por el dispatch de app.py (AST).
+
+    Sirve para verificar que ninguna rama de despacho apunta a un archivo que
+    ya no existe en `web/operaciones/`."""
+    fuente = (RAIZ / "web" / "app.py").read_text(encoding="utf-8")
+    arbol = ast.parse(fuente)
+    modulos = set()
+    for nodo in ast.walk(arbol):
+        if isinstance(nodo, ast.ImportFrom) and nodo.module:
+            if nodo.module.startswith("web.operaciones."):
+                modulos.add(nodo.module.rsplit(".", 1)[-1])
+    return modulos
 
 
 def _llamadas_y_definiciones_sidebar() -> tuple[set, set]:
@@ -727,23 +741,38 @@ def run(check):
         ),
     )
 
+    fuente_app = (RAIZ / "web" / "app.py").read_text(encoding="utf-8")
     check(
-        "navegacion: quedan 15 operaciones visibles (18 - 3 ocultas)",
-        len(opciones) == 15,
+        "navegacion: quedan 15 operaciones visibles y sin lineas comentadas "
+        "de ocultamiento",
+        len(opciones) == 15
+        and "OCULTO" not in fuente_app
+        and not any(
+            linea.strip().startswith('# "') for linea in fuente_app.splitlines()
+        ),
         f"(real={len(opciones)})",
-    )
-    check(
-        "navegacion: las 3 operaciones ocultas NO estan en el menu",
-        not (set(OPS_OCULTAS) & conocidas)
-        and not (set(OPS_OCULTAS) & set(en_categorias)),
     )
     check(
         "navegacion: cada operacion visible conserva su branch de despacho",
         all(any(op.startswith(pref) for pref in prefijos) for op in opciones),
     )
     check(
-        "navegacion: las operaciones ocultas siguen despachables (1 linea)",
-        all(any(op.startswith(pref) for pref in prefijos) for op in OPS_OCULTAS),
+        "navegacion: todo prefijo despachado tiene su operacion (sin ramas "
+        "muertas)",
+        all(any(op.startswith(pref) for op in conocidas) for pref in prefijos),
+        f"({len(prefijos)} prefijos)",
+    )
+    modulos_ops = _modulos_operaciones_importados_app()
+    faltantes_disco = sorted(
+        modulo
+        for modulo in modulos_ops
+        if not (RAIZ / "web" / "operaciones" / f"{modulo}.py").exists()
+    )
+    check(
+        "navegacion: cada modulo de operaciones importado por el dispatch "
+        "existe en disco",
+        bool(modulos_ops) and not faltantes_disco,
+        str(faltantes_disco) or f"({len(modulos_ops)} modulos)",
     )
 
     tabs_modos = [tab for modos in MODOS_TABS.values() for tab in modos]
@@ -815,10 +844,20 @@ def run(check):
     )
 
     llamadas_sidebar, definidas_sidebar = _llamadas_y_definiciones_sidebar()
+    fuente_multimedia = (RAIZ / "web" / "operaciones" / "multimedia.py").read_text(
+        encoding="utf-8"
+    )
     check(
-        "sidebar: Generar Imagen (multimedia) esta oculto pero su funcion vive",
+        "sidebar: sin bloque multimedia huerfano (ni _seccion_multimedia ni "
+        "web_generar_imagen)",
         "_seccion_multimedia" not in llamadas_sidebar
-        and "_seccion_multimedia" in definidas_sidebar,
+        and "_seccion_multimedia" not in definidas_sidebar
+        and "web_generar_imagen" not in fuente_multimedia,
+    )
+    check(
+        "multimedia: el boton Generar Imagen y _texto_sobre_imagen siguen vivos",
+        'st.button("🎨 Generar Imagen"' in fuente_multimedia
+        and "def _texto_sobre_imagen(" in fuente_multimedia,
     )
     check(
         "activacion: navegadores por defecto = 2 (recomendado)",

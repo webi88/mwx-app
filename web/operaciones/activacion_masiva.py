@@ -122,11 +122,6 @@ _CAMPANA_ACTIVA = threading.Event()
 RUTA_CAMPANA_ACTIVA = "data/.campana_activa"
 
 
-def _campana_en_curso() -> bool:
-    """True si hay una campana de activacion ejecutandose en este proceso."""
-    return _CAMPANA_ACTIVA.is_set()
-
-
 def _marcar_campana_activa() -> None:
     """Escribe `data/.campana_activa` con el timestamp actual (epoch).
 

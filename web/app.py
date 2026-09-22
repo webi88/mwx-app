@@ -45,17 +45,11 @@ OPCIONES = [
     "⚡ RTS / Activaciones",
     "🎯 Activación Masiva",
     "❤️ Influencia: Likes",
-    # OCULTO (sin soporte Twitter): reactivable borrando el '#'.
-    # "🚀 Impulso: Follows",
     "🚩 Reportar Posts",
-    # OCULTO (sin soporte Twitter): reactivable borrando el '#'.
-    # "👁️ Visualizaciones",
     "🚨 Alertas",
     "💬 Crisis: Respuestas",
     "👥 Grupos: Reciprocidad",
     "📋 Resúmenes Ejecutivos",
-    # OCULTO (sin backend real de blogs): reactivable borrando el '#'.
-    # "🌐 Blogs Web",
     "✍️ Change.org: Peticiones",
     "📊 Reportes",
     "📈 Monitor: Actividad",
@@ -85,13 +79,7 @@ CATEGORIAS = [
             "⚡ RTS / Activaciones",
             "🎯 Activación Masiva",
             "❤️ Influencia: Likes",
-            # OCULTO (sin soporte Twitter en TwitterBot): reactivable borrando
-            # el '#' de la línea correspondiente en OPCIONES y aquí.
-            # "🚀 Impulso: Follows",
             "🚩 Reportar Posts",
-            # OCULTO (sin soporte Twitter en TwitterBot): reactivable borrando
-            # el '#' de la línea correspondiente en OPCIONES y aquí.
-            # "👁️ Visualizaciones",
         ],
     ),
     (
@@ -101,9 +89,6 @@ CATEGORIAS = [
             "💬 Crisis: Respuestas",
             "👥 Grupos: Reciprocidad",
             "📋 Resúmenes Ejecutivos",
-            # OCULTO (blogs.py no tiene backend real): reactivable borrando el
-            # '#' de la línea correspondiente en OPCIONES y aquí.
-            # "🌐 Blogs Web",
             "✍️ Change.org: Peticiones",
         ],
     ),
@@ -357,23 +342,14 @@ def main():
     elif seleccion.startswith("💬"):
         from web.operaciones.crisis import render
         render(usuario)
-    elif seleccion.startswith("👁️"):
-        from web.operaciones.visualizaciones import render
-        render(usuario)
     elif seleccion.startswith("📋"):
         from web.operaciones.resumenes import render
         render(usuario)
     elif seleccion.startswith("✍️"):
         from web.operaciones.change import render
         render(usuario)
-    elif seleccion.startswith("🌐"):
-        from web.operaciones.blogs import render
-        render(usuario)
     elif seleccion.startswith("❤️"):
         from web.operaciones.likes import render
-        render(usuario)
-    elif seleccion.startswith("🚀"):
-        from web.operaciones.follows import render
         render(usuario)
     elif seleccion.startswith("🚩"):
         from web.operaciones.reportar import render

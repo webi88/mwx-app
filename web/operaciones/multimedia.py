@@ -20,9 +20,6 @@ def render(usuario: dict):
 def _generar_imagen():
     st.markdown("### 🎨 Generar Imagen con IA")
     
-    if "web_generar_imagen" in st.session_state:
-        st.info(f"Prompt programado desde el sidebar: {st.session_state['web_generar_imagen']}")
-    
     prompt = st.text_area(
         "Describe la imagen",
         height=100,
@@ -40,9 +37,6 @@ def _generar_imagen():
         with st.spinner("Generando imagen con OpenAI..."):
             generador = GeneradorContenido()
             ruta = generador.generar_imagen(prompt)
-        
-        if "web_generar_imagen" in st.session_state:
-            del st.session_state["web_generar_imagen"]
         
         if ruta and os.path.exists(ruta):
             st.image(ruta, caption="Imagen generada")

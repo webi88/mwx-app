@@ -36,10 +36,6 @@ def render_sidebar(usuario: dict):
     
     _seccion_gestion_clientes(usuario)
     _seccion_asistente_ia(usuario)
-    # OCULTO (2 pasos y no genera): "🎨 Generar Imagen" solo guardaba el
-    # prompt en session_state y exigía ir a Multimedia para generarla. La
-    # función se conserva; reactivable descomentando esta llamada.
-    # _seccion_multimedia(usuario)
     _seccion_inventario(usuario)
 
 
@@ -198,19 +194,6 @@ def _generar_contenido_sidebar(tipo: str, celula_id, cliente_id, contexto: str, 
         )
     else:
         st.error(f"Error de generación: {error or 'sin respuesta'}")
-
-
-def _seccion_multimedia(usuario: dict):
-    with st.expander("◧ MULTIMEDIA", expanded=False):
-        st.caption("🎨 Generar Imagen con IA")
-        prompt_img = st.text_area(
-            "Prompt de la imagen", height=80,
-            key="sb_img_prompt",
-            placeholder="Describe la imagen a generar..."
-        )
-        if st.button("🎨 Generar Imagen", key="sb_btn_imagen"):
-            st.session_state["web_generar_imagen"] = prompt_img
-            st.success("Imagen programada. Revisa la sección Multimedia de la página principal.")
 
 
 def _seccion_inventario(usuario: dict):

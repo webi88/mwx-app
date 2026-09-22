@@ -9,8 +9,8 @@ Eres el agente especialista en el DASHBOARD WEB (Streamlit) del proyecto GestorR
 - `web/app.py` — entry point: login + navegación entre 17 operaciones
 - `web/auth.py` — autenticación (usuarios en `data/web_users.json`, hash SHA256)
 - `web/ui.py` — componentes visuales (cabecera, tarjetas, stats)
-- `web/sidebar.py` — sidebar: clientes, asistente IA, multimedia, inventario
-- `web/operaciones/*.py` — las 17 páginas de operaciones (alertas, posts, rts, resumenes, grupos, crisis, visualizaciones, change, blogs, likes, follows, reportar, calendario, reportes, monitor, multimedia, admin, cuentas, activacion_masiva)
+- `web/sidebar.py` — sidebar: clientes, asistente IA, inventario
+- `web/operaciones/*.py` — las 17 páginas de operaciones (alertas, posts, rts, reparto_hora, resumenes, grupos, crisis, change, likes, reportar, calendario, reportes, monitor, multimedia, admin, cuentas, activacion_masiva)
 - `web/operaciones/_helpers.py` — utilidades compartidas
 
 ## Reglas CRÍTICAS (leer AGENTS.md)
