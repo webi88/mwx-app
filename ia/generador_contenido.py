@@ -14,6 +14,7 @@ from core.perfiles import (
 )
 from core.registros import normalizar_tipo_cuenta
 from ia.prompts import (
+    REGLA_MAX_100,
     bloque_estilo_perfil,
     bloque_tweet_ancla,
     get_prompt_hashtags,
@@ -142,6 +143,11 @@ class GeneradorContenido:
         except (TypeError, ValueError):
             cantidad = 10
 
+        # Tipos con su PROPIO limite de largo, fuera de la regla de 100:
+        # blog (600), verificado y harfuch (240).
+        tipo_norm = str(tipo or "").strip().lower()
+        exento_100 = tipo_norm in ("blog", "verificado", "harfuch")
+
         try:
             if tipo == "verificado":
                 prompt = get_prompt_verificado_ambiental(contexto)
@@ -192,7 +198,16 @@ class GeneradorContenido:
 
             # La generacion principal tuvo exito (el relleno pudo fallar).
             self.ultimo_error = ""
-            return textos[:cantidad] if cantidad > 0 else textos
+            resultado = textos[:cantidad] if cantidad > 0 else textos
+
+            # Corte DURO (regla de oro) SOLO para los tipos de POST estandar:
+            # si la IA ignora el prompt, igual se publica <= 100 caracteres.
+            # Blog/verificado/harfuch conservan su limite propio. El mapeo
+            # respeta la cantidad y el orden de los textos.
+            if not exento_100:
+                resultado = [_acotar_limite(t) for t in resultado]
+
+            return resultado
 
         except Exception as e:
             self.ultimo_error = str(e)[:300]
@@ -235,9 +250,11 @@ class GeneradorContenido:
                 f"Genera EXACTAMENTE {cantidad} versiones distintas y únicas de la "
                 "siguiente cita. Mantén el mismo sentido, pero varía la "
                 "redacción, el orden de las ideas y las palabras. Cada texto debe "
-                "tener un MÁXIMO de 240 caracteres."
+                "tener un MÁXIMO ESTRICTO de 100 caracteres (incluyendo "
+                "hashtags y espacios)."
             )
-            prompt += _reglas_registro(registro)
+            prompt += _reglas_registro(registro, incluir_limite=False)
+            prompt += f"\n{REGLA_MAX_100}\n"
             prompt += bloque_estilo_perfil(perfil_norm)
             prompt += _reglas_trasfondo()
             prompt += (
@@ -357,7 +374,31 @@ class GeneradorContenido:
         if perfil_norm:
             limpios = [colocar_hashtag_en_medio(t) for t in limpios]
 
-        return limpios[:cantidad]
+        # Corte DURO final (regla de oro): TODA variacion/cita <= 100 chars,
+        # venga de la IA o del relleno local/sufijos. Contrato "EXACTAMENTE
+        # cantidad": si el recorte crea duplicados se intenta variarlos (3
+        # intentos) y, si siguen colisionando, se CONSERVA el texto acotado
+        # (mejor un duplicado que devolver menos de los pedidos).
+        acotados: list[str] = []
+        vistos_final: set[str] = set()
+        for t in limpios:
+            t = _acotar_limite(t)
+            if not t:
+                continue
+            if t in vistos_final:
+                for _ in range(3):
+                    try:
+                        alterno = _variar_hasta_unico(t, vistos_final)
+                    except Exception:
+                        alterno = ""
+                    alterno = _acotar_limite(alterno)
+                    if alterno and alterno not in vistos_final:
+                        t = alterno
+                        break
+            vistos_final.add(t)
+            acotados.append(t)
+
+        return acotados[:cantidad]
 
     def generar_imagen(self, prompt: str) -> str:
         try:
@@ -501,7 +542,11 @@ def generar_pool_por_cuenta(
                 vistos.add(variante)
                 unicos.append(variante)
 
-        return unicos[:n_cuentas]
+        # Corte DURO final (regla de oro): cada texto del pool <= 100 chars,
+        # incluidos los rellenos locales y los sufijos numerados. Mapeo directo
+        # que conserva SIEMPRE el conteo y el orden (mejor un duplicado que
+        # devolver menos textos de los pedidos).
+        return [_acotar_limite(t) for t in unicos][:n_cuentas]
 
     # --- Con registro y/o perfil: agrupar cuentas por estilo. ---
     reglas = []
@@ -584,7 +629,9 @@ def generar_pool_por_cuenta(
             vistos.add(relleno)
             resultado[i] = relleno
 
-    return [t or "" for t in resultado][:n_cuentas]
+    # Corte DURO final (regla de oro): cada texto <= 100 chars, conservando
+    # SIEMPRE la alineacion indice i -> cuenta i.
+    return [_acotar_limite(t or "") for t in resultado][:n_cuentas]
 
 
 # ===================================================================== #
@@ -1928,7 +1975,9 @@ def _prompt_lote_mantenimiento(
             "\nPERSONALIDAD DE LA CUENTA (respeta su tono e intereses): "
             f"{personalidad or 'persona mexicana comun'}"
         )
-        reglas = _reglas_registro(registro).strip()
+        reglas = _reglas_registro(
+            registro, incluir_limite=(accion != "comentario")
+        ).strip()
         if reglas:
             linea += f"\n{reglas}"
         estilo = bloque_estilo_perfil(perfil).strip()
@@ -1973,6 +2022,18 @@ def _prompt_lote_mantenimiento(
             "campana, y sin copiarlo ni parafrasearlo.\n"
         )
 
+    # Largo del lote: regla de oro de 100 SOLO para POSTS; los COMENTARIOS
+    # quedan fuera del limite (240 como antes).
+    if solo_comentarios:
+        reglas_largo = "- Maximo 240 caracteres por texto.\n"
+    elif hay_comentarios:
+        reglas_largo = (
+            "- Maximo 100 caracteres para los POSTS (estricto); los "
+            "COMENTARIOS pueden llegar a 240.\n"
+        )
+    else:
+        reglas_largo = "- Maximo 100 caracteres por texto.\n"
+
     partes.append(
         "REGLAS DEL LOTE:\n"
         f"- Genera EXACTAMENTE {n_textos} textos DISTINTOS entre si, sin repetir "
@@ -1993,8 +2054,8 @@ def _prompt_lote_mantenimiento(
         "- Los textos de COMENTARIO/RESPUESTA deben ser breves y conversacionales "
         "(1-2 frases; el perfil formal con sus 3 bloques pero cortos).\n"
         + reglas_hashtag
-        + "- Maximo 240 caracteres por texto.\n"
-        "- NO numeres, NO uses etiquetas ni corchetes.\n"
+        + reglas_largo
+        + "- NO numeres, NO uses etiquetas ni corchetes.\n"
         "- Responde SOLO con los textos separados por '---'."
     )
     return "\n\n".join(partes)
@@ -2041,14 +2102,16 @@ def _fallback_estructura_mantenimiento(cuentas_info, n_por_cuenta) -> list[list[
                 # Comentarios spam-safe: sin hashtags, links ni @menciones.
                 t = limpiar_comentario_spam(t)
             else:
+                # Regla de oro: los POSTS jamas superan 100 caracteres.
                 t = _con_hashtag_en_medio(t)
+                t = _acotar_limite(t)
             if t in vistos:
                 t = _variar_hasta_unico(t, vistos)
                 t = _humanizar_por_registro(t, registro, semilla=i * 100 + j + 997)
                 if es_comentario:
                     t = limpiar_comentario_spam(t)
                 else:
-                    t = _con_hashtag_en_medio(t)
+                    t = _acotar_limite(_con_hashtag_en_medio(t))
             vistos.add(t)
             fila.append(t)
         resultado.append(fila)
@@ -2237,7 +2300,17 @@ def _generar_textos_mantenimiento_impl(
                 # Garantia final: TODO comentario (IA o fallback) sale por
                 # `limpiar_comentario_spam` (NUNCA con #, links ni @) y jamas
                 # vacio: si queda muy corto, devuelve un cierre conversacional.
+                # Los COMENTARIOS quedan FUERA del limite de 100.
                 t = limpiar_comentario_spam(t)
+            else:
+                # Corte DURO (regla de oro): los POSTS (IA o fallback) jamas
+                # superan 100 caracteres. Si el recorte colisiona con otro
+                # texto, se varia SIN volver a pasarse del limite.
+                t = _acotar_limite(t)
+                if t in vistos:
+                    alterno = _acotar_limite(_variar_hasta_unico(t, vistos))
+                    if alterno and alterno not in vistos:
+                        t = alterno
             vistos.add(t)
             fila.append(t)
         resultado[i] = fila
@@ -2480,12 +2553,15 @@ def _generar_citas_campana(
                 t = f"{base} ({j + 1})" if base else f"Cita {j + 1}"
             t = _humanizar_por_registro(t, registro, semilla=i * 100 + j + 7)
             t = _con_hashtag_en_medio(t)
+            # Corte DURO (regla de oro): ninguna cita/RT supera 100 chars.
+            t = _acotar_limite(t)
             if t in vistos_local:
                 t = _variar_hasta_unico(t, vistos_local)
                 t = _humanizar_por_registro(
                     t, registro, semilla=i * 100 + j + 1997
                 )
                 t = _con_hashtag_en_medio(t)
+                t = _acotar_limite(t)
             vistos_local.add(t)
             resultado[i][j] = t
     return [list(fila) for fila in resultado]
@@ -2609,14 +2685,15 @@ def generar_pool_campana_por_cuenta(
             if es_comentario:
                 t = limpiar_comentario_spam(t)
             else:
-                t = _con_hashtag_en_medio(t)
+                # Corte DURO (regla de oro): posts y citas <= 100 chars.
+                t = _acotar_limite(_con_hashtag_en_medio(t))
             if t in vistos:
                 t = _variar_hasta_unico(t, vistos)
                 t = _humanizar_por_registro(t, registro, semilla=semilla)
                 if es_comentario:
                     t = limpiar_comentario_spam(t)
                 else:
-                    t = _con_hashtag_en_medio(t)
+                    t = _acotar_limite(_con_hashtag_en_medio(t))
             vistos.add(t)
             return t
 
@@ -2692,11 +2769,12 @@ def generar_textos_campana_3_3_3(
 # ===================================================================== #
 _MAX_CUENTAS_HASHTAGS_POR_LLAMADA = 15
 
-# Limite DURO de largo para los posts del rol "hashtags". El prompt pide 240
-# caracteres y X corta en 280; el margen de 40 cubre menciones o URLs que se
-# agreguen despues. TODO texto de `generar_textos_hashtags_por_cuenta` y de
-# `_texto_hashtag_local` sale con len(texto) <= _MAX_LARGO_HASHTAG.
-_MAX_LARGO_HASHTAG = 240
+# Limite DURO de largo para POSTS y RETWEETS CON CITA generados por IA
+# (regla de oro: maximo estricto de 100 caracteres, incluidos hashtags y
+# espacios). X corta en 280 como red externa, pero aqui el contrato es 100.
+# TODO texto de `generar_textos_hashtags_por_cuenta`, de `_texto_hashtag_local`
+# y del corte final `_acotar_limite` sale con len(texto) <= _MAX_LARGO_HASHTAG.
+_MAX_LARGO_HASHTAG = 100
 
 
 def _reemplazar_tag_exacto(texto: str, tag_pedido: str, reemplazo: str) -> str:
@@ -2894,6 +2972,50 @@ def _recortar_limite_hashtag(
     except Exception as e:
         logger.error(f"Error recortando texto de hashtag: {e}")
         return str(texto or "").strip()
+
+
+def _acotar_limite(texto, limite: int = _MAX_LARGO_HASHTAG) -> str:
+    """Corte DURO de ultima barrera: deja ``texto`` en <= ``limite`` chars.
+
+    Extrae los hashtags presentes (unicos, case-insensitive) y delega en
+    `_recortar_limite_hashtag`, que recorta en cierre de frase o en el ultimo
+    espacio + "…" (sin partir palabras), preserva/reinserta los hashtags EN
+    MEDIO y garantiza que el texto NUNCA termine en hashtag.
+
+    Es la ultima barrera del limite de 100 de posts/citas generados por IA:
+    se aplica aunque la IA (o el relleno local/sufijos) se pase. Nunca lanza;
+    si todo falla devuelve un corte seguro que respeta el limite.
+    """
+    try:
+        t = str(texto or "").strip()
+    except Exception:
+        return texto
+    if not t:
+        return t
+    try:
+        limite = max(40, int(limite))
+    except (TypeError, ValueError):
+        limite = _MAX_LARGO_HASHTAG
+    if len(t) <= limite:
+        return t
+    try:
+        tags: list[str] = []
+        vistos: set = set()
+        for tag in re.findall(r"#[A-Za-z0-9ÁÉÍÓÚÜÑáéíóúüñ_]+", t):
+            clave = tag.lower()
+            if clave not in vistos:
+                vistos.add(clave)
+                tags.append(tag)
+        acotado = _recortar_limite_hashtag(t, tags, limite)
+        if acotado and len(acotado) <= limite:
+            return acotado
+    except Exception as e:
+        logger.error(f"Error acotando texto a {limite} caracteres: {e}")
+    # Ultimo recurso: corte seguro sin salir del limite.
+    try:
+        return _cortar_texto_a_limite(t, limite)
+    except Exception:
+        return t[:limite].rstrip()
 
 
 # Plantillas locales (fallback sin OpenAI) para el rol "hashtags".

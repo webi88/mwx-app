@@ -94,19 +94,45 @@ _REGLAS_REGISTRO = {
 }
 
 
-def _reglas_registro(registro: str = "") -> str:
+# Regla de oro del proyecto para POSTS y RETWEETS CON CITA generados por IA:
+# texto final <= 100 caracteres (incluyendo hashtags y espacios). Vive aqui para
+# inyectarse en TODOS los prompts de posts/citas y reutilizarse en el corte duro
+# de ``ia/generador_contenido.py`` (ultima barrera, por si la IA se pasa).
+REGLA_MAX_100 = (
+    "REGLA DE ORO: EL TEXTO FINAL DEBE TENER UN MÁXIMO ESTRICTO DE 100 "
+    "CARACTERES EN TOTAL, INCLUYENDO HASHTAGS Y ESPACIOS. SÉ MUY BREVE Y "
+    "DIRECTO."
+)
+
+# Alias privado (compatibilidad con quien prefiera el guion bajo).
+_REGLA_MAX_100 = REGLA_MAX_100
+
+
+def _reglas_registro(registro: str = "", incluir_limite: bool = True) -> str:
     """Bloque de reglas de registro listo para concatenar (con saltos de linea).
 
     "politica" -> lenguaje institucional/formal.
     "activista" -> tecnico-coloquial (terminos politicos + lenguaje popular).
     "ciudadana" -> lenguaje muy coloquial de una persona mexicana real.
-    Cualquier otro valor (o vacio) no agrega reglas extra.
+    Cualquier otro valor (o vacio) no agrega reglas de registro.
+
+    ``incluir_limite`` (kwarg nuevo AL FINAL, default True): agrega SIEMPRE la
+    ``REGLA_MAX_100`` (posts/citas con maximo estricto de 100 caracteres),
+    incluso cuando el registro viene vacio o desconocido. Los llamadores de
+    COMENTARIOS/BLOG pasan ``incluir_limite=False``: quedan FUERA del limite de
+    100. Los llamadores actuales de 1 argumento siguen funcionando igual (el
+    default incluye la regla).
     """
     clave = (registro or "").strip().lower()
     regla = _REGLAS_REGISTRO.get(clave)
-    if not regla:
+    bloques = []
+    if incluir_limite:
+        bloques.append(REGLA_MAX_100)
+    if regla:
+        bloques.append(regla)
+    if not bloques:
         return ""
-    return f"\n{regla}\n"
+    return "\n" + "\n".join(bloques) + "\n"
 
 
 # --------------------------------------------------------------------------- #
@@ -311,11 +337,15 @@ def _bloque_tema_personalidad(tema: str = "", personalidad: str = "") -> str:
 
 def _reglas_formato(
     cantidad: int = 0,
-    max_chars: int = 240,
+    max_chars: int = 100,
     estructura: bool = True,
     hashtags: bool = True,
 ) -> str:
     """Reglas de formato comunes a todos los tipos de contenido.
+
+    El default es 100 caracteres (regla de oro de posts/citas); los formatos
+    fuera de ese alcance pasan su propio ``max_chars`` explicito (blog 600,
+    comentario 200).
 
     ``hashtags=False`` omite la regla de hashtag obligatorio en medio (util
     para formatos donde no aplica, p. ej. blog).
@@ -438,14 +468,15 @@ def _prompt_reposteo(
 ) -> str:
     return (
         _base_narrativa(narrativa, entrenamiento)
-        + _reglas_registro(registro)
+        + _reglas_registro(registro, incluir_limite=False)
+        + f"\n{REGLA_MAX_100}\n"
         + "\nTIPO DE CONTENIDO: REPOSTEO CON CITA.\n"
         "TAREA: lograr que la audiencia comparta el contenido.\n"
         "- Invita a dar RT, citar el tuit o compartir en otras redes.\n"
         "- Textos cortos, directos y con llamado explicito a compartir.\n"
         "- Cada texto debe invitar a compartir de una forma distinta.\n"
         + _bloque_tema_personalidad(tema, personalidad)
-        + _reglas_formato(cantidad)
+        + _reglas_formato(cantidad, max_chars=100)
         + bloque_estilo_perfil(perfil)
     )
 
@@ -461,7 +492,7 @@ def _prompt_blog(
 ) -> str:
     return (
         _base_narrativa(narrativa, entrenamiento)
-        + _reglas_registro(registro)
+        + _reglas_registro(registro, incluir_limite=False)
         + "\nTIPO DE CONTENIDO: BLOG.\n"
         "TAREA: redactar articulos breves para blog.\n"
         "- Desarrolla la idea con inicio, desarrollo y cierre.\n"
@@ -677,7 +708,7 @@ def get_prompt_comentario(
     return (
         _base_narrativa(narrativa, entrenamiento)
         + (_reglas_trasfondo() if narrativa else "")
-        + _reglas_registro(registro)
+        + _reglas_registro(registro, incluir_limite=False)
         + "\nTIPO DE CONTENIDO: COMENTARIO/RESPUESTA BREVE.\n"
         "TAREA: comentar o responder una publicacion de forma breve y natural.\n"
         "- Los textos son para responder: directos, conversacionales y con "
@@ -719,7 +750,8 @@ def get_prompt_hashtags(
     prompt = (
         _base_narrativa(narrativa, entrenamiento)
         + (_reglas_trasfondo() if narrativa else "")
-        + _reglas_registro(registro)
+        + _reglas_registro(registro, incluir_limite=False)
+        + f"\n{REGLA_MAX_100}\n"
         + "\nTIPO DE CONTENIDO: POST ORIGINAL CON HASHTAG.\n"
         "TAREA: redactar publicaciones ORIGINALES con opinion propia sobre el "
         "CONTEXTO indicado.\n"
@@ -741,9 +773,9 @@ def get_prompt_hashtags(
         "estuviera.\n"
         "- PROHIBIDO dejar el hashtag al final del texto: nunca al final ni "
         "como cierre ni en una lista aparte.\n"
-        "- EXTENSION: maximo 240 caracteres por texto. El texto debe quedar "
-        "COMPLETO y con sentido (incluida su frase de cierre), nunca cortado "
-        "a la mitad.\n"
+        "- EXTENSION: MÁXIMO ESTRICTO de 100 caracteres por texto "
+        "(incluyendo hashtags y espacios). El texto debe quedar COMPLETO y con "
+        "sentido (incluida su frase de cierre), nunca cortado a la mitad.\n"
         + _bloque_tema_personalidad("", personalidad)
     )
     if hashtags:
@@ -766,7 +798,7 @@ def get_prompt_hashtags(
             "debes copiar su redacción):\n"
             f"{contexto}"
         )
-    prompt += _reglas_formato(cantidad)
+    prompt += _reglas_formato(cantidad, max_chars=100)
     prompt += bloque_estilo_perfil(perfil)
     return prompt
 
