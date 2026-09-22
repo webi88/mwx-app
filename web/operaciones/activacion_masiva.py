@@ -24,24 +24,24 @@ SUBCUENTAS por rol (`Cuenta.rol_activacion`, ver `core/roles.py`):
   - "hashtags"   -> Hashtags y menciones.
   - "comentario" -> Comentario en el tweet ancla (reply; requiere URLs).
   - "rt"         -> Retweet simple.
-Permite asignar el rol a la seleccion (selector masivo de `web.operaciones.
-cuentas`), repartir automaticamente entre los 4 roles, ver conteos/ejemplos y
-lanzar `MotorActivacion.ejecutar_por_roles` limitado a una seccion opcional.
+El reparto de roles es POR PORCENTAJES: el usuario elige las cuentas (p. ej.
+el selector en modo Filtro -> Seccion: Libertad), define el % de cada rol en
+«🎚️ Reparto por porcentajes» y lo aplica. La campana usa SIEMPRE el rol
+guardado de cada cuenta (`roles_aleatorios=False` en la llamada al motor: el
+motor lo sigue soportando, pero la UI ya no ofrece el modo aleatorio). El
+expander «🏷️ Asignar roles manualmente» queda para cuentas sueltas. Ver
+conteos/ejemplos y lanzar `MotorActivacion.ejecutar_por_roles` limitado a una
+seccion opcional.
 
 Modo "📝 Campaña solo de posts (sin tweet ancla)": checkbox de la pestana B
 para campanas donde NO hay tweet ancla. Deshabilita las URLs y limita las
-acciones a posts con hashtag/contexto (`solo_roles=["hashtags"]` tanto en
-modo rol aleatorio como en rol fijo); requiere material para que la IA genere
-los posts: hashtags, texto base, el contexto manual (tema) o el trasfondo de
-noticias (que NUNCA se menciona).
+acciones a posts con hashtag/contexto (`solo_roles=["hashtags"]` con rol
+fijo); requiere material para que la IA genere los posts: hashtags, texto
+base, el contexto manual (tema) o el trasfondo de noticias (que NUNCA se
+menciona).
 
-Con "🎲 Rol aleatorio por cuenta en cada ronda" (default) el rol guardado NO
-se usa como filtro: en cada ronda el motor sortea cita/hashtags/comentario/rt
-por cuenta (`roles_aleatorios=True`) y cada cuenta CAMBIA de accion respecto
-a su participacion anterior (si hizo RT, la siguiente puede ser cita, post con
-hashtag o comentario; nunca repite mientras haya 2+ roles posibles).
-`cooldown_min` evita que una misma cuenta repita accion antes de ese descanso.
-Las cuentas sin registro siguen saltandose.
+Las cuentas sin registro siguen saltandose. `cooldown_min` evita que una
+misma cuenta repita accion antes de ese descanso.
 
 Con "🔁 Repetir hasta agotar el tiempo" (+ porcentajes) cada ronda usa un
 SUBCONJUNTO ALEATORIO de cuentas: mas del minimo% y menos del maximo%, la
@@ -77,14 +77,13 @@ comentarios al MISMO tweet de 15s. Los disyuntores de la API
 en un caption y se ajustan por env. En Railway NO conviene pasar de 3-4
 "navegadores": si Chrome crashea, la campana se frena en cascada.
 
-Caso de uso "trending con UN solo tweet ancla" (pestana B): el boton «🎯
-Preset: Trending 1 hora» deja la campana lista en un clic (60 min, 2
-navegadores, 12 trabajadores, rol aleatorio, repetir 40-90%, descanso de 8 min
-por cuenta y pausa de 30s entre comentarios al mismo tweet) y «🎯 Reparto
-trending» reparte las cuentas seleccionadas con pesos RT 45 / Citas 25 /
-Hashtags 20 / Comentarios 10 (`_repartir_trending`): X castiga las rafagas de
-respuestas al mismo tweet y el RT simple es la accion mas confiable para
-amplificar, mientras citas y hashtags alimentan el trending.
+Caso de uso "trending con UN solo tweet ancla" (pestana B): usa el selector
+de cuentas en modo Filtro (p. ej. Seccion: Libertad), define el porcentaje de
+cada rol en «🎚️ Reparto por porcentajes» y aplica (el boton queda
+deshabilitado si la suma no es 100%). Para una campana de ancla unica suele
+funcionar mas RT simple (amplifica y es lo que menos castiga X) con citas y
+hashtags como combustible; los comentarios van en minoria y espaciados
+(ver `pausa_comentario_url_seg`).
 """
 import os
 import threading
@@ -203,54 +202,33 @@ def _navegadores_default() -> int:
     return NAVEGADORES_RECOMENDADOS
 
 
-# Valores del preset "🎯 Trending 1 hora" (campana de UN solo tweet ancla):
-# deja la campana lista sin tocar nada. La clave es la `key` del widget de la
-# pestana "Por roles" y el valor lo que se escribe en session_state.
-PRESET_TRENDING = {
-    "act_roles_dur": 60,
-    "act_roles_repetir": True,
-    "act_roles_cooldown": 8,
-    "act_roles_pausa_comentario": 30,
-    "act_roles_pct_min": 40,
-    "act_roles_pct_max": 90,
-    "act_roles_nav": NAVEGADORES_RECOMENDADOS,
-    "act_roles_workers": 12,
-    "act_roles_aleatorio": True,
-    "act_roles_seccion": OPCION_TODAS_SECCIONES,
-}
-
-
-def _aplicar_preset_trending():
-    """Callback (`on_click`) del boton «🎯 Preset: Trending 1 hora».
-
-    Escribe las keys de `PRESET_TRENDING` en `st.session_state`. Al correr como
-    callback del boton, se ejecuta ANTES del rerun (cuando los widgets de la
-    pestana todavia no estan instanciados), por lo que funciona aunque el
-    expander «⚙️ Opciones avanzadas» este cerrado: los widgets leen el valor
-    nuevo al construirse. No lanza: cada asignacion va en try/except.
-    """
-    for clave, valor in PRESET_TRENDING.items():
-        try:
-            st.session_state[clave] = valor
-        except Exception:
-            pass
-
-
 # ============================ LOGICA PURA ============================
 
-def _repartir_tercios(usuarios: list) -> dict:
-    """Reparte 'usuarios' (en orden) entre los 4 roles en bloques contiguos.
+def _repartir_por_porcentajes(usuarios: list, pesos: dict | None = None) -> dict:
+    """Reparte 'usuarios' (en orden) entre los 4 roles segun `pesos` (%).
 
-    Criterio exacto:
-      - Se limpian valores vacios y se quitan duplicados conservando el primer
-        orden de aparicion (se ignora un '@' inicial).
-      - Con n usuarios se calcula divmod(n, 4); el resto se reparte de a uno a
-        los primeros roles en el orden cita -> hashtags -> comentario -> rt.
-      - Los cortes son contiguos, por lo que ningun usuario se pierde y ninguno
-        queda en dos roles a la vez.
+    Pensado para que el usuario controle el reparto desde la pestana "Por
+    roles": elige las cuentas (p. ej. el selector en modo Filtro -> Seccion:
+    Libertad), define el % de cada rol en «🎚️ Reparto por porcentajes» y lo
+    aplica a `Cuenta.rol_activacion`.
 
-    Ejemplos: 10 -> cita 3 / hashtags 3 / comentario 2 / rt 2;
-    2 -> 1/1/0/0; 0 -> 0/0/0/0.
+    Reglas:
+      - `pesos` es {rol: numero >= 0}; default equitativo 25/25/25/25.
+        Si todos los pesos son 0 (o `pesos` es None), reparte equitativo.
+      - Se normaliza por la SUMA (matematicamente igual con suma 100):
+        p. ej. {1,1,1,1} = {25,25,25,25}.
+      - Metodo del RESTO MAYOR: cuota = n * peso / suma; la parte entera se
+        asigna y los puestos sobrantes van a los mayores restos (empate ->
+        mayor peso, luego orden de ORDEN_ROLES). La suma es EXACTA = n.
+      - Los roles con peso 0 NUNCA reciben cuentas.
+      - Mismas garantias que el resto de repartos: limpia None/vacios y
+        duplicados (se ignora un '@' inicial, case-insensitive), cortes
+        CONTIGUOS y ningun usuario queda en dos roles a la vez.
+
+    Ejemplos: n=100 equitativo -> 25/25/25/25; n=141 equitativo ->
+    cita 36 / hashtags 35 / comentario 35 / rt 35; n=100 con
+    {cita:50, hashtags:30, comentario:10, rt:10} -> 50/30/10/10; un rol con
+    peso 0 -> 0 cuentas.
     """
     limpios, vistos = [], set()
     for u in (usuarios or []):
@@ -270,92 +248,41 @@ def _repartir_tercios(usuarios: list) -> dict:
     if n == 0:
         return reparto
 
-    base, resto = divmod(n, len(ORDEN_ROLES))
-    tamanos = [
-        base + (1 if i < resto else 0) for i in range(len(ORDEN_ROLES))
-    ]
-    inicio = 0
-    for rol, tam in zip(ORDEN_ROLES, tamanos):
-        reparto[rol] = limpios[inicio:inicio + tam]
-        inicio += tam
-    return reparto
+    pesos_rol: dict = {}
+    for rol in ORDEN_ROLES:
+        try:
+            valor = float((pesos or {}).get(rol, 0.0))
+        except (TypeError, ValueError):
+            valor = 0.0
+        pesos_rol[rol] = valor if valor > 0 else 0.0
+    if sum(pesos_rol.values()) <= 0:
+        # Sin pesos utiles (None o todos 0): reparto equitativo.
+        pesos_rol = {rol: 1.0 for rol in ORDEN_ROLES}
+    total = sum(pesos_rol.values())
 
-
-# Pesos (%) del reparto "trending" para campanas de UN SOLO tweet ancla: el RT
-# simple amplifica, es la accion mas confiable y la que X castiga menos; las
-# citas y los hashtags son el combustible del trending; los comentarios van en
-# minoria porque X marca como spam cuando muchas cuentas responden al mismo
-# tweet en rafaga.
-PESOS_TRENDING = {"cita": 25, "hashtags": 20, "comentario": 10, "rt": 45}
-
-
-def _repartir_trending(usuarios: list) -> dict:
-    """Reparte 'usuarios' (en orden) con los pesos trending 25/20/10/45.
-
-    Pensado para posicionar trending con UN solo tweet ancla:
-      - RT 45%: amplificacion pura (lo mas confiable y lo que menos castiga X).
-      - Citas 25%: texto original con el enlace (combustible del trending).
-      - Hashtags 20%: posts con hashtag (combustible del trending).
-      - Comentarios 10%: minoria y espaciados (X castiga las rafagas de
-        respuestas al mismo tweet; ver `pausa_comentario_url_seg`).
-
-    Metodo del resto mayor para que la suma sea EXACTA = len(usuarios):
-      - Cuota de cada rol = n * peso / 100; se toma la parte entera.
-      - Los puestos restantes van a los mayores restos (empate -> mayor peso).
-      - Con pocas cuentas (n <= 4) se reparte 0-1 por rol en orden de
-        prioridad (rt -> cita -> hashtags -> comentario): todas participan en
-        un rol distinto y ninguna se pierde.
-
-    Mismas garantias que `_repartir_tercios`: limpia vacios y duplicados
-    (ignorando un '@' inicial), cortes contiguos y ningun usuario queda en dos
-    roles a la vez.
-
-    Ejemplos (claves de ORDEN_ROLES): 100 -> cita 25 / hashtags 20 /
-    comentario 10 / rt 45; 141 -> 35/28/14/64; 4 -> 1/1/1/1 (uno por rol);
-    3 -> 1/1/0/1; 1 -> 0/0/0/1.
-    """
-    limpios, vistos = [], set()
-    for u in (usuarios or []):
-        if u is None:
-            continue
-        nombre = str(u).strip().lstrip("@")
-        if not nombre:
-            continue
-        clave = nombre.lower()
-        if clave in vistos:
-            continue
-        vistos.add(clave)
-        limpios.append(nombre)
-
-    reparto = {rol: [] for rol in ORDEN_ROLES}
-    n = len(limpios)
-    if n == 0:
-        return reparto
-
-    if n <= len(ORDEN_ROLES):
-        # Pocas cuentas: un rol por cuenta en orden de prioridad (el mas
-        # pesado primero) para cubrir al maximo los 4 tipos de accion.
-        prioridad = sorted(
-            ORDEN_ROLES, key=lambda rol: (-PESOS_TRENDING[rol], ORDEN_ROLES.index(rol))
-        )
-        asignados = {rol: 0 for rol in ORDEN_ROLES}
-        for i in range(n):
-            asignados[prioridad[i]] = 1
-    else:
-        cuotas = {rol: n * PESOS_TRENDING[rol] / 100.0 for rol in ORDEN_ROLES}
-        asignados = {rol: int(cuotas[rol]) for rol in ORDEN_ROLES}
-        restantes = n - sum(asignados.values())
-        if restantes > 0:
-            orden_restos = sorted(
-                ORDEN_ROLES,
-                key=lambda rol: (
-                    -(cuotas[rol] - int(cuotas[rol])),
-                    -PESOS_TRENDING[rol],
-                    ORDEN_ROLES.index(rol),
-                ),
+    cuotas = {rol: n * pesos_rol[rol] / total for rol in ORDEN_ROLES}
+    asignados = {rol: int(cuotas[rol]) for rol in ORDEN_ROLES}
+    restantes = n - sum(asignados.values())
+    if restantes > 0:
+        # Solo los roles con peso > 0 pueden recibir sobrantes.
+        candidatos = [rol for rol in ORDEN_ROLES if pesos_rol[rol] > 0]
+        candidatos.sort(
+            key=lambda rol: (
+                -(cuotas[rol] - int(cuotas[rol])),
+                -pesos_rol[rol],
+                ORDEN_ROLES.index(rol),
             )
-            for rol in orden_restos[:restantes]:
-                asignados[rol] += 1
+        )
+        for rol in candidatos[:restantes]:
+            asignados[rol] += 1
+        # Red de seguridad para redondeos de punto flotante: la particion
+        # siempre queda EXACTA (= n).
+        faltan = n - sum(asignados.values())
+        for rol in candidatos:
+            if faltan <= 0:
+                break
+            asignados[rol] += 1
+            faltan -= 1
 
     inicio = 0
     for rol in ORDEN_ROLES:
@@ -406,8 +333,8 @@ def _cuentas_objetivo(cuentas: list, usuarios: list | None) -> list:
     """Cuentas que cumplen el filtro `usuarios` (sin '@', case-insensitive).
 
     Mismo criterio que `MotorActivacion._obtener_cuentas_por_rol`: sin
-    `usuarios` devuelve todas. Sirve para validar que el modo de rol aleatorio
-    tiene al menos una cuenta que procesar aunque no tenga rol guardado.
+    `usuarios` devuelve todas. Sirve para validar que la seleccion de la
+    campana tiene al menos una cuenta que procesar.
     """
     base = list(cuentas or [])
     if not usuarios:
@@ -960,16 +887,6 @@ def _mostrar_resultados_roles(resultados: dict):
         )
     for col, (etiqueta, valor) in zip(st.columns(len(metricas)), metricas):
         col.metric(etiqueta, valor)
-
-    if resultados.get("roles_aleatorios"):
-        try:
-            cooldown = float(resultados.get("cooldown_min") or 0)
-        except (TypeError, ValueError):
-            cooldown = 0.0
-        st.caption(
-            f"🎲 Roles sorteados por cuenta en cada ronda · "
-            f"descanso por cuenta: {cooldown:g} min"
-        )
 
     st.markdown("#### 🗂️ Subcuentas por rol")
     por_rol = resultados.get("por_rol") or {}
@@ -1633,14 +1550,17 @@ def _cita_masiva():
 
 
 def _por_roles():
-    """Pestana B: subcuentas por rol (asignar + lanzar campana).
+    """Pestana B: subcuentas por rol (reparto por porcentajes + lanzar).
 
-    La vista principal deja lo esencial: selector de cuentas, seccion, modo
-    sin tweet ancla + URLs, contexto/hashtags/menciones, duracion y el boton
-    de lanzar. La asignacion manual de roles, los conteos y todo el resto
-    (cohortes, navegadores, trabajadores, cooldown, pausa anti-spam, rol
-    aleatorio, repetir/porcentajes y opciones de velocidad) viven en
-    «⚙️ Opciones avanzadas» con los valores recomendados ya fijos."""
+    La vista principal deja lo esencial: selector de cuentas, «🎚️ Reparto por
+    porcentajes», seccion, modo sin tweet ancla + URLs,
+    contexto/hashtags/menciones, duracion y el boton de lanzar. La campana usa
+    SIEMPRE el rol guardado de cada cuenta (`roles_aleatorios=False`: el motor
+    lo sigue soportando, pero la UI ya no ofrece el modo aleatorio). La
+    asignacion manual de roles sueltos, los conteos y todo el resto (cohortes,
+    navegadores, trabajadores, cooldown, pausa anti-spam, repetir/porcentajes
+    y opciones de velocidad) viven en «⚙️ Opciones avanzadas» con los valores
+    recomendados ya fijos."""
     from core.roles import ROLES_ACTIVACION, etiqueta_rol_activacion, normalizar_rol_activacion
 
     # Import perezoso: cuentas.py importa Streamlit y compania y solo se
@@ -1667,60 +1587,87 @@ def _por_roles():
     seleccion = _selector_masivo(cuentas, "act_roles_selector")
     usuarios_sel = [f.get("usuario") for f in seleccion if f.get("usuario")]
 
-    # ---------------- Trending de 1 clic (un solo tweet ancla) ----------------
-    # Solo 2 botones visibles: el reparto ponderado y el preset de 1 hora.
-    col_reparto, col_preset = st.columns([2, 1])
-    with col_reparto:
-        repartir_trending = st.button(
-            "🎯 Reparto trending (RT 45 / Citas 25 / Hashtags 20 / Comentarios 10)",
-            key="btn_act_roles_trending",
-            help=(
-                "Asigna roles ponderados a las cuentas seleccionadas: RT simple "
-                "45%, citas 25%, posts con hashtag 20% y comentarios 10%. "
-                "Pensado para posicionar trending con UN solo tweet ancla."
-            ),
-        )
-    with col_preset:
-        st.button(
-            "🎯 Preset: Trending 1 hora",
-            key="btn_preset_trending",
-            on_click=_aplicar_preset_trending,
-            help=(
-                "Deja la campaña lista en 1 clic: 60 min, 2 navegadores, 12 "
-                "trabajadores, rol aleatorio, repetir por rondas (40-90%), "
-                "descanso de 8 min por cuenta y pausa de 30s entre comentarios "
-                "al mismo tweet. Funciona con «Opciones avanzadas» cerradas."
-            ),
-        )
+    # ---------------- Reparto por porcentajes ----------------
+    # El usuario elige las cuentas (selector de arriba, p. ej. modo Filtro ->
+    # Sección: Libertad), define el % de cada rol y lo aplica. La campana usa
+    # SIEMPRE el rol guardado (`Cuenta.rol_activacion`) que deja este reparto.
+    st.markdown("#### 🎚️ Reparto por porcentajes")
     st.caption(
-        "🔥 Estrategia de ancla única: **RT = amplificación** (el más "
-        "confiable), **Citas y Hashtags = combustible del trending**, "
-        "**Comentarios = minoría y espaciados** (X marca spam en ráfagas al "
-        "mismo tweet). Deja el preset puesto y lanza; no toques nada más."
+        "Elige la sección en el selector de arriba (modo **Filtro**, p. ej. "
+        "**Libertad**), define cuánto hace cada rol y aplica el reparto: la "
+        "campaña usará el rol guardado de cada cuenta."
     )
+    claves_pct = {
+        "cita": "act_roles_pct_cita",
+        "hashtags": "act_roles_pct_hashtags",
+        "comentario": "act_roles_pct_comentario",
+        "rt": "act_roles_pct_rt",
+    }
+    pesos = {}
+    for columna, rol in zip(st.columns(4), ORDEN_ROLES):
+        with columna:
+            pesos[rol] = st.number_input(
+                f"{etiqueta_rol_activacion(rol)} (%)",
+                min_value=0,
+                max_value=100,
+                value=25,
+                step=5,
+                key=claves_pct[rol],
+            )
+    try:
+        suma_pct = sum(int(p or 0) for p in pesos.values())
+    except (TypeError, ValueError):
+        suma_pct = 0
 
-    if repartir_trending:
+    reparto_preview = _repartir_por_porcentajes(usuarios_sel, pesos)
+    st.markdown(
+        f"Con **{len(usuarios_sel)}** cuentas seleccionadas: "
+        + " · ".join(
+            f"{etiqueta_rol_activacion(rol)} **{len(reparto_preview[rol])}**"
+            for rol in ORDEN_ROLES
+        )
+    )
+    if suma_pct != 100:
+        st.warning(
+            f"Los porcentajes suman **{suma_pct}%**: ajústalos hasta 100% "
+            "para poder aplicar el reparto."
+        )
+
+    aplicar_pct = st.button(
+        "💾 Aplicar reparto por porcentajes a las cuentas seleccionadas",
+        key="btn_act_roles_pct_apply",
+        disabled=suma_pct != 100,
+        help=(
+            "Asigna a cada cuenta seleccionada el rol que le toca según los "
+            "porcentajes (en bloques contiguos, como están ordenadas)."
+        ),
+    )
+    if aplicar_pct:
         if not usuarios_sel:
             st.warning(
-                "Selecciona al menos una cuenta para el reparto trending."
+                "Selecciona al menos una cuenta para aplicar el reparto por "
+                "porcentajes."
             )
         else:
-            reparto = _repartir_trending(usuarios_sel)
             resumen = []
             for rol in ORDEN_ROLES:
-                n = _actualizar_roles(reparto[rol], rol)
-                resumen.append(f"{etiqueta_rol_activacion(rol)}: {n}")
-            st.success("🎯 Reparto trending → " + " · ".join(resumen))
+                n_rol = _actualizar_roles(reparto_preview[rol], rol)
+                resumen.append(f"{etiqueta_rol_activacion(rol)}: {n_rol}")
+            st.session_state["act_roles_pct_msg"] = (
+                "🎚️ Reparto por porcentajes → " + " · ".join(resumen)
+            )
             st.rerun()
+    mensaje_pct = st.session_state.pop("act_roles_pct_msg", "")
+    if mensaje_pct:
+        st.success(mensaje_pct)
 
-    # ---------------- Asignar roles (avanzado) ----------------
-    # El modo recomendado es «🎲 Rol aleatorio por cuenta en cada ronda», que
-    # sortea la acción en cada ronda sin usar el rol guardado; la asignación
-    # manual de roles vive en un expander para no llenar la vista.
+    # ---------------- Asignar roles manualmente (avanzado) ----------------
+    # El reparto masivo vive en «🎚️ Reparto por porcentajes»; este expander
+    # queda para asignar rol a cuentas sueltas y ver los conteos actuales.
     with st.expander("🏷️ Asignar roles manualmente (opcional)", expanded=False):
         st.caption(
-            "Solo hace falta si vas a lanzar con «Rol aleatorio» desactivado: "
-            "en el modo recomendado el motor sortea la acción de cada cuenta."
+            "Para cuentas sueltas: si quieres repartir TODAS las "
+            "seleccionadas usa «🎚️ Reparto por porcentajes»."
         )
         opciones_rol = [OPCION_SIN_ROL] + list(ROLES_ACTIVACION.values())
         col_rol, col_btn = st.columns([2, 1])
@@ -1737,15 +1684,6 @@ def _por_roles():
                 "💾 Asignar rol a seleccionadas",
                 key="btn_act_roles_assign",
             )
-        repartir = st.button(
-            "🎲 Repartir automáticamente entre los 4 roles",
-            key="btn_act_roles_tercios",
-            help=(
-                "En orden alfabético: reparte las cuentas seleccionadas entre "
-                "Retweet con cita, Hashtags y menciones, Comentario en el tweet "
-                "ancla y Retweet simple."
-            ),
-        )
 
         if asignar:
             if not usuarios_sel:
@@ -1756,20 +1694,6 @@ def _por_roles():
                 st.success(
                     f"✅ Rol «{etiqueta_rol_activacion(codigo)}» asignado a {n} cuenta(s)."
                 )
-                st.rerun()
-
-        if repartir:
-            if not usuarios_sel:
-                st.warning(
-                    "Selecciona al menos una cuenta para repartir entre los 4 roles."
-                )
-            else:
-                reparto = _repartir_tercios(usuarios_sel)
-                resumen = []
-                for rol in ORDEN_ROLES:
-                    n = _actualizar_roles(reparto[rol], rol)
-                    resumen.append(f"{etiqueta_rol_activacion(rol)}: {n}")
-                st.success("🎲 Reparto entre los 4 roles → " + " · ".join(resumen))
                 st.rerun()
 
         # ---------------- Conteos y subcuentas ----------------
@@ -1901,8 +1825,9 @@ def _por_roles():
     with st.expander("⚙️ Opciones avanzadas (ya vienen configuradas)", expanded=False):
         st.caption(
             "Valores recomendados ya fijos: 2 navegadores, 12 trabajadores, "
-            "pestaña persistente, rol aleatorio por ronda, repetir por rondas "
-            "(40-90% de cuentas), sin proxy, sin API y pausa anti-spam de 15s. "
+            "pestaña persistente, repetir por rondas (40-90% de cuentas), sin "
+            "proxy, sin API y pausa anti-spam de 15s. Los roles son FIJOS: la "
+            "campaña usa el rol que asigna «🎚️ Reparto por porcentajes». "
             "Cámbialos solo si sabes lo que haces."
         )
         col_coh, col_nav, col_work = st.columns(3)
@@ -1964,22 +1889,6 @@ def _por_roles():
                 ),
             )
 
-        roles_aleatorios = st.checkbox(
-            "🎲 Rol aleatorio por cuenta en cada ronda",
-            value=True,
-            key="act_roles_aleatorio",
-            help=(
-                "La IA sortea la acción de cada cuenta en cada ronda: RT con cita, "
-                "post con hashtags, comentario en el tweet ancla o RT simple. Una "
-                "cuenta que participa en rondas seguidas cambia de acción respecto "
-                "a su participación anterior (si hizo RT, la siguiente puede ser "
-                "cita, post con hashtag o comentario). Los inputs definen qué roles "
-                "entran: sin URLs no hay cita/rt/comentario; sin hashtags ni "
-                "contexto no hay posts con hashtag. Al marcarlo se ignora el rol "
-                "guardado y se desactiva el filtro «Solo cuentas con rol»."
-            ),
-        )
-
         col_like, col_solo, col_rep = st.columns(3)
         with col_like:
             dar_like = st.checkbox(
@@ -1990,19 +1899,11 @@ def _por_roles():
                 "Solo cuentas con rol",
                 value=True,
                 key="act_roles_solo_rol",
-                disabled=roles_aleatorios,
                 help=(
-                    "Ignorado con «Rol aleatorio por cuenta»: el rol guardado no "
-                    "filtra; todas las cuentas con registro entran al sorteo."
-                    if roles_aleatorios
-                    else "Limita la campaña a las cuentas que ya tienen rol."
+                    "Limita la campaña a las cuentas que ya tienen rol (así se "
+                    "respeta el reparto por porcentajes)."
                 ),
             )
-            if roles_aleatorios:
-                st.caption(
-                    "🎲 Deshabilitado: el rol se sortea por cuenta en cada ronda, "
-                    "sin usar el rol guardado."
-                )
         with col_rep:
             repetir = st.checkbox(
                 "🔁 Repetir hasta agotar el tiempo (textos nuevos en cada ronda)",
@@ -2049,10 +1950,10 @@ def _por_roles():
         if todas_cuentas:
             st.caption(
                 "📢 **Todas las cuentas publican**: se ignora el selector de "
-                "cuentas y se usan todas las activas (con rol aleatorio, sin "
-                "filtrar por rol guardado). Solo publican las que tengan registro "
-                "definido (político/activista/ciudadanía); las cuentas sin "
-                "registro no hacen nada."
+                "cuentas y se usan todas las activas. Solo entran las que "
+                "tengan registro definido (político/activista/ciudadanía) y, "
+                "con «Solo cuentas con rol», las que ya tengan rol asignado; "
+                "las demás no hacen nada."
             )
 
         limpiar_contexto_al_terminar = st.checkbox(
@@ -2155,14 +2056,11 @@ def _por_roles():
     )
     comentario_posible = False
     if not sin_ancla:
-        if roles_aleatorios:
-            comentario_posible = True
-        else:
-            comentario_posible = "comentario" in _roles_objetivo(
-                base_objetivo,
-                usuarios_param,
-                list(ORDEN_ROLES) if solo_con_rol else None,
-            )
+        comentario_posible = "comentario" in _roles_objetivo(
+            base_objetivo,
+            usuarios_param,
+            list(ORDEN_ROLES) if solo_con_rol else None,
+        )
     if len(urls_previas) == 1 and comentario_posible:
         st.warning(
             "⚠️ Con una sola URL ancla todos los comentarios van al mismo "
@@ -2171,14 +2069,15 @@ def _por_roles():
         )
 
     # "Solo cuentas con registro": para el RT simple no se necesita registro,
-    # asi que este filtro puede dejar fuera cuentas utiles para el trending.
-    # (El checkbox no se toca; el aviso solo aparece si esta encendido.)
+    # asi que este filtro puede dejar fuera cuentas utiles para el reparto por
+    # porcentajes. (El checkbox no se toca; el aviso solo aparece si esta
+    # encendido.)
     if todas_cuentas:
         st.warning(
             "⚠️ «Todas las cuentas publican» está encendido: solo entran las "
             "cuentas con registro (político/activista/ciudadanía) y el RT "
             "simple no necesita registro, así que podrías dejar fuera cuentas "
-            "útiles para el trending."
+            "útiles para el reparto por porcentajes."
         )
 
     if st.button(
@@ -2186,10 +2085,9 @@ def _por_roles():
         type="primary",
         key="btn_act_roles_launch",
         help=(
-            "Con «Rol aleatorio por cuenta» (recomendado) cada cuenta recibe "
-            "una acción distinta sorteada en cada ronda (cita, hashtag, "
-            "comentario o rt); desmárcalo para usar el rol guardado de cada "
-            "subcuenta."
+            "La campaña usa el rol FIJO de cada subcuenta asignado con "
+            "«🎚️ Reparto por porcentajes» (Retweet con cita, Hashtags y "
+            "menciones, Comentario en el tweet ancla o Retweet simple)."
         ),
     ):
         urls = (
@@ -2209,15 +2107,11 @@ def _por_roles():
             )
             return
         if sin_ancla:
-            # Campaña sin tweet ancla: SOLO posts con hashtag/contexto, tanto
-            # en modo rol aleatorio como en modo rol fijo.
+            # Campaña sin tweet ancla: SOLO posts con hashtag/contexto (rol
+            # fijo; la UI ya no ofrece el modo aleatorio).
             solo_roles_param = ["hashtags"]
         else:
-            solo_roles_param = (
-                None
-                if roles_aleatorios
-                else (list(ORDEN_ROLES) if solo_con_rol else None)
-            )
+            solo_roles_param = list(ORDEN_ROLES) if solo_con_rol else None
 
         material_posts = (
             str(hashtags or "").strip()
@@ -2227,44 +2121,21 @@ def _por_roles():
         )
 
         if sin_ancla:
-            if roles_aleatorios:
-                if not _cuentas_objetivo(base_objetivo, usuarios_param):
-                    st.warning(
-                        "No hay cuentas que cumplan la selección (sección, "
-                        "selector o registro). Revisa los filtros."
-                    )
-                    return
-            else:
-                roles_objetivo = _roles_objetivo(
-                    base_objetivo, usuarios_param, solo_roles_param
+            roles_objetivo = _roles_objetivo(
+                base_objetivo, usuarios_param, solo_roles_param
+            )
+            if "hashtags" not in roles_objetivo:
+                st.warning(
+                    "No hay cuentas con rol 'Hashtags y menciones' que "
+                    "cumplan la selección. Asigna ese rol con el reparto por "
+                    "porcentajes («🎚️ Reparto por porcentajes»)."
                 )
-                if "hashtags" not in roles_objetivo:
-                    st.warning(
-                        "No hay cuentas con rol 'Hashtags y menciones' que "
-                        "cumplan la selección. Asigna ese rol o activa «🎲 Rol "
-                        "aleatorio por cuenta en cada ronda»."
-                    )
-                    return
+                return
             if not material_posts:
                 st.warning(
                     "Sin tweet ancla necesitas al menos hashtags, texto base, "
                     "el contexto de los posts o links de noticias (trasfondo) "
                     "para que la IA genere los posts."
-                )
-                return
-        elif roles_aleatorios:
-            if not _cuentas_objetivo(base_objetivo, usuarios_param):
-                st.warning(
-                    "No hay cuentas que cumplan la selección (sección, "
-                    "selector o registro). Revisa los filtros."
-                )
-                return
-            if not urls and not material_posts:
-                st.warning(
-                    "Pega al menos una URL objetivo, escribe hashtags, texto "
-                    "base o el contexto de los posts, o extrae las noticias "
-                    "de trasfondo: sin URLs el rol aleatorio no puede hacer "
-                    "cita/rt/comentario y solo quedan posts con hashtag."
                 )
                 return
         else:
@@ -2274,7 +2145,8 @@ def _por_roles():
             if not roles_objetivo:
                 st.warning(
                     "No hay cuentas con rol que cumplan la selección. Asigna "
-                    "roles en «🏷️ Asignar roles» o revisa los filtros."
+                    "roles con el reparto por porcentajes («🎚️ Reparto por "
+                    "porcentajes») o revisa los filtros."
                 )
                 return
             if not urls and (roles_objetivo & {"cita", "comentario", "rt"}):
@@ -2309,7 +2181,10 @@ def _por_roles():
                 narrativa=narrativa_noticias,
                 repetir=bool(repetir),
                 solo_con_registro=bool(todas_cuentas),
-                roles_aleatorios=bool(roles_aleatorios),
+                # La UI ya no ofrece el modo aleatorio: la campaña usa SIEMPRE
+                # el rol guardado que asigna «🎚️ Reparto por porcentajes». El
+                # motor lo sigue soportando (por si se reactiva la UI).
+                roles_aleatorios=False,
                 cooldown_min=float(cooldown_min),
                 secciones=secciones_param,
                 porcentaje_min_ronda=int(pct_min),

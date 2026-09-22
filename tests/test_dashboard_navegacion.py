@@ -13,8 +13,10 @@ Verifica (sin Chrome y sin Streamlit runtime) que:
     es 2.
   - `iniciar_dashboard` se importa sin arrancar Streamlit (def main + guard) y
     `web/operaciones/change.py` NO borra `builtins.input` (lo restaura).
-  - El preset "Trending 1 hora" y el reparto ponderado `_repartir_trending`
-    (RT 45 / Citas 25 / Hashtags 20 / Comentarios 10) de Activacion Masiva.
+  - El reparto por porcentajes `_repartir_por_porcentajes` de Activacion
+    Masiva (helper puro: resto mayor, roles con peso 0 nunca reciben cuentas)
+    y que los widgets/botones viejos (rol aleatorio, preset trending, reparto
+    en tercios) ya no existen en la fuente.
   - El marcador `data/.campana_activa` del guard de campana unica (se crea al
     adquirir, se borra al liberar incluso si la campana falla).
   - La pestana "Nombres" de Cuentas renderiza con `AppTest` y expone el flujo
@@ -457,11 +459,97 @@ def _guard_centralizado_en_lanzar() -> tuple[bool, int, int, bool]:
     return adquiere, finales, liberaciones, not crudo
 
 
+def _fuente_activacion() -> str:
+    """Fuente de `web/operaciones/activacion_masiva.py` (checks de widgets)."""
+    return (RAIZ / "web" / "operaciones" / "activacion_masiva.py").read_text(
+        encoding="utf-8"
+    )
+
+
+def _app_por_roles():
+    """Script de AppTest: pestana Por roles con cuentas simuladas.
+
+    Solo ASCII: `AppTest.from_function` escribe el script temporal con la
+    codificacion local de Windows y los acentos lo rompen en silencio."""
+    from web.operaciones import activacion_masiva as am
+
+    class _CuentasFake:
+        def __call__(self, *args, **kwargs):
+            roles = ("cita", "hashtags", "comentario", "rt")
+            return [
+                {
+                    "usuario": f"cuenta_{i:03d}",
+                    "status": "active",
+                    "seccion": "LIB",
+                    "tipo_cuenta": "ciudadana",
+                    "handle_actual": "",
+                    "grupo": "A",
+                    "rol_activacion": roles[i % len(roles)],
+                }
+                for i in range(12)
+            ]
+
+    original = am._cargar_cuentas_con_roles
+    am._cargar_cuentas_con_roles = _CuentasFake()
+    try:
+        am._por_roles()
+    finally:
+        # Sin esto, el fake quedaria activo para el resto de la suite.
+        am._cargar_cuentas_con_roles = original
+
+
+def _app_test_por_roles() -> tuple[bool, str, dict]:
+    """Corre la pestana Por roles con `AppTest` y reporta los widgets nuevos."""
+    from streamlit.testing.v1 import AppTest
+
+    resultado = {
+        "sin_excepciones": False,
+        "pct_cita": False,
+        "pct_hashtags": False,
+        "pct_comentario": False,
+        "pct_rt": False,
+        "btn_apply": False,
+        "sin_viejos": False,
+    }
+    try:
+        at = AppTest.from_function(_app_por_roles, default_timeout=60)
+        at.run()
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}", resultado
+
+    if at.exception:
+        return False, str(at.exception[0].value)[:200], resultado
+    resultado["sin_excepciones"] = True
+
+    claves_inputs = {n.key for n in at.number_input}
+    resultado["pct_cita"] = "act_roles_pct_cita" in claves_inputs
+    resultado["pct_hashtags"] = "act_roles_pct_hashtags" in claves_inputs
+    resultado["pct_comentario"] = "act_roles_pct_comentario" in claves_inputs
+    resultado["pct_rt"] = "act_roles_pct_rt" in claves_inputs
+    resultado["btn_apply"] = any(
+        b.key == "btn_act_roles_pct_apply" for b in at.button
+    )
+    claves_widgets = (
+        claves_inputs
+        | {b.key for b in at.button}
+        | {c.key for c in at.checkbox}
+        | {r.key for r in at.radio}
+    )
+    viejos = {
+        "act_roles_aleatorio",
+        "btn_act_roles_trending",
+        "btn_preset_trending",
+        "btn_act_roles_tercios",
+    }
+    resultado["sin_viejos"] = not (claves_widgets & viejos)
+    return True, "", resultado
+
+
 def run(check):
     from web.operaciones.activacion_masiva import (
-        PRESET_TRENDING,
+        ORDEN_ROLES,
         _navegadores_default,
-        _repartir_trending,
+        _repartir_por_porcentajes,
     )
     from web.operaciones.cuentas import MODOS_TABS, TABS, _modo_de_tab
 
@@ -612,78 +700,129 @@ def run(check):
         str({k: v for k, v in app_widgets.items() if not v}) or "todos presentes",
     )
 
-    # ---------------- Preset "Trending 1 hora" ----------------
-    esperado_preset = {
-        "act_roles_dur": 60,
-        "act_roles_repetir": True,
-        "act_roles_cooldown": 8,
-        "act_roles_pausa_comentario": 30,
-        "act_roles_pct_min": 40,
-        "act_roles_pct_max": 90,
-        "act_roles_nav": 2,
-        "act_roles_workers": 12,
-        "act_roles_aleatorio": True,
-        "act_roles_seccion": "Todas",
-    }
-    check(
-        "trending: PRESET_TRENDING fija duracion/rondas/cooldown/pausa/equipo",
-        PRESET_TRENDING == esperado_preset,
-        f"(real={PRESET_TRENDING!r})",
-    )
-
-    # ---------------- Reparto ponderado `_repartir_trending` ----------------
+    # ---------------- Reparto por porcentajes `_repartir_por_porcentajes` ----
     def _cuentas(n: int) -> list:
         return [f"cuenta_{i:03d}" for i in range(1, n + 1)]
 
-    esperados_exactos = {
-        100: {"cita": 25, "hashtags": 20, "comentario": 10, "rt": 45},
-        141: {"cita": 35, "hashtags": 28, "comentario": 14, "rt": 64},
-    }
-    exactos_ok = True
-    for n, esperado in esperados_exactos.items():
-        reparto = _repartir_trending(_cuentas(n))
-        exactos_ok = exactos_ok and {
-            rol: len(v) for rol, v in reparto.items()
-        } == esperado
+    reparto_100 = _repartir_por_porcentajes(_cuentas(100))
     check(
-        "trending: reparto ponderado exacto en n=100 (25/20/10/45) y n=141",
-        exactos_ok,
+        "reparto pct: default equitativo n=100 -> 25 por rol",
+        {rol: len(v) for rol, v in reparto_100.items()}
+        == {"cita": 25, "hashtags": 25, "comentario": 25, "rt": 25},
+    )
+
+    reparto_141 = _repartir_por_porcentajes(_cuentas(141))
+    conteo_141 = {rol: len(v) for rol, v in reparto_141.items()}
+    check(
+        "reparto pct: default equitativo n=141 -> 36/35/35/35 (resto mayor)",
+        conteo_141 == {"cita": 36, "hashtags": 35, "comentario": 35, "rt": 35},
+        f"(real={conteo_141})",
+    )
+
+    pesos_custom = {"cita": 50, "hashtags": 30, "comentario": 10, "rt": 10}
+    reparto_custom = _repartir_por_porcentajes(_cuentas(100), pesos_custom)
+    check(
+        "reparto pct: pesos 50/30/10/10 en n=100 -> exacto",
+        {rol: len(v) for rol, v in reparto_custom.items()} == pesos_custom,
+    )
+
+    reparto_cero = _repartir_por_porcentajes(
+        _cuentas(20), {"cita": 50, "hashtags": 50, "comentario": 0, "rt": 0}
+    )
+    check(
+        "reparto pct: un rol con peso 0 nunca recibe cuentas",
+        len(reparto_cero["comentario"]) == 0
+        and len(reparto_cero["rt"]) == 0
+        and sum(len(v) for v in reparto_cero.values()) == 20,
     )
 
     general_ok = True
     for n in range(1, 11):
         limpios = _cuentas(n)
-        reparto = _repartir_trending(limpios)
+        reparto = _repartir_por_porcentajes(limpios)
         # Suma exacta + particion + orden original preservado (bloques).
-        concatenados = [u for rol in ("cita", "hashtags", "comentario", "rt")
-                        for u in reparto[rol]]
+        concatenados = [u for rol in ORDEN_ROLES for u in reparto[rol]]
         if concatenados != limpios:
             general_ok = False
-        # Resto mayor: cada rol a menos de 1 de su cuota.
-        for rol, peso in (("cita", 25), ("hashtags", 20), ("comentario", 10), ("rt", 45)):
-            if abs(len(reparto[rol]) - n * peso / 100.0) > 1:
-                general_ok = False
-        # Pocas cuentas: 0-1 por rol (nadie se pierde).
-        if n <= 4 and any(len(v) > 1 for v in reparto.values()):
+        if sum(len(v) for v in reparto.values()) != n:
             general_ok = False
+        # Resto mayor: cada rol a menos de 1 de su cuota equitativa.
+        for rol in ORDEN_ROLES:
+            if abs(len(reparto[rol]) - n * 25 / 100.0) > 1:
+                general_ok = False
     check(
-        "trending: n=1..10 suma exacta, sin perder cuentas y proporcional",
+        "reparto pct: n=1..10 suma exacta, sin perder cuentas y contiguo",
         general_ok,
     )
 
-    reparto_1 = _repartir_trending(["solo_una"])
+    reparto_limpio = _repartir_por_porcentajes(
+        ["@Ana", "ana", "", None, "Beto"],
+        {"cita": 50, "hashtags": 50, "comentario": 0, "rt": 0},
+    )
     check(
-        "trending: con 1 cuenta va al RT (rol mas confiable)",
-        reparto_1["rt"] == ["solo_una"]
-        and sum(len(v) for v in reparto_1.values()) == 1,
+        "reparto pct: limpia '@'/vacios/duplicados (2 unicas de 5 entradas)",
+        sum(len(v) for v in reparto_limpio.values()) == 2
+        and reparto_limpio["cita"] == ["Ana"]
+        and reparto_limpio["hashtags"] == ["Beto"],
     )
 
-    reparto_limpio = _repartir_trending(["@Ana", "ana", "", None, "Beto"])
+    reparto_norm = _repartir_por_porcentajes(
+        _cuentas(100), {"cita": 1, "hashtags": 1, "comentario": 1, "rt": 1}
+    )
     check(
-        "trending: limpia '@'/vacios/duplicados (2 unicas de 5 entradas)",
-        sum(len(v) for v in reparto_limpio.values()) == 2
-        and len(reparto_limpio["rt"]) == 1
-        and len(reparto_limpio["cita"]) == 1,
+        "reparto pct: suma != 100 se normaliza (pesos 1/1/1/1 = equitativo)",
+        {rol: len(v) for rol, v in reparto_norm.items()}
+        == {"cita": 25, "hashtags": 25, "comentario": 25, "rt": 25},
+    )
+
+    # ---------------- Widgets viejos fuera y nuevos dentro ----------------
+    fuente = _fuente_activacion()
+    viejos = (
+        "btn_act_roles_trending",
+        "btn_preset_trending",
+        "btn_act_roles_tercios",
+        "act_roles_aleatorio",
+        "PESOS_TRENDING",
+        "_repartir_trending",
+        "PRESET_TRENDING",
+    )
+    presentes_viejos = [nombre for nombre in viejos if nombre in fuente]
+    check(
+        "reparto pct: los widgets/constantes viejos ya no existen en la fuente",
+        not presentes_viejos,
+        str(presentes_viejos) or "ninguno",
+    )
+    nuevos = (
+        "act_roles_pct_cita",
+        "act_roles_pct_hashtags",
+        "act_roles_pct_comentario",
+        "act_roles_pct_rt",
+        "btn_act_roles_pct_apply",
+        "_repartir_por_porcentajes",
+    )
+    faltantes = [nombre for nombre in nuevos if nombre not in fuente]
+    check(
+        "reparto pct: los widgets nuevos existen en la fuente",
+        not faltantes,
+        str(faltantes) or "todos",
+    )
+
+    app_ok, app_detalle, app_widgets = _app_test_por_roles()
+    check(
+        "reparto pct: la pestana Por roles renderiza sin excepciones (AppTest)",
+        app_ok,
+        app_detalle,
+    )
+    check(
+        "reparto pct: los 4 number inputs y el boton de aplicar estan presentes",
+        app_widgets["sin_excepciones"]
+        and app_widgets["pct_cita"]
+        and app_widgets["pct_hashtags"]
+        and app_widgets["pct_comentario"]
+        and app_widgets["pct_rt"]
+        and app_widgets["btn_apply"]
+        and app_widgets["sin_viejos"],
+        str({k: v for k, v in app_widgets.items() if not v}) or "todos presentes",
     )
 
     # ---------------- Marcador de campana activa (data/.campana_activa) -------
