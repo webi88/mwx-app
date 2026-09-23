@@ -157,13 +157,16 @@ def _etiqueta_tier_badge(valor) -> str:
     """Badge de Tier para el inventario y las tablas.
 
     Tier 1 -> "🏅 Tier 1 (Líder/Boosted)"; Tier 2 -> "🧱 Tier 2 (Volumen/Aged)";
-    vacío/desconocido -> "—". Nunca lanza."""
+    Tier 3 -> "📊 Tier 3 (Métricas / Soporte)"; vacío/desconocido -> "—".
+    Nunca lanza."""
     codigo = _normalizar_tier_seguro(valor)
     etiqueta = _etiqueta_tier_segura(codigo)
     if codigo == "tier1":
         return f"🏅 {etiqueta}" if etiqueta else "🏅 Tier 1"
     if codigo == "tier2":
         return f"🧱 {etiqueta}" if etiqueta else "🧱 Tier 2"
+    if codigo == "tier3":
+        return f"📊 {etiqueta}" if etiqueta else "📊 Tier 3"
     return "—"
 
 
@@ -209,6 +212,37 @@ def _errores_tier2_hashtags(filas) -> list:
             continue
         try:
             mensaje = error_rol_tier(_fila_como_cuenta(fila), "hashtags")
+        except Exception:
+            mensaje = ""
+        if mensaje:
+            errores.append(mensaje)
+    return errores
+
+
+def _errores_roles_tier(filas) -> list:
+    """Mensajes bloqueantes de `core.tiers` para CUALQUIER tier/rol efectivo.
+
+    Recorre filas del inventario (dicts con `usuario`, `tier_calidad` y
+    `rol_activacion`) y devuelve los mensajes NO vacíos de
+    `core.tiers.error_rol_tier` usando el rol EFECTIVO de cada fila
+    (`core.registro.normalizar_rol_cuota`). Cubre Tier 2 (rol "hashtags",
+    incluidos "post"/"mantenimiento"/"hilo") y Tier 3 (cualquier rol que no sea
+    "rt"/"like": hashtags/cita/comentario...). Con rol efectivo vacío no hay
+    error; Tier 1/sin tier nunca dan mensaje. Nunca lanza: si `core.tiers` no
+    existe (core viejo) devuelve []."""
+    try:
+        from core.tiers import error_rol_tier
+    except Exception:
+        return []
+    errores = []
+    for fila in filas or []:
+        if not isinstance(fila, dict):
+            continue
+        rol = _normalizar_rol_cuota_seguro(fila.get("rol_activacion"))
+        if not rol:
+            continue
+        try:
+            mensaje = error_rol_tier(_fila_como_cuenta(fila), rol)
         except Exception:
             mensaje = ""
         if mensaje:
@@ -4461,32 +4495,38 @@ def _tab_anti_deteccion():
 
 
 def _tab_tiers():
-    """Asignación de tiers de calidad (Tier 1 / Tier 2) con validación bloqueante.
+    """Asignación de tiers de calidad (Tier 1 / Tier 2 / Tier 3) con validación.
 
-    Regla de negocio centralizada en `core.tiers`: una cuenta Tier 2 tiene
-    PROHIBIDO el rol efectivo "hashtags" (posts originales). Al intentar
-    asignar Tier 2 a una cuenta con ese rol el sistema NO escribe nada y
-    muestra `error_rol_tier(...)` (nunca auto-corrige en silencio)."""
+    Reglas de negocio centralizadas en `core.tiers`: Tier 2 tiene PROHIBIDO el
+    rol efectivo "hashtags" (posts originales) y Tier 3 (Métricas/Soporte) solo
+    puede RT y likes (prohibidos hashtags/post, cita y comentario). Al intentar
+    asignar un tier incompatible el sistema NO escribe nada y muestra
+    `error_rol_tier(...)` (nunca auto-corrige en silencio)."""
     st.markdown("### 🏅 Tiers de calidad")
     st.caption(
         "**Tier 1 (Líder/Boosted)**: cuentas fuertes; SÍ pueden publicar posts "
         "originales con hashtags. **Tier 2 (Volumen/Aged)**: cuentas de "
         "volumen; tienen PROHIBIDO el rol «Hashtags y menciones» y solo hacen "
-        "RT, Cita o Comentario. El bloqueo también aplica al reparto de roles "
-        "y al lanzar campañas."
+        "RT, Cita o Comentario. **Tier 3 (Métricas / Soporte)**: cuentas de "
+        "granja/baja calidad; SOLO hacen RT y likes (volumen ciego), JAMÁS "
+        "hashtags, cita ni comentario. En la Curva de Aceleración el Tier 3 "
+        "queda ignorado en fase 1 y entra en fase 2 en cascada (RT/likes a los "
+        "posts de los Tier 1). El bloqueo también aplica al reparto de roles y "
+        "al lanzar campañas."
     )
 
     todas = _listar_cuentas(OPCION_TODAS)
 
-    conteos = {"tier1": 0, "tier2": 0, "": 0}
+    conteos = {"tier1": 0, "tier2": 0, "tier3": 0, "": 0}
     for fila in todas:
         clave = _normalizar_tier_seguro(fila.get("tier_calidad")) or ""
         conteos[clave] = conteos.get(clave, 0) + 1
 
-    columnas = st.columns(3)
+    columnas = st.columns(4)
     columnas[0].metric("🏅 Tier 1", conteos.get("tier1", 0))
     columnas[1].metric("🧱 Tier 2", conteos.get("tier2", 0))
-    columnas[2].metric(OPCION_SIN_ASIGNAR, conteos.get("", 0))
+    columnas[2].metric("📊 Tier 3", conteos.get("tier3", 0))
+    columnas[3].metric(OPCION_SIN_ASIGNAR, conteos.get("", 0))
 
     st.markdown("---")
 
@@ -4524,7 +4564,7 @@ def _tab_tiers():
     if descripcion_sel:
         st.caption(f"Se aplicará el cambio con: {descripcion_sel}")
 
-    col_t1, col_t2, col_quitar = st.columns(3)
+    col_t1, col_t2, col_t3, col_quitar = st.columns(4)
     with col_t1:
         btn_tier1 = st.button(
             "🏅 Asignar Tier 1",
@@ -4536,6 +4576,12 @@ def _tab_tiers():
             "🧱 Asignar Tier 2",
             use_container_width=True,
             key="btn_tier2",
+        )
+    with col_t3:
+        btn_tier3 = st.button(
+            "📊 Asignar Tier 3",
+            use_container_width=True,
+            key="btn_tier3",
         )
     with col_quitar:
         btn_quitar = st.button(
@@ -4562,6 +4608,21 @@ def _tab_tiers():
                     "Tier 1."
                 )
                 return
+        if codigo == "tier3":
+            # BLOQUEO: Tier 3 (Métricas/Soporte) SOLO puede RT y likes; si
+            # alguna seleccionada tiene hashtags/post, cita o comentario, NO se
+            # escribe nada y se muestra `error_rol_tier` por cuenta.
+            errores = _errores_roles_tier(seleccion)
+            if errores:
+                st.error(
+                    "🚫 **No se puede asignar Tier 3** (Métricas/Soporte): "
+                    "estas cuentas solo pueden ejecutar RT y likes (volumen "
+                    "ciego). **Sistema no modificado.**\n\n"
+                    + "\n".join(f"- {mensaje}" for mensaje in errores)
+                    + "\n\nCorrige el rol (asígnales RT) o usa Tier 1/Tier 2 "
+                    "para los roles de posts, citas o comentarios."
+                )
+                return
         usuarios = [f["usuario"] for f in seleccion]
         try:
             actualizadas = _asignar_tier(usuarios, codigo)
@@ -4577,6 +4638,8 @@ def _tab_tiers():
         _aplicar_tier("tier1", "🏅 Tier 1 (Líder/Boosted)")
     if btn_tier2:
         _aplicar_tier("tier2", "🧱 Tier 2 (Volumen/Aged)")
+    if btn_tier3:
+        _aplicar_tier("tier3", "📊 Tier 3 (Métricas / Soporte)")
     if btn_quitar:
         _aplicar_tier("", "Sin tier")
 

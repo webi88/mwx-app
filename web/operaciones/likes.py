@@ -48,5 +48,7 @@ def render(usuario: dict):
                     todos_ok = False
             return todos_ok
         
-        resultados = ejecutar_en_cuentas(cuentas_sel, accion, plataforma, progreso, estado)
+        resultados = ejecutar_en_cuentas(
+            cuentas_sel, accion, plataforma, progreso, estado, tipo="like"
+        )
         mostrar_resultados(resultados)

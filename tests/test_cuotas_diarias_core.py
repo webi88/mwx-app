@@ -27,7 +27,8 @@ Cubre:
         `tier_de_cuenta` con objetos fake y tolerancia a objetos explosivos.
     (8) `rol_permitido_tier` / `error_rol_tier`: Tier 2 tiene PROHIBIDO
         "hashtags" (y "post"/"publicacion"/... porque normalizan a "hashtags"),
-        pero SI puede rt/cita/comentario; Tier 1 y tier vacio sin restriccion.
+        pero SI puede rt/cita/comentario; Tier 3 SOLO permite rt/like (el resto
+        prohibido); Tier 1 y tier vacio sin restriccion.
     (9) `esta_agotada_dia` / `usuarios_agotados_dia` con conteos y tope
         simulados: 12 -> agotada, 11 -> no; tope 0 o interruptor apagado ->
         nunca agotada; `limite` explicito > 0 manda.
@@ -72,9 +73,12 @@ from core.registro import (  # noqa: E402
 )
 from core.tiers import (  # noqa: E402
     ROL_PROHIBIDO_TIER2,
+    ROLES_PERMITIDOS_TIER3,
+    ROLES_PROHIBIDOS_TIER3,
     TIERS,
     error_rol_tier,
     es_tier2,
+    es_tier3,
     etiqueta_tier,
     normalizar_tier,
     rol_permitido_tier,
@@ -652,8 +656,12 @@ class _CuentaExplosiva:
 
 
 def test_tiers_normalizacion(check):
-    print("(7) normalizar_tier / etiqueta_tier / tier_de_cuenta / es_tier2")
-    check("TIERS tiene exactamente tier1 y tier2", set(TIERS) == {"tier1", "tier2"})
+    print("(7) normalizar_tier / etiqueta_tier / tier_de_cuenta / es_tier2 / es_tier3")
+    check(
+        "TIERS tiene exactamente tier1, tier2 y tier3",
+        set(TIERS) == {"tier1", "tier2", "tier3"},
+        f"({sorted(TIERS)})",
+    )
     check(
         "etiqueta tier1 exacta",
         TIERS["tier1"] == "Tier 1 (Líder/Boosted)",
@@ -664,7 +672,22 @@ def test_tiers_normalizacion(check):
         TIERS["tier2"] == "Tier 2 (Volumen/Aged)",
         f"({TIERS['tier2']})",
     )
+    check(
+        "etiqueta tier3 exacta",
+        TIERS["tier3"] == "Tier 3 (Métricas / Soporte)",
+        f"({TIERS['tier3']})",
+    )
     check("ROL_PROHIBIDO_TIER2 = 'hashtags'", ROL_PROHIBIDO_TIER2 == "hashtags")
+    check(
+        "ROLES_PERMITIDOS_TIER3 = ('rt', 'like')",
+        tuple(ROLES_PERMITIDOS_TIER3) == ("rt", "like"),
+        f"({ROLES_PERMITIDOS_TIER3!r})",
+    )
+    check(
+        "ROLES_PROHIBIDOS_TIER3 = ('hashtags', 'cita', 'comentario')",
+        tuple(ROLES_PROHIBIDOS_TIER3) == ("hashtags", "cita", "comentario"),
+        f"({ROLES_PROHIBIDOS_TIER3!r})",
+    )
 
     variantes_tier1 = (
         "tier1",
@@ -715,7 +738,35 @@ def test_tiers_normalizacion(check):
             f"(={normalizar_tier(valor)!r})",
         )
 
-    invalidos = ("", "   ", None, "tier3", "3", "gold", "premium", 0, "sin tier", "tier")
+    variantes_tier3 = (
+        "tier3",
+        "Tier3",
+        "TIER 3",
+        "tier 3",
+        "Tier 3",
+        "3",
+        "granja",
+        "granjas",
+        "farm",
+        "metricas",
+        "métricas",
+        "Métricas",
+        "soporte",
+        "Soporte",
+        "baja calidad",
+        "baja_calidad",
+        "bajacalidad",
+        " tier 3 ",
+        "Tier 3 (Métricas / Soporte)",
+    )
+    for valor in variantes_tier3:
+        check(
+            f"normalizar_tier({valor!r}) -> 'tier3'",
+            normalizar_tier(valor) == "tier3",
+            f"(={normalizar_tier(valor)!r})",
+        )
+
+    invalidos = ("", "   ", None, "gold", "premium", 0, "sin tier", "tier")
     for valor in invalidos:
         check(
             f"normalizar_tier({valor!r}) -> ''",
@@ -732,6 +783,18 @@ def test_tiers_normalizacion(check):
     check(
         "etiqueta_tier('aged') -> etiqueta tier2",
         etiqueta_tier("aged") == "Tier 2 (Volumen/Aged)",
+    )
+    check(
+        "etiqueta_tier('tier3')",
+        etiqueta_tier("tier3") == "Tier 3 (Métricas / Soporte)",
+    )
+    check(
+        "etiqueta_tier('Métricas') -> etiqueta tier3",
+        etiqueta_tier("Métricas") == "Tier 3 (Métricas / Soporte)",
+    )
+    check(
+        "etiqueta_tier('Tier 3 (Métricas / Soporte)') -> etiqueta tier3",
+        etiqueta_tier("Tier 3 (Métricas / Soporte)") == "Tier 3 (Métricas / Soporte)",
     )
     check("etiqueta_tier('') -> ''", etiqueta_tier("") == "")
     check("etiqueta_tier(None) -> ''", etiqueta_tier(None) == "")
@@ -758,11 +821,27 @@ def test_tiers_normalizacion(check):
     check("es_tier2(None) False", es_tier2(None) is False)
     check("es_tier2(explosiva) False sin lanzar", es_tier2(_CuentaExplosiva()) is False)
 
+    check("es_tier3(Tier 3) True", es_tier3(_CuentaFake(tier_calidad="tier3")) is True)
+    check(
+        "es_tier3('granja') True",
+        es_tier3(_CuentaFake(tier_calidad="granja")) is True,
+    )
+    check(
+        "es_tier3('Tier 3 (Métricas / Soporte)') True",
+        es_tier3(_CuentaFake(tier_calidad="Tier 3 (Métricas / Soporte)")) is True,
+    )
+    check("es_tier3(Tier 1) False", es_tier3(_CuentaFake(tier_calidad="boosted")) is False)
+    check("es_tier3(Tier 2) False", es_tier3(_CuentaFake(tier_calidad="volumen")) is False)
+    check("es_tier3(tier vacio) False", es_tier3(_CuentaFake()) is False)
+    check("es_tier3(None) False", es_tier3(None) is False)
+    check("es_tier3(explosiva) False sin lanzar", es_tier3(_CuentaExplosiva()) is False)
+
 
 def test_tiers_roles(check):
-    print("(8) rol_permitido_tier / error_rol_tier: Tier 2 no publica hashtags")
+    print("(8) rol_permitido_tier / error_rol_tier: Tier 2 no hashtags, Tier 3 solo RT/like")
     tier1 = _CuentaFake(usuario="lider_uno", tier_calidad="tier1")
     tier2 = _CuentaFake(usuario="volumen_dos", tier_calidad="tier2")
+    tier3 = _CuentaFake(usuario="metricas_tres", tier_calidad="tier3")
     sin_tier = _CuentaFake(usuario="nueva_tres")
     desconocido = _CuentaFake(usuario="rara_cuatro", tier_calidad="gold")
 
@@ -813,6 +892,42 @@ def test_tiers_roles(check):
             f"tier desconocido permitido el rol {rol!r}",
             rol_permitido_tier(desconocido, rol) is True,
         )
+
+    # Tier 3: SOLO rt/like (o sin rol). Cualquier otra accion -> False.
+    for rol in ("rt", "RT", "retweet", "repost", "Retweet", "like", "Like", "", None):
+        check(
+            f"Tier 3 permitido el rol {rol!r}",
+            rol_permitido_tier(tier3, rol) is True,
+        )
+    for rol in (
+        "hashtags",
+        "Hashtags",
+        "post",
+        "publicacion",
+        "mantenimiento",
+        "calentamiento",
+        "hilo",
+        "cita",
+        "quote",
+        "Retweet con cita",
+        "comentario",
+        "respuesta",
+        "reply",
+        "desconocido",
+        "likes",
+    ):
+        check(
+            f"Tier 3 PROHIBIDO el rol {rol!r}",
+            rol_permitido_tier(tier3, rol) is False,
+        )
+    check(
+        "cuenta None con rol like -> permitido sin lanzar",
+        rol_permitido_tier(None, "like") is True,
+    )
+    check(
+        "Tier 3 explosiva -> permitido sin lanzar",
+        rol_permitido_tier(_CuentaExplosiva(), "hashtags") is True,
+    )
     check(
         "cuenta None -> permitido sin lanzar",
         rol_permitido_tier(None, "hashtags") is True,
@@ -832,6 +947,11 @@ def test_tiers_roles(check):
         f"({error_rol_tier(tier2, 'hashtags')!r})",
     )
     check(
+        "mensaje viejo de Tier 2 conserva 'Tier 2 - Volumen/Aged'",
+        "Tier 2 - Volumen/Aged" in error_rol_tier(tier2, "hashtags"),
+        f"({error_rol_tier(tier2, 'hashtags')!r})",
+    )
+    check(
         "error_rol_tier(Tier 2, post) tambien bloquea",
         error_rol_tier(tier2, "post") != "",
     )
@@ -843,6 +963,29 @@ def test_tiers_roles(check):
     check(
         "error_rol_tier(Tier 2, comentario) = ''",
         error_rol_tier(tier2, "comentario") == "",
+    )
+    check(
+        "error_rol_tier(Tier 3, cita) bloquea y menciona 'Tier 3'",
+        error_rol_tier(tier3, "cita") != ""
+        and "Tier 3" in error_rol_tier(tier3, "cita"),
+        f"({error_rol_tier(tier3, 'cita')!r})",
+    )
+    check(
+        "error_rol_tier(Tier 3, rt) = ''",
+        error_rol_tier(tier3, "rt") == "",
+    )
+    check(
+        "error_rol_tier(Tier 3, like) = ''",
+        error_rol_tier(tier3, "like") == "",
+    )
+    check(
+        "error_rol_tier(Tier 3, hashtags) bloquea",
+        error_rol_tier(tier3, "hashtags") != "",
+    )
+    check(
+        "mensaje de Tier 3 prohibido contiene el rol efectivo",
+        "'cita'" in error_rol_tier(tier3, "Retweet con cita"),
+        f"({error_rol_tier(tier3, 'Retweet con cita')!r})",
     )
     check(
         "error_rol_tier(Tier 1, hashtags) = ''",

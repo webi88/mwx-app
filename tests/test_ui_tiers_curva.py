@@ -3,20 +3,20 @@
 Cubren, sin Chrome y sin BD real (fakes + monkeypatch), lo agregado en
 `web/operaciones/cuentas.py` y `web/operaciones/activacion_masiva.py`:
 
-  - Badges de Tier (Tier 1 / Tier 2 / sin asignar) y columna "Cuota hoy"
-    (`usado/limite`, "Agotada por hoy" y "sin tope").
-  - Validacion BLOQUEANTE Tier 2 + rol efectivo "hashtags" a nivel helper y a
-    nivel vista: la pestana Tiers NO llama al guardado (espia que falla si se
-    escribe) y muestra el error de `core.tiers.error_rol_tier`.
-  - Pestana "🏅 Tiers" (AppTest con fakes): metricas, tabla, botones, bloqueo y
-    asignaciones permitidas despues del bloqueo.
+  - Badges de Tier (Tier 1 / Tier 2 / Tier 3 / sin asignar) y columna "Cuota
+    hoy" (`usado/limite`, "Agotada por hoy" y "sin tope").
+  - Validacion BLOQUEANTE de tiers a nivel helper y a nivel vista: Tier 2 +
+    rol efectivo "hashtags" y Tier 3 + hashtags/cita/comentario (solo RT y
+    likes) NO escriben nada y muestran el error de `core.tiers.error_rol_tier`.
+  - Pestana "🏅 Tiers" (AppTest con fakes): metricas, tabla, botones (incluido
+    Tier 3), bloqueo y asignaciones permitidas despues del bloqueo.
   - Inventario con las columnas nuevas "tier" y "cuota_hoy" (AppTest con fakes
-    y conteos fake de `contar_acciones_dia_por_usuario`).
+    y conteos fake de `contar_acciones_dia_por_usuarios`).
   - Activacion Masiva: controles de Curva de Aceleracion y respaldo presentes
     en AMBAS pestanas; al lanzar, un motor falso captura `curva_aceleracion`,
     `curva_fase1_min` y `reserva_usuarios`; sin el checkbox no se pasan; con
-    Tier 2 + hashtags fijos la campana NO se lanza (motor no llamado) y se
-    muestra el error bloqueante.
+    Tier 2 + hashtags fijos o Tier 3 + cita la campana NO se lanza (motor no
+    llamado) y se muestra el error bloqueante.
 
 Los scripts de `AppTest.from_function` son SOLO ASCII: Streamlit escribe el
 script temporal con la codificacion local de Windows y los acentos/emojis lo
@@ -91,11 +91,14 @@ class _MotorFake:
 class _CuentasRolesFake:
     """Cuentas activas simuladas para la pestana Por roles.
 
-    Con `incluir_tier2=True` la cuenta del rol "hashtags" queda marcada como
-    Tier 2 (escenario de bloqueo)."""
+    Con `incluir_tier2=True` las cuentas del rol "hashtags" quedan Tier 2
+    (escenario de bloqueo). Con `incluir_tier3=True` las del rol "cita" quedan
+    Tier 3 (solo RT/likes -> escenario de bloqueo nuevo)."""
 
-    def __init__(self, incluir_tier2: bool = False):
+    def __init__(self, incluir_tier2: bool = False,
+                 incluir_tier3: bool = False):
         self.incluir_tier2 = bool(incluir_tier2)
+        self.incluir_tier3 = bool(incluir_tier3)
 
     def __call__(self, *args, **kwargs):
         roles = ("cita", "hashtags", "comentario", "rt")
@@ -117,6 +120,10 @@ class _CuentasRolesFake:
             for fila in filas:
                 if fila["rol_activacion"] == "hashtags":
                     fila["tier_calidad"] = "Tier 2"
+        if self.incluir_tier3:
+            for fila in filas:
+                if fila["rol_activacion"] == "cita":
+                    fila["tier_calidad"] = "Tier 3"
         return filas
 
 
@@ -295,13 +302,57 @@ def _app_test_tiers() -> tuple:
             datos["excepcion"] = str(at.exception[0].value)[:200]
             return False, datos["excepcion"], datos
         datos["llamadas"] = list(espia.llamadas)
+
+        # Click extra bloqueante: Tier 3 con la cuenta Tier 2+hashtags
+        # seleccionada tampoco debe escribir nada.
+        at.button(key="btn_tier3").click().run()
+        if at.exception:
+            datos["excepcion"] = str(at.exception[0].value)[:200]
+            return False, datos["excepcion"], datos
+        datos["errores_tier3"] = [str(e.value) for e in at.error]
+        datos["llamadas_tras_tier3"] = len(espia.llamadas)
         return True, "", datos
     finally:
         cuentas._listar_cuentas = original_listar
         cuentas._asignar_tier = original_asignar
 
 
-def _app_test_roles_launch(con_curva: bool, incluir_tier2: bool = False) -> tuple:
+def _app_test_tiers_tier3(filas) -> tuple:
+    """AppTest de la pestana Tiers con foco en Tier 3 (bloqueo y exito).
+
+    `filas` decide el escenario: con una cuenta Tier 3 de rol prohibido el
+    click en "📊 Asignar Tier 3" bloquea sin escribir; con Tier 3 de rol rt el
+    guardado si ocurre (codigo "tier3")."""
+    from streamlit.testing.v1 import AppTest
+
+    from web.operaciones import cuentas
+
+    espia = _EspiaTier()
+    datos = {"errores": [], "llamadas": [], "excepcion": ""}
+    original_listar = cuentas._listar_cuentas
+    original_asignar = cuentas._asignar_tier
+    cuentas._listar_cuentas = _ListarFake(filas)
+    cuentas._asignar_tier = espia
+    try:
+        at = AppTest.from_function(_app_tiers, default_timeout=60)
+        at.run()
+        if at.exception:
+            datos["excepcion"] = str(at.exception[0].value)[:200]
+            return False, datos["excepcion"], datos
+        at.button(key="btn_tier3").click().run()
+        if at.exception:
+            datos["excepcion"] = str(at.exception[0].value)[:200]
+            return False, datos["excepcion"], datos
+        datos["errores"] = [str(e.value) for e in at.error]
+        datos["llamadas"] = list(espia.llamadas)
+        return True, "", datos
+    finally:
+        cuentas._listar_cuentas = original_listar
+        cuentas._asignar_tier = original_asignar
+
+
+def _app_test_roles_launch(con_curva: bool, incluir_tier2: bool = False,
+                           incluir_tier3: bool = False) -> tuple:
     """AppTest de la pestana Por roles lanzando con un motor falso."""
     from streamlit.testing.v1 import AppTest
 
@@ -319,7 +370,7 @@ def _app_test_roles_launch(con_curva: bool, incluir_tier2: bool = False) -> tupl
     original_cuentas = am._cargar_cuentas_con_roles
     original_reserva = am._cargar_reserva_usuarios
     original_motor = motor_mod.MotorActivacion
-    am._cargar_cuentas_con_roles = _CuentasRolesFake(incluir_tier2)
+    am._cargar_cuentas_con_roles = _CuentasRolesFake(incluir_tier2, incluir_tier3)
     am._cargar_reserva_usuarios = _reserva_fake
     motor_mod.MotorActivacion = _MotorFake
     _MotorFake.capturados.clear()
@@ -421,6 +472,26 @@ def run(check):
         and badge_t2 == badge_t2b,
         ascii(badge_t2),
     )
+    badge_t3 = cuentas._etiqueta_tier_badge("tier3")
+    badge_t3b = cuentas._etiqueta_tier_badge("Métricas")
+    badge_t3c = cuentas._etiqueta_tier_badge("granja")
+    badge_t3d = cuentas._etiqueta_tier_badge(3)
+    check(
+        "tiers badge: tier3 -> Tier 3 (Metricas/Soporte) con emoji propio",
+        badge_t3 == "📊 Tier 3 (Métricas / Soporte)"
+        and badge_t3 == badge_t3b
+        and badge_t3 == badge_t3c
+        and badge_t3 == badge_t3d
+        and badge_t3.startswith("📊")
+        and "Tier 3" in badge_t3,
+        ascii(badge_t3),
+    )
+    check(
+        "tiers badge: tier3 acepta '3' numerico y no pisa a Tier 1/Tier 2",
+        badge_t3d == badge_t3
+        and badge_t1.startswith("🏅")
+        and badge_t2.startswith("🧱"),
+    )
     check(
         "tiers badge: vacio/desconocido -> guion",
         cuentas._etiqueta_tier_badge("") == "—"
@@ -511,6 +582,100 @@ def run(check):
         == [],
     )
 
+    # ---------------- 3b) Tier 3 (solo RT/likes) y rol destino ----------------
+    f_t3_hashtags = {"usuario": "t3h", "tier_calidad": "tier3", "rol_activacion": "hashtags"}
+    f_t3_cita = {"usuario": "t3c", "tier_calidad": "Tier 3", "rol_activacion": "cita"}
+    f_t3_coment = {"usuario": "t3m", "tier_calidad": "Métricas", "rol_activacion": "comentario"}
+    f_t3_post = {"usuario": "t3p", "tier_calidad": "granja", "rol_activacion": "post"}
+    f_t3_rt = {"usuario": "t3r", "tier_calidad": "tier3", "rol_activacion": "rt"}
+    f_t3_like = {"usuario": "t3l", "tier_calidad": "tier3", "rol_activacion": "like"}
+    f_t3_vacia = {"usuario": "t3v", "tier_calidad": "tier3", "rol_activacion": ""}
+    errores_t3 = cuentas._errores_roles_tier(
+        [f_t3_hashtags, f_t3_cita, f_t3_coment, f_t3_post, f_t3_rt, f_t3_like,
+         f_t3_vacia]
+    )
+    check(
+        "tier3 helper: hashtags/cita/comentario/post incumplen; rt/like/vacio no",
+        len(errores_t3) == 4
+        and all("Tier 3" in m and "RT y likes" in m for m in errores_t3),
+        f"({len(errores_t3)} errores)",
+    )
+    errores_mixto = cuentas._errores_roles_tier(
+        [f_t2_hashtags, f_t2_rt, f_t1_hashtags, f_vacia_hashtags]
+    )
+    check(
+        "roles tier helper: tambien cubre Tier 2 + hashtags (Tier 1 sin tier no)",
+        len(errores_mixto) == 1 and "Tier 2" in errores_mixto[0],
+        ascii(errores_mixto),
+    )
+    check(
+        "roles tier helper: rol vacio no genera error y filas raras tampoco",
+        cuentas._errores_roles_tier([f_t3_vacia, f_t3_like]) == []
+        and cuentas._errores_roles_tier([None, "x", {}, {"usuario": "x"}]) == [],
+    )
+    check(
+        "roles tier destino: valida el rol a ASIGNAR (tier3 cita/hashtags bloquean)",
+        len(am._errores_rol_tier_destino([f_t3_rt], "cita")) == 1
+        and am._errores_rol_tier_destino([f_t3_rt], "hashtags")
+        and am._errores_rol_tier_destino([f_t3_rt], "comentario")
+        and am._errores_rol_tier_destino([f_t3_rt], "rt") == []
+        and am._errores_rol_tier_destino([f_t3_rt], "like") == []
+        and am._errores_rol_tier_destino([f_t3_rt], "") == [],
+    )
+    check(
+        "roles tier destino: tier2 + hashtags bloquea; rt permitido",
+        len(am._errores_rol_tier_destino([f_t2_rt], "hashtags")) == 1
+        and am._errores_rol_tier_destino([f_t2_rt], "rt") == []
+        and am._errores_rol_tier_destino([f_t1_hashtags], "hashtags") == [],
+    )
+    check(
+        "bloqueo roles tier: tier3 con cita/rt, filtros y alias tier2",
+        len(am._bloqueo_roles_tier([f_t3_cita, f_t3_rt])) == 1
+        and am._bloqueo_roles_tier([f_t3_cita], solo_roles=["rt"]) == []
+        and am._bloqueo_roles_tier([f_t3_cita], usuarios=["OTRO"]) == []
+        and am._bloqueo_roles_tier([f_t3_cita], aleatorio=True) == []
+        and len(am._bloqueo_tier2_hashtags([f_t3_coment])) == 1
+        and am._bloqueo_tier2_hashtags([f_t3_rt]) == [],
+    )
+    # Reparto: si un bloque termina en tier3 con hashtags/cita/comentario (o
+    # tier2 con hashtags) el reparto queda bloqueado (helpers puros).
+    reparto_t3 = am._repartir_por_porcentajes(
+        ["t3_a", "t3_b", "t3_c", "t3_d"],
+        {"cita": 25, "hashtags": 50, "comentario": 25, "rt": 0},
+    )
+    filas_t3 = {
+        u: {"usuario": u, "tier_calidad": "tier3", "rol_activacion": ""}
+        for u in ("t3_a", "t3_b", "t3_c", "t3_d")
+    }
+    errores_reparto = []
+    for rol in am.ORDEN_ROLES:
+        filas_bloque = [
+            filas_t3.get(u) or {"usuario": u} for u in reparto_t3[rol]
+        ]
+        if filas_bloque:
+            errores_reparto.extend(
+                am._errores_rol_tier_destino(filas_bloque, rol)
+            )
+    check(
+        "reparto tier3: bloques cita/hashtags/comentario quedan bloqueados",
+        len(errores_reparto) == 4
+        and all("Tier 3" in m for m in errores_reparto),
+        f"({len(errores_reparto)} errores) {ascii(reparto_t3)}",
+    )
+    reparto_rt = am._repartir_por_porcentajes(
+        ["t3_e", "t3_f"],
+        {"cita": 0, "hashtags": 0, "comentario": 0, "rt": 100},
+    )
+    filas_rt = [
+        {"usuario": u, "tier_calidad": "tier3", "rol_activacion": ""}
+        for u in reparto_rt["rt"]
+    ]
+    check(
+        "reparto tier3: un bloque que solo toca rt no bloquea",
+        reparto_rt["rt"] == ["t3_e", "t3_f"]
+        and am._errores_rol_tier_destino(filas_rt, "rt") == [],
+    )
+
     # ---------------- 4) Reserva de respaldo (helper puro) ----------------
     rng = random.Random(1234)
     reserva = am._seleccionar_reserva(
@@ -577,6 +742,27 @@ def run(check):
         and metricas.get("🛡️ Reserva disponible") == 5,
         ascii(metricas),
     )
+    resumen_t3 = {
+        "tier3_omitidas": ["a", "b"],
+        "tier3_sin_rol": 3,
+        "tier3_liberadas": 7,
+        "sustituciones_bloqueadas_tier": 1,
+    }
+    metricas_t3 = dict(am._metricas_tier_curva(resumen_t3))
+    check(
+        "metricas tier3: claves opcionales -> 4 metricas nuevas",
+        len(metricas_t3) == 4
+        and metricas_t3.get("📊 Tier 3 sin rol") == 2
+        and metricas_t3.get("📊 Tier 3 sin acción") == 3
+        and metricas_t3.get("🚀 Tier 3 liberadas fase 2") == 7
+        and metricas_t3.get("📊 Reservas bloqueadas por tier") == 1,
+        ascii(metricas_t3),
+    )
+    check(
+        "metricas tier3: sin claves nuevas no aparecen",
+        am._metricas_tier_curva({"tier2_hashtags_omitidas": 1})
+        == [("🧱 Tier 2 sin hashtags", 1)],
+    )
 
     # ---------------- 6) Fuente: controles y pestana registrada ----------------
     fuente_am = (RAIZ / "web" / "operaciones" / "activacion_masiva.py").read_text(
@@ -617,6 +803,27 @@ def run(check):
         and "_errores_tier2_hashtags" in fuente_cuentas
         and "tier_calidad" in fuente_cuentas
         and '"cuota_hoy"' in fuente_cuentas,
+    )
+    check(
+        "cuentas fuente: boton/validacion Tier 3 y helper de roles tier",
+        "btn_tier3" in fuente_cuentas
+        and "📊 Asignar Tier 3" in fuente_cuentas
+        and "def _errores_roles_tier" in fuente_cuentas
+        and 'columnas[2].metric("📊 Tier 3"' in fuente_cuentas
+        and "Tier 3 (Métricas / Soporte)" in fuente_cuentas,
+    )
+    check(
+        "activacion fuente: bloqueo por tiers cubre Tier 3 y reparto destino",
+        "def _bloqueo_roles_tier" in fuente_am
+        and "def _errores_rol_tier_destino" in fuente_am
+        and "_errores_rol_tier_destino(filas_bloque, rol)" in fuente_am
+        and "_errores_rol_tier_destino(filas_sel, codigo)" in fuente_am
+        and "Tier 3 solo RT y " in fuente_am
+        and "RT y likes" in fuente_am
+        and "Fase 2: se " in fuente_am
+        and "el Tier 3 solo dispara RT/likes en " in fuente_am
+        and "tier3_omitidas" in fuente_am
+        and "sustituciones_bloqueadas_tier" in fuente_am,
     )
     tab_tiers = [t for t in cuentas.TABS if "Tiers" in t]
     check(
@@ -690,6 +897,52 @@ def run(check):
         and len(datos_tiers["llamadas"][0][0]) == 3,
         str(datos_tiers["llamadas"]),
     )
+    check(
+        "tiers tab: boton Tier 3 y bloqueo extra sin escrituras (AppTest)",
+        ok
+        and "btn_tier3" in datos_tiers["botones"]
+        and any(
+            "No se puede asignar Tier 3" in e
+            for e in datos_tiers.get("errores_tier3", [])
+        )
+        and datos_tiers.get("llamadas_tras_tier3") == 2,
+        ascii(datos_tiers.get("errores_tier3", []))[:200],
+    )
+
+    # Tier 3 aislado: bloqueo real (comentario) y exito (rt/like).
+    ok, detalle, datos_t3_bloqueo = _app_test_tiers_tier3(
+        [
+            _fila_ui("granja_coment", "tier3", "comentario"),
+            _fila_ui("lider_ok", "tier1", "rt"),
+        ]
+    )
+    check(
+        "tiers tab tier3: Tier 3 + comentario bloquea y no escribe (AppTest)",
+        ok
+        and not datos_t3_bloqueo["llamadas"]
+        and any(
+            "No se puede asignar Tier 3" in e
+            and "RT y likes" in e
+            and "Sistema no modificado" in e
+            for e in datos_t3_bloqueo["errores"]
+        ),
+        ascii(datos_t3_bloqueo["errores"])[:220],
+    )
+    ok, detalle, datos_t3_ok = _app_test_tiers_tier3(
+        [
+            _fila_ui("granja_rt", "tier3", "rt"),
+            _fila_ui("granja_like", "Métricas", "like"),
+        ]
+    )
+    check(
+        "tiers tab tier3: Tier 3 con rt/like si escribe tier3 (AppTest)",
+        ok
+        and [codigo for _, codigo in datos_t3_ok["llamadas"]] == ["tier3"]
+        and sorted(datos_t3_ok["llamadas"][0][0])
+        == ["granja_like", "granja_rt"]
+        and not datos_t3_ok["errores"],
+        str(datos_t3_ok["llamadas"]),
+    )
 
     # ---------------- 9) Activacion Masiva: curva + reserva (AppTest) ----------------
     ok, detalle, datos_roles = _app_test_roles_launch(con_curva=True)
@@ -754,6 +1007,27 @@ def run(check):
             "Pega al menos una URL" in w for w in datos_bloqueo["advertencias"]
         ),
         ascii(datos_bloqueo["errores"])[:200],
+    )
+
+    ok, detalle, datos_bloqueo_t3 = _app_test_roles_launch(
+        con_curva=False, incluir_tier3=True
+    )
+    check(
+        "activacion roles: Tier 3 + cita fijo NO lanza (motor no llamado)",
+        ok and not datos_bloqueo_t3.get("captura"),
+        str(datos_bloqueo_t3.get("captura")),
+    )
+    check(
+        "activacion roles: error menciona Tier 3 y la sugerencia de corregir",
+        ok
+        and any(
+            "Tier 3" in e and "No se lanzó" in e
+            for e in datos_bloqueo_t3["errores"]
+        )
+        and any(
+            "Corrige el rol" in e for e in datos_bloqueo_t3["errores"]
+        ),
+        ascii(datos_bloqueo_t3["errores"])[:240],
     )
 
     ok, detalle, datos_cita = _app_test_cita_launch(con_curva=True)

@@ -788,6 +788,28 @@ def _metricas_tier_curva(resultados: dict) -> list:
                 _valor_metrica(res.get("tier2_hashtags_omitidas")),
             )
         )
+    if "tier3_omitidas" in res:
+        metricas.append(
+            ("📊 Tier 3 sin rol", _valor_metrica(res.get("tier3_omitidas")))
+        )
+    if "tier3_sin_rol" in res:
+        metricas.append(
+            ("📊 Tier 3 sin acción", _valor_metrica(res.get("tier3_sin_rol")))
+        )
+    if "tier3_liberadas" in res:
+        metricas.append(
+            (
+                "🚀 Tier 3 liberadas fase 2",
+                _valor_metrica(res.get("tier3_liberadas")),
+            )
+        )
+    if "sustituciones_bloqueadas_tier" in res:
+        metricas.append(
+            (
+                "📊 Reservas bloqueadas por tier",
+                _valor_metrica(res.get("sustituciones_bloqueadas_tier")),
+            )
+        )
     if "rotadas_por_cuota_dia" in res:
         metricas.append(
             ("♻️ Rotadas a respaldo", _valor_metrica(res.get("rotadas_por_cuota_dia")))
@@ -807,20 +829,23 @@ def _metricas_tier_curva(resultados: dict) -> list:
     return metricas
 
 
-def _bloqueo_tier2_hashtags(filas, usuarios=None, solo_roles=None,
-                            aleatorio: bool = False) -> list:
-    """Mensajes bloqueantes de las cuentas Tier 2 con rol efectivo hashtags.
+def _bloqueo_roles_tier(filas, usuarios=None, solo_roles=None,
+                        aleatorio: bool = False) -> list:
+    """Mensajes bloqueantes de `core.tiers` para cuentas con rol prohibido.
 
     Aplica los mismos filtros que la campana (`_cuentas_objetivo` + roles
     permitidos por `solo_roles`) y devuelve los mensajes de
-    `core.tiers.error_rol_tier` (vacio = la campana puede lanzarse). Con
-    `aleatorio=True` devuelve []: el motor sortea sin hashtags para Tier 2.
-    Nunca lanza (si el core es viejo devuelve [])."""
+    `core.tiers.error_rol_tier` de CUALQUIER fila cuyo tier prohiba su rol
+    efectivo ALMACENADO (Tier 2 con "hashtags" -incluye post/mantenimiento/
+    hilo- y Tier 3 con "hashtags"/"cita"/"comentario"; Tier 3 solo admite
+    rt/like). Lista vacía = la campana puede lanzarse. Con `aleatorio=True`
+    devuelve []: el motor sortea roles permitidos por tier. Nunca lanza (si el
+    core es viejo devuelve [])."""
     if aleatorio:
         return []
     try:
         from core.registro import normalizar_rol_cuota
-        from web.operaciones.cuentas import _errores_tier2_hashtags
+        from web.operaciones.cuentas import _errores_roles_tier
     except Exception:
         return []
 
@@ -835,18 +860,56 @@ def _bloqueo_tier2_hashtags(filas, usuarios=None, solo_roles=None,
 
     candidatas = []
     for fila in objetivo:
-        rol = normalizar_rol_cuota((fila or {}).get("rol_activacion"))
+        if not isinstance(fila, dict):
+            continue
+        rol = normalizar_rol_cuota(fila.get("rol_activacion"))
         if not rol:
             continue
         if permitidos is not None and rol not in permitidos:
             continue
-        if rol != "hashtags":
-            continue
         candidatas.append(fila)
     try:
-        return _errores_tier2_hashtags(candidatas)
+        return _errores_roles_tier(candidatas)
     except Exception:
         return []
+
+
+def _bloqueo_tier2_hashtags(filas, usuarios=None, solo_roles=None,
+                            aleatorio: bool = False) -> list:
+    """Alias retrocompatible de `_bloqueo_roles_tier` (Tier 2 y Tier 3).
+
+    Se conserva el nombre viejo para no romper tests/llamadas existentes; la
+    validacion ahora cubre ambos tiers (Tier 2 no puede hashtags; Tier 3 solo
+    RT y likes)."""
+    return _bloqueo_roles_tier(
+        filas, usuarios=usuarios, solo_roles=solo_roles, aleatorio=aleatorio
+    )
+
+
+def _errores_rol_tier_destino(filas, rol) -> list:
+    """Mensajes bloqueantes al querer ASIGNAR `rol` (rol DESTINO) a esas filas.
+
+    A diferencia de `_bloqueo_roles_tier` (que valida el rol ya almacenado),
+    aquí se valida el rol que el reparto por porcentajes o la asignación manual
+    van a escribir: `core.tiers.error_rol_tier` por cada fila (Tier 2 + hashtags
+    y Tier 3 + hashtags/cita/comentario bloquean). Devuelve solo los mensajes
+    NO vacíos. Nunca lanza."""
+    try:
+        from core.tiers import error_rol_tier
+        from web.operaciones.cuentas import _fila_como_cuenta
+    except Exception:
+        return []
+    errores = []
+    for fila in filas or []:
+        if not isinstance(fila, dict):
+            continue
+        try:
+            mensaje = error_rol_tier(_fila_como_cuenta(fila), rol)
+        except Exception:
+            mensaje = ""
+        if mensaje:
+            errores.append(mensaje)
+    return errores
 
 
 def _excluidos_cita(cuentas: list, cantidad, todas_cuentas: bool) -> set:
@@ -2387,7 +2450,10 @@ def _cita_masiva():
         help=(
             "Arranca con pocas cuentas (Fase 1) y acelera el volumen en la "
             "Fase 2: la campaña se ve más orgánica y evita ráfagas que X "
-            "castiga. Se combina con la rotación a cuentas de respaldo."
+            "castiga. Se combina con la rotación a cuentas de respaldo. "
+            "Fase 1: solo Tier 1 (Tier 2 y Tier 3 ignorados). Fase 2: se "
+            "liberan Tier 2 y Tier 3; el Tier 3 solo dispara RT/likes en "
+            "cascada a los posts de los Tier 1."
         ),
     )
     curva_fase1 = 15
@@ -2756,7 +2822,9 @@ def _por_roles():
     st.caption(
         "🛡️ **Tiers**: las cuentas **Tier 2 (Volumen/Aged)** no pueden recibir "
         "el rol **Hashtags y menciones** (el reparto y el lanzamiento lo "
-        "bloquean); solo hacen RT, Cita o Comentario."
+        "bloquean); solo hacen RT, Cita o Comentario. Las **Tier 3 (Métricas/"
+        "Soporte)** SOLO hacen RT y likes: el reparto y el lanzamiento bloquean "
+        "hashtags, cita y comentario (volumen ciego en cascada)."
     )
     claves_pct = {
         "cita": "act_roles_pct_cita",
@@ -2810,21 +2878,30 @@ def _por_roles():
                 "porcentajes."
             )
         else:
-            # VALIDACION BLOQUEANTE: ninguna cuenta Tier 2 puede terminar con
-            # el rol "hashtags"; si el reparto lo intenta, no se aplica NADA.
-            filas_hashtags = [
-                filas_por_usuario.get(u) or {"usuario": u}
-                for u in reparto_preview["hashtags"]
-            ]
-            errores_tier = _bloqueo_tier2_hashtags(filas_hashtags, aleatorio=False)
+            # VALIDACION BLOQUEANTE: ningun bloque del reparto puede dejar a
+            # una cuenta con un rol prohibido por su tier (Tier 2 + hashtags;
+            # Tier 3 + hashtags/cita/comentario, que solo admite RT y likes).
+            # Si algo falla, NO se aplica NADA.
+            errores_tier = []
+            for rol in ORDEN_ROLES:
+                filas_bloque = [
+                    filas_por_usuario.get(u) or {"usuario": u}
+                    for u in reparto_preview[rol]
+                ]
+                if not filas_bloque:
+                    continue
+                errores_tier.extend(
+                    _errores_rol_tier_destino(filas_bloque, rol)
+                )
             if errores_tier:
                 st.error(
-                    "🚫 **Reparto bloqueado**: una cuenta Tier 2 (Volumen/Aged) "
-                    "no puede tener el rol 'hashtags'. **No se aplicó ningún "
-                    "cambio.**\n\n"
+                    "🚫 **Reparto bloqueado**: hay cuentas cuyo tier no permite "
+                    "el rol que les toca (Tier 2 no puede 'hashtags'; Tier 3 "
+                    "solo RT y likes). **No se aplicó ningún cambio.**\n\n"
                     + "\n".join(f"- {mensaje}" for mensaje in errores_tier)
                     + "\n\nAjusta los porcentajes (deja Hashtags solo para "
-                    "Tier 1) y vuelve a aplicar."
+                    "Tier 1) o cambia el tier de esas cuentas y vuelve a "
+                    "aplicar."
                 )
             else:
                 resumen = []
@@ -2868,21 +2945,19 @@ def _por_roles():
                 st.warning("Selecciona al menos una cuenta para asignarle rol.")
             else:
                 codigo = normalizar_rol_activacion(opcion_rol)
-                errores_tier = []
-                if codigo == "hashtags":
-                    # Misma regla bloqueante que en el reparto por porcentajes.
-                    filas_sel = [
-                        filas_por_usuario.get(u) or {"usuario": u}
-                        for u in usuarios_sel
-                    ]
-                    errores_tier = _bloqueo_tier2_hashtags(
-                        filas_sel, aleatorio=False
-                    )
+                # Validacion por TIER para CUALQUIER rol destino (Tier 2 no
+                # puede hashtags; Tier 3 solo RT/likes): si algo falla no se
+                # asigna nada.
+                filas_sel = [
+                    filas_por_usuario.get(u) or {"usuario": u}
+                    for u in usuarios_sel
+                ]
+                errores_tier = _errores_rol_tier_destino(filas_sel, codigo)
                 if errores_tier:
                     st.error(
-                        "🚫 **Rol bloqueado**: una cuenta Tier 2 (Volumen/Aged) "
-                        "no puede tener el rol 'hashtags'. **No se asignó "
-                        "nada.**\n\n"
+                        "🚫 **Rol bloqueado**: hay cuentas cuyo tier no permite "
+                        "el rol elegido (Tier 2 no puede 'hashtags'; Tier 3 "
+                        "solo RT y likes). **No se asignó nada.**\n\n"
                         + "\n".join(f"- {mensaje}" for mensaje in errores_tier)
                     )
                 else:
@@ -3026,7 +3101,10 @@ def _por_roles():
         help=(
             "Arranca con pocas cuentas (Fase 1) y acelera el volumen en la "
             "Fase 2: la campaña se ve más orgánica y evita ráfagas que X "
-            "castiga. Se combina con la rotación a cuentas de respaldo."
+            "castiga. Se combina con la rotación a cuentas de respaldo. "
+            "Fase 1: solo Tier 1 (Tier 2 y Tier 3 ignorados). Fase 2: se "
+            "liberan Tier 2 y Tier 3; el Tier 3 solo dispara RT/likes en "
+            "cascada a los posts de los Tier 1."
         ),
     )
     curva_fase1 = 15
@@ -3358,7 +3436,8 @@ def _por_roles():
             solo_roles_param = list(ORDEN_ROLES) if solo_con_rol else None
 
         # VALIDACION BLOQUEANTE de tiers: con roles FIJOS, ninguna cuenta
-        # Tier 2 puede quedarse con el rol "hashtags". Se avisa con
+        # Tier 2 puede quedarse con el rol "hashtags" y ninguna Tier 3 con
+        # hashtags/cita/comentario (solo RT y likes). Se avisa con
         # `error_rol_tier` y NO se lanza la campaña (el usuario debe corregir).
         errores_tier = _bloqueo_tier2_hashtags(
             base_objetivo,
@@ -3368,12 +3447,13 @@ def _por_roles():
         )
         if errores_tier:
             st.error(
-                "🚫 **No se lanzó la campaña**: una cuenta Tier 2 (Volumen/"
-                "Aged) tiene el rol 'hashtags', que le está PROHIBIDO.\n\n"
+                "🚫 **No se lanzó la campaña**: hay cuentas cuyo tier no permite "
+                "su rol guardado (Tier 2 no puede hashtags; Tier 3 solo RT y "
+                "likes).\n\n"
                 + "\n".join(f"- {mensaje}" for mensaje in errores_tier)
                 + "\n\nCorrige el rol con «🎚️ Reparto por porcentajes» "
-                "(asígnale RT/Cita/Comentario) o cambia su tier, y vuelve a "
-                "lanzar."
+                "(asígnale RT, o Cita/Comentario si es Tier 2), cambia su tier, "
+                "y vuelve a lanzar."
             )
             return
 

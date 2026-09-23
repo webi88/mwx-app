@@ -145,6 +145,44 @@ class EjecutorTareas:
     #: varias tareas de la misma cuenta a la misma hora y no queremos rafagas.
     TIPOS_CON_PAUSA_CIERRE = ("post", "comentario", "retweet")
 
+    #: Acciones normalizadas que un Tier 3 (Métricas/Soporte) NO puede
+    #: ejecutar: solo RT/likes. `core.registro.normalizar_rol_cuota` mapea
+    #: "post"/"publicacion"/"mantenimiento"/"calentamiento"/"hilo" -> "hashtags".
+    TIPOS_PROHIBIDOS_TIER3 = ("hashtags", "cita", "comentario")
+
+    @classmethod
+    def _bloqueada_por_tier(cls, tarea, cuenta) -> bool:
+        """True si el tier de la cuenta prohibe el tipo de la tarea.
+
+        Tier 3 (Métricas/Soporte) solo puede RT/likes: cualquier tarea que
+        normalice a "hashtags" (post/publicacion/mantenimiento/calentamiento/
+        hilo), "cita" o "comentario" queda bloqueada ANTES de crear el bot.
+        Tier 2, Tier 1 y cuentas sin tier NO se bloquean aqui (el Tier 2 tiene
+        su propio blindaje de posts en las campanas, no en el scheduler).
+        Nunca lanza: ante cualquier fallo devuelve False (no bloquear de mas).
+        """
+        try:
+            from core.registro import normalizar_rol_cuota
+            from core.tiers import tier_de_cuenta
+
+            if tier_de_cuenta(cuenta) != "tier3":
+                return False
+            return (
+                normalizar_rol_cuota(getattr(tarea, "tipo", ""))
+                in cls.TIPOS_PROHIBIDOS_TIER3
+            )
+        except Exception:  # noqa: BLE001
+            return False
+
+    @staticmethod
+    def _motivo_tier3(tarea) -> str:
+        """Motivo del bloqueo por Tier 3 (jamas coincide con los reintentables)."""
+        tipo = str(getattr(tarea, "tipo", "") or "")
+        return (
+            f"tier 3 (Métricas/Soporte): la accion '{tipo}' esta PROHIBIDA "
+            f"(solo RT/likes); no se ejecuto"
+        )
+
     def _ejecutar_accion(self, tarea: Tarea, cuenta: Cuenta) -> tuple:
         """Ejecuta UNA accion de la tarea en UNA cuenta.
 
@@ -153,12 +191,26 @@ class EjecutorTareas:
         `bot.ultimo_error`). Registra SIEMPRE la accion en `core.registro`
         (exito/fallido) y garantiza `bot.cerrar()` incluso si algo lanza
         (antes una excepcion dejaba Chrome huerfano). Nunca lanza.
+
+        TIER 3: post/hashtags, cita y comentario se cortan ANTES de crear el
+        bot (sin abrir Chrome) y se registran como fallido con un motivo que
+        NO es reintentable (`retweet`/`like`/`visualizacion` si pasan).
         """
         bot = None
         motivo = ""
         cerrado = False
         registrado = False
         try:
+            if self._bloqueada_por_tier(tarea, cuenta):
+                motivo = self._motivo_tier3(tarea)
+                logger.warning(
+                    f"Accion {tarea.tipo} PROHIBIDA para @{cuenta.usuario} "
+                    f"por su tier (Métricas/Soporte): no se abre navegador"
+                )
+                self._registrar(cuenta, tarea, False, None, motivo)
+                registrado = True
+                return False, motivo
+
             from plataformas.base import PlataformaFactory
             bot = PlataformaFactory.crear_bot(cuenta.plataforma, cuenta.usuario)
             

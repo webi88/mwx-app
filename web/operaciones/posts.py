@@ -13,6 +13,7 @@ from web.operaciones._helpers import (
     mostrar_resultados,
     guardar_imagen_subida,
     generar_pool_por_cuenta_seguro,
+    bloqueo_tier_ejecucion,
 )
 
 
@@ -161,9 +162,15 @@ def _publicar_hilo():
             st.warning("El hilo necesita al menos 2 tweets.")
             return
         
-        resultados = {"exitos": 0, "fallidos": 0, "detalles": []}
+        resultados = {"exitos": 0, "fallidos": 0, "detalles": [], "omitidas": 0}
         
         for cuenta in cuentas:
+            # Guard de Tier: una cuenta Tier 3/2 con rol prohibido no publica.
+            motivo_tier = bloqueo_tier_ejecucion(cuenta, "hilo")
+            if motivo_tier:
+                resultados["omitidas"] += 1
+                resultados["detalles"].append(motivo_tier)
+                continue
             try:
                 from plataformas.twitter.selenium_bot import TwitterBot
                 bot = TwitterBot(cuenta.usuario)
@@ -469,7 +476,7 @@ def _publicar_pool_por_cuenta(posts: list[str], cuentas: list):
         st.error("No se pudieron generar suficientes textos para todas las cuentas.")
         return
     
-    resultados = {"exitos": 0, "fallidos": 0, "detalles": []}
+    resultados = {"exitos": 0, "fallidos": 0, "detalles": [], "omitidas": 0}
     progreso = st.progress(0)
     estado = st.empty()
     total = len(cuentas)
@@ -477,6 +484,13 @@ def _publicar_pool_por_cuenta(posts: list[str], cuentas: list):
     for i, cuenta in enumerate(cuentas):
         texto = pool[i]
         estado.write(f"⏳ Publicando en **@{cuenta.usuario}** ({i + 1}/{total})...")
+        # Guard de Tier: una cuenta Tier 3/2 con rol prohibido no publica.
+        motivo_tier = bloqueo_tier_ejecucion(cuenta, "mantenimiento")
+        if motivo_tier:
+            resultados["omitidas"] += 1
+            resultados["detalles"].append(motivo_tier)
+            progreso.progress((i + 1) / total)
+            continue
         bot = None
         try:
             from plataformas.twitter.selenium_bot import TwitterBot

@@ -229,7 +229,12 @@ def _tiene_sesion(cuenta) -> bool:
 
 
 def _es_elegible(cuenta, recientes: set, excluidos: set) -> bool:
-    """Filtro final en Python (complementa la consulta SQL). Nunca lanza."""
+    """Filtro final en Python (complementa la consulta SQL). Nunca lanza.
+
+    TIER: las cuentas Tier 3 (Métricas/Soporte) quedan FUERA porque el
+    calentamiento publica un post (rol hashtags) y el Tier 3 solo puede
+    RT/likes. Tier 2 NO se excluye (mantiene el comportamiento actual).
+    """
     try:
         if getattr(cuenta, "id", None) is None:
             return False
@@ -237,6 +242,14 @@ def _es_elegible(cuenta, recientes: set, excluidos: set) -> bool:
             return False
         if str(getattr(cuenta, "plataforma", "") or "").strip().lower() != "twitter":
             return False
+        try:
+            from core.tiers import tier_de_cuenta
+
+            if tier_de_cuenta(cuenta) == "tier3":
+                return False
+        except Exception:  # noqa: BLE001
+            # Sin `core.tiers` disponible se conserva el comportamiento previo.
+            pass
         if str(getattr(cuenta, "status", "") or "").strip().lower() == "suspended":
             return False
         if not _tiene_sesion(cuenta):

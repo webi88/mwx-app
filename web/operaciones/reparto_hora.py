@@ -39,7 +39,9 @@ def render(usuario: dict):
         "Cada cuenta objetivo recibe, **por cada hora** de la ventana: "
         "**3 posts + 3 comentarios + 3 RTs del tweet principal = 9 acciones**, "
         "repartidas a lo largo de la ventana con pausas aleatorias. "
-        "Los 9 textos usan el perfil de cada cuenta y llevan hashtag en medio."
+        "Los 9 textos usan el perfil de cada cuenta y llevan hashtag en medio. "
+        "Las cuentas **Tier 3 (Métricas/Soporte)** quedan limitadas a **RTs** "
+        "(sin posts ni comentarios)."
     )
 
     # ------------------ Paso 1: cuentas ------------------
@@ -60,6 +62,14 @@ def render(usuario: dict):
         key="rh_cuentas",
     )
     seleccion = [opciones[n] for n in seleccion_nombres]
+
+    tier3_seleccion = [c.usuario for c in seleccion if _es_tier3(c)]
+    if tier3_seleccion:
+        st.caption(
+            f"📊 {len(tier3_seleccion)} cuenta(s) **Tier 3 (Métricas/Soporte)** "
+            "en la selección: el plan les asignará SOLO RTs (0 posts y 0 "
+            "comentarios)."
+        )
 
     sin_perfil = [c.usuario for c in seleccion if not (getattr(c, "perfil_personalidad", "") or "").strip()]
     if sin_perfil:
@@ -179,6 +189,12 @@ def render(usuario: dict):
             f"{resumen_previo.get('comentarios', 0)} comentarios · "
             f"{resumen_previo.get('retweets', 0)} retweets."
         )
+        tier3_previas = int(resumen_previo.get("tier3_limitadas") or 0)
+        if tier3_previas:
+            st.caption(
+                f"📊 {tier3_previas} cuenta(s) **Tier 3** quedaron limitadas a "
+                "RTs: no se les programó ningún post ni comentario."
+            )
 
     col_b1, col_b2, col_b3 = st.columns(3)
     with col_b1:
@@ -251,6 +267,57 @@ def _perfiles_normalizados(seleccion: list) -> dict:
     }
 
 
+def _es_tier3(cuenta) -> bool:
+    """True si la cuenta es Tier 3 (Métricas/Soporte); core viejo -> False."""
+    try:
+        from core.tiers import es_tier3
+
+        return bool(es_tier3(cuenta))
+    except Exception:
+        return False
+
+
+def _ritmo_por_cuenta(seleccion: list, n_posts: int, n_comentarios: int,
+                      n_rts: int) -> dict:
+    """Ritmo efectivo por cuenta: `{usuario: (posts, comentarios, rts)}`.
+
+    Las cuentas Tier 3 (Métricas/Soporte) SOLO hacen RTs: reciben
+    `n_posts=0` y `n_comentarios=0` y conservan sus `n_rts` (regla
+    centralizada en `core.tiers`). El resto no cambia. Nunca lanza."""
+    ritmo: dict[str, tuple] = {}
+    for cuenta in seleccion or []:
+        usuario = str(getattr(cuenta, "usuario", "") or "")
+        if not usuario:
+            continue
+        rts_cuenta = max(0, int(n_rts or 0))
+        if _es_tier3(cuenta):
+            ritmo[usuario] = (0, 0, rts_cuenta)
+        else:
+            ritmo[usuario] = (
+                max(0, int(n_posts or 0)),
+                max(0, int(n_comentarios or 0)),
+                rts_cuenta,
+            )
+    return ritmo
+
+
+def _pool_por_usuario(pool, cuentas_info: list) -> dict:
+    """`{usuario: fila del pool}` emparejando `pool[i]` con `cuentas_info[i]`.
+
+    El generador de la campaña devuelve una fila por cuenta de `cuentas_info`
+    (que EXCLUYE a las Tier 3, porque no necesitan textos); mapear por índice
+    contra `seleccion` desalinearía los textos. Nunca lanza."""
+    mapeado: dict[str, dict] = {}
+    if not isinstance(pool, list):
+        return mapeado
+    for i, info in enumerate(cuentas_info or []):
+        if i < len(pool) and isinstance(pool[i], dict):
+            usuario = str((info or {}).get("usuario") or "")
+            if usuario:
+                mapeado[usuario] = pool[i]
+    return mapeado
+
+
 def _preparar(
     seleccion: list,
     inicio_dt: datetime,
@@ -276,25 +343,34 @@ def _preparar(
     n_comentarios = max(0, int(n_comentarios))
     n_rts = max(0, int(n_rts))
 
+    # Tier 3 (Métricas/Soporte): SOLO RTs. Se les fuerza posts=0 y
+    # comentarios=0; sus RTs se conservan.
+    ritmo = _ritmo_por_cuenta(seleccion, n_posts, n_comentarios, n_rts)
+    tier3 = {c.usuario for c in seleccion if _es_tier3(c)}
+
     # 1) Distribucion de acciones y horarios (3+3+3 por defecto).
     orden = []
     for usuario in usuarios:
+        posts_cuenta, comentarios_cuenta, rts_cuenta = ritmo.get(
+            usuario, (n_posts, n_comentarios, n_rts)
+        )
         rng = random.Random(hash((usuario, inicio_dt.isoformat())) & 0xFFFFFFFF)
         orden.extend(
             plan_hora_cuenta(
                 usuario,
                 perfil_por_usuario.get(usuario, ""),
                 inicio_dt,
-                n_posts=n_posts,
-                n_comentarios=n_comentarios,
-                n_rts=n_rts,
+                n_posts=posts_cuenta,
+                n_comentarios=comentarios_cuenta,
+                n_rts=rts_cuenta,
                 ventana_minutos=int(ventana),
                 rng=rng,
             )
         )
 
     # 2) 9 textos por cuenta con la campaña 3+3+3 (SOLO llamada a ia/, el
-    #    modulo ia/ no se edita desde el dashboard).
+    #    modulo ia/ no se edita desde el dashboard). Las Tier 3 no piden
+    #    textos: no tienen posts/comentarios y los RT no llevan texto.
     cuentas_info = [
         {
             "usuario": c.usuario,
@@ -305,11 +381,12 @@ def _preparar(
             "perfil": perfil_por_usuario.get(c.usuario, ""),
         }
         for c in seleccion
+        if c.usuario not in tier3
     ]
 
     progreso = st.progress(0.0)
     estado = st.empty()
-    total_estimado = max(1, len(seleccion) * (n_posts + n_comentarios + n_rts))
+    total_estimado = max(1, len(cuentas_info) * (n_posts + n_comentarios + n_rts))
 
     def _cb(hechas, total):
         try:
@@ -318,40 +395,39 @@ def _preparar(
         except Exception:
             pass
 
-    try:
-        from ia.generador_contenido import generar_pool_campana_por_cuenta
+    pool = []
+    if cuentas_info:
+        try:
+            from ia.generador_contenido import generar_pool_campana_por_cuenta
 
-        pool = generar_pool_campana_por_cuenta(
-            cuentas_info,
-            n_posts=n_posts,
-            n_comentarios=n_comentarios,
-            n_citas=n_rts,
-            base_cita=base_cita or "",
-            callback=_cb,
-        )
-    except TypeError:
-        # Firma no disponible: atajo fijo 3+3+3 del mismo modulo.
-        from ia.generador_contenido import generar_textos_campana_3_3_3
+            pool = generar_pool_campana_por_cuenta(
+                cuentas_info,
+                n_posts=n_posts,
+                n_comentarios=n_comentarios,
+                n_citas=n_rts,
+                base_cita=base_cita or "",
+                callback=_cb,
+            )
+        except TypeError:
+            # Firma no disponible: atajo fijo 3+3+3 del mismo modulo.
+            from ia.generador_contenido import generar_textos_campana_3_3_3
 
-        pool = generar_textos_campana_3_3_3(
-            cuentas_info,
-            base_cita=base_cita or "",
-            callback=_cb,
-        )
-    except Exception as e:
-        logger.exception(f"Error generando campaña 3+3+3: {e}")
-        st.error(f"Error generando textos: {e}")
-        return
+            pool = generar_textos_campana_3_3_3(
+                cuentas_info,
+                base_cita=base_cita or "",
+                callback=_cb,
+            )
+        except Exception as e:
+            logger.exception(f"Error generando campaña 3+3+3: {e}")
+            st.error(f"Error generando textos: {e}")
+            return
 
     textos_posts: dict[str, list] = {}
     textos_com: dict[str, list] = {}
     textos_citas: dict[str, list] = {}
-    for i, c in enumerate(seleccion):
-        fila = (
-            pool[i]
-            if isinstance(pool, list) and i < len(pool) and isinstance(pool[i], dict)
-            else {}
-        )
+    textos_por_usuario = _pool_por_usuario(pool, cuentas_info)
+    for c in seleccion:
+        fila = textos_por_usuario.get(c.usuario) or {}
         textos_posts[c.usuario] = [
             str(t).strip() for t in (fila.get("posts") or []) if str(t).strip()
         ]
@@ -365,7 +441,10 @@ def _preparar(
         ]
 
     progreso.progress(1.0)
-    estado.caption("✅ Textos listos (3 posts + 3 comentarios + 3 citas por cuenta).")
+    if cuentas_info:
+        estado.caption("✅ Textos listos (3 posts + 3 comentarios + 3 citas por cuenta).")
+    else:
+        estado.caption("📊 Sin textos: todas las cuentas seleccionadas son Tier 3 (solo RTs).")
 
     # 3) Asignar contenido y fecha a cada accion.
     plan = construir_plan_completo(
@@ -419,6 +498,7 @@ def _preparar(
         "posts": sum(1 for p in plan if p["tipo"] == "post"),
         "comentarios": sum(1 for p in plan if p["tipo"] == "comentario"),
         "retweets": sum(1 for p in plan if p["tipo"] == "retweet"),
+        "tier3_limitadas": len(tier3),
         "faltantes": faltantes,
     }
     st.rerun()

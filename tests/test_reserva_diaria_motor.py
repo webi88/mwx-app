@@ -4,7 +4,10 @@
 Regla: las cuentas "Agotadas por hoy" (tope diario) se retiran de la campana y
 se sustituyen 1:1 por cuentas de respaldo (`reserva_usuarios`). En modo fijo la
 reserva toma el MISMO rol de la cuenta retirada y una reserva Tier 2 JAMAS
-sustituye un rol hashtags. Sin `reserva_usuarios` nada cambia.
+sustituye un rol hashtags. Una cuenta Tier 3 agotada SOLO se sustituye por
+reservas Tier 2/Tier 3 (una Tier 1 o una sin tier NUNCA sustituye a Tier 3) y
+el bloqueo se cuenta en `sustituciones_bloqueadas_tier`. Sin `reserva_usuarios`
+nada cambia.
 
 Sin red, sin Chrome y SIN tocar la base real (fakes + contadores parcheados).
 
@@ -13,10 +16,17 @@ Cubre:
         sesion, `solo_con_registro` y tope `RESERVA_MAX_CUENTAS`.
     (2) `_rotar_agotadas_dia`: sustitucion 1:1 (mismo rol), bloqueo de Tier 2
         para hashtags, contadores y listas mutadas.
+    (2b) `_tier_compatible_reserva`: Tier 3 solo por Tier 2/Tier 3.
+    (2c) `_rotar_agotadas_dia` con Tier 3 agotada: bloquea Tier 1 y sin tier,
+        sustituye por Tier 2/Tier 3 y cuenta `sustituciones_bloqueadas_tier`.
+    (2d) E2E: la Tier 3 agotada no se sustituye por una reserva Tier 1; con
+        reserva Tier 2 si hay sustitucion.
     (3) E2E single-pass: la agotada se sustituye ANTES de encolar; contadores
         `agotadas_dia`/`rotadas_por_cuota_dia`/`reserva_*`.
     (4) E2E en rondas: la rotacion corre al iniciar cada ronda.
     (5) Sin `reserva_usuarios` el comportamiento y los contadores no cambian.
+    (6) Hilos/RAM: MAX_WORKERS acotado, pestaña por edad y log de rendimiento.
+    (7) La base diaria incluye principal + reservas y claves siempre presentes.
 
 Uso:
     .venv/Scripts/python.exe tests/run_tests.py
@@ -339,6 +349,245 @@ def test_rotar_agotadas(check):
         "sin cuotas no rota nada",
         motor3._rotar_agotadas_dia(activos3, [], {}, True, resumen3) == 0
         and [c.usuario for c in activos3] == ["normal"],
+    )
+
+
+# --------------------------------------------------------------------------- #
+# (2b) _tier_compatible_reserva: Tier 3 solo por Tier 2/Tier 3
+# --------------------------------------------------------------------------- #
+def test_tier_compatible_reserva(check):
+    print("(2b) _tier_compatible_reserva: Tier 3 solo por Tier 2/Tier 3")
+    f = motor_mod._tier_compatible_reserva
+    check("tier3 agotada + reserva tier1 -> False", f("tier3", "tier1") is False)
+    check("tier3 agotada + reserva sin tier -> False", f("tier3", "") is False)
+    check("tier3 agotada + reserva tier2 -> True", f("tier3", "tier2") is True)
+    check("tier3 agotada + reserva tier3 -> True", f("tier3", "tier3") is True)
+    check(
+        "normal (tier1 agotada + reserva tier3) -> True",
+        f("tier1", "tier3") is True,
+    )
+    check(
+        "normal (tier2 agotada + reserva sin tier) -> True",
+        f("tier2", "") is True,
+    )
+    check(
+        "etiquetas legibles se normalizan",
+        f("Tier 3 (Métricas / Soporte)", "tier2") is True
+        and f("Tier 3 (Métricas / Soporte)", "Tier 1 (Líder/Boosted)") is False,
+    )
+    check(
+        "valores raros no lanzan",
+        f(None, None) is True and f("tier3", None) is False,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# (2c) _rotar_agotadas_dia con Tier 3 agotada
+# --------------------------------------------------------------------------- #
+def test_rotar_agotadas_tier3(check):
+    print("(2c) _rotar_agotadas_dia: Tier 3 agotada solo por reserva Tier 2/Tier 3")
+    # Caso A: hay reservas Tier 1/sin tier y una Tier 2 compatible -> esa entra.
+    motor = MotorActivacion(max_concurrente=1)
+    motor._cuotas = CuotasHorarias(limites={"rt": 7}, limite_dia=1)
+    _preparar_cuotas_fake(
+        motor._cuotas, ["t3_agotada", "r_t1", "r_sin", "r_t2"],
+        base_dia={"t3_agotada": 1},
+    )
+    agotada = _CuentaFake("t3_agotada", rol_activacion="rt", tier_calidad="tier3")
+    activa = _CuentaFake("otra", rol_activacion="rt", tier_calidad="tier2")
+    r_t1 = _CuentaFake("r_t1", rol_activacion="rt", tier_calidad="tier1")
+    r_sin = _CuentaFake("r_sin", rol_activacion="rt", tier_calidad="")
+    r_t2 = _CuentaFake("r_t2", rol_activacion="rt", tier_calidad="tier2")
+    activos = [agotada, activa]
+    reservas = [r_t1, r_sin, r_t2]
+    rol_de = {"t3_agotada": "rt", "otra": "rt"}
+    grupos = {"cita": [], "hashtags": [], "comentario": [], "rt": [agotada, activa]}
+    resumen = {
+        "agotadas_dia": 0, "rotadas_por_cuota_dia": 0,
+        "reserva_usada": 0, "reserva_disponible": 3,
+    }
+    sustituciones = motor._rotar_agotadas_dia(
+        activos, reservas, rol_de, False, resumen, grupos
+    )
+    check(
+        "Tier 1 y sin tier bloqueadas: sustituye la Tier 2",
+        sustituciones == 1
+        and [c.usuario for c in activos] == ["otra", "r_t2"],
+        f"({sustituciones}, {[c.usuario for c in activos]})",
+    )
+    check(
+        "la reserva Tier 1 y la sin tier siguen disponibles",
+        [c.usuario for c in reservas] == ["r_t1", "r_sin"],
+        f"({[c.usuario for c in reservas]})",
+    )
+    check(
+        "sin bloqueo contado (habia reserva compatible)",
+        resumen.get("sustituciones_bloqueadas_tier", 0) == 0,
+        f"({resumen.get('sustituciones_bloqueadas_tier')})",
+    )
+    check(
+        "contadores normales de rotacion",
+        resumen["agotadas_dia"] == 1 and resumen["rotadas_por_cuota_dia"] == 1,
+        f"({resumen})",
+    )
+
+    # Caso B: SOLO reservas Tier 1/sin tier -> se retira y se cuenta el bloqueo.
+    motor2 = MotorActivacion(max_concurrente=1)
+    motor2._cuotas = CuotasHorarias(limites={"rt": 7}, limite_dia=1)
+    _preparar_cuotas_fake(
+        motor2._cuotas, ["t3_agotada2", "r_t1b", "r_sinb"],
+        base_dia={"t3_agotada2": 1},
+    )
+    agotada2 = _CuentaFake(
+        "t3_agotada2", rol_activacion="rt", tier_calidad="tier3"
+    )
+    r_t1b = _CuentaFake("r_t1b", rol_activacion="rt", tier_calidad="tier1")
+    r_sinb = _CuentaFake("r_sinb", rol_activacion="rt", tier_calidad="")
+    activos2 = [agotada2]
+    reservas2 = [r_t1b, r_sinb]
+    resumen2 = {
+        "agotadas_dia": 0, "rotadas_por_cuota_dia": 0,
+        "reserva_usada": 0, "reserva_disponible": 2,
+    }
+    logger_falso = _LoggerFalso()
+    with _parches((motor_mod, "logger", logger_falso)):
+        sustituciones2 = motor2._rotar_agotadas_dia(
+            activos2, reservas2, {"t3_agotada2": "rt"}, False, resumen2
+        )
+    check(
+        "sin reserva Tier 2/Tier 3: se retira sin sustituir",
+        sustituciones2 == 0 and activos2 == [],
+        f"({sustituciones2}, {activos2})",
+    )
+    check(
+        "sustituciones_bloqueadas_tier = 1",
+        resumen2.get("sustituciones_bloqueadas_tier") == 1,
+        f"({resumen2.get('sustituciones_bloqueadas_tier')})",
+    )
+    check(
+        "las reservas Tier 1/sin tier quedan intactas",
+        [c.usuario for c in reservas2] == ["r_t1b", "r_sinb"],
+        f"({[c.usuario for c in reservas2]})",
+    )
+    check(
+        "log claro del bloqueo Tier 1 -> Tier 3",
+        any(
+            "no hay reserva Tier 2/Tier 3 compatible" in mensaje
+            for _nivel, mensaje in logger_falso.mensajes
+        ),
+        f"({logger_falso.mensajes[:2]})",
+    )
+    check(
+        "la agotada se retira y se cuenta igual",
+        resumen2["agotadas_dia"] == 1
+        and resumen2["rotadas_por_cuota_dia"] == 0,
+        f"({resumen2})",
+    )
+
+    # Caso C: la reserva Tier 3 si sustituye (mismo tier).
+    motor3 = MotorActivacion(max_concurrente=1)
+    motor3._cuotas = CuotasHorarias(limites={"rt": 7}, limite_dia=1)
+    _preparar_cuotas_fake(
+        motor3._cuotas, ["t3_agotada3", "r_t3c"], base_dia={"t3_agotada3": 1}
+    )
+    agotada3 = _CuentaFake(
+        "t3_agotada3", rol_activacion="rt", tier_calidad="tier3"
+    )
+    r_t3c = _CuentaFake("r_t3c", rol_activacion="rt", tier_calidad="tier3")
+    activos3 = [agotada3]
+    reservas3 = [r_t3c]
+    resumen3 = {
+        "agotadas_dia": 0, "rotadas_por_cuota_dia": 0,
+        "reserva_usada": 0, "reserva_disponible": 1,
+    }
+    motor3._rotar_agotadas_dia(
+        activos3, reservas3, {"t3_agotada3": "rt"}, False, resumen3
+    )
+    check(
+        "una reserva Tier 3 SI sustituye a otra Tier 3",
+        [c.usuario for c in activos3] == ["r_t3c"]
+        and resumen3.get("sustituciones_bloqueadas_tier", 0) == 0,
+        f"({[c.usuario for c in activos3]}, {resumen3})",
+    )
+
+
+# --------------------------------------------------------------------------- #
+# (2d) E2E: Tier 3 agotada con reserva Tier 1 no se sustituye
+# --------------------------------------------------------------------------- #
+def test_e2e_reserva_tier3(check):
+    print("(2d) E2E: Tier 3 agotada no se sustituye por reserva Tier 1")
+    cuentas = [
+        _CuentaFake("t3_ag", rol_activacion="rt", tier_calidad="tier3"),
+        _CuentaFake("t2_sano", rol_activacion="rt", tier_calidad="tier2"),
+    ]
+    reserva_t1 = _CuentaFake("res_t1", rol_activacion="rt", tier_calidad="tier1")
+    motor = MotorActivacion(max_concurrente=1)
+    llamadas: list = []
+    registros: list = []
+    _preparar_motor_roles(motor, cuentas, llamadas)
+    with _parches(*_patches_e2e(registros, base_dia={"t3_ag": 12})):
+        resumen = motor.ejecutar_por_roles(
+            urls=["https://x.com/ancla"],
+            texto_base="texto",
+            hashtags="#x",
+            usuarios=["t3_ag", "t2_sano"],
+            duracion_min=1,
+            cohortes=1,
+            repetir=False,
+            reserva_usuarios=[reserva_t1],
+        )
+    usuarios_llamados = {u for u, _r in llamadas}
+    check(
+        "la Tier 3 agotada se retira y la reserva Tier 1 NO entra",
+        "t3_ag" not in usuarios_llamados
+        and "res_t1" not in usuarios_llamados
+        and "t2_sano" in usuarios_llamados,
+        f"({sorted(usuarios_llamados)})",
+    )
+    check(
+        "sustituciones_bloqueadas_tier = 1",
+        resumen.get("sustituciones_bloqueadas_tier") == 1,
+        f"({resumen.get('sustituciones_bloqueadas_tier')})",
+    )
+    check(
+        "agotadas_dia=1, rotadas=0 y reserva intacta",
+        resumen.get("agotadas_dia") == 1
+        and resumen.get("rotadas_por_cuota_dia") == 0
+        and resumen.get("reserva_disponible") == 1,
+        f"(agotadas={resumen.get('agotadas_dia')}, "
+        f"rotadas={resumen.get('rotadas_por_cuota_dia')}, "
+        f"disponible={resumen.get('reserva_disponible')})",
+    )
+
+    # Con reserva Tier 2 si hay sustitucion (y ejecuta su rt).
+    motor2 = MotorActivacion(max_concurrente=1)
+    llamadas2: list = []
+    registros2: list = []
+    reserva_t2 = _CuentaFake("res_t2", rol_activacion="rt", tier_calidad="tier2")
+    _preparar_motor_roles(motor2, cuentas, llamadas2)
+    with _parches(*_patches_e2e(registros2, base_dia={"t3_ag": 12})):
+        resumen2 = motor2.ejecutar_por_roles(
+            urls=["https://x.com/ancla"],
+            texto_base="texto",
+            hashtags="#x",
+            usuarios=["t3_ag", "t2_sano"],
+            duracion_min=1,
+            cohortes=1,
+            repetir=False,
+            reserva_usuarios=[reserva_t2],
+        )
+    usuarios2 = {u for u, _r in llamadas2}
+    check(
+        "con reserva Tier 2 SI se sustituye y ejecuta",
+        "t3_ag" not in usuarios2 and "res_t2" in usuarios2,
+        f"({sorted(usuarios2)})",
+    )
+    check(
+        "contadores: rotadas=1 y sin bloqueos",
+        resumen2.get("rotadas_por_cuota_dia") == 1
+        and resumen2.get("sustituciones_bloqueadas_tier", 0) == 0,
+        f"(rotadas={resumen2.get('rotadas_por_cuota_dia')}, "
+        f"bloqueos={resumen2.get('sustituciones_bloqueadas_tier')})",
     )
 
 
@@ -715,6 +964,9 @@ def run(check):
     """Ejecuta los checks con el `check` del runner (o del marco local)."""
     test_preparar_reservas(check)
     test_rotar_agotadas(check)
+    test_tier_compatible_reserva(check)
+    test_rotar_agotadas_tier3(check)
+    test_e2e_reserva_tier3(check)
     test_e2e_single_pass(check)
     test_e2e_rondas(check)
     test_sin_reservas(check)

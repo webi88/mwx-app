@@ -190,6 +190,14 @@ MENSAJE_TIER2_SIN_ROL = (
     "tier 2 sin rol permitido: solo RT/Cita/Comentario (no publica hashtags)"
 )
 
+# Resultado de una accion NO ejecutada porque el tier de la cuenta prohibe el
+# rol (Tier 3 "Métricas/Soporte" SOLO puede hacer RT/like: jamas publica
+# hashtags/posts, citas ni comentarios): tampoco es exito ni fallo y jamas toca
+# la BD.
+MENSAJE_TIER3_SIN_ROL = (
+    "tier 3 (métricas/soporte) sin rol permitido: solo RT y likes (volumen ciego)"
+)
+
 
 def _avisar_cuota_agotada_log(cuotas, usuario) -> bool:
     """Avisa (una vez por minuto y cuenta) que la cuenta agoto sus cuotas.
@@ -758,18 +766,62 @@ def _es_tier2(cuenta) -> bool:
         return False
 
 
+def _es_tier3(cuenta) -> bool:
+    """True si la cuenta es Tier 3 (Métricas/Soporte). Nunca lanza.
+
+    Las cuentas Tier 3 solo pueden hacer RT y likes (volumen ciego): hashtags/
+    posts, citas y comentarios les quedan PROHIBIDOS. Import perezoso de
+    `core.tiers.es_tier3`; ante cualquier fallo devuelve False (no bloquear de
+    mas por un import roto).
+    """
+    try:
+        from core.tiers import es_tier3
+
+        return bool(es_tier3(cuenta))
+    except Exception:
+        return False
+
+
 def _tier_permitido(cuenta, rol) -> bool:
     """True si el tier de la cuenta permite ese rol (import perezoso).
 
     False SOLO si es Tier 2 y el rol normalizado es "hashtags" (incluye
-    post/publicacion/mantenimiento/calentamiento/hilo). Ante cualquier fallo
-    devuelve True (no bloquear por un import roto)."""
+    post/publicacion/mantenimiento/calentamiento/hilo) o si es Tier 3 y el rol
+    efectivo NO es "rt"/"like". Ante cualquier fallo devuelve True (no bloquear
+    por un import roto)."""
     try:
         from core.tiers import rol_permitido_tier
 
         return bool(rol_permitido_tier(cuenta, rol))
     except Exception:
         return True
+
+
+def _tier_compatible_reserva(tier_agotada, tier_reserva) -> bool:
+    """True si una reserva de `tier_reserva` puede sustituir a `tier_agotada`.
+
+    Mecanica normal de reservas (True) salvo que la cuenta agotada sea Tier 3
+    (Métricas/Soporte): en ese caso SOLO valen reservas Tier 2 o Tier 3; una
+    reserva Tier 1 o SIN tier ("") NUNCA sustituye a una Tier 3 (el Tier 1
+    queda reservado para roles de texto que el Tier 3 no puede hacer). Los
+    tiers se normalizan con `core.tiers.normalizar_tier` (import perezoso);
+    cualquier fallo devuelve True para no romper la rotacion. Nunca lanza.
+    """
+    try:
+        from core.tiers import normalizar_tier
+
+        agotada = normalizar_tier(tier_agotada)
+        if agotada != "tier3":
+            return True
+        return normalizar_tier(tier_reserva) in ("tier2", "tier3")
+    except Exception:
+        try:
+            agotada = str(tier_agotada or "").strip().lower()
+            if agotada != "tier3":
+                return True
+            return str(tier_reserva or "").strip().lower() in ("tier2", "tier3")
+        except Exception:
+            return True
 
 
 def _error_tier(cuenta, rol) -> str:
@@ -1303,10 +1355,16 @@ class MotorActivacion:
         self._curva_fase2_t0 = None
         self._urls_fase1: list = []
         self._cascada_usadas: set = set()
-        # Tier de cada cuenta de la campana (usuario -> "tier1"/"tier2"/"")
+        # Tier de cada cuenta de la campana (usuario -> "tier1"/"tier2"/"tier3"/"")
         self._tier_de: dict = {}
         # Cuentas Tier 2 que `_obtener_cuentas_por_rol` excluyo por defensa.
         self._tier2_filtradas_rol: list = []
+        # Cuentas Tier 3 que `_obtener_cuentas_por_rol` excluyo por defensa
+        # (solo RT/likes permitidos: hashtags/cita/comentario prohibidos).
+        self._tier3_filtradas_rol: list = []
+        # Cuentas Tier 3 DISTINTAS con al menos una accion EXITOSA en la fase 2
+        # de la curva (`tier3_liberadas` del resumen).
+        self._tier3_liberadas_usr: set = set()
         # PARO TOTAL: evento de cancelacion de la campana en curso. Lo asigna
         # cada campana con el kwarg `cancelar` (solo si parece un Event real)
         # o `solicitar_paro()` (fallback interno ya seteado). `None` = sin
@@ -1905,6 +1963,16 @@ class MotorActivacion:
         resumen.setdefault("tier2_hashtags_usuarios", [])
         resumen.setdefault("tier2_sin_rol", 0)
         resumen.setdefault("tier2_sin_rol_usuarios", [])
+        resumen.setdefault("tier3_omitidas", 0)
+        resumen.setdefault("tier3_omitidas_usuarios", [])
+        resumen.setdefault("tier3_sin_rol", 0)
+        resumen.setdefault("tier3_sin_rol_usuarios", [])
+        resumen.setdefault("sustituciones_bloqueadas_tier", 0)
+        try:
+            with self._lock:
+                resumen["tier3_liberadas"] = len(self._tier3_liberadas_usr)
+        except Exception:
+            resumen.setdefault("tier3_liberadas", 0)
         resumen.setdefault("rotadas_por_cuota_dia", 0)
         resumen.setdefault("agotadas_dia", 0)
         resumen.setdefault("reserva_usada", 0)
@@ -2000,6 +2068,8 @@ class MotorActivacion:
                 self._cascada_usadas = set()
                 self._tier_de = {}
                 self._tier2_filtradas_rol = []
+                self._tier3_filtradas_rol = []
+                self._tier3_liberadas_usr = set()
                 self.progreso["fase_actual"] = 1
         except Exception:
             pass
@@ -2081,7 +2151,8 @@ class MotorActivacion:
             return False, fase1
         logger.info(
             f"Activacion: curva de aceleracion activa (fase 1 solo Tier 1 "
-            f"durante {fase1} min; fase 2 despues)"
+            f"(Tier 2/Tier 3 ignorados) durante {fase1} min; fase 2 libera "
+            f"Tier 2 y Tier 3 (Tier 3 solo RT/likes en cascada))"
         )
         return True, fase1
 
@@ -2091,6 +2162,11 @@ class MotorActivacion:
         Se evalua al INICIAR CADA RONDA: en fase 1 solo cuentas Tier 1; al
         pasar `curva_fase1_min` minutos todas son elegibles (fase 2). Actualiza
         `progreso["fase_actual"]` en cada evaluacion. Nunca lanza.
+
+        FASE 1 = solo Tier 1: Tier 2 y Tier 3 quedan COMPLETAMENTE ignorados
+        (no entran al subconjunto de la ronda: no se les generan textos ni
+        abren navegador). En fase 2 se liberan, pero el blindaje de roles sigue
+        vigente: una cuenta Tier 3 solo podra ejecutar "rt"/"like" en cascada.
         """
         if not activa:
             return None
@@ -2110,6 +2186,9 @@ class MotorActivacion:
             except Exception:
                 pass
             if fase == 1:
+                # Tier 2 y Tier 3 no son elegibles en fase 1 (ni textos ni
+                # navegador): el gate de `_bucle_rondas` los descarta antes de
+                # llamar a `generar_textos`.
                 return self._tier_de.get(str(usuario)) == "tier1"
             return True
 
@@ -2127,12 +2206,13 @@ class MotorActivacion:
     def _urls_efectivas_rol(self, rol, urls):
         """URLs objetivo de un rol: cascada de fase 1 si esta disponible.
 
-        En fase 2, para `rt`/`cita`/`comentario`, si hay URLs publicadas por
-        Tier 1 en fase 1 (`self._urls_fase1`) se usan como objetivo; si no, se
-        cae a las URLs de la campana. Nunca lanza.
+        En fase 2, para `rt`/`like`/`cita`/`comentario`, si hay URLs publicadas
+        por Tier 1 en fase 1 (`self._urls_fase1`) se usan como objetivo; si no,
+        se cae a las URLs de la campana. `like` se trata igual que `rt` (mismo
+        criterio de cascada). Nunca lanza.
         """
         try:
-            if rol not in ("rt", "cita", "comentario"):
+            if rol not in ("rt", "like", "cita", "comentario"):
                 return urls
             if not self._en_fase2():
                 return urls
@@ -2284,6 +2364,10 @@ class MotorActivacion:
                     rol_requerido = (
                         "" if roles_aleatorios else str(rol_de.get(usuario, "") or "")
                     )
+                    # Tier de la agotada: una Tier 3 SOLO se sustituye por
+                    # reservas Tier 2/Tier 3 (jamas por Tier 1 ni sin tier).
+                    tier_agotada = _tier_cuenta(cuenta)
+                    bloqueadas_tier = 0
                     sustituta = None
                     for i, reserva in enumerate(list(reservas)):
                         try:
@@ -2293,6 +2377,11 @@ class MotorActivacion:
                         except Exception:
                             permitida = roles_aleatorios
                         if not permitida:
+                            continue
+                        if not _tier_compatible_reserva(
+                            tier_agotada, _tier_cuenta(reserva)
+                        ):
+                            bloqueadas_tier += 1
                             continue
                         try:
                             reservas.remove(reserva)
@@ -2315,6 +2404,21 @@ class MotorActivacion:
                         resumen.get("agotadas_dia", 0) or 0
                     ) + 1
                     if sustituta is None:
+                        if bloqueadas_tier:
+                            # Habia reservas pero NINGUNA compatible por tier.
+                            try:
+                                resumen["sustituciones_bloqueadas_tier"] = int(
+                                    resumen.get(
+                                        "sustituciones_bloqueadas_tier", 0
+                                    ) or 0
+                                ) + 1
+                            except Exception:
+                                pass
+                            logger.warning(
+                                f"Activacion: @{usuario} agotada por hoy; no hay "
+                                f"reserva Tier 2/Tier 3 compatible (una Tier 1 "
+                                f"nunca sustituye a Tier 3)"
+                            )
                         logger.info(
                             f"Activacion: @{usuario} agotada por hoy; se retira "
                             f"sin sustituta (no hay reserva con rol compatible)"
@@ -2376,6 +2480,99 @@ class MotorActivacion:
                 resumen["tier2_sin_rol"] = int(
                     resumen.get("tier2_sin_rol", 0) or 0
                 ) + 1
+        except Exception:
+            pass
+
+    def _contar_tier3_sin_rol(self, usuario, resumen) -> None:
+        """Suma (una sola vez) una cuenta Tier 3 sin rol permitido. Nunca lanza.
+
+        Mismo patron que `_contar_tier2_sin_rol`, con las claves
+        `tier3_sin_rol` / `tier3_sin_rol_usuarios` (cuentas Tier 3 a las que el
+        sorteo no les pudo dar "rt"/"like": sin accion, jamas abren navegador).
+        """
+        try:
+            usuario = str(usuario or "").strip()
+            if not usuario:
+                return
+            with self._lock:
+                usuarios = resumen.setdefault("tier3_sin_rol_usuarios", [])
+                if not isinstance(usuarios, list):
+                    usuarios = []
+                    resumen["tier3_sin_rol_usuarios"] = usuarios
+                if usuario in usuarios:
+                    return
+                usuarios.append(usuario)
+                resumen["tier3_sin_rol"] = int(
+                    resumen.get("tier3_sin_rol", 0) or 0
+                ) + 1
+        except Exception:
+            pass
+
+    def _contar_tier3_omitida(self, usuario, resumen) -> None:
+        """Suma (una sola vez) una cuenta Tier 3 omitida de un grupo por su tier.
+
+        Claves `tier3_omitidas` / `tier3_omitidas_usuarios`: cuentas Tier 3
+        excluidas en MODO FIJO de los grupos hashtags/cita/comentario (roles
+        prohibidos), sin abrir navegador. Nunca lanza.
+        """
+        try:
+            usuario = str(usuario or "").strip()
+            if not usuario:
+                return
+            with self._lock:
+                usuarios = resumen.setdefault("tier3_omitidas_usuarios", [])
+                if not isinstance(usuarios, list):
+                    usuarios = []
+                    resumen["tier3_omitidas_usuarios"] = usuarios
+                if usuario in usuarios:
+                    return
+                usuarios.append(usuario)
+                resumen["tier3_omitidas"] = int(
+                    resumen.get("tier3_omitidas", 0) or 0
+                ) + 1
+        except Exception:
+            pass
+
+    def _contar_sin_rol_por_tier(self, usuario, resumen, cuenta=None) -> None:
+        """Enruta una cuenta sin rol permitido al contador de SU tier.
+
+        Tier 3 -> `tier3_sin_rol*`; Tier 2 -> `tier2_sin_rol*` (comportamiento
+        actual); Tier 1 o sin tier -> no cuenta nada (como antes de los tiers).
+        Usa `_es_tier3`/`_es_tier2` con la Cuenta si se pasa; si no, el tier
+        registrado en `_tier_de`. Nunca lanza.
+        """
+        try:
+            tier = ""
+            if cuenta is not None:
+                if _es_tier3(cuenta):
+                    tier = "tier3"
+                elif _es_tier2(cuenta):
+                    tier = "tier2"
+            if not tier:
+                tier = str(self._tier_de.get(str(usuario)) or "")
+            if tier == "tier3":
+                self._contar_tier3_sin_rol(usuario, resumen)
+            elif tier == "tier2":
+                self._contar_tier2_sin_rol(usuario, resumen)
+        except Exception:
+            pass
+
+    def _marcar_tier3_liberada(self, cuenta) -> None:
+        """Anota una cuenta Tier 3 con al menos una accion EXITOSA en fase 2.
+
+        Alimenta `tier3_liberadas` (cuentas Tier 3 DISTINTAS que la curva
+        libero al entrar la fase 2 y que lograron publicar; por el blindaje de
+        roles solo pueden ser RT/likes, en cascada sobre las URLs de Tier 1).
+        Fuera de la fase 2 (o sin curva) no cuenta. Nunca lanza.
+        """
+        try:
+            if not _es_tier3(cuenta) or not self._en_fase2():
+                return
+            usuario = str(getattr(cuenta, "usuario", "") or "")
+            if not usuario:
+                return
+            with self._lock:
+                self._tier3_liberadas_usr.add(usuario)
         except Exception:
             pass
 
@@ -2629,7 +2826,7 @@ class MotorActivacion:
             permitidos.discard("")
             if not permitidos:
                 return []
-            finales, filtradas = [], []
+            finales, filtradas, filtradas_tier3 = [], [], []
             for c in cuentas:
                 try:
                     # Alias ("post" -> hashtags, "respuesta"/"reply" ->
@@ -2639,10 +2836,13 @@ class MotorActivacion:
                     rol_c = ""
                 if rol_c not in permitidos:
                     continue
-                # Defensa extra: Tier 2 jamas entra en un filtro de hashtags
-                # (aunque su rol guardado lo diga).
+                # Defensa extra: el tier de la cuenta manda. Tier 2 jamas entra
+                # en un filtro de hashtags y Tier 3 solo en rt/like (aunque su
+                # rol guardado diga otra cosa).
                 if _tier_permitido(c, rol_c):
                     finales.append(c)
+                elif _es_tier3(c):
+                    filtradas_tier3.append(str(c.usuario))
                 else:
                     filtradas.append(str(c.usuario))
             cuentas = finales
@@ -2658,6 +2858,23 @@ class MotorActivacion:
                     f"Activacion: {len(filtradas)} cuenta(s) Tier 2 con rol "
                     f"prohibido ({'/'.join(filtradas[:5])}...) quedan fuera "
                     f"del filtro por rol (NO se desactivan en la BD)"
+                )
+            if filtradas_tier3:
+                try:
+                    actuales3 = list(
+                        getattr(self, "_tier3_filtradas_rol", []) or []
+                    )
+                    self._tier3_filtradas_rol = sorted(
+                        set(actuales3) | set(filtradas_tier3)
+                    )
+                except Exception:
+                    pass
+                logger.warning(
+                    f"Activacion: {len(filtradas_tier3)} cuenta(s) con rol "
+                    f"prohibido por su tier "
+                    f"({'/'.join(filtradas_tier3[:5])}...) quedan fuera del "
+                    f"filtro por rol (Tier 3 solo RT/likes; NO se desactivan "
+                    f"en la BD)"
                 )
 
         return cuentas
@@ -2961,7 +3178,15 @@ class MotorActivacion:
         tags = _normalizar_hashtags(hashtags)
         narrativa = _narrativa_con_ronda(narrativa, ronda)
 
-        citas = list(grupos_ejec.get("cita") or [])
+        # Blindaje por tier en la generacion (defensa extra para llamadas
+        # directas): Tier 2 jamas recibe texto de hashtags y Tier 3 jamas
+        # recibe texto de hashtags/cita/comentario (solo rt; los RT no llevan
+        # texto). Los grupos ya vienen filtrados del flujo normal.
+        citas = [
+            c
+            for c in (grupos_ejec.get("cita") or [])
+            if _tier_permitido(c, "cita")
+        ]
         if citas:
             # Cada grupo (registro, perfil) recibe SU propio pool de variaciones
             # para que el texto de la cita hable como la cuenta que lo publica.
@@ -3051,7 +3276,11 @@ class MotorActivacion:
                         textos_ia[cuenta.usuario], menciones_norm
                     )
 
-        cuentas_comentario = list(grupos_ejec.get("comentario") or [])
+        cuentas_comentario = [
+            c
+            for c in (grupos_ejec.get("comentario") or [])
+            if _tier_permitido(c, "comentario")
+        ]
         if cuentas_comentario:
             # Material general de la campana (contexto manual o texto base).
             material_general = (
@@ -4283,6 +4512,10 @@ class MotorActivacion:
                 # las rondas siguientes de la campana (conteo unico, sin abrir
                 # Chrome).
                 self._registrar_sesion_caida(resultado[0], resultado[3])
+            else:
+                # Curva: Tier 3 liberado en fase 2 con accion exitosa (solo
+                # rt/like por el blindaje de roles).
+                self._marcar_tier3_liberada(cuenta)
             return resultado
         finally:
             if reservado and cuotas is not None:
@@ -4389,6 +4622,10 @@ class MotorActivacion:
           de cuentas por ronda (estricto: mas del minimo, menos que todas).
         - reserva_usuarios: cuentas de RESPALDO (str o Cuentas) que sustituyen
           1:1 a las "Agotadas por hoy" (tope diario).
+        - TIER: las cuentas Tier 3 (Métricas/Soporte) NO entran a Cita masiva
+          (el rol "cita" esta prohibido para su tier: solo RT/likes); se omite
+          tambien cualquier reserva Tier 3. Se cuentan en `tier3_omitidas*` y
+          jamas se desactivan en la BD.
         - curva_aceleracion/curva_fase1_min: "modo explosion": fase 1 solo
           Tier 1; fase 2 (Tier 2 y sin tier) tras `curva_fase1_min` minutos.
         - cancelar: `threading.Event` con `is_set()` para el PARO TOTAL.
@@ -4451,6 +4688,23 @@ class MotorActivacion:
             })
 
         con_sesion, sin_sesion = _partir_por_sesion(cuentas)
+        # TIER: Cita masiva hace quote-RT (rol "cita") para TODAS las cuentas
+        # de `con_sesion`: las Tier 3 (Métricas/Soporte) NO pueden citar (solo
+        # RT/likes), asi que se omiten ANTES de abrir navegador y se cuentan en
+        # `tier3_omitidas*` (nunca se desactivan en la BD).
+        tier3_resumen: dict = {"tier3_omitidas": 0, "tier3_omitidas_usuarios": []}
+        permitidas_cita = []
+        for cuenta in con_sesion:
+            if _tier_permitido(cuenta, "cita"):
+                permitidas_cita.append(cuenta)
+            else:
+                self._contar_tier3_omitida(cuenta.usuario, tier3_resumen)
+                logger.warning(
+                    f"Activacion: @{cuenta.usuario} Tier 3 con rol cita "
+                    f"PROHIBIDO: se omite sin abrir navegador (solo "
+                    f"RT/likes). {_error_tier(cuenta, 'cita')}"
+                )
+        con_sesion = permitidas_cita
         sin_sesion_usuarios = [c.usuario for c in sin_sesion]
         sugerencia_sesion = _sugerencia_sesion(len(sin_sesion)) if sin_sesion else ""
 
@@ -4496,6 +4750,12 @@ class MotorActivacion:
                 "sin_registro_usuarios": sin_registro_usuarios,
                 "sugerencia_registro": sugerencia_registro,
                 "rondas": 0 if repetir else 1,
+                "tier3_omitidas": int(
+                    tier3_resumen.get("tier3_omitidas", 0) or 0
+                ),
+                "tier3_omitidas_usuarios": list(
+                    tier3_resumen.get("tier3_omitidas_usuarios") or []
+                ),
             }
             logger.info(
                 f"Activacion finalizada: {resumen_vacio['exitosas']} exitosas, "
@@ -4510,6 +4770,21 @@ class MotorActivacion:
             reserva_usuarios, con_sesion, secciones=secciones,
             solo_con_registro=solo_con_registro,
         )
+        # Una reserva Tier 3 JAMAS entra a Cita masiva (rol "cita" prohibido:
+        # solo RT/likes): se filtra antes de registrar tiers/cuotas/curva.
+        reservas_cita, reservas_tier3 = [], []
+        for reserva in reservas:
+            if _tier_permitido(reserva, "cita"):
+                reservas_cita.append(reserva)
+            else:
+                reservas_tier3.append(str(getattr(reserva, "usuario", "") or ""))
+        reservas = reservas_cita
+        if reservas_tier3:
+            logger.warning(
+                f"Activacion: {len(reservas_tier3)} reserva(s) Tier 3 con rol "
+                f"cita PROHIBIDO: quedan fuera de Cita masiva (solo "
+                f"RT/likes; NO se desactivan en la BD)"
+            )
         self._registrar_tiers(list(con_sesion) + list(reservas))
         self._preparar_cuotas(
             [c.usuario for c in con_sesion] + [c.usuario for c in reservas]
@@ -4519,6 +4794,10 @@ class MotorActivacion:
             "reserva_usada": 0,
             "agotadas_dia": 0,
             "rotadas_por_cuota_dia": 0,
+            "tier3_omitidas": int(tier3_resumen.get("tier3_omitidas", 0) or 0),
+            "tier3_omitidas_usuarios": list(
+                tier3_resumen.get("tier3_omitidas_usuarios") or []
+            ),
         }
         curva_activa, fase1_min = self._configurar_curva(
             con_sesion, curva_aceleracion, curva_fase1_min, duracion_min,
@@ -4977,12 +5256,20 @@ class MotorActivacion:
           frena citas/RTs/hashtags ni comentarios a otras URLs).
         - TIER: las cuentas Tier 2 NO pueden publicar hashtags/posts (modo fijo
           se excluyen y se cuentan en `tier2_hashtags_omitidas`; en modo
-          aleatorio nunca les toca ese rol). Jamas se desactivan en la BD.
+          aleatorio nunca les toca ese rol). Las cuentas Tier 3 SOLO pueden
+          RT/likes: en modo fijo se excluyen de hashtags/cita/comentario y se
+          cuentan en `tier3_omitidas*`; en modo aleatorio solo les puede tocar
+          "rt". Si su tier no deja ningun rol posible se cuentan en
+          `tier3_sin_rol*` (Tier 2: `tier2_sin_rol*`). Jamas se desactivan en
+          la BD.
         - `reserva_usuarios`: cuentas de RESPALDO (usuarios o Cuentas) que
           sustituyen 1:1 a las "Agotadas por hoy" (Tier 2 jamas sustituye un
-          rol hashtags).
+          rol hashtags; una Tier 3 agotada solo se sustituye por reservas
+          Tier 2/Tier 3).
         - `curva_aceleracion`/`curva_fase1_min`: "modo explosion": fase 1 solo
-          Tier 1; fase 2 (Tier 2 y sin tier) tras `curva_fase1_min` minutos.
+          Tier 1 (Tier 2 y Tier 3 completamente ignorados); fase 2 los libera
+          tras `curva_fase1_min` minutos (Tier 3 solo RT/likes en cascada;
+          `tier3_liberadas` cuenta los Tier 3 con accion exitosa en fase 2).
         - Cohortes temporales + delay aleatorio y concurrencia limitada,
           igual que `ejecutar()`.
         - `cancelar`: `threading.Event` con `is_set()` para el PARO TOTAL.
@@ -5099,6 +5386,9 @@ class MotorActivacion:
         grupos = {"cita": [], "hashtags": [], "comentario": [], "rt": []}
         sin_rol_usuarios = []
         tier2_hashtags_usuarios: list = []
+        # Contadores de omisiones Tier 3 del modo fijo (se vuelcan al resumen):
+        # se acumulan con `_contar_tier3_omitida` (dedupe + lock).
+        tier3_resumen: dict = {"tier3_omitidas": 0, "tier3_omitidas_usuarios": []}
         if roles_aleatorios:
             # El rol guardado no filtra: cada cuenta recibe un rol sorteado en
             # cada ronda (los roles posibles ya se validaron arriba).
@@ -5115,31 +5405,51 @@ class MotorActivacion:
                 else:
                     sin_rol_usuarios.append(cuenta.usuario)
 
-            # TIER: las cuentas Tier 2 con rol efectivo "hashtags" (incluye
-            # "post"/"mantenimiento"/"hilo", que normalizan a hashtags) se
-            # EXCLUYEN antes de abrir navegador. NO se desactivan en la BD:
-            # solo se omiten de la campaña y se reportan en `tier2_hashtags_*`.
-            permitidas_tier = []
-            for cuenta in grupos["hashtags"]:
-                if _tier_permitido(cuenta, "hashtags"):
-                    permitidas_tier.append(cuenta)
-                else:
-                    usuario_omitido = str(cuenta.usuario)
-                    tier2_hashtags_usuarios.append(usuario_omitido)
-                    logger.warning(
-                        f"Activacion por roles: @{usuario_omitido} es Tier 2 y "
-                        f"el rol 'hashtags' esta PROHIBIDO para su tier; se "
-                        f"omite sin abrir navegador (NO se desactiva en la "
-                        f"BD). {_error_tier(cuenta, 'hashtags')}"
-                    )
-            grupos["hashtags"] = permitidas_tier
+            # TIER: toda cuenta cuyo tier PROHIBE el rol de su grupo se EXCLUYE
+            # antes de abrir navegador. Tier 2: solo "hashtags" (incluye
+            # "post"/"mantenimiento"/"hilo", que normalizan a hashtags). Tier 3
+            # (Métricas/Soporte): "hashtags", "cita" y "comentario" (solo puede
+            # RT/likes). "rt" nunca se prohibe. NO se desactivan en la BD:
+            # solo se omiten de la campaña y se reportan (`tier2_hashtags_*`
+            # para Tier 2; `tier3_omitidas*` para Tier 3).
+            for rol_grupo in ("hashtags", "cita", "comentario"):
+                permitidas_tier = []
+                for cuenta in grupos[rol_grupo]:
+                    if _tier_permitido(cuenta, rol_grupo):
+                        permitidas_tier.append(cuenta)
+                    elif _es_tier3(cuenta):
+                        usuario_omitido = str(cuenta.usuario)
+                        self._contar_tier3_omitida(usuario_omitido, tier3_resumen)
+                        logger.warning(
+                            f"Activacion por roles: @{usuario_omitido} es Tier 3 "
+                            f"y el rol '{rol_grupo}' esta PROHIBIDO para su "
+                            f"tier; se omite sin abrir navegador (NO se "
+                            f"desactiva en la BD). "
+                            f"{_error_tier(cuenta, rol_grupo)}"
+                        )
+                    elif _es_tier2(cuenta):
+                        usuario_omitido = str(cuenta.usuario)
+                        tier2_hashtags_usuarios.append(usuario_omitido)
+                        logger.warning(
+                            f"Activacion por roles: @{usuario_omitido} es Tier 2 "
+                            f"y el rol '{rol_grupo}' esta PROHIBIDO para su "
+                            f"tier; se omite sin abrir navegador (NO se "
+                            f"desactiva en la BD). "
+                            f"{_error_tier(cuenta, rol_grupo)}"
+                        )
+                grupos[rol_grupo] = permitidas_tier
             # Defensa extra: cuentas que `_obtener_cuentas_por_rol` ya filtro
-            # por el mismo motivo (solo_roles=["hashtags"]).
+            # por el mismo motivo (solo_roles=["hashtags"] para Tier 2 o
+            # ["hashtags"/"cita"/"comentario"] para Tier 3).
             for usuario_filtrado in list(
                 getattr(self, "_tier2_filtradas_rol", []) or []
             ):
                 if usuario_filtrado not in tier2_hashtags_usuarios:
                     tier2_hashtags_usuarios.append(usuario_filtrado)
+            for usuario_filtrado in list(
+                getattr(self, "_tier3_filtradas_rol", []) or []
+            ):
+                self._contar_tier3_omitida(usuario_filtrado, tier3_resumen)
 
             procesables = (
                 grupos["cita"] + grupos["hashtags"]
@@ -5194,6 +5504,12 @@ class MotorActivacion:
             "tier2_hashtags_usuarios": list(tier2_hashtags_usuarios),
             "tier2_sin_rol": 0,
             "tier2_sin_rol_usuarios": [],
+            "tier3_omitidas": int(tier3_resumen.get("tier3_omitidas", 0) or 0),
+            "tier3_omitidas_usuarios": list(
+                tier3_resumen.get("tier3_omitidas_usuarios") or []
+            ),
+            "tier3_sin_rol": 0,
+            "tier3_sin_rol_usuarios": [],
         }
         for cuenta in sin_sesion:
             rol = rol_de.get(cuenta.usuario, "")
@@ -5329,16 +5645,18 @@ class MotorActivacion:
                     for candidata in base:
                         if roles_ronda.get(candidata.usuario, ""):
                             continue
-                        if not _es_tier2(candidata):
-                            continue
                         if any(
                             _tier_permitido(candidata, r)
                             for r in roles_sortear
                         ):
                             continue
-                        self._contar_tier2_sin_rol(
-                            candidata.usuario, resumen
-                        )
+                        # Sin rol permitido por su TIER: Tier 3 -> tier3_sin_rol;
+                        # Tier 2 -> tier2_sin_rol; sin tier -> no se cuenta
+                        # (comportamiento previo).
+                        if _es_tier3(candidata) or _es_tier2(candidata):
+                            self._contar_sin_rol_por_tier(
+                                candidata.usuario, resumen, cuenta=candidata
+                            )
                     grupos_ronda = self._grupos_desde_roles(
                         base, roles_ronda
                     )
@@ -5403,15 +5721,21 @@ class MotorActivacion:
                 rol_efectivo = rol or rol_por_usuario.get(cuenta.usuario, "")
                 if not rol_efectivo:
                     # Sin rol efectivo: la cuenta no tiene cupo (modo aleatorio
-                    # con cuotas) o es Tier 2 sin ningun rol permitido. JAMAS
-                    # abre navegador; sin este guard caeria al flujo hashtags.
-                    sin_rol_tier = _es_tier2(cuenta) and not any(
+                    # con cuotas) o su tier no le permite NINGUN rol sorteado
+                    # (Tier 2: hashtags; Tier 3: todo menos rt). JAMAS abre
+                    # navegador; sin este guard caeria al flujo hashtags.
+                    sin_rol_tier2 = _es_tier2(cuenta) and not any(
                         _tier_permitido(cuenta, r) for r in roles_sortear
                     )
-                    detalle = (
-                        MENSAJE_TIER2_SIN_ROL if sin_rol_tier
-                        else MENSAJE_CUOTA_AGOTADA
+                    sin_rol_tier3 = _es_tier3(cuenta) and not any(
+                        _tier_permitido(cuenta, r) for r in roles_sortear
                     )
+                    if sin_rol_tier3:
+                        detalle = MENSAJE_TIER3_SIN_ROL
+                    elif sin_rol_tier2:
+                        detalle = MENSAJE_TIER2_SIN_ROL
+                    else:
+                        detalle = MENSAJE_CUOTA_AGOTADA
                     return (cuenta.usuario, rol_efectivo, None, detalle, "")
                 try:
                     return self._ejecutar_accion_rol(
@@ -5438,6 +5762,8 @@ class MotorActivacion:
                         )
                     if str(detalle) == MENSAJE_TIER2_SIN_ROL:
                         self._contar_tier2_sin_rol(usuario_res, resumen)
+                    elif str(detalle) == MENSAJE_TIER3_SIN_ROL:
+                        self._contar_tier3_sin_rol(usuario_res, resumen)
                     elif str(detalle) == MENSAJE_CANCELADO:
                         with self._lock:
                             resumen["omitidas_por_cancelacion"] = (
@@ -5543,13 +5869,14 @@ class MotorActivacion:
                 for candidata in cuentas_pasada:
                     if roles_pasada.get(candidata.usuario, ""):
                         continue
-                    if not _es_tier2(candidata):
-                        continue
                     if any(
                         _tier_permitido(candidata, r) for r in roles_sortear
                     ):
                         continue
-                    self._contar_tier2_sin_rol(candidata.usuario, resumen)
+                    if _es_tier3(candidata) or _es_tier2(candidata):
+                        self._contar_sin_rol_por_tier(
+                            candidata.usuario, resumen, cuenta=candidata
+                        )
                 grupos_pasada = self._grupos_desde_roles(
                     cuentas_pasada, roles_pasada
                 )
@@ -5595,17 +5922,19 @@ class MotorActivacion:
                         rol = roles_pasada.get(cuenta.usuario, "")
                         if not rol:
                             # Sin rol efectivo: cuota agotada (modo aleatorio)
-                            # o Tier 2 sin ningun rol permitido. No abre nada.
+                            # o cuenta sin ningun rol permitido por su tier
+                            # (Tier 2: hashtags; Tier 3: todo menos rt). No
+                            # abre nada.
                             with self._lock:
                                 self.progreso["omitidas"] = (
                                     self.progreso.get("omitidas", 0) + 1
                                 )
-                            if _es_tier2(cuenta) and not any(
+                            if not any(
                                 _tier_permitido(cuenta, r)
                                 for r in roles_sortear
-                            ):
-                                self._contar_tier2_sin_rol(
-                                    cuenta.usuario, resumen
+                            ) and (_es_tier2(cuenta) or _es_tier3(cuenta)):
+                                self._contar_sin_rol_por_tier(
+                                    cuenta.usuario, resumen, cuenta=cuenta
                                 )
                             else:
                                 omitidas_por_cuota += 1
@@ -5653,6 +5982,8 @@ class MotorActivacion:
                             )
                         if str(detalle) == MENSAJE_TIER2_SIN_ROL:
                             self._contar_tier2_sin_rol(usuario_res, resumen)
+                        elif str(detalle) == MENSAJE_TIER3_SIN_ROL:
+                            self._contar_tier3_sin_rol(usuario_res, resumen)
                         elif str(detalle) == MENSAJE_CANCELADO:
                             omitidas_por_cancelacion += 1
                         else:

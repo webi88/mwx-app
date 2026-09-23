@@ -2,9 +2,10 @@
 """Tests de la CURVA DE ACELERACION ("modo explosion de tendencia") del motor.
 
 Regla: fase 1 = SOLO cuentas Tier 1; tras `curva_fase1_min` minutos se libera
-la fase 2 (Tier 2 y sin tier). La ronda no avanza ni genera textos mientras el
-gate no deje elegibles. En fase 2 los roles rt/cita/comentario apuntan a las
-URLs publicadas por Tier 1 (cascada).
+la fase 2 (Tier 2, Tier 3 y sin tier). La ronda no avanza ni genera textos
+mientras el gate no deje elegibles. En fase 2 los roles rt/like/cita/comentario
+apuntan a las URLs publicadas por Tier 1 (cascada); las cuentas Tier 3 solo
+pueden RT/likes y se cuentan en `tier3_liberadas`.
 
 Sin red, sin Chrome y SIN tocar la base real (fakes + reloj falso + parches,
 mismo patron que las suites del motor).
@@ -17,11 +18,14 @@ Cubre:
     (3) `_bucle_rondas(elegibilidad=...)`: el gate se evalua cada ronda, las
         cuentas no elegibles no cuentan como fallo y sin elegibles no avanza.
     (4) Cascada: `_capturar_url_fase1` (cap 50, perfil/RT fuera) y
-        `_urls_efectivas_rol` solo en fase 2 para rt/cita/comentario; el
+        `_urls_efectivas_rol` solo en fase 2 para rt/like/cita/comentario; el
         contador `cascada_urls` del resumen.
     (5) E2E `repetir=False` con curva: DOS etapas secuenciales (Tier 1 y luego
         el resto) en `ejecutar_por_roles` y en `ejecutar` (cita masiva); sin
         curva todo ejecuta en una pasada (comportamiento previo).
+    (6) Tier 3 en la curva: fase 1 lo ignora por completo (ni textos ni
+        navegador); fase 2 lo libera para rt en cascada y lo cuenta en
+        `tier3_liberadas` (Tier 2 sigue igual).
 
 Uso:
     .venv/Scripts/python.exe tests/run_tests.py
@@ -371,8 +375,9 @@ def test_cascada(check):
 
     motor._curva_fase2_t0 = 0.0  # fase 2 (pasado)
     check(
-        "fase 2: rt/cita/comentario usan las URLs de Tier 1",
+        "fase 2: rt/like/cita/comentario usan las URLs de Tier 1",
         motor._urls_efectivas_rol("rt", url_campana) == motor._urls_fase1
+        and motor._urls_efectivas_rol("like", url_campana) == motor._urls_fase1
         and motor._urls_efectivas_rol("cita", url_campana) == motor._urls_fase1
         and motor._urls_efectivas_rol("comentario", url_campana)
         == motor._urls_fase1,
@@ -681,6 +686,155 @@ def test_e2e_rondas_curva(check):
 
 
 # --------------------------------------------------------------------------- #
+# (6) Tier 3 en la curva: fase 1 lo ignora; fase 2 lo libera (rt en cascada)
+# --------------------------------------------------------------------------- #
+def test_fase1_ignora_tier3(check):
+    print("(6) curva fase 1: Tier 3 completamente ignorado (rt incluido)")
+    motor = MotorActivacion(max_concurrente=1)
+    motor._tier_de = {"t1_ig": "tier1", "t2_ig": "tier2", "t3_ig": "tier3"}
+    motor._curva_activa = True
+    original_time = motor_mod.time
+    motor_mod.time = _RelojFalso(paso=0.5)
+    try:
+        motor._curva_fase2_t0 = motor_mod.time.monotonic() + 3600.0
+        elegible = motor._elegibilidad_curva(True)
+        check(
+            "fase 1: Tier 3 con rol rt NO es elegible",
+            elegible("t3_ig") is False,
+        )
+        check(
+            "fase 1: Tier 2 tampoco es elegible",
+            elegible("t2_ig") is False,
+        )
+        check("fase 1: Tier 1 si es elegible", elegible("t1_ig") is True)
+        check(
+            "la fase queda en 1",
+            motor.snapshot_progreso().get("fase_actual") == 1,
+            f"({motor.snapshot_progreso().get('fase_actual')})",
+        )
+
+        motor._n_workers = lambda: 2
+        generadas: list = []
+        ejecutadas: list = []
+        rondas = motor._bucle_rondas(
+            [_CuentaFake("t3_ig", rol_activacion="rt", tier_calidad="tier3")],
+            1,
+            lambda ronda, usuarios=None: generadas.append(ronda) or {},
+            lambda c, t, r="": ejecutadas.append(c.usuario),
+            lambda resultado, ronda: None,
+            elegibilidad=elegible,
+        )
+    finally:
+        motor_mod.time = original_time
+    check(
+        "fase 1: 0 rondas con solo Tier 3",
+        rondas == 0,
+        f"({rondas})",
+    )
+    check(
+        "fase 1: 0 textos generados para Tier 3",
+        generadas == [],
+        f"({generadas})",
+    )
+    check(
+        "fase 1: 0 ejecuciones de Tier 3",
+        ejecutadas == [],
+        f"({ejecutadas})",
+    )
+
+
+def test_e2e_fase2_tier3_rt_cascada(check):
+    print("(6b) curva fase 2: Tier 3 ejecuta rt en cascada y cuenta en tier3_liberadas")
+    cuentas = [
+        _CuentaFake("t1_cas", rol_activacion="hashtags", tier_calidad="tier1"),
+        _CuentaFake("t2_cas", rol_activacion="cita", tier_calidad="tier2"),
+        _CuentaFake("t3_cas", rol_activacion="rt", tier_calidad="tier3"),
+    ]
+    motor = MotorActivacion(max_concurrente=1)
+    motor._n_workers = lambda: 2
+    motor._obtener_cuentas_por_rol = lambda *a, **k: list(cuentas)
+    motor._obtener_anclas = lambda urls: {}
+    motor._generar_textos_por_rol = (
+        lambda grupos, *a, **k: {
+            c.usuario: "texto #x"
+            for lista in grupos.values() for c in lista
+        }
+    )
+    motor._distribuir_cohortes = lambda cs, duracion, cohortes: [list(cs)]
+    # Sin esperas reales de cohorte/anti-spam (los retardos se conservan).
+    motor._dormir_cancelable = lambda *a, **k: True
+    orden: list = []
+    capturado: dict = {}
+    urls_publicadas = {
+        "t1_cas": "https://x.com/t1_cas/status/1",
+        "t2_cas": "https://x.com/t2_cas/status/2",
+        "t3_cas": "",
+    }
+
+    def _intentar(cuenta, rol, urls, texto, dar_like):
+        orden.append(cuenta.usuario)
+        capturado[cuenta.usuario] = list(urls)
+        return (
+            cuenta.usuario, rol, True, "ok",
+            urls_publicadas.get(cuenta.usuario, ""),
+        )
+
+    motor._intentar_accion_rol = _intentar
+    registros: list = []
+    with _parches(*_patches_e2e(registros)):
+        resumen = motor.ejecutar_por_roles(
+            urls=["https://x.com/ancla"],
+            texto_base="texto",
+            hashtags="#x",
+            usuarios=[c.usuario for c in cuentas],
+            duracion_min=3,
+            cohortes=1,
+            repetir=False,
+            curva_aceleracion=True,
+            curva_fase1_min=1,
+        )
+    check(
+        "etapa 1 primero: solo Tier 1 ejecuto antes que el resto",
+        orden and orden[0] == "t1_cas"
+        and sorted(orden) == ["t1_cas", "t2_cas", "t3_cas"],
+        f"({orden})",
+    )
+    check(
+        "Tier 1 de fase 1 uso las URLs de la campana (sin cascada todavia)",
+        capturado.get("t1_cas") == ["https://x.com/ancla"],
+        f"({capturado.get('t1_cas')})",
+    )
+    check(
+        "Tier 3 de fase 2 ejecuta rt apuntando a las URLs de Tier 1 (cascada)",
+        capturado.get("t3_cas") == ["https://x.com/t1_cas/status/1"],
+        f"({capturado.get('t3_cas')})",
+    )
+    check(
+        "Tier 2 de fase 2 tambien usa la cascada (sigue igual)",
+        capturado.get("t2_cas") == ["https://x.com/t1_cas/status/1"],
+        f"({capturado.get('t2_cas')})",
+    )
+    check(
+        "tier3_liberadas = 1 (solo el Tier 3 con exito en fase 2)",
+        resumen.get("tier3_liberadas") == 1,
+        f"({resumen.get('tier3_liberadas')})",
+    )
+    check(
+        "resumen: 3 exitosas, fase final 2 y sin omitidas Tier 3",
+        resumen.get("exitosas") == 3
+        and resumen.get("fase_actual") == 2
+        and resumen.get("tier3_omitidas") == 0,
+        f"(exitosas={resumen.get('exitosas')}, "
+        f"fase={resumen.get('fase_actual')}, "
+        f"tier3_omitidas={resumen.get('tier3_omitidas')})",
+    )
+    check(
+        "el motor quedo en fase 2 (cascada habilitada)",
+        motor._en_fase2() is True,
+    )
+
+
+# --------------------------------------------------------------------------- #
 # Runner
 # --------------------------------------------------------------------------- #
 def run(check):
@@ -694,6 +848,8 @@ def run(check):
     test_e2e_cita_masiva(check)
     test_e2e_sin_tier1(check)
     test_e2e_rondas_curva(check)
+    test_fase1_ignora_tier3(check)
+    test_e2e_fase2_tier3_rt_cascada(check)
 
 
 if __name__ == "__main__":

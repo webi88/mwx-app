@@ -62,5 +62,9 @@ def render(usuario: dict):
                     todos_ok = False
             return todos_ok
         
-        resultados = ejecutar_en_cuentas(cuentas_sel, accion, plataforma, progreso, estado)
+        # `reportar` no es un rol de publicacion: no cae en el blindaje por
+        # Tier (Tier 2/3 pueden reportar; el tipo se etiqueta correctamente).
+        resultados = ejecutar_en_cuentas(
+            cuentas_sel, accion, plataforma, progreso, estado, tipo="reportar"
+        )
         mostrar_resultados(resultados)

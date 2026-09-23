@@ -148,7 +148,7 @@ def _rt_cita():
             )
             return resultados.get("exitos", 0) > 0
         
-        resultados = ejecutar_en_cuentas(cuentas, accion, "twitter", progreso, estado, tipo="activacion")
+        resultados = ejecutar_en_cuentas(cuentas, accion, "twitter", progreso, estado, tipo="cita")
         mostrar_resultados(resultados)
 
 

@@ -15,6 +15,9 @@ Cubre el contrato completo del calentamiento continuo:
       duplicar pendientes de la misma cuenta (con DB fake).
   (f) `ejecutar_tanda_si_toca()`: apagado, pausado por campana, primera espera,
       tanda completa con fakes, intervalo dentro de rango y tolerancia a fallos.
+  (g) TIER 3 (Métricas/Soporte): fuera del calentamiento (`_es_elegible` /
+      `elegir_cuenta`) y bloqueado en `EjecutorTareas._ejecutar_accion` para
+      post/hashtags, cita y comentario SIN abrir Chrome (RT/like si pasan).
 
 Uso:
     .venv/Scripts/python.exe tests/run_tests.py
@@ -1556,6 +1559,172 @@ def test_manager_reintentos(check):
     )
 
 
+# --------------------------------------------------------------------------- #
+# (j) Tier 3: NO elegible para calentamiento y bloqueado en el ejecutor
+# --------------------------------------------------------------------------- #
+def test_tier3_elegibilidad(check):
+    print("(j) Tier 3 fuera del calentamiento; Tier 1/2/sin tier si")
+    with _env():
+        recientes, excluidos = set(), set()
+        t1 = _cuenta(201, "t1_cal", tier_calidad="tier1")
+        t2 = _cuenta(202, "t2_cal", tier_calidad="tier2")
+        t3 = _cuenta(203, "t3_cal", tier_calidad="tier3")
+        sin_tier = _cuenta(204, "sin_tier_cal")
+        check(
+            "_es_elegible: Tier 1 elegible",
+            calentamiento._es_elegible(t1, recientes, excluidos) is True,
+        )
+        check(
+            "_es_elegible: Tier 2 elegible (no se excluye)",
+            calentamiento._es_elegible(t2, recientes, excluidos) is True,
+        )
+        check(
+            "_es_elegible: Tier 3 NO elegible",
+            calentamiento._es_elegible(t3, recientes, excluidos) is False,
+        )
+        check(
+            "_es_elegible: sin tier elegible",
+            calentamiento._es_elegible(sin_tier, recientes, excluidos) is True,
+        )
+        t3_label = _cuenta(
+            205, "t3_label", tier_calidad="Tier 3 (Métricas / Soporte)"
+        )
+        check(
+            "_es_elegible: etiqueta legible de Tier 3 tambien queda fuera",
+            calentamiento._es_elegible(t3_label, recientes, excluidos) is False,
+        )
+
+        # `elegir_cuenta`: con SOLO un Tier 3 no hay candidata.
+        check(
+            "elegir_cuenta: solo Tier 3 -> None",
+            calentamiento.elegir_cuenta(_FakeDB(cuentas=[t3])) is None,
+        )
+        # Mezcla: elige Tier 1/2/sin tier, jamas un Tier 3.
+        db = _FakeDB(cuentas=[t3, t1, t2, sin_tier])
+        elegidas = set()
+        for semilla in range(20):
+            random.seed(semilla)
+            elegida = calentamiento.elegir_cuenta(db)
+            if elegida is not None:
+                elegidas.add(elegida.usuario)
+        check(
+            "elegir_cuenta: nunca elige un Tier 3 (y si a los demas)",
+            elegidas and "t3_cal" not in elegidas,
+            repr(sorted(elegidas)),
+        )
+
+
+def test_ejecutor_tier3(check):
+    print("(j2) EjecutorTareas: Tier 3 bloqueado en post/cita/comentario")
+    ejecutor = ejecutor_mod.EjecutorTareas()
+    t3 = _cuenta(90, "u_t3", tier_calidad="tier3")
+    t1 = _cuenta(91, "u_t1", tier_calidad="tier1")
+    t2 = _cuenta(92, "u_t2", tier_calidad="tier2")
+    sin_tier = _cuenta(93, "u_sin")
+
+    # Guard puro: Tier 3 prohibido en hashtags/post/cita/comentario.
+    prohibidos = (
+        "post", "publicacion", "mantenimiento", "calentamiento", "hilo",
+        "hashtags", "comentario", "cita",
+    )
+    for tipo in prohibidos:
+        check(
+            f"guard Tier 3 + {tipo}: bloqueado",
+            ejecutor_mod.EjecutorTareas._bloqueada_por_tier(
+                _tarea(tipo=tipo), t3
+            ) is True,
+            repr(tipo),
+        )
+    for tipo in ("retweet", "like", "visualizacion"):
+        check(
+            f"guard Tier 3 + {tipo}: NO bloqueado",
+            ejecutor_mod.EjecutorTareas._bloqueada_por_tier(
+                _tarea(tipo=tipo), t3
+            ) is False,
+            repr(tipo),
+        )
+    for cuenta_ok in (t1, t2, sin_tier):
+        check(
+            f"guard {cuenta_ok.usuario} + post: NO bloqueado",
+            ejecutor_mod.EjecutorTareas._bloqueada_por_tier(
+                _tarea(tipo="post"), cuenta_ok
+            ) is False,
+        )
+    t3_label = _cuenta(94, "u_t3_label", tier_calidad="Tier 3 (Métricas / Soporte)")
+    check(
+        "guard: la etiqueta legible de Tier 3 tambien bloquea",
+        ejecutor_mod.EjecutorTareas._bloqueada_por_tier(
+            _tarea(tipo="post"), t3_label
+        ) is True,
+    )
+
+    # _ejecutar_accion: NO instancia bot/Chrome y registra UN fallo.
+    with mock.patch(
+        "plataformas.base.PlataformaFactory.crear_bot",
+        side_effect=AssertionError("no debe crear bot para Tier 3"),
+    ) as crear, mock.patch.object(ejecutor_mod, "registrar_accion") as registrar:
+        ok, motivo = ejecutor._ejecutar_accion(_tarea(tipo="post"), t3)
+    check(
+        "ejecutar Tier 3 + post: (False, motivo PROHIBIDA) sin crear bot",
+        ok is False
+        and crear.call_count == 0
+        and motivo
+        == (
+            "tier 3 (Métricas/Soporte): la accion 'post' esta PROHIBIDA "
+            "(solo RT/likes); no se ejecuto"
+        ),
+        f"ok={ok!r} motivo={motivo!r} crear={crear.call_count}",
+    )
+    check(
+        "ejecutar Tier 3: el motivo NO es reintentable",
+        ejecutor_mod._es_error_reintentable(motivo) is False,
+        repr(motivo),
+    )
+    check(
+        "ejecutar Tier 3: registra UN fallido con el motivo",
+        registrar.call_count == 1
+        and registrar.call_args.args[0] == "u_t3"
+        and registrar.call_args.args[2] == "fallido"
+        and "PROHIBIDA" in registrar.call_args.args[4],
+        repr(registrar.call_args),
+    )
+
+    # Varios tipos prohibidos: un registro por cada uno, siempre sin bot.
+    with mock.patch(
+        "plataformas.base.PlataformaFactory.crear_bot",
+        side_effect=AssertionError("no debe crear bot para Tier 3"),
+    ) as crear2, mock.patch.object(ejecutor_mod, "registrar_accion") as registrar2:
+        for tipo in ("comentario", "cita", "mantenimiento"):
+            ejecutor._ejecutar_accion(_tarea(tipo=tipo), t3)
+    check(
+        "ejecutar Tier 3: comentario/cita/mantenimiento tambien bloqueados",
+        crear2.call_count == 0 and registrar2.call_count == 3,
+        f"(crear={crear2.call_count}, registros={registrar2.call_count})",
+    )
+
+    # retweet en Tier 3: NO se bloquea y ejecuta con el bot fake.
+    class _BotRT(_FakeBot):
+        def solo_retwittear(self, urls, usuario, **kwargs):
+            return {"exitos": 1, "urls": ["https://x.com/a/status/1"]}
+
+    bot_rt = _BotRT(ok=True)
+    with mock.patch(
+        "plataformas.base.PlataformaFactory.crear_bot", return_value=bot_rt
+    ), mock.patch.object(ejecutor_mod, "registrar_accion"), _sin_sleep():
+        ok_rt, motivo_rt = ejecutor._ejecutar_accion(
+            _tarea(
+                tipo="retweet",
+                contenido=json.dumps(["https://x.com/a/status/1"]),
+            ),
+            t3,
+        )
+    check(
+        "ejecutar Tier 3 + retweet: SI ejecuta (no se bloquea)",
+        ok_rt is True and motivo_rt == "" and bot_rt.cerrados == 1,
+        f"ok={ok_rt!r} motivo={motivo_rt!r} cerrados={bot_rt.cerrados}",
+    )
+
+
 def run(check):
     """Ejecuta los checks con el `check` del runner (o del marco local)."""
     test_config(check)
@@ -1570,6 +1739,8 @@ def run(check):
     test_reintentables(check)
     test_ejecutor(check)
     test_manager_reintentos(check)
+    test_tier3_elegibilidad(check)
+    test_ejecutor_tier3(check)
 
 
 if __name__ == "__main__":

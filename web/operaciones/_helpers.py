@@ -173,6 +173,61 @@ def generar_pool_por_cuenta_seguro(
     return pool[:n_cuentas], uso_fallback
 
 
+def _rol_efectivo_ejecucion(tipo) -> str:
+    """Rol efectivo del `tipo` de un flujo DIRECTO del dashboard.
+
+    Igual que `core.registro.normalizar_rol_cuota` con UNA salvedad: en los
+    flujos del dashboard "calentamiento" hace RT+likes (`rts._calentamiento`),
+    no publica posts, así que se trata como "rt" (no como "hashtags"). Nunca
+    lanza."""
+    texto = str(tipo or "").strip().lower()
+    try:
+        from core.registro import normalizar_rol_cuota
+
+        rol = normalizar_rol_cuota(tipo)
+    except Exception:
+        rol = texto
+    if rol == "hashtags" and "calentamiento" in texto:
+        return "rt"
+    return rol
+
+
+def bloqueo_tier_ejecucion(cuenta, tipo) -> str:
+    """Mensaje "⛔ ..." (o "") si el tier de `cuenta` prohíbe ejecutar `tipo`.
+
+    Regla de negocio (centralizada en `core.tiers`):
+      - Tier 3 (Métricas/Soporte): SOLO RT y likes. Bloquea el rol efectivo
+        "hashtags" (post/mantenimiento/hilo), "cita" y "comentario"; pasan
+        rt/like, calentamiento (RT+likes), visualizacion, vacío y desconocidos.
+      - Tier 2 (Volumen/Aged): bloquea el rol efectivo "hashtags".
+      - Tier 1 o sin tier: nunca bloquea.
+    Se usa ANTES de crear el bot: una cuenta bloqueada no abre Chrome ni
+    registra nada. Nunca lanza: con `core.tiers` viejo devuelve "" (sin
+    bloqueo)."""
+    try:
+        from core.tiers import es_tier2, es_tier3
+    except Exception:
+        return ""
+    try:
+        usuario = str(getattr(cuenta, "usuario", "") or "")
+        if es_tier3(cuenta):
+            rol = _rol_efectivo_ejecucion(tipo)
+            if rol in ("hashtags", "cita", "comentario"):
+                return (
+                    f"⛔ @{usuario} — Tier 3: rol '{rol}' PROHIBIDO "
+                    "(no se ejecutó; solo RT y likes)"
+                )
+        if es_tier2(cuenta):
+            if _rol_efectivo_ejecucion(tipo) == "hashtags":
+                return (
+                    f"⛔ @{usuario} — Tier 2: rol 'hashtags' PROHIBIDO "
+                    "(no se ejecutó; solo RT, Cita o Comentario)"
+                )
+    except Exception:
+        return ""
+    return ""
+
+
 def ejecutar_en_cuentas(cuentas: list[Cuenta], accion, plataforma: str = "twitter",
                         progreso: st.progress = None, estado: st.empty = None,
                         tipo: str = "post") -> dict:
@@ -181,10 +236,14 @@ def ejecutar_en_cuentas(cuentas: list[Cuenta], accion, plataforma: str = "twitte
     'accion' puede ser un callable o una lista/tupla de callables (uno por
     cuenta, en el mismo orden). Esto permite publicar un texto distinto en
     cada cuenta: `[lambda bot, t=t: bot.publicar_tweet(t) for t in pool]`.
-    """
+
+    ANTES de crear el bot de cada cuenta se valida su Tier: Tier 3 solo RT y
+    likes y Tier 2 no puede hashtags (`bloqueo_tier_ejecucion`). Las cuentas
+    bloqueadas NO abren navegador ni registran `RegistroAccion`: suman a
+    `resultados["omitidas"]` con un detalle "⛔ ..."."""
     from plataformas.base import PlataformaFactory
     
-    resultados = {"exitos": 0, "fallidos": 0, "detalles": []}
+    resultados = {"exitos": 0, "fallidos": 0, "detalles": [], "omitidas": 0}
     total = len(cuentas)
     if isinstance(accion, (list, tuple)):
         acciones = list(accion)
@@ -192,6 +251,13 @@ def ejecutar_en_cuentas(cuentas: list[Cuenta], accion, plataforma: str = "twitte
         acciones = [accion] * total
     
     for i, cuenta in enumerate(cuentas):
+        motivo_tier = bloqueo_tier_ejecucion(cuenta, tipo)
+        if motivo_tier:
+            resultados["omitidas"] += 1
+            resultados["detalles"].append(motivo_tier)
+            if progreso and total > 0:
+                progreso.progress((i + 1) / total)
+            continue
         try:
             if estado:
                 estado.write(f"⏳ Trabajando con **@{cuenta.usuario}**...")
@@ -247,7 +313,14 @@ def mostrar_resultados(resultados: dict):
         st.metric("✅ Exitosos", resultados["exitos"])
     with col2:
         st.metric("❌ Fallidos", resultados["fallidos"])
-    
+
+    omitidas = int(resultados.get("omitidas") or 0)
+    if omitidas:
+        st.caption(
+            f"⛔ {omitidas} cuenta(s) omitida(s) por su Tier "
+            "(no se abrió navegador ni se registró nada)."
+        )
+
     if resultados.get("detalles"):
         with st.expander("🔍 Detalle por cuenta"):
             for detalle in resultados["detalles"]:
