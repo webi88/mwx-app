@@ -77,6 +77,18 @@ comentarios al MISMO tweet de 15s. Los disyuntores de la API
 en un caption y se ajustan por env. En Railway NO conviene pasar de 3-4
 "navegadores": si Chrome crashea, la campana se frena en cascada.
 
+Proceso persistente, paro y respaldo de estado: las campanas se registran a
+nivel MODULO (`_CAMPANAS`), asi que el panel "🚦 Proceso en vivo" (barra con
+tiempo/avance, ronda, velocidad y feed de eventos) sigue visible si recargas la
+pagina o cambias de operacion, y aparece en AMBAS pestanas de activacion.
+Incluye "⛔ Paro total" (evento `cancelar` para el motor, con
+`motor.solicitar_paro()` como fallback) que corta la campana en segundos y
+libera el guard, y "⚠️ Forzar liberación" a los 90s si el hilo no muere. El
+ultimo estado se guarda (escritura atomica, sin credenciales) en
+`data/campanas/ultima_campana.json` y se muestra si ya no hay campana en
+memoria. El guard usa un token de propiedad: el hilo viejo nunca libera el
+guard de una campana nueva.
+
 Caso de uso "trending con UN solo tweet ancla" (pestana B): usa el selector
 de cuentas en modo Filtro (p. ej. Seccion: Libertad), define el porcentaje de
 cada rol en «🎚️ Reparto por porcentajes» y aplica (el boton queda
@@ -85,8 +97,11 @@ funcionar mas RT simple (amplifica y es lo que menos castiga X) con citas y
 hashtags como combustible; los comentarios van en minoria y espaciados
 (ver `pausa_comentario_url_seg`).
 """
+import json
 import os
 import threading
+import time
+import uuid
 
 import streamlit as st
 
@@ -115,11 +130,45 @@ ICONOS_ROL = {
 # terminar (o fallar) el lanzamiento.
 _CAMPANA_ACTIVA = threading.Event()
 
+# Token de PROPIEDAD del guard: id de la campana que lo tomo. Permite que el
+# "forzar liberacion" del panel libere el guard para relanzar de inmediato SIN
+# que el hilo viejo (que sigue muriendo) libere por error el guard de una
+# campana NUEVA al ejecutarse su `finally`.
+_CAMPANA_ID = ""
+
+# REGISTRO DE CAMPANAS a nivel MODULO: sobrevive a recargados de la pagina y a
+# la navegacion entre operaciones (no vive en `st.session_state`). Cada entrada:
+#   {"id", "motor", "hilo", "evento" (threading.Event de paro), "inicio",
+#    "inicio_mono", "fin", "estado" ("en_curso"|"deteniendo"|"terminada"|
+#    "cancelada"|"error"), "tipo" ("citas"|"roles"), "resumen", "error",
+#    "parametros", "previos_env", "usa_cancelar", "paro_solicitado", "total"}
+# El hilo del motor SOLO escribe en este registro (y en el JSON de disco); los
+# `st.*` los pinta el hilo principal desde `snapshot_progreso()`.
+_CAMPANAS: dict = {}
+_CAMPANAS_LOCK = threading.RLock()
+
 # Marcador de ARCHIVO de campana activa: lo leen otros procesos del sistema
 # (p. ej. el calentamiento continuo del scheduler) para NO lanzar acciones
 # mientras hay una campana de activacion en curso. Se escribe al adquirir el
 # guard y se borra al liberarlo (ver `_adquirir_campana`/`_liberar_campana`).
 RUTA_CAMPANA_ACTIVA = "data/.campana_activa"
+
+# Persistencia del ultimo proceso: un JSON chico, atomico y SIN credenciales
+# (id/estado/tiempos/tipo/parametros seguros/resumen saneado/progreso). Se
+# escribe al registrar la campana, en cada tick del panel en vivo y al
+# terminar; al abrir la pagina sin campana en memoria se muestra ese estado.
+RUTA_ULTIMA_CAMPANA = "data/campanas/ultima_campana.json"
+
+# Segundos que se espera, tras "⛔ Paro total", antes de ofrecer el boton
+# "⚠️ Forzar liberación" (red de seguridad; nunca se fuerza solo).
+PARO_FORZAR_SEG = 90
+
+# Claves de `st.session_state` del panel persistente: id descartado con
+# "🧹 Ocultar", id de la campana que lanzo ESTA sesion (para la limpieza
+# diferida del contexto) y marca de limpieza ya programada.
+CLAVE_CAMPANA_OCULTA = "act_proceso_oculto"
+CLAVE_CAMPANA_LANZADA = "act_campana_lanzada_id"
+CLAVE_CAMPANA_LIMPIEZA = "act_campana_limpieza_hecha"
 
 
 def _marcar_campana_activa() -> None:
@@ -172,13 +221,327 @@ def _adquirir_campana() -> bool:
     return True
 
 
-def _liberar_campana() -> None:
+def _liberar_campana(id_campana=None) -> bool:
     """Libera el guard de campana unica (evento + marcador). Idempotente.
 
-    Centraliza la liberacion para todos los caminos (exito, error del motor,
-    excepcion inesperada o fallo al arrancar el hilo)."""
+    Con `id_campana` solo libera si esa campana sigue siendo la DUEÑA del
+    guard (token): asi el `finally` de un hilo viejo que termina tarde (tras un
+    "forzar liberación" y el relanzamiento de OTRA campaña) no libera el guard
+    de la campaña nueva. Sin `id_campana` libera incondicionalmente (limpieza y
+    compatibilidad)."""
+    global _CAMPANA_ID
+    with _CAMPANAS_LOCK:
+        if id_campana is not None and _CAMPANA_ID and _CAMPANA_ID != id_campana:
+            return False
+        _CAMPANA_ID = ""
     _CAMPANA_ACTIVA.clear()
     _limpiar_campana_activa()
+    return True
+
+
+def _es_dueno(id_campana) -> bool:
+    """True si `id_campana` sigue siendo el dueño actual del guard."""
+    with _CAMPANAS_LOCK:
+        return bool(id_campana) and _CAMPANA_ID == id_campana
+
+
+def _campana_actual():
+    """Ultima entrada del registro (la campana mas reciente) o None.
+
+    Es una referencia viva a la entrada (los paneles leen `snapshot_progreso`
+    del motor); no la mutan fuera de los helpers con lock."""
+    with _CAMPANAS_LOCK:
+        if not _CAMPANAS:
+            return None
+        return list(_CAMPANAS.values())[-1]
+
+
+def _campana_en_curso():
+    """Entrada mas reciente con estado "en_curso" o "deteniendo" (o None)."""
+    with _CAMPANAS_LOCK:
+        for entrada in reversed(list(_CAMPANAS.values())):
+            if entrada.get("estado") in ("en_curso", "deteniendo"):
+                return entrada
+    return None
+
+
+def _limpiar_registro(id_campana=None) -> None:
+    """Borra una entrada del registro (o TODAS si no se pasa id)."""
+    with _CAMPANAS_LOCK:
+        if id_campana is None:
+            _CAMPANAS.clear()
+        else:
+            _CAMPANAS.pop(id_campana, None)
+
+
+def _solicitar_paro() -> bool:
+    """Pide el paro TOTAL de la campaña en curso (evento + estado).
+
+    Setea el `threading.Event` de la campaña (el motor lo consulta en sus
+    bucles y muere en segundos), marca el estado "deteniendo" y, si el motor
+    NO recibio el evento (`_soporta_kwarg(..., "cancelar")` era False), llama a
+    `motor.solicitar_paro()` como fallback. Devuelve False si no habia campaña.
+    """
+    entrada = _campana_en_curso()
+    if entrada is None:
+        return False
+    entrada["estado"] = "deteniendo"
+    entrada["paro_solicitado"] = time.time()
+    evento = entrada.get("evento")
+    if evento is not None:
+        try:
+            evento.set()
+        except Exception:
+            pass
+    if not entrada.get("usa_cancelar"):
+        func = getattr(entrada.get("motor"), "solicitar_paro", None)
+        if callable(func):
+            try:
+                func()
+            except Exception:
+                pass
+    _escribir_ultima_campana(_entrada_para_json(entrada))
+    return True
+
+
+def _snapshot_progreso(motor) -> dict:
+    """`motor.snapshot_progreso()` tolerante ({} si no existe o falla)."""
+    func = getattr(motor, "snapshot_progreso", None)
+    if not callable(func):
+        return {}
+    try:
+        datos = func()
+        return datos if isinstance(datos, dict) else {}
+    except Exception:
+        return {}
+
+
+def _entero(valor) -> int:
+    """int() tolerante a None/str/basura."""
+    try:
+        return int(valor or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _sanear_url(valor) -> str:
+    """URL sin query/fragment (los links pueden traer tokens/credenciales)."""
+    texto = str(valor or "")
+    if not texto.lower().startswith(("http://", "https://")):
+        return texto
+    try:
+        from urllib.parse import urlsplit, urlunsplit
+
+        partes = urlsplit(texto)
+        return urlunsplit((partes.scheme, partes.netloc, partes.path, "", ""))
+    except Exception:
+        return texto.split("?", 1)[0].split("#", 1)[0]
+
+
+def _valor_saneado(valor, profundidad: int = 0):
+    """Version JSON-segura de un valor del resumen (sin objetos ni tokens)."""
+    if valor is None or isinstance(valor, (bool, int, float)):
+        return valor
+    if isinstance(valor, str):
+        if valor.lower().startswith(("http://", "https://")):
+            return _sanear_url(valor)[:500]
+        return valor[:500]
+    if profundidad >= 3:
+        return str(valor)[:200]
+    if isinstance(valor, dict):
+        saneado = {}
+        for clave, sub in list(valor.items())[:40]:
+            saneado[str(clave)[:60]] = _valor_saneado(sub, profundidad + 1)
+        return saneado
+    if isinstance(valor, (list, tuple, set)):
+        return [_valor_saneado(sub, profundidad + 1) for sub in list(valor)[:40]]
+    return str(valor)[:200]
+
+
+def _resumen_saneado(resumen) -> dict:
+    """Resumen del motor listo para JSON: mismo contenido, sin URLs con tokens."""
+    if not isinstance(resumen, dict):
+        return {}
+    return _valor_saneado(resumen, 0)
+
+
+def _evento_saneado(evento) -> dict:
+    """Evento del feed en formato JSON-seguro (para el archivo de disco)."""
+    if not isinstance(evento, dict):
+        return {}
+    return {
+        "usuario": str(evento.get("usuario") or "")[:80],
+        "ok": bool(evento.get("ok")),
+        "detalle": _recortar(evento.get("detalle"), 120),
+        "ronda": evento.get("ronda"),
+        "rol": str(evento.get("rol") or "")[:40],
+        "url": _sanear_url(evento.get("url"))[:300],
+    }
+
+
+def _ruta_ultima_campana() -> str:
+    """Ruta absoluta del JSON de persistencia (tolerante a core viejo)."""
+    try:
+        from core.config import resolver_ruta
+
+        return resolver_ruta(RUTA_ULTIMA_CAMPANA)
+    except Exception:
+        return RUTA_ULTIMA_CAMPANA
+
+
+def _escribir_ultima_campana(datos: dict) -> bool:
+    """Escribe el JSON de disco de forma ATOMICA (tmp + os.replace).
+
+    Nunca lanza: la persistencia es un extra del panel y no debe romper la
+    campaña. El contenido ya viene saneado por `_entrada_para_json`."""
+    try:
+        ruta = _ruta_ultima_campana()
+        carpeta = os.path.dirname(ruta)
+        if carpeta:
+            os.makedirs(carpeta, exist_ok=True)
+        temporal = f"{ruta}.tmp"
+        with open(temporal, "w", encoding="utf-8") as archivo:
+            json.dump(datos, archivo, ensure_ascii=False, indent=2, default=str)
+        os.replace(temporal, ruta)
+        return True
+    except Exception:
+        return False
+
+
+def _leer_ultima_campana() -> dict:
+    """Lee el JSON de disco del ultimo proceso ({} si no existe o esta roto)."""
+    try:
+        with open(_ruta_ultima_campana(), "r", encoding="utf-8") as archivo:
+            datos = json.load(archivo)
+        return datos if isinstance(datos, dict) else {}
+    except Exception:
+        return {}
+
+
+def _entrada_para_json(entrada: dict, snap: dict | None = None) -> dict:
+    """Version serializable de una entrada del registro (SIN credenciales).
+
+    Solo se copian claves conocidas: id/estado/tiempos, tipo, un resumen
+    saneado, el error y el progreso (hechas/exitosas/fallidas/omitidas/ronda/
+    fase + ultimos 8 eventos con URLs sin query). Nunca se serializan
+    `motor`/`hilo`/`evento`/`previos_env` ni `parametros` completos."""
+    if snap is None:
+        snap = _snapshot_progreso(entrada.get("motor"))
+    parametros = entrada.get("parametros") or {}
+    eventos = list(snap.get("eventos") or [])[-8:]
+    return {
+        "id": str(entrada.get("id") or ""),
+        "estado": str(entrada.get("estado") or ""),
+        "tipo": str(entrada.get("tipo") or "citas"),
+        "inicio": entrada.get("inicio"),
+        "fin": entrada.get("fin"),
+        "actualizado": time.time(),
+        "duracion_min": parametros.get("duracion_min"),
+        "repetir": bool(parametros.get("repetir")),
+        "curva_aceleracion": bool(parametros.get("curva_aceleracion")),
+        "curva_fase1_min": parametros.get("curva_fase1_min"),
+        "resumen": _resumen_saneado(entrada.get("resumen") or {}),
+        "error": _recortar(entrada.get("error"), 300),
+        "progreso": {
+            "hechas": _entero(snap.get("hechas")),
+            "exitosas": _entero(snap.get("exitosas")),
+            "fallidas": _entero(snap.get("fallidas")),
+            "omitidas": _entero(snap.get("omitidas")),
+            "ronda_actual": _entero(snap.get("ronda_actual")) or 1,
+            "fase_actual": snap.get("fase_actual"),
+            "eventos": [_evento_saneado(evento) for evento in eventos],
+        },
+    }
+
+
+def _registrar_campana(motor=None, hilo=None, evento=None, tipo: str = "citas",
+                       parametros: dict | None = None, previos_env=None,
+                       usa_cancelar: bool = False,
+                       id_campana: str | None = None) -> str:
+    """Registra una campaña en `_CAMPANAS` y devuelve su id.
+
+    La entrada queda disponible para el panel persistente (aunque la sesion
+    que la lanzo se recargue o navegue a otra operacion) y se escribe el JSON
+    de disco al registrar."""
+    id_campana = id_campana or f"{int(time.time())}-{uuid.uuid4().hex[:8]}"
+    entrada = {
+        "id": id_campana,
+        "motor": motor,
+        "hilo": hilo,
+        "evento": evento if evento is not None else threading.Event(),
+        "inicio": time.time(),
+        "inicio_mono": time.monotonic(),
+        "fin": None,
+        "estado": "en_curso",
+        "tipo": str(tipo or "citas"),
+        "resumen": None,
+        "error": "",
+        "parametros": dict(parametros or {}),
+        "previos_env": previos_env,
+        "usa_cancelar": bool(usa_cancelar),
+        "paro_solicitado": None,
+        "total": 0,
+        "forzada": False,
+        "ultimo_json": 0.0,
+    }
+    global _CAMPANA_ID
+    with _CAMPANAS_LOCK:
+        _CAMPANAS[id_campana] = entrada
+        _CAMPANA_ID = id_campana
+    _escribir_ultima_campana(_entrada_para_json(entrada))
+    return id_campana
+
+
+def _finalizar_campana(id_campana, resumen=None, error=None) -> bool:
+    """Cierra una campaña del registro: estado, fin, resumen y guard.
+
+    - Estado final: "error" si hubo excepcion; "cancelada" si se pidio el paro
+      (evento set) o el resumen trae `cancelada=True`; "terminada" si no.
+    - Restaura las env de velocidad guardadas SOLO si esta campaña seguia
+      siendo la dueña del guard (si se forzo la liberacion y ya corre otra,
+      la campaña nueva manda).
+    - Escribe el JSON de disco (si es la ultima entrada) y libera el guard con
+      token (`_liberar_campana(id_campana)`), para no pisar a una campaña nueva.
+    Devuelve True si la entrada existia. Nunca lanza."""
+    if not id_campana:
+        return False
+    previos = None
+    entrada = None
+    es_ultima = False
+    try:
+        with _CAMPANAS_LOCK:
+            entrada = _CAMPANAS.get(id_campana)
+            if entrada is not None:
+                evento = entrada.get("evento")
+                cancelada = bool(
+                    (evento is not None and evento.is_set())
+                    or (
+                        isinstance(resumen, dict)
+                        and resumen.get("cancelada")
+                    )
+                )
+                if error is not None:
+                    entrada["estado"] = "error"
+                elif cancelada:
+                    entrada["estado"] = "cancelada"
+                else:
+                    entrada["estado"] = "terminada"
+                entrada["fin"] = time.time()
+                if isinstance(resumen, dict):
+                    entrada["resumen"] = resumen
+                entrada["error"] = "" if error is None else _recortar(error, 300)
+                previos = entrada.pop("previos_env", None)
+                es_ultima = bool(
+                    _CAMPANAS and list(_CAMPANAS.values())[-1].get("id") == id_campana
+                )
+        if previos is not None and _es_dueno(id_campana):
+            _restaurar_opciones_velocidad(previos)
+        if entrada is not None and es_ultima:
+            _escribir_ultima_campana(_entrada_para_json(entrada))
+    except Exception:
+        pass
+    _liberar_campana(id_campana)
+    return entrada is not None
 
 
 # Navegadores recomendados para una campaña normal (valor FIJO que trae el
@@ -619,11 +982,13 @@ def _formato_tiempo(segundos) -> str:
     return f"{minutos:02d}:{segs:02d}"
 
 
-def _invocar_lanzar(lanzar, callback):
-    """Llama `lanzar(callback)` si acepta un parametro; si no, `lanzar()`.
+def _invocar_lanzar(lanzar, callback, cancelar=None):
+    """Llama `lanzar(callback, cancelar)` / `lanzar(callback)` / `lanzar()`.
 
-    Permite que el lanzamiento reciba el callback que guarda el `total` sin
-    romper a callables de cero argumentos (p. ej. en pruebas).
+    Decide por firma (sin capturar `TypeError` internos): con 2+ parametros
+    posicionales pasa tambien el `threading.Event` de paro; con 1 pasa solo el
+    callback; sin parametros no pasa nada. Asi los motores viejos que no
+    soportan `cancelar` siguen funcionando igual.
     """
     import inspect
 
@@ -631,9 +996,18 @@ def _invocar_lanzar(lanzar, callback):
         parametros = inspect.signature(lanzar).parameters
     except (TypeError, ValueError):
         parametros = {}
-    if parametros:
-        return lanzar(callback)
-    return lanzar()
+    if not parametros:
+        return lanzar()
+    posicionales = [
+        p for p in parametros.values()
+        if p.kind in (
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        )
+    ]
+    if len(posicionales) >= 2:
+        return lanzar(callback, cancelar)
+    return lanzar(callback)
 
 
 def _recortar(texto, limite: int = 80) -> str:
@@ -661,153 +1035,542 @@ def _linea_evento(evento: dict) -> str:
     return linea
 
 
-def _lanzar_con_progreso(lanzar, motor, duracion_min: int, repetir: bool) -> dict:
-    """Ejecuta `lanzar()` en un hilo y pinta contador, barra y feed en vivo.
+# ==================== PANEL PERSISTENTE DE PROCESO ====================
 
-    `lanzar` es un callable que llama al motor (bloqueante) y devuelve el
-    resumen; si acepta un parametro, recibe un callback que SOLO guarda el
-    total de cuentas en un dict (los callbacks del motor corren en hilos y
-    nunca deben tocar `st.*`). El hilo principal refresca cada ~1s la barra,
-    las metricas y el feed leyendo `motor.snapshot_progreso()`.
+def _ss_get(clave, default=None):
+    """`st.session_state.get` tolerante (fuera de un script devuelve default)."""
+    try:
+        return st.session_state.get(clave, default)
+    except Exception:
+        return default
 
-    Con `repetir=True` la barra avanza por tiempo (`duracion_min`); con
-    `repetir=False` avanza por cuentas hechas sobre el total estimado.
 
-    La linea de metricas incluye un indicador de VELOCIDAD calculado con
-    `hechas` del snapshot y el tiempo transcurrido:
-    `⚡ N acciones · r/min ≈ R/h`.
+def _ss_set(clave, valor) -> None:
+    """Asigna `st.session_state[clave]` tolerante (no rompe en modo bare)."""
+    try:
+        st.session_state[clave] = valor
+    except Exception:
+        pass
 
-    Si `lanzar()` lanza, la excepcion se re-lanza aqui tras cerrar la barra.
-    Devuelve el resumen del motor.
 
-    Guard de campana unica: si otra campana ya esta en curso en este proceso,
-    muestra `st.error` y devuelve `{}` sin lanzar hilo ni barra. Al adquirir el
-    guard se escribe el marcador `data/.campana_activa` (lo lee el calentamiento
-    continuo del scheduler) y se borra SIEMPRE al liberarlo: en el `finally`
-    del hilo runner (exito, error del motor o excepcion inesperada) y tambien
-    si falla el arranque del hilo.
+def _en_contexto_streamlit() -> bool:
+    """True solo dentro de un script de Streamlit (AppTest incluido).
+
+    En modo bare (tests que llaman helpers sin runtime) es False, de modo que
+    `_lanzar_con_progreso` no intenta `st.rerun()` ni pinta widgets."""
+    try:
+        from streamlit.runtime.scriptrunner import get_script_run_ctx
+
+        return get_script_run_ctx() is not None
+    except Exception:
+        return False
+
+
+def _fecha_corta(ts) -> str:
+    """Timestamp -> "YYYY-MM-DD HH:MM:SS" local (tolerante)."""
+    try:
+        return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(float(ts)))
+    except Exception:
+        return str(ts or "")
+
+
+def _estado_para_panel(entrada=None, snap=None, ahora=None) -> dict:
+    """Estado PURO (sin `st.*`) de una campaña para el panel persistente.
+
+    Devuelve {} sin entrada. Con entrada, un dict con el avance (0..1), el
+    `tiempo_txt`, la linea de metricas/velocidad/fase, los eventos del feed,
+    `puede_forzar` (paro pedido hace `PARO_FORZAR_SEG` y el hilo sigue vivo),
+    `cancelada` y el resumen final. `_pintar_proceso` solo pinta este dict;
+    asi la logica queda testeable sin Streamlit.
     """
-    import time
+    if not isinstance(entrada, dict):
+        return {}
+    if snap is None:
+        snap = _snapshot_progreso(entrada.get("motor"))
+    if ahora is None:
+        ahora = time.monotonic()
 
-    if not _adquirir_campana():
-        st.error(
-            "⚠️ Ya hay una campaña de activación en curso. Espera a que "
-            "termine antes de lanzar otra: dos campañas simultáneas saturan "
-            "Chrome (tab crashed) y hacen más lenta la que ya corre."
+    parametros = entrada.get("parametros") or {}
+    estado = str(entrada.get("estado") or "")
+    hechas = _entero(snap.get("hechas"))
+    exitosas = _entero(snap.get("exitosas"))
+    fallidas = _entero(snap.get("fallidas"))
+    omitidas = _entero(snap.get("omitidas"))
+    ronda_actual = _entero(snap.get("ronda_actual")) or 1
+    fase_actual = snap.get("fase_actual")
+
+    inicio_mono = entrada.get("inicio_mono")
+    try:
+        base = float(inicio_mono) if inicio_mono is not None else ahora
+    except (TypeError, ValueError):
+        base = ahora
+    transcurrido = max(0.0, ahora - base)
+
+    repetir = bool(parametros.get("repetir"))
+    duracion_min = _entero(parametros.get("duracion_min"))
+    if repetir:
+        limite_segundos = max(1.0, duracion_min * 60.0)
+        avance = min(1.0, transcurrido / limite_segundos)
+        tiempo_txt = (
+            f"⏱️ Faltan "
+            f"{_formato_tiempo(max(0.0, limite_segundos - transcurrido))}"
         )
+    else:
+        total_estimado = _entero(entrada.get("total"))
+        referencia = total_estimado if total_estimado > 0 else max(1, hechas)
+        avance = min(1.0, hechas / max(1, referencia))
+        tiempo_txt = f"⏳ Transcurrido {_formato_tiempo(transcurrido)}"
+
+    linea_curva = ""
+    if fase_actual not in (None, ""):
+        linea_curva = f" · 🚀 Fase {fase_actual}/2 de la curva"
+    ritmo = (hechas / transcurrido * 60.0) if transcurrido > 0 else 0.0
+    linea = (
+        f"**🔄 Ronda {ronda_actual}** · ✅ {exitosas} exitosas · "
+        f"❌ {fallidas} fallidas · 🧮 {hechas} hechas · "
+        f"⚡ {hechas} acciones · {ritmo:.1f}/min ≈ {ritmo * 60.0:.0f}/h · "
+        f"{tiempo_txt}{linea_curva}"
+    )
+
+    hilo = entrada.get("hilo")
+    try:
+        vivo = bool(hilo is not None and hilo.is_alive())
+    except Exception:
+        vivo = False
+    paro_solicitado = entrada.get("paro_solicitado")
+    puede_forzar = False
+    if estado == "deteniendo" and vivo and paro_solicitado is not None:
+        try:
+            puede_forzar = (time.time() - float(paro_solicitado)) >= PARO_FORZAR_SEG
+        except (TypeError, ValueError):
+            puede_forzar = False
+
+    evento = entrada.get("evento")
+    try:
+        cancelada = bool(evento is not None and evento.is_set())
+    except Exception:
+        cancelada = False
+    if snap.get("cancelada"):
+        # El motor tambien reporta la cancelacion en su snapshot.
+        cancelada = True
+
+    resumen = entrada.get("resumen")
+    return {
+        "id": str(entrada.get("id") or ""),
+        "estado": estado,
+        "en_curso": estado in ("en_curso", "deteniendo"),
+        "deteniendo": estado == "deteniendo",
+        "terminada": estado in ("terminada", "cancelada", "error"),
+        "tipo": str(entrada.get("tipo") or "citas"),
+        "transcurrido": transcurrido,
+        "avance": avance,
+        "tiempo_txt": tiempo_txt,
+        "hechas": hechas,
+        "exitosas": exitosas,
+        "fallidas": fallidas,
+        "omitidas": omitidas,
+        "ronda_actual": ronda_actual,
+        "fase_actual": fase_actual,
+        "linea": linea,
+        "eventos": list(snap.get("eventos") or []),
+        "vivo": vivo,
+        "puede_forzar": puede_forzar,
+        "cancelada": cancelada,
+        "resumen": resumen if isinstance(resumen, dict) else {},
+        "error": str(entrada.get("error") or ""),
+    }
+
+
+def _mostrar_resultados_citas(resultados: dict) -> None:
+    """Metricas + detalle de una campana de Cita masiva (render de siempre)."""
+    st.markdown("---")
+    metricas = [
+        ("🎯 Total", resultados.get("total", 0)),
+        ("✅ Exitosas", resultados.get("exitosas", 0)),
+        ("❌ Fallidas", resultados.get("fallidas", 0)),
+    ]
+    if "rondas" in resultados:
+        metricas.append(("🔄 Rondas", resultados.get("rondas", 0)))
+    if "sin_registro" in resultados:
+        metricas.append(
+            ("🪪 Sin registro (saltadas)", resultados.get("sin_registro", 0))
+        )
+    # Metricas opcionales de la curva/tiers/cuotas (solo si el motor las trae).
+    metricas.extend(_metricas_tier_curva(resultados))
+    for col, (etiqueta, valor) in zip(st.columns(len(metricas)), metricas):
+        col.metric(etiqueta, valor)
+
+    detalles = resultados.get("detalles") or []
+    if detalles:
+        with st.expander("🔍 Detalle por cuenta", expanded=False):
+            for d in detalles:
+                icono = "✅" if d.get("ok") else "❌"
+                linea = f"{icono} @{d.get('usuario', '')} — {d.get('detalle', '')}"
+                if d.get("url"):
+                    linea += f" — [ver post]({d['url']})"
+                if d.get("ronda"):
+                    linea += f" — ronda {d['ronda']}"
+                st.markdown(linea)
+
+    sin_registro_usuarios = resultados.get("sin_registro_usuarios") or []
+    sugerencia_registro = (resultados.get("sugerencia_registro") or "").strip()
+    if sin_registro_usuarios or sugerencia_registro:
+        with st.expander(
+            f"🪪 Cuentas sin registro (saltadas) ({len(sin_registro_usuarios)})",
+            expanded=False,
+        ):
+            if sugerencia_registro:
+                st.info(sugerencia_registro)
+            if sin_registro_usuarios:
+                st.caption(", ".join(f"@{u}" for u in sin_registro_usuarios))
+
+
+def _render_resultados(resumen, tipo: str = "citas") -> None:
+    """Pinta el resumen final con el render que corresponde al tipo de campaña."""
+    resumen = resumen if isinstance(resumen, dict) else {}
+    if str(tipo or "") == "roles":
+        _mostrar_resultados_roles(resumen)
+    else:
+        _mostrar_resultados_citas(resumen)
+
+
+def _render_ultimo_desde_disco(prefix: str = "act") -> None:
+    """Expander discreto con el ultimo estado guardado en disco (si existe).
+
+    Se muestra cuando NO hay campaña en memoria (p. ej. tras reiniciar el
+    proceso del dashboard): el proceso en vivo ya no se puede conectar, pero
+    el JSON guardado deja ver como quedo el ultimo proceso."""
+    datos = _leer_ultima_campana()
+    if not datos:
+        return
+    progreso = datos.get("progreso") or {}
+    resumen = datos.get("resumen") or {}
+    with st.expander(
+        "🗂️ Último proceso guardado (sin conexión en vivo)", expanded=False
+    ):
+        st.caption(
+            "No hay campaña en memoria en esta sesión; este es el último estado "
+            "guardado en disco. La tabla completa de acciones vive en Reportes."
+        )
+        columnas = st.columns(4)
+        columnas[0].metric("Estado", str(datos.get("estado") or "—"))
+        columnas[1].metric(
+            "✅ Exitosas",
+            _entero(resumen.get("exitosas", progreso.get("exitosas"))),
+        )
+        columnas[2].metric(
+            "❌ Fallidas",
+            _entero(resumen.get("fallidas", progreso.get("fallidas"))),
+        )
+        columnas[3].metric("🧮 Hechas", _entero(progreso.get("hechas")))
+        actualizado = datos.get("fin") or datos.get("actualizado")
+        if actualizado:
+            st.caption(f"Última actualización: {_fecha_corta(actualizado)}")
+        eventos = progreso.get("eventos") or []
+        lineas = [_linea_evento(ev) for ev in eventos[-8:]]
+        if lineas:
+            st.markdown("  \n".join(lineas))
+
+
+def _actualizar_json_proceso(entrada: dict, snap: dict | None = None) -> None:
+    """Escribe el tick del panel en disco (throttle ~2s; nunca lanza)."""
+    ahora = time.time()
+    try:
+        ultimo = float(entrada.get("ultimo_json") or 0.0)
+    except (TypeError, ValueError):
+        ultimo = 0.0
+    if ahora - ultimo < 2.0:
+        return
+    entrada["ultimo_json"] = ahora
+    _escribir_ultima_campana(_entrada_para_json(entrada, snap))
+
+
+def _limpieza_contexto_si_termino(entrada: dict, estado: dict) -> None:
+    """Programa la limpieza diferida del contexto si ESTA sesion lanzo la
+    campaña y el checkbox la pidio. Tras un refresh la marca se pierde (la
+    limpieza diferida es de la sesion que lanzo; limitacion aceptada)."""
+    parametros = entrada.get("parametros") or {}
+    if not parametros.get("limpiar_contexto"):
+        return
+    if _ss_get(CLAVE_CAMPANA_LANZADA) != entrada.get("id"):
+        return
+    if _ss_get(CLAVE_CAMPANA_LIMPIEZA) == entrada.get("id"):
+        return
+    _programar_limpieza_contexto(parametros.get("prefix") or "act")
+    _ss_set(CLAVE_CAMPANA_LIMPIEZA, entrada.get("id"))
+
+
+def _pintar_en_curso(prefix: str, entrada: dict, estado: dict) -> None:
+    """Barra + metricas + feed + boton "⛔ Paro total" de una campaña viva."""
+    st.markdown("#### 🚦 Proceso en vivo")
+    st.progress(estado["avance"], text=estado["tiempo_txt"])
+    st.markdown(estado["linea"])
+    eventos = estado.get("eventos") or []
+    if eventos:
+        st.markdown("  \n".join(_linea_evento(ev) for ev in eventos[-8:]))
+    else:
+        st.markdown("⏳ Esperando las primeras cuentas…")
+    if estado["deteniendo"]:
+        st.warning("⛔ Paro solicitado: cerrando navegadores…")
+    columnas = st.columns(2)
+    with columnas[0]:
+        if st.button(
+            "⛔ Paro total",
+            type="primary",
+            key=f"{prefix}_btn_paro",
+            disabled=estado["deteniendo"],
+            help=(
+                "Corta la campaña en segundos: el motor deja de abrir cuentas "
+                "nuevas y cierra los navegadores; el guard se libera al morir "
+                "el hilo."
+            ),
+        ):
+            if _solicitar_paro():
+                st.rerun()
+    with columnas[1]:
+        if estado["puede_forzar"]:
+            st.warning(
+                f"⚠️ La campaña sigue viva {PARO_FORZAR_SEG}s después del paro. "
+                "Al forzar la liberación podrás lanzar otra de inmediato, pero "
+                "la campaña vieja puede seguir cerrando navegadores."
+            )
+            if st.button("⚠️ Forzar liberación", key=f"{prefix}_btn_forzar"):
+                _liberar_campana(entrada.get("id"))
+                entrada["estado"] = "terminada"
+                entrada["forzada"] = True
+                if not entrada.get("error"):
+                    entrada["error"] = "liberación forzada desde el panel"
+                _escribir_ultima_campana(_entrada_para_json(entrada))
+                st.rerun()
+
+
+def _pintar_terminada(prefix: str, entrada: dict, estado: dict) -> None:
+    """Panel "Último proceso" de una campaña terminada (resumen + Ocultar)."""
+    if estado["estado"] == "error":
+        st.error(
+            "❌ Campaña interrumpida: "
+            + (estado["error"] or "error inesperado del motor")
+        )
+    elif estado["cancelada"] or estado["estado"] == "cancelada":
+        st.success("⛔ Campaña detenida")
+        st.caption(
+            "El guard quedó libre: ya puedes lanzar otra campaña de inmediato."
+        )
+    else:
+        resumen = estado.get("resumen") or {}
+        linea = (
+            f"✅ Campaña finalizada: {_entero(resumen.get('exitosas'))} ok / "
+            f"{_entero(resumen.get('fallidas'))} errores"
+        )
+        rondas = resumen.get("rondas")
+        if rondas not in (None, ""):
+            linea += f" · {rondas} rondas"
+        st.success(linea)
+    st.markdown("#### 🧾 Último proceso")
+    _render_resultados(estado.get("resumen") or {}, estado.get("tipo") or "citas")
+    if st.button("🧹 Ocultar", key=f"{prefix}_btn_ocultar"):
+        _ss_set(CLAVE_CAMPANA_OCULTA, entrada.get("id"))
+        st.rerun()
+
+
+def _pintar_proceso(prefix: str = "act") -> None:
+    """Pinta el panel persistente: proceso en vivo, ultimo proceso o disco.
+
+    Lee SIEMPRE del registro de modulo (no de `st.session_state`), por lo que
+    el panel reaparece aunque el usuario recargue o cambie de operacion."""
+    entrada = _campana_en_curso() or _campana_actual()
+    if entrada is None:
+        _render_ultimo_desde_disco(prefix)
+        return
+    snap = _snapshot_progreso(entrada.get("motor"))
+    estado = _estado_para_panel(entrada, snap)
+    if not estado.get("en_curso"):
+        if _ss_get(CLAVE_CAMPANA_OCULTA) == entrada.get("id"):
+            return
+        _limpieza_contexto_si_termino(entrada, estado)
+        _pintar_terminada(prefix, entrada, estado)
+        return
+    _pintar_en_curso(prefix, entrada, estado)
+    _actualizar_json_proceso(entrada, snap)
+
+
+def _refrescar_con_fragmento(prefix: str) -> bool:
+    """Registra un `st.fragment(run_every=1s)` que repinta el proceso.
+
+    Devuelve False si esta version de Streamlit no soporta fragmentos (el
+    llamador cae al bucle `time.sleep(1); st.rerun()`). Cuando la campaña
+    termina, el fragmento dispara UN rerun completo y deja de refrescar."""
+    fabrica = getattr(st, "fragment", None)
+    if not callable(fabrica):
+        return False
+
+    def _pasada():
+        if _campana_en_curso() is None:
+            st.rerun(scope="app")
+            return
+        _pintar_proceso(prefix)
+
+    try:
+        decorada = fabrica(run_every=1.0)(_pasada)
+    except Exception:
+        return False
+    decorada()
+    return True
+
+
+def _render_proceso_activo(prefix: str = "act", max_pasos=None) -> None:
+    """Panel de proceso persistente de una pestana (auto-refresco en vivo).
+
+    - Con campaña en curso: usa `st.fragment(run_every=1s)` si esta disponible
+      y, si no, el bucle `time.sleep(1); st.rerun()` (SOLO mientras corre).
+    - Sin campaña en curso: UNA pasada (ultimo proceso en memoria o el
+      expander con el JSON de disco).
+
+    `max_pasos` es un flag interno para tests/llamadas acotadas: con un valor
+    (p. ej. 1) se pinta UNA sola pasada, sin fragmentos ni bucles."""
+    if max_pasos is not None:
+        _pintar_proceso(prefix)
+        return
+    if _campana_en_curso() is None:
+        _pintar_proceso(prefix)
+        return
+    if _refrescar_con_fragmento(prefix):
+        return
+    _pintar_proceso(prefix)
+    time.sleep(1)
+    st.rerun()
+
+
+def _motor_usa_cancelar(motor, tipo: str = "citas") -> bool:
+    """True si el motor acepta el kwarg `cancelar` en el flujo del `tipo`.
+
+    Se comprueba la firma del metodo que la pagina va a llamar
+    (`ejecutar_por_roles` para "roles"; `ejecutar` para el resto). Con un motor
+    viejo devuelve False y el paro usa `motor.solicitar_paro()` como fallback.
+    """
+    nombre = "ejecutar_por_roles" if str(tipo or "") == "roles" else "ejecutar"
+    func = getattr(motor, nombre, None)
+    return bool(func is not None and _soporta_kwarg(func, "cancelar"))
+
+
+def _lanzar_motor(func, base_kwargs: dict):
+    """Envuelve una llamada al motor en un callable `(callback, cancelar)`.
+
+    `cancelar` (threading.Event) se pasa SOLO si el motor lo soporta
+    (`_soporta_kwarg`): asi un motor viejo sigue funcionando igual y el paro
+    cae a `motor.solicitar_paro()` como fallback. Los call sites construyen
+    `base_kwargs` con el resto de argumentos (urls, textos, curva, reserva...).
+    """
+    soporta_cancelar = _soporta_kwarg(func, "cancelar")
+
+    def _lanzar(cb, cancelar=None):
+        extra = dict(base_kwargs)
+        if cancelar is not None and soporta_cancelar:
+            extra["cancelar"] = cancelar
+        return func(callback=cb, **extra)
+
+    return _lanzar
+
+
+def _lanzar_con_progreso(lanzar, motor, duracion_min: int, repetir: bool,
+                         tipo: str = "citas", parametros: dict | None = None,
+                         previos_env=None, prefix: str = "act",
+                         info_lanzamiento=None) -> dict:
+    """Lanza el motor en un hilo y REGISTRA la campaña (panel persistente).
+
+    Mantiene la firma publica `(lanzar, motor, duracion_min, repetir)`; el
+    resto de parametros son opcionales:
+
+    - `lanzar` es un callable que llama al motor (bloqueante) y devuelve el
+      resumen. Si acepta un segundo argumento recibe el `threading.Event` de
+      paro (`_invocar_lanzar`); si no, solo el callback del total.
+    - La campaña se registra en `_CAMPANAS` ANTES de arrancar el hilo y el
+      `finally` del runner la finaliza: estado/fin/resumen/error, restauracion
+      de las env de velocidad (`previos_env`) y liberacion del guard CON TOKEN
+      (el hilo viejo nunca libera el guard de una campaña nueva).
+    - Ya NO pinta el bucle en vivo: delega en `_render_proceso_activo` (panel
+      persistente a nivel modulo, sobrevive a refresh/navegacion). Fuera de un
+      script de Streamlit (tests en modo bare) espera al hilo y devuelve el
+      resumen.
+
+    Guard de campaña unica: si otra campaña ya esta en curso, repinta el panel
+    al recargar (con su boton "⛔ Paro total") y devuelve `{}`."""
+    if not _adquirir_campana():
+        if _en_contexto_streamlit():
+            # El panel persistente (al inicio de la pestana) mostra la campaña
+            # en curso con su boton de paro: no dejamos al usuario sin salida.
+            st.rerun()
+        else:
+            st.error(
+                "⚠️ Ya hay una campaña de activación en curso. Espera a que "
+                "termine antes de lanzar otra: dos campañas simultáneas "
+                "saturan Chrome (tab crashed) y hacen más lenta la que corre."
+            )
         return {}
 
     resultado: dict = {}
-    estado: dict = {"total": 0}
+    referencia: dict = {"entrada": None}
+    id_campana = f"{int(time.time())}-{uuid.uuid4().hex[:8]}"
+    evento = threading.Event()
+    parametros_camp = dict(parametros or {})
+    parametros_camp.setdefault("duracion_min", int(duracion_min or 0))
+    parametros_camp.setdefault("repetir", bool(repetir))
+    parametros_camp["prefix"] = prefix
+    usa_cancelar = _motor_usa_cancelar(motor, tipo)
 
     def _cb_total(hechas, total, usuario, ok):
+        """Callback del motor: SOLO guarda el total (corre en otro hilo)."""
         try:
-            estado["total"] = int(total or 0)
+            total_int = int(total or 0)
         except (TypeError, ValueError):
-            pass
+            total_int = 0
+        entrada = referencia.get("entrada")
+        if entrada is not None:
+            entrada["total"] = total_int
 
     def _runner():
+        error = None
         try:
-            resultado["resumen"] = _invocar_lanzar(lanzar, _cb_total)
-        except BaseException as e:  # re-lanzada en el hilo principal
+            resultado["resumen"] = _invocar_lanzar(lanzar, _cb_total, evento)
+        except BaseException as e:
             resultado["error"] = e
+            error = e
         finally:
-            # El guard (y el marcador de archivo) se libera SIEMPRE: exito,
-            # error del motor o excepcion inesperada, antes de que el hilo
-            # principal re-lance el error.
-            _liberar_campana()
+            # Estado final + restauracion de envs + liberacion del guard con
+            # token (si otra campaña ya tomo el relevo, no se toca).
+            _finalizar_campana(
+                id_campana, resumen=resultado.get("resumen"), error=error
+            )
+            _liberar_campana(id_campana)
 
+    hilo = threading.Thread(target=_runner, daemon=True)
+    _registrar_campana(
+        motor=motor, hilo=hilo, evento=evento, tipo=tipo,
+        parametros=parametros_camp, previos_env=previos_env,
+        usa_cancelar=usa_cancelar, id_campana=id_campana,
+    )
+    referencia["entrada"] = _campana_actual()
+    if info_lanzamiento is not None:
+        info_lanzamiento["registrada"] = True
+    en_streamlit = _en_contexto_streamlit()
+    if en_streamlit:
+        _ss_set(CLAVE_CAMPANA_LANZADA, id_campana)
     try:
-        hilo = threading.Thread(target=_runner, daemon=True)
-        inicio = time.monotonic()
         hilo.start()
     except BaseException:
         # Si el hilo no llego a arrancar, nadie mas liberaria el guard.
-        _liberar_campana()
+        _finalizar_campana(id_campana, resumen=resultado.get("resumen"))
+        _liberar_campana(id_campana)
+        if previos_env is not None:
+            _restaurar_opciones_velocidad(previos_env)
         raise
 
-    barra = st.progress(0.0)
-    metricas = st.empty()
-    feed = st.empty()
-    snapshot_fn = getattr(motor, "snapshot_progreso", None)
-    limite_segundos = max(1.0, float(int(duracion_min or 0)) * 60.0)
-
-    while hilo.is_alive():
-        snap = {}
-        if callable(snapshot_fn):
-            try:
-                snap = snapshot_fn() or {}
-            except Exception:
-                snap = {}
-        hechas = int(snap.get("hechas") or 0)
-        exitosas = int(snap.get("exitosas") or 0)
-        fallidas = int(snap.get("fallidas") or 0)
-        ronda_actual = int(snap.get("ronda_actual") or 1)
-        fase_actual = snap.get("fase_actual")
-        transcurrido = max(0.0, time.monotonic() - inicio)
-        ritmo = (hechas / transcurrido * 60.0) if transcurrido > 0 else 0.0
-
-        if repetir:
-            avance = min(1.0, transcurrido / limite_segundos)
-            tiempo_txt = (
-                f"⏱️ Faltan "
-                f"{_formato_tiempo(max(0.0, limite_segundos - transcurrido))}"
-            )
-        else:
-            total_estimado = int(estado.get("total") or 0)
-            referencia = total_estimado if total_estimado > 0 else max(1, hechas)
-            avance = min(1.0, hechas / max(1, referencia))
-            tiempo_txt = f"⏳ Transcurrido {_formato_tiempo(transcurrido)}"
-
-        # Curva de Aceleracion: el motor reporta `fase_actual` (1 o 2) en el
-        # snapshot; se muestra junto a la ronda y los contadores.
-        linea_curva = ""
-        if fase_actual not in (None, ""):
-            linea_curva = f" · 🚀 Fase {fase_actual}/2 de la curva"
-
-        barra.progress(avance, text=tiempo_txt)
-        metricas.markdown(
-            f"**🔄 Ronda {ronda_actual}** · ✅ {exitosas} exitosas · "
-            f"❌ {fallidas} fallidas · 🧮 {hechas} hechas · "
-            f"⚡ {hechas} acciones · {ritmo:.1f}/min ≈ {ritmo * 60.0:.0f}/h · "
-            f"{tiempo_txt}{linea_curva}"
-        )
-
-        eventos = snap.get("eventos") or []
-        lineas = [_linea_evento(ev) for ev in eventos[-8:]]
-        if lineas:
-            feed.markdown("  \n".join(lineas))
-        else:
-            feed.markdown("⏳ Esperando las primeras cuentas…")
-        time.sleep(1)
-
-    hilo.join()
-    barra.progress(1.0, text="✅ Campaña finalizada")
-
-    if "error" in resultado:
-        error = resultado["error"]
-        feed.markdown(f"❌ Campaña interrumpida: {_recortar(error, 160)}")
-        raise error
-
-    resumen = resultado.get("resumen") or {}
-    exitosas = int(resumen.get("exitosas") or 0)
-    fallidas = int(resumen.get("fallidas") or 0)
-    rondas = resumen.get("rondas")
-    linea_final = f"✅ Campaña finalizada: {exitosas} ok / {fallidas} errores"
-    if rondas not in (None, ""):
-        linea_final += f" · {rondas} rondas"
-
-    snap_final = {}
-    if callable(snapshot_fn):
-        try:
-            snap_final = snapshot_fn() or {}
-        except Exception:
-            snap_final = {}
-    eventos = snap_final.get("eventos") or []
-    lineas = [_linea_evento(ev) for ev in eventos[-8:]]
-    lineas.append(f"**{linea_final}**")
-    feed.markdown("  \n".join(lineas))
-    return resumen
+    if en_streamlit:
+        # El panel persistente toma el relevo en el rerun (auto-refresco vivo).
+        st.rerun()
+        return {}
+    hilo.join(timeout=10.0)
+    return resultado.get("resumen") or {}
 
 
 def _soporta_kwarg(func, nombre: str) -> bool:
@@ -895,20 +1658,37 @@ def _parametros_curva_reserva(func, curva: bool, curva_fase1, reserva_activa: bo
 
 
 def _lanzar_con_progreso_o_limpiar(lanzar, motor, duracion_min: int, repetir: bool,
-                                   prefix: str, limpiar: bool) -> dict:
+                                   prefix: str, limpiar: bool,
+                                   tipo: str = "citas",
+                                   parametros: dict | None = None,
+                                   previos_env=None,
+                                   info_lanzamiento=None) -> dict:
     """`_lanzar_con_progreso` + limpieza diferida del contexto al volver.
 
-    Si `limpiar` y la campana llego a lanzarse (exito) o fallo, programa la
-    limpieza del contexto de `prefix`; se aplicara en el siguiente rerun, sin
-    borrar la pantalla de resultados actual. Si el guard de campana unica
-    rechazo el lanzamiento (`_lanzar_con_progreso` devuelve `{}`), no limpia
-    nada. La excepcion, si la hay, se re-lanza tal cual.
-    """
+    Si `limpiar` y el lanzamiento devuelve un resumen (modo bare/tests), se
+    programa la limpieza del contexto de `prefix`; en Streamlit el lanzamiento
+    sale por `st.rerun()` y la limpieza la re-programa el panel persistente al
+    terminar la campaña (`_limpieza_contexto_si_termino`). Si el guard de
+    campaña unica rechaza el lanzamiento (`{}`), no se limpia nada.
+
+    La limpieza SOLO vive en `st.session_state` de la sesion que lanzo: si el
+    usuario recarga la pagina a mitad de campaña, se pierde (limitacion
+    aceptable). El panel persistente re-programa la limpieza al terminar si la
+    sesion sigue viva (ver `_limpieza_contexto_si_termino`). Los parametros
+    extra viajan al registro de la campaña (tipo/JSON/panel)."""
+    parametros_camp = dict(parametros or {})
+    parametros_camp["limpiar_contexto"] = bool(limpiar)
+    parametros_camp["prefix"] = prefix
     try:
-        resultados = _lanzar_con_progreso(lanzar, motor, duracion_min, repetir)
+        resultados = _lanzar_con_progreso(
+            lanzar, motor, duracion_min, repetir, tipo=tipo,
+            parametros=parametros_camp, previos_env=previos_env, prefix=prefix,
+            info_lanzamiento=info_lanzamiento,
+        )
     except BaseException:
-        if limpiar:
-            _programar_limpieza_contexto(prefix)
+        # OJO: un lanzamiento exitoso sale por `st.rerun()` (RerunException),
+        # asi que NO se limpia aqui: la limpieza de una campaña registrada la
+        # re-programa el panel persistente al terminar (sesion que lanzo).
         raise
     if limpiar and resultados:
         _programar_limpieza_contexto(prefix)
@@ -1040,17 +1820,22 @@ def _lanzar_con_opciones_velocidad(lanzar, motor, duracion_min: int,
                                    max_workers: int = 8,
                                    permitir_password: bool = False,
                                    modo_pestana: bool = True,
-                                   pestana_max_acciones: int = 40) -> dict:
+                                   pestana_max_acciones: int = 40,
+                                   tipo: str = "citas",
+                                   parametros: dict | None = None) -> dict:
     """`_lanzar_con_progreso_o_limpiar` aplicando y restaurando la velocidad.
 
     Las env (`TWITTER_SIN_PROXY`, `CHROME_SIN_IMAGENES`, `RT_POR_API`,
     `API_PRIMERO`, `MAX_WORKERS`, `ACTIVACION_PERMITIR_PASSWORD`,
     `MODO_PESTANA` y `PESTANA_MAX_ACCIONES`) se escriben ANTES de lanzar (el
     motor las lee al abrir cada navegador/hacer cada peticion) y se restauran a
-    sus valores previos SIEMPRE al volver: exito, guard de campana unica que
-    devuelve `{}` o excepcion (el `finally` re-lanza el error original tal
-    cual). `api_primero=None` usa el valor de `rt_api` (alias/compat).
-    `modo_pestana`/`pestana_max_acciones` tienen defaults retrocompatibles.
+    sus valores previos SIEMPRE: si la campaña se registra, el `finally` del
+    hilo runner las restaura via `_finalizar_campana` (asi un refresh a mitad
+    de campaña no deja las env colgadas); si el lanzamiento se rechaza o falla,
+    se restauran aqui mismo (idempotente). `api_primero=None` usa `rt_api`
+    (alias/compat). `tipo`/`parametros` viajan al registro (panel y JSON).
+
+    Devuelve lo mismo que `_lanzar_con_progreso`: el resumen en modo bare o {}.
     """
     previos = _aplicar_opciones_velocidad(
         sin_proxy, sin_imagenes, rt_api,
@@ -1059,12 +1844,16 @@ def _lanzar_con_opciones_velocidad(lanzar, motor, duracion_min: int,
         modo_pestana=modo_pestana,
         pestana_max_acciones=pestana_max_acciones,
     )
+    info = {"registrada": False}
     try:
         return _lanzar_con_progreso_o_limpiar(
-            lanzar, motor, duracion_min, repetir, prefix=prefix, limpiar=limpiar
+            lanzar, motor, duracion_min, repetir, prefix=prefix, limpiar=limpiar,
+            tipo=tipo, parametros=parametros, previos_env=previos,
+            info_lanzamiento=info,
         )
     finally:
-        _restaurar_opciones_velocidad(previos)
+        if not info.get("registrada"):
+            _restaurar_opciones_velocidad(previos)
 
 
 # ============================ ACCESO A DATOS ============================
@@ -1520,6 +2309,18 @@ def _cita_masiva():
     # Limpieza diferida del contexto (fin de campana / "Limpiar contexto"):
     # SIEMPRE antes de crear cualquier widget de la pestana.
     _aplicar_limpieza_contexto_pendiente("act")
+
+    # Panel de proceso persistente: si hay una campaña corriendo (aunque la
+    # haya lanzado otra sesion o esta pagina se haya recargado), se muestra el
+    # proceso en vivo con su boton "⛔ Paro total" y NO se repinta el formulario.
+    _render_proceso_activo(prefix="act")
+    if _campana_en_curso() is not None:
+        st.caption(
+            "🚦 Hay una campaña en curso: usa el panel de arriba para "
+            "detenerla o espera a que termine para lanzar otra."
+        )
+        return
+
     st.markdown("Pega una URL de tweet por línea (objetivos a citar):")
     urls_text = st.text_area("URLs objetivo", height=100, key="act_urls")
 
@@ -1842,27 +2643,30 @@ def _cita_masiva():
             reserva_rotar,
             reserva_usuarios,
         )
-        resultados = _lanzar_con_opciones_velocidad(
-            lambda cb: motor.ejecutar(
-                urls=urls,
-                texto_base=texto_base,
-                narrativa=panel_noticias["contexto"],
-                cantidad_cuentas=(
+        lanzar = _lanzar_motor(
+            motor.ejecutar,
+            {
+                "urls": urls,
+                "texto_base": texto_base,
+                "narrativa": panel_noticias["contexto"],
+                "cantidad_cuentas": (
                     None if todas_cuentas else (int(cantidad) if cantidad > 0 else None)
                 ),
-                grupo=grupo.strip() or None,
-                dar_like=dar_like,
-                duracion_min=int(duracion_min),
-                cohortes=int(cohortes),
-                callback=cb,
-                hashtags=hashtags,
-                repetir=bool(repetir),
-                solo_con_registro=bool(todas_cuentas),
-                secciones=secciones_param,
-                porcentaje_min_ronda=int(pct_min),
-                porcentaje_max_ronda=int(pct_max),
+                "grupo": grupo.strip() or None,
+                "dar_like": dar_like,
+                "duracion_min": int(duracion_min),
+                "cohortes": int(cohortes),
+                "hashtags": hashtags,
+                "repetir": bool(repetir),
+                "solo_con_registro": bool(todas_cuentas),
+                "secciones": secciones_param,
+                "porcentaje_min_ronda": int(pct_min),
+                "porcentaje_max_ronda": int(pct_max),
                 **parametros_extra,
-            ),
+            },
+        )
+        _lanzar_con_opciones_velocidad(
+            lanzar,
             motor,
             duracion_min=int(duracion_min),
             repetir=bool(repetir),
@@ -1876,48 +2680,16 @@ def _cita_masiva():
             permitir_password=bool(permitir_password),
             modo_pestana=bool(modo_pestana),
             pestana_max_acciones=int(pestana_max_acciones),
+            tipo="citas",
+            parametros={
+                "duracion_min": int(duracion_min),
+                "repetir": bool(repetir),
+                "curva_aceleracion": bool(curva),
+                "curva_fase1_min": int(curva_fase1) if curva else None,
+            },
         )
-
-        st.markdown("---")
-        metricas = [
-            ("🎯 Total", resultados.get("total", 0)),
-            ("✅ Exitosas", resultados.get("exitosas", 0)),
-            ("❌ Fallidas", resultados.get("fallidas", 0)),
-        ]
-        if "rondas" in resultados:
-            metricas.append(("🔄 Rondas", resultados.get("rondas", 0)))
-        if "sin_registro" in resultados:
-            metricas.append(
-                ("🪪 Sin registro (saltadas)", resultados.get("sin_registro", 0))
-            )
-        # Metricas opcionales de la curva/tiers/cuotas (solo si el motor las trae).
-        metricas.extend(_metricas_tier_curva(resultados))
-        for col, (etiqueta, valor) in zip(st.columns(len(metricas)), metricas):
-            col.metric(etiqueta, valor)
-
-        detalles = resultados.get("detalles") or []
-        if detalles:
-            with st.expander("🔍 Detalle por cuenta", expanded=False):
-                for d in detalles:
-                    icono = "✅" if d.get("ok") else "❌"
-                    linea = f"{icono} @{d.get('usuario', '')} — {d.get('detalle', '')}"
-                    if d.get("url"):
-                        linea += f" — [ver post]({d['url']})"
-                    if d.get("ronda"):
-                        linea += f" — ronda {d['ronda']}"
-                    st.markdown(linea)
-
-        sin_registro_usuarios = resultados.get("sin_registro_usuarios") or []
-        sugerencia_registro = (resultados.get("sugerencia_registro") or "").strip()
-        if sin_registro_usuarios or sugerencia_registro:
-            with st.expander(
-                f"🪪 Cuentas sin registro (saltadas) ({len(sin_registro_usuarios)})",
-                expanded=False,
-            ):
-                if sugerencia_registro:
-                    st.info(sugerencia_registro)
-                if sin_registro_usuarios:
-                    st.caption(", ".join(f"@{u}" for u in sin_registro_usuarios))
+        # El panel persistente (arriba de la pestana) pinta el proceso en vivo
+        # y, al terminar, el resumen: aqui no se pinta nada mas.
 
 
 def _por_roles():
@@ -1942,6 +2714,16 @@ def _por_roles():
     # SIEMPRE antes de crear cualquier widget de la pestana (incluido
     # `act_roles_contexto`).
     _aplicar_limpieza_contexto_pendiente("act_roles")
+
+    # Panel de proceso persistente (mismo comportamiento que la pestana A):
+    # campaña en curso -> proceso en vivo con paro y sin formulario.
+    _render_proceso_activo(prefix="act_roles")
+    if _campana_en_curso() is not None:
+        st.caption(
+            "🚦 Hay una campaña en curso: usa el panel de arriba para "
+            "detenerla o espera a que termine para lanzar otra."
+        )
+        return
 
     cuentas = _cargar_cuentas_con_roles()
     st.caption(f"Cuentas twitter activas: **{len(cuentas)}**")
@@ -2669,33 +3451,36 @@ def _por_roles():
             reserva_rotar,
             reserva_usuarios,
         )
-        resultados = _lanzar_con_opciones_velocidad(
-            lambda cb: motor.ejecutar_por_roles(
-                urls=urls,
-                texto_base=texto_base,
-                hashtags=hashtags,
-                menciones=menciones,
-                dar_like=dar_like,
-                duracion_min=int(duracion_min),
-                cohortes=int(cohortes),
-                usuarios=usuarios_param,
-                solo_roles=solo_roles_param,
-                callback=cb,
-                contexto=contexto_manual,
-                narrativa=narrativa_noticias,
-                repetir=bool(repetir),
-                solo_con_registro=bool(todas_cuentas),
+        lanzar = _lanzar_motor(
+            motor.ejecutar_por_roles,
+            {
+                "urls": urls,
+                "texto_base": texto_base,
+                "hashtags": hashtags,
+                "menciones": menciones,
+                "dar_like": dar_like,
+                "duracion_min": int(duracion_min),
+                "cohortes": int(cohortes),
+                "usuarios": usuarios_param,
+                "solo_roles": solo_roles_param,
+                "contexto": contexto_manual,
+                "narrativa": narrativa_noticias,
+                "repetir": bool(repetir),
+                "solo_con_registro": bool(todas_cuentas),
                 # La UI ya no ofrece el modo aleatorio: la campaña usa SIEMPRE
                 # el rol guardado que asigna «🎚️ Reparto por porcentajes». El
                 # motor lo sigue soportando (por si se reactiva la UI).
-                roles_aleatorios=False,
-                cooldown_min=float(cooldown_min),
-                secciones=secciones_param,
-                porcentaje_min_ronda=int(pct_min),
-                porcentaje_max_ronda=int(pct_max),
+                "roles_aleatorios": False,
+                "cooldown_min": float(cooldown_min),
+                "secciones": secciones_param,
+                "porcentaje_min_ronda": int(pct_min),
+                "porcentaje_max_ronda": int(pct_max),
                 **pausa_kwargs,
                 **parametros_extra,
-            ),
+            },
+        )
+        _lanzar_con_opciones_velocidad(
+            lanzar,
             motor,
             duracion_min=int(duracion_min),
             repetir=bool(repetir),
@@ -2709,8 +3494,16 @@ def _por_roles():
             permitir_password=bool(permitir_password),
             modo_pestana=bool(modo_pestana),
             pestana_max_acciones=int(pestana_max_acciones),
+            tipo="roles",
+            parametros={
+                "duracion_min": int(duracion_min),
+                "repetir": bool(repetir),
+                "curva_aceleracion": bool(curva),
+                "curva_fase1_min": int(curva_fase1) if curva else None,
+            },
         )
-        _mostrar_resultados_roles(resultados)
+        # El panel persistente (arriba de la pestana) pinta el proceso en vivo
+        # y, al terminar, el resumen; aqui no se pinta nada mas.
 
 
 def render(usuario: dict):

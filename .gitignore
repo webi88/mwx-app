@@ -18,5 +18,6 @@ data/avatar*/*.png
 data/avatars/
 data/portadas/
 data/backups/
+data/campanas/
 .DS_Store
 Thumbs.db

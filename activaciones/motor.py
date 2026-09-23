@@ -148,6 +148,11 @@ MENSAJE_SOLO_PASSWORD = (
 # callback.
 MENSAJE_CUOTA_AGOTADA = "cuota agotada: la cuenta alcanzo sus limites por hora"
 
+# Resultado de una accion NO ejecutada por PARO TOTAL del usuario (`ok=None`):
+# mismo tratamiento que la cuota agotada (no es exito ni fallo, no abre
+# navegador, no reserva cuota, no registra nada en la BD y no dispara callback).
+MENSAJE_CANCELADO = "campaña cancelada por el usuario"
+
 # Resultado de una accion NO ejecutada porque el TIER de la cuenta prohibe el
 # rol (Tier 2 jamas publica hashtags/posts originales): tampoco es exito ni
 # fallo y jamas toca la BD.
@@ -1272,15 +1277,128 @@ class MotorActivacion:
         self._tier_de: dict = {}
         # Cuentas Tier 2 que `_obtener_cuentas_por_rol` excluyo por defensa.
         self._tier2_filtradas_rol: list = []
+        # PARO TOTAL: evento de cancelacion de la campana en curso. Lo asigna
+        # cada campana con el kwarg `cancelar` (solo si parece un Event real)
+        # o `solicitar_paro()` (fallback interno ya seteado). `None` = sin
+        # cancelacion (comportamiento actual exacto).
+        self._cancelar = None
+        # Evita repetir el INFO del paro mas de una vez por evento.
+        self._paro_logueado = False
 
     _VENTANA_RECURSOS_SEG = 30.0
 
-    def _adquirir_navegador(self) -> None:
-        """Reserva un cupo de navegador (espera si el limite esta lleno)."""
+    # ------------------------------------------------------------------ #
+    # PARO TOTAL (cancelacion)
+    # ------------------------------------------------------------------ #
+    def _log_paro(self) -> None:
+        """Loguea UNA sola vez el paro total (idempotente; nunca lanza)."""
+        try:
+            if getattr(self, "_paro_logueado", False):
+                return
+            self._paro_logueado = True
+            logger.info("Activacion: paro total solicitado; cerrando...")
+        except Exception:
+            pass
+
+    def solicitar_paro(self) -> None:
+        """Pide el PARO TOTAL de la campana en curso (idempotente; nunca lanza).
+
+        Crea (si hace falta) un `threading.Event` interno YA SETEADO, lo deja
+        en `self._cancelar` y despierta a los workers que esperan cupo de
+        navegador/pestaña para que salgan de inmediato. Sirve de fallback
+        cuando la UI no pasa `cancelar` a `ejecutar`/`ejecutar_por_roles`: las
+        campanas siguientes lo respetan (terminan de inmediato).
+        """
+        try:
+            evento = getattr(self, "_cancelar", None)
+            if not callable(getattr(evento, "is_set", None)):
+                evento = threading.Event()
+                self._cancelar = evento
+                self._paro_logueado = False
+            evento.set()
+            self._log_paro()
+            for cond in (
+                getattr(self, "_navegadores_cond", None),
+                getattr(self, "_pestanas_cond", None),
+            ):
+                try:
+                    if cond is not None:
+                        with cond:
+                            cond.notify_all()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def _guardar_cancelar(self, cancelar) -> None:
+        """Guarda el evento de cancelacion externo (si parece un Event real).
+
+        Con `None` o un objeto sin `is_set()` NO se toca `self._cancelar`: se
+        conserva el evento interno de `solicitar_paro()` (si existe) para que
+        la campana siguiente tambien lo respete. Nunca lanza.
+        """
+        try:
+            if not callable(getattr(cancelar, "is_set", None)):
+                return
+            if cancelar is not getattr(self, "_cancelar", None):
+                # Evento nuevo: el INFO del paro se emite una vez por evento.
+                self._paro_logueado = False
+            self._cancelar = cancelar
+        except Exception:
+            pass
+
+    def _cancelado(self) -> bool:
+        """True si hay paro total solicitado (kwarg `cancelar` o `solicitar_paro`).
+
+        Nunca lanza: sin evento o con un objeto raro devuelve False
+        (comportamiento identico al actual). Emite el INFO del paro UNA vez.
+        """
+        try:
+            evento = getattr(self, "_cancelar", None)
+            is_set = getattr(evento, "is_set", None)
+            marcado = bool(is_set()) if callable(is_set) else False
+        except Exception:
+            return False
+        if marcado:
+            self._log_paro()
+        return marcado
+
+    def _dormir_cancelable(self, segundos, tramo: float = 0.5) -> bool:
+        """Duerme `segundos` en tramos <= `tramo`, cortando si hay paro total.
+
+        Devuelve True si completo la espera y False si se cancelo. Nunca lanza
+        (un valor raro se trata como 0).
+        """
+        try:
+            total = max(0.0, float(segundos or 0))
+        except (TypeError, ValueError):
+            total = 0.0
+        try:
+            tramo = max(0.05, float(tramo))
+        except (TypeError, ValueError):
+            tramo = 0.5
+        fin = time.monotonic() + total
+        while True:
+            if self._cancelado():
+                return False
+            restante = fin - time.monotonic()
+            if restante <= 0:
+                return True
+            time.sleep(min(tramo, restante))
+
+    def _adquirir_navegador(self) -> bool:
+        """Reserva un cupo de navegador (espera si el limite esta lleno).
+
+        Devuelve False si se solicito el paro total mientras esperaba cupo (el
+        llamador NO debe crear el navegador). Nunca lanza.
+        """
         with self._navegadores_cond:
             while self._navegadores_activos >= self._limite_navegadores:
+                if self._cancelado():
+                    return False
                 self._navegadores_cond.wait(timeout=0.5)
             self._navegadores_activos += 1
+        return True
 
     def _liberar_navegador(self) -> None:
         """Devuelve un cupo de navegador (sin negativos; despierta waiters)."""
@@ -1392,6 +1510,9 @@ class MotorActivacion:
             espera_total = 180.0
         deadline = time.monotonic() + espera_total
         while True:
+            # Paro total: no dejar workers esperando cupo hasta 3 minutos.
+            if self._cancelado():
+                return None
             reserva = None
             with self._pestanas_cond:
                 for pestana in self._pestanas:
@@ -1417,6 +1538,17 @@ class MotorActivacion:
                         timeout=min(1.0, max(0.05, restante))
                     )
                     continue
+
+            if self._cancelado():
+                # Se cancelo entre la reserva y la creacion: devolver el cupo
+                # SIN abrir Chrome.
+                with self._pestanas_cond:
+                    try:
+                        self._pestanas.remove(reserva)
+                    except ValueError:
+                        pass
+                    self._pestanas_cond.notify_all()
+                return None
 
             bot = None
             try:
@@ -1508,6 +1640,11 @@ class MotorActivacion:
                     bot.cerrar()
                 except Exception:
                     pass
+                return None
+            if self._cancelado():
+                # La campana se cancelo mientras se creaba el Chrome: cerrarlo
+                # (nunca dejarlo huerfano) y no entregarlo a ningun worker.
+                self._descartar_pestana(reserva)
                 return None
             return reserva
 
@@ -1744,11 +1881,31 @@ class MotorActivacion:
         resumen.setdefault("reserva_disponible", 0)
         resumen.setdefault("curva_aceleracion", False)
         resumen.setdefault("curva_fase1_min", 0)
+        resumen.setdefault("omitidas_por_cancelacion", 0)
         resumen.setdefault("fase_actual", int(self.progreso.get("fase_actual", 1) or 1))
         try:
             resumen["cascada_urls"] = len(self._cascada_usadas)
         except Exception:
             resumen["cascada_urls"] = 0
+        # PARO TOTAL: `cancelada` SIEMPRE presente. El resumen interno puede
+        # traerla (salida temprana); si no, manda el estado real del motor.
+        try:
+            cancelada = bool(self._cancelado())
+        except Exception:
+            cancelada = False
+        resumen["cancelada"] = bool(resumen.get("cancelada", False)) or cancelada
+        if resumen["cancelada"]:
+            try:
+                exitosas = int(resumen.get("exitosas", 0) or 0)
+                fallidas = int(resumen.get("fallidas", 0) or 0)
+                omitidas = int(resumen.get("omitidas_por_cancelacion", 0) or 0)
+                omitidas += int(resumen.get("omitidas_por_cuota", 0) or 0)
+            except Exception:
+                exitosas, fallidas, omitidas = 0, 0, 0
+            logger.info(
+                f"Activacion: campaña cancelada por el usuario; {exitosas} "
+                f"exitosas, {fallidas} fallidas, {omitidas} omitidas"
+            )
         return resumen
 
     def _n_workers(self) -> int:
@@ -2386,6 +2543,7 @@ class MotorActivacion:
                 "omitidas": self.progreso.get("omitidas", 0),
                 "ronda_actual": self.progreso.get("ronda_actual", 1),
                 "fase_actual": self.progreso.get("fase_actual", 1),
+                "cancelada": bool(self._cancelado()),
                 "eventos": list(eventos) if isinstance(eventos, list) else [],
             }
 
@@ -3107,6 +3265,8 @@ class MotorActivacion:
             hay elegibles, no incrementa la ronda ni genera textos: los
             workers duermen y reintentan.
             """
+            if self._cancelado():
+                return False
             if sustituir is not None:
                 try:
                     sustituir()
@@ -3130,6 +3290,10 @@ class MotorActivacion:
                 elegibles = filtrados
             if not elegibles:
                 return False
+            # Paro total: cortar ANTES de incrementar la ronda y de generar
+            # textos (la IA puede tardar); nada de trabajo nuevo.
+            if self._cancelado():
+                return False
             estado["ronda"] += 1
             with self._lock:
                 self.progreso["ronda_actual"] = estado["ronda"]
@@ -3144,6 +3308,8 @@ class MotorActivacion:
             random.shuffle(subset)
             estado["orden"] = subset
             estado["cursor"] = 0
+            if self._cancelado():
+                return False
             usuarios = [c.usuario for c in subset]
             try:
                 try:
@@ -3201,8 +3367,10 @@ class MotorActivacion:
             return None
 
         def _worker() -> None:
-            while time.monotonic() < fin:
+            while time.monotonic() < fin and not self._cancelado():
                 with lock:
+                    if self._cancelado():
+                        return
                     elegido = _tomar_cuenta_locked()
                     ronda = estado["ronda"]
                 if elegido is None:
@@ -3212,6 +3380,9 @@ class MotorActivacion:
                         time.sleep(random.uniform(1, 2))
                     continue
                 cuenta, texto, rol = elegido
+                # Paro total: no ejecutar la cuenta recien tomada.
+                if self._cancelado():
+                    return
                 if time.monotonic() >= fin:
                     return
                 try:
@@ -3539,6 +3710,9 @@ class MotorActivacion:
         Devuelve una tupla de 4 elementos:
         (usuario, exito, detalle, url_publicada).
         """
+        # Paro total: ni API ni navegador (ok=None = omitida).
+        if self._cancelado():
+            return (cuenta.usuario, None, MENSAJE_CANCELADO, "")
         bot = None
         detalle_final = ""
         try:
@@ -3562,6 +3736,9 @@ class MotorActivacion:
                     pestana, cuenta, url, texto, dar_like
                 )
 
+            # Paro total: no crear Chrome para el camino clasico.
+            if self._cancelado():
+                return (cuenta.usuario, None, MENSAJE_CANCELADO, "")
             bot = TwitterBot(cuenta.usuario)
             ok_sesion, detalle_sesion = self._asegurar_sesion(bot, cuenta)
             if not ok_sesion:
@@ -3620,6 +3797,9 @@ class MotorActivacion:
         """
         cuotas = self._cuotas
         reservado = False
+        # Paro total: devolver ok=None SIN reservar cuota ni abrir navegador.
+        if self._cancelado():
+            return (cuenta.usuario, None, MENSAJE_CANCELADO, "")
         if cuotas is not None:
             reservado = bool(cuotas.reservar(cuenta.usuario, "cita"))
             if not reservado:
@@ -3636,7 +3816,11 @@ class MotorActivacion:
                 )
                 return resultado
             if retardo > 0:
-                time.sleep(retardo)
+                # Retardo de cohortes (puede ser de minutos) en tramos
+                # cancelables: con paro total NO se ejecuta la accion.
+                if not self._dormir_cancelable(retardo):
+                    resultado = (cuenta.usuario, None, MENSAJE_CANCELADO, "")
+                    return resultado
 
             # Cascada de fase 1 (curva): la cita apunta a las URLs publicadas
             # por Tier 1 si ya empezo la fase 2.
@@ -3644,6 +3828,9 @@ class MotorActivacion:
             resultado = self._intentar_quote_rt(
                 cuenta, urls_efectivas, texto, dar_like
             )
+            if resultado[1] is None:
+                # Cancelada a mitad: no es sesion caida ni se reintenta.
+                return resultado
             if not resultado[1]:
                 detalle = resultado[2]
                 if _es_error_recursos(detalle):
@@ -3662,6 +3849,8 @@ class MotorActivacion:
                     resultado = self._intentar_quote_rt(
                         cuenta, urls_efectivas, texto, dar_like
                     )
+                    if resultado[1] is None:
+                        return resultado
             if not resultado[1]:
                 self._registrar_sesion_caida(resultado[0], resultado[2])
             return resultado
@@ -3699,7 +3888,10 @@ class MotorActivacion:
                 self._ultimo_comentario_url[url] = base + pausa
             if espera > 0:
                 dormido = min(espera, 60.0)
-                time.sleep(dormido)
+                # Espera anti-spam en tramos <=0.5s: con paro total se corta y
+                # la accion ya no se ejecuta (el llamador vuelve a chequear).
+                if not self._dormir_cancelable(dormido):
+                    return 0.0
                 return dormido
             return 0.0
         except Exception:
@@ -3818,6 +4010,10 @@ class MotorActivacion:
         if rol == "post":
             rol = "hashtags"
 
+        # Paro total: ok=None (omitida) sin API, cuota ni navegador.
+        if self._cancelado():
+            return (cuenta.usuario, rol, None, MENSAJE_CANCELADO, "")
+
         bot = None
         url_objetivo = ""
         try:
@@ -3837,6 +4033,12 @@ class MotorActivacion:
                     logger.debug(
                         f"comentario: pausa anti-spam {espero:.1f}s para "
                         f"{url_objetivo}"
+                    )
+                # La espera puede haberse cortado por paro total.
+                if self._cancelado():
+                    return (
+                        cuenta.usuario, rol, None, MENSAJE_CANCELADO,
+                        url_objetivo,
                     )
 
             # --- API PRIMERO (sin navegador ni gate). ---
@@ -3866,9 +4068,18 @@ class MotorActivacion:
                 )
 
             # --- Selenium (fallback clasico): gate de navegadores. ---
-            self._adquirir_navegador()
+            if not self._adquirir_navegador():
+                return (
+                    cuenta.usuario, rol, None, MENSAJE_CANCELADO, url_objetivo,
+                )
             detalle_accion = ""
             try:
+                if self._cancelado():
+                    # El paro llego esperando cupo: no crear Chrome.
+                    return (
+                        cuenta.usuario, rol, None, MENSAJE_CANCELADO,
+                        url_objetivo,
+                    )
                 bot = TwitterBot(cuenta.usuario)
                 ok_sesion, detalle_sesion = self._asegurar_sesion(bot, cuenta)
                 if not ok_sesion:
@@ -3925,6 +4136,9 @@ class MotorActivacion:
         """
         cuotas = self._cuotas
         rol_norm = "hashtags" if rol == "post" else (rol or "")
+        # Paro total: ok=None (omitida) SIN reservar cuota ni abrir navegador.
+        if self._cancelado():
+            return (cuenta.usuario, rol, None, MENSAJE_CANCELADO, "")
         # Cascada de fase 1 (curva): rt/cita/comentario apuntan a las URLs
         # publicadas por Tier 1 si ya empezo la fase 2; si no, a las de siempre.
         urls_efectivas = self._urls_efectivas_rol(rol_norm, urls)
@@ -3949,11 +4163,20 @@ class MotorActivacion:
                 )
                 return resultado
             if retardo > 0:
-                time.sleep(retardo)
+                # Retardo de cohortes (puede ser de minutos) en tramos
+                # cancelables: con paro total NO se ejecuta la accion.
+                if not self._dormir_cancelable(retardo):
+                    resultado = (
+                        cuenta.usuario, rol, None, MENSAJE_CANCELADO, "",
+                    )
+                    return resultado
 
             resultado = self._intentar_accion_rol(
                 cuenta, rol, urls_efectivas, texto, dar_like
             )
+            if resultado[2] is None:
+                # Cancelada a mitad: no es sesion caida ni se reintenta.
+                return resultado
             if not resultado[2]:
                 detalle = resultado[3]
                 if _es_error_recursos(detalle):
@@ -3973,6 +4196,8 @@ class MotorActivacion:
                     resultado = self._intentar_accion_rol(
                         cuenta, rol, urls_efectivas, texto, dar_like
                     )
+                    if resultado[2] is None:
+                        return resultado
             if not resultado[2]:
                 # Sesion caida (cookies vencidas/sin credenciales): se omite en
                 # las rondas siguientes de la campana (conteo unico, sin abrir
@@ -4011,6 +4236,7 @@ class MotorActivacion:
         reserva_usuarios=None,
         curva_aceleracion: bool = False,
         curva_fase1_min=None,
+        cancelar=None,
     ) -> dict:
         """Lanza la campaña completa (wrapper del flujo real).
 
@@ -4021,7 +4247,9 @@ class MotorActivacion:
 
         `reserva_usuarios`: cuentas de RESPALDO (usuarios o Cuentas) que
         sustituyen 1:1 a las "Agotadas por hoy". `curva_aceleracion`/
-        `curva_fase1_min`: modo explosion (fase 1 solo Tier 1).
+        `curva_fase1_min`: modo explosion (fase 1 solo Tier 1). `cancelar`:
+        `threading.Event` (basta `is_set()`) para el PARO TOTAL; `None` =
+        comportamiento actual exacto.
         """
         inicio = time.monotonic()
         try:
@@ -4031,6 +4259,7 @@ class MotorActivacion:
                 callback, hashtags, solo_con_registro, repetir, secciones,
                 porcentaje_min_ronda, porcentaje_max_ronda,
                 reserva_usuarios, curva_aceleracion, curva_fase1_min,
+                cancelar,
             )
         finally:
             self._cerrar_pestanas()
@@ -4060,6 +4289,7 @@ class MotorActivacion:
         reserva_usuarios=None,
         curva_aceleracion: bool = False,
         curva_fase1_min=None,
+        cancelar=None,
     ) -> dict:
         """Lanza la campaña completa.
 
@@ -4081,11 +4311,33 @@ class MotorActivacion:
           1:1 a las "Agotadas por hoy" (tope diario).
         - curva_aceleracion/curva_fase1_min: "modo explosion": fase 1 solo
           Tier 1; fase 2 (Tier 2 y sin tier) tras `curva_fase1_min` minutos.
+        - cancelar: `threading.Event` con `is_set()` para el PARO TOTAL.
+          Ya seteado = la campana termina de inmediato (sin abrir navegador);
+          a mitad = los workers salen en segundos y lo pendiente queda
+          OMITIDO (`ok=None` + `MENSAJE_CANCELADO`). `None` = comportamiento
+          actual exacto (o el evento interno de `solicitar_paro()`).
         """
         # Cuotas horarias: cada campana arranca limpia y las prepara con las
         # cuentas que realmente van a ejecutar (mas abajo).
         self._cuotas = None
         self._reset_curva_campana()
+        # PARO TOTAL: guardar el evento externo (no pisa el interno de
+        # `solicitar_paro()` cuando `cancelar` viene None).
+        self._guardar_cancelar(cancelar)
+        if self._cancelado():
+            logger.info(
+                "Activacion: paro total solicitado antes de arrancar; "
+                "no se ejecuta ninguna accion"
+            )
+            return self._claves_cuotas({
+                "exitosas": 0, "fallidas": 0, "detalles": [], "total": 0,
+                "sin_sesion": 0, "sin_sesion_usuarios": [],
+                "sugerencia_sesion": "",
+                "sin_registro": 0, "sin_registro_usuarios": [],
+                "sugerencia_registro": "",
+                "rondas": 0, "omitidas_por_cuota": 0,
+                "omitidas_por_cancelacion": 0, "cancelada": True,
+            })
         with self._lock:
             self.progreso["ronda_actual"] = 1
         cuentas = self._obtener_cuentas(
@@ -4257,15 +4509,20 @@ class MotorActivacion:
                     # Cascada: URL publicada por Tier 1 en fase 1 (cita).
                     self._capturar_url_fase1(usuario_res, "cita", url)
                 if ok is None:
-                    # Omitida por cuota agotada: no es exito ni fallo, no se
-                    # registra en la BD y no dispara callback.
+                    # Omitida (cuota agotada o PARO TOTAL): no es exito ni
+                    # fallo, no se registra en la BD y no dispara callback.
                     with self._lock:
                         self.progreso["omitidas"] = (
                             self.progreso.get("omitidas", 0) + 1
                         )
-                        resumen["omitidas_por_cuota"] = (
-                            resumen.get("omitidas_por_cuota", 0) + 1
-                        )
+                        if str(detalle) == MENSAJE_CANCELADO:
+                            resumen["omitidas_por_cancelacion"] = (
+                                resumen.get("omitidas_por_cancelacion", 0) + 1
+                            )
+                        else:
+                            resumen["omitidas_por_cuota"] = (
+                                resumen.get("omitidas_por_cuota", 0) + 1
+                            )
                     return
                 with self._lock:
                     self.progreso["hechas"] += 1
@@ -4335,11 +4592,12 @@ class MotorActivacion:
         # Omitidas por cuota horaria/diaria ANTES de encolar (la garantia
         # atomica la da la reserva interna de `_quote_rt_una_cuenta`).
         omitidas_por_cuota = 0
+        omitidas_por_cancelacion = 0
 
         def _pasada_simple(cuentas_pasada, duracion_pasada):
             """Ejecuta una pasada de quote-RTs sobre `cuentas_pasada`."""
-            nonlocal omitidas_por_cuota
-            if not cuentas_pasada:
+            nonlocal omitidas_por_cuota, omitidas_por_cancelacion
+            if not cuentas_pasada or self._cancelado():
                 return
             # Un pool por grupo (registro, perfil): cada cuenta publica una cita
             # con su propio estilo. La narrativa viaja solo como trasfondo.
@@ -4366,7 +4624,12 @@ class MotorActivacion:
             with ThreadPoolExecutor(max_workers=self.max_concurrente) as pool_exec:
                 futuros = []
                 for idx, bloque in enumerate(bloques):
+                    # Paro total: no encolar mas tareas.
+                    if self._cancelado():
+                        break
                     for cuenta in bloque:
+                        if self._cancelado():
+                            break
                         if (
                             self._cuotas is not None
                             and not self._cuotas.rol_permitido(cuenta.usuario, "cita")
@@ -4386,8 +4649,12 @@ class MotorActivacion:
                         ), cuenta.usuario))
 
                 # Recoger resultados en orden de arranque (los retardos ya
-                # fueron aplicados al submit via scheduling del pool).
+                # fueron aplicados al submit via scheduling del pool). Con el
+                # paro total se corta la recoleccion: las tareas ya encoladas
+                # terminan/salen solas (ok=None) al ver el evento.
                 for retardo, futuro, usuario in sorted(futuros, key=lambda x: x[0]):
+                    if self._cancelado():
+                        break
                     try:
                         usuario_res, ok, detalle, url = futuro.result()
                     except Exception as e:
@@ -4396,12 +4663,16 @@ class MotorActivacion:
                     if ok:
                         self._capturar_url_fase1(usuario_res, "cita", url)
                     if ok is None:
-                        # Omitida por cuota agotada (carrera con otro worker).
+                        # Omitida (cuota agotada o PARO TOTAL; carrera con otro
+                        # worker): no es exito ni fallo ni toca la BD.
                         with self._lock:
                             self.progreso["omitidas"] = (
                                 self.progreso.get("omitidas", 0) + 1
                             )
-                        omitidas_por_cuota += 1
+                        if str(detalle) == MENSAJE_CANCELADO:
+                            omitidas_por_cancelacion += 1
+                        else:
+                            omitidas_por_cuota += 1
                         continue
 
                     with self._lock:
@@ -4485,6 +4756,7 @@ class MotorActivacion:
             "sugerencia_registro": sugerencia_registro,
             "rondas": 1,
             "omitidas_por_cuota": omitidas_por_cuota,
+            "omitidas_por_cancelacion": omitidas_por_cancelacion,
             "fase_actual": fase_final,
             **claves_dinamicas,
         }
@@ -4522,6 +4794,7 @@ class MotorActivacion:
         reserva_usuarios=None,
         curva_aceleracion: bool = False,
         curva_fase1_min=None,
+        cancelar=None,
     ) -> dict:
         """Campaña masiva dividida en subcuentas por rol (wrapper del flujo).
 
@@ -4533,7 +4806,8 @@ class MotorActivacion:
         `reserva_usuarios`: cuentas de RESPALDO (usuarios o Cuentas) que
         sustituyen 1:1 a las "Agotadas por hoy" (Tier 2 jamas sustituye un rol
         hashtags). `curva_aceleracion`/`curva_fase1_min`: modo explosion
-        (fase 1 solo Tier 1).
+        (fase 1 solo Tier 1). `cancelar`: `threading.Event` (basta `is_set()`)
+        para el PARO TOTAL; `None` = comportamiento actual exacto.
         """
         inicio = time.monotonic()
         try:
@@ -4544,6 +4818,7 @@ class MotorActivacion:
                 cooldown_min, secciones, porcentaje_min_ronda,
                 porcentaje_max_ronda, pausa_comentario_url_seg,
                 reserva_usuarios, curva_aceleracion, curva_fase1_min,
+                cancelar,
             )
         finally:
             self._cerrar_pestanas()
@@ -4576,6 +4851,7 @@ class MotorActivacion:
         reserva_usuarios=None,
         curva_aceleracion: bool = False,
         curva_fase1_min=None,
+        cancelar=None,
     ) -> dict:
         """Campaña masiva dividida en subcuentas por rol.
 
@@ -4629,6 +4905,11 @@ class MotorActivacion:
           Tier 1; fase 2 (Tier 2 y sin tier) tras `curva_fase1_min` minutos.
         - Cohortes temporales + delay aleatorio y concurrencia limitada,
           igual que `ejecutar()`.
+        - `cancelar`: `threading.Event` con `is_set()` para el PARO TOTAL.
+          Ya seteado = la campana termina de inmediato (sin abrir navegador);
+          a mitad = los workers salen en segundos y lo pendiente queda
+          OMITIDO (`ok=None` + `MENSAJE_CANCELADO`). `None` = comportamiento
+          actual exacto (o el evento interno de `solicitar_paro()`).
         - Nunca lanza: cada cuenta fallida se reporta en `detalles`.
         """
         # Cuotas horarias: cada campana arranca limpia y las prepara con las
@@ -4647,6 +4928,41 @@ class MotorActivacion:
         except (TypeError, ValueError):
             pausa_comentario_val = 0.0
         self.pausa_comentario_url_seg = pausa_comentario_val
+        # PARO TOTAL: guardar el evento externo (no pisa el interno de
+        # `solicitar_paro()` cuando `cancelar` viene None).
+        self._guardar_cancelar(cancelar)
+        if self._cancelado():
+            logger.info(
+                "Activacion por roles: paro total solicitado antes de "
+                "arrancar; no se ejecuta ninguna accion"
+            )
+            return self._claves_cuotas({
+                "total": 0,
+                "exitosas": 0,
+                "fallidas": 0,
+                "sin_rol": 0,
+                "sin_sesion": 0,
+                "por_rol": {
+                    "cita": {"total": 0, "exitosas": 0, "fallidas": 0},
+                    "hashtags": {"total": 0, "exitosas": 0, "fallidas": 0},
+                    "comentario": {"total": 0, "exitosas": 0, "fallidas": 0},
+                    "rt": {"total": 0, "exitosas": 0, "fallidas": 0},
+                },
+                "detalles": [],
+                "sin_rol_usuarios": [],
+                "sin_sesion_usuarios": [],
+                "sugerencia_sesion": "",
+                "sin_registro": 0,
+                "sin_registro_usuarios": [],
+                "sugerencia_registro": "",
+                "rondas": 0,
+                "roles_aleatorios": bool(roles_aleatorios),
+                "cooldown_min": cooldown_val,
+                "pausa_comentario_url_seg": pausa_comentario_val,
+                "omitidas_por_cuota": 0,
+                "omitidas_por_cancelacion": 0,
+                "cancelada": True,
+            })
         roles_sortear = (
             _roles_disponibles_aleatorios(
                 urls, hashtags, contexto, texto_base, solo_roles,
@@ -5033,15 +5349,20 @@ class MotorActivacion:
                     # Cascada: URL publicada por Tier 1 en fase 1.
                     self._capturar_url_fase1(usuario_res, rol_res, url)
                 if ok is None:
-                    # Omitida (cuota agotada o Tier 2 sin rol permitido): no es
-                    # exito ni fallo, no se registra en la BD, no genera evento
-                    # ni callback.
+                    # Omitida (cuota agotada, Tier 2 sin rol permitido o PARO
+                    # TOTAL): no es exito ni fallo, no se registra en la BD, no
+                    # genera evento ni callback.
                     with self._lock:
                         self.progreso["omitidas"] = (
                             self.progreso.get("omitidas", 0) + 1
                         )
                     if str(detalle) == MENSAJE_TIER2_SIN_ROL:
                         self._contar_tier2_sin_rol(usuario_res, resumen)
+                    elif str(detalle) == MENSAJE_CANCELADO:
+                        with self._lock:
+                            resumen["omitidas_por_cancelacion"] = (
+                                resumen.get("omitidas_por_cancelacion", 0) + 1
+                            )
                     else:
                         with self._lock:
                             resumen["omitidas_por_cuota"] = (
@@ -5128,11 +5449,12 @@ class MotorActivacion:
         )
 
         omitidas_por_cuota = 0
+        omitidas_por_cancelacion = 0
 
         def _pasada_rol_simple(cuentas_pasada, duracion_pasada):
             """Ejecuta UNA pasada por roles sobre `cuentas_pasada`."""
-            nonlocal omitidas_por_cuota
-            if not cuentas_pasada:
+            nonlocal omitidas_por_cuota, omitidas_por_cancelacion
+            if not cuentas_pasada or self._cancelado():
                 return
             if roles_aleatorios:
                 roles_pasada = self._asignar_roles_aleatorios(
@@ -5184,7 +5506,12 @@ class MotorActivacion:
             with ThreadPoolExecutor(max_workers=self.max_concurrente) as pool_exec:
                 futuros = []
                 for idx, bloque in enumerate(bloques):
+                    # Paro total: no encolar mas tareas.
+                    if self._cancelado():
+                        break
                     for cuenta in bloque:
+                        if self._cancelado():
+                            break
                         rol = roles_pasada.get(cuenta.usuario, "")
                         if not rol:
                             # Sin rol efectivo: cuota agotada (modo aleatorio)
@@ -5226,6 +5553,8 @@ class MotorActivacion:
                         ), cuenta.usuario))
 
                 for retardo, futuro, usuario in sorted(futuros, key=lambda x: x[0]):
+                    if self._cancelado():
+                        break
                     try:
                         usuario_res, rol_res, ok, detalle, url = futuro.result()
                     except Exception as e:
@@ -5236,14 +5565,16 @@ class MotorActivacion:
                     if ok:
                         self._capturar_url_fase1(usuario_res, rol_res, url)
                     if ok is None:
-                        # Omitida (cuota o Tier 2 sin rol permitido): no es
-                        # exito ni fallo ni toca la BD.
+                        # Omitida (cuota, Tier 2 sin rol permitido o PARO
+                        # TOTAL): no es exito ni fallo ni toca la BD.
                         with self._lock:
                             self.progreso["omitidas"] = (
                                 self.progreso.get("omitidas", 0) + 1
                             )
                         if str(detalle) == MENSAJE_TIER2_SIN_ROL:
                             self._contar_tier2_sin_rol(usuario_res, resumen)
+                        elif str(detalle) == MENSAJE_CANCELADO:
+                            omitidas_por_cancelacion += 1
                         else:
                             omitidas_por_cuota += 1
                         continue
@@ -5317,6 +5648,7 @@ class MotorActivacion:
             _pasada_rol_simple(list(ejecutables), duracion_min)
 
         resumen["omitidas_por_cuota"] = omitidas_por_cuota
+        resumen["omitidas_por_cancelacion"] = omitidas_por_cancelacion
         resumen["fase_actual"] = fase_final
         logger.info(
             f"Activacion por roles finalizada: {resumen['exitosas']} exitosas, "
