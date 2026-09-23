@@ -1778,6 +1778,98 @@ class TwitterBot:
             pass
         return False
 
+    # Regex de una URL de PUBLICACION (host twitter.com/x.com + /status/<id>).
+    _RE_URL_STATUS = re.compile(
+        r"^https?://(?:[a-z0-9-]+\.)*(?:twitter\.com|x\.com)/"
+        r"([^/?#]+)/status/\d+",
+        re.IGNORECASE,
+    )
+
+    def _handles_propios(self) -> set:
+        """Handles que cuentan como "la propia cuenta" (en minusculas).
+
+        Usa `self.usuario` (clave interna) y, si el bot conoce el handle real
+        (`handle_actual`/`nombre_usuario`...), tambien lo acepta: tras un cambio
+        de @ la clave interna puede no coincidir con el handle de X. Nunca
+        lanza; sin handles devuelve un set vacio.
+        """
+        handles: set = set()
+        for attr in ("usuario", "handle_actual", "handle_propuesto",
+                     "nombre_usuario", "screen_name"):
+            try:
+                valor = str(getattr(self, attr, "") or "").strip().lstrip("@").lower()
+            except Exception:
+                continue
+            if valor:
+                handles.add(valor)
+        return handles
+
+    def _obtener_enlace_reciente_timeline(
+        self, texto_publicado: str = "", timeout: float = 3.0
+    ) -> Optional[str]:
+        """Ruta RAPIDA: link de la publicacion recien hecha en el timeline actual.
+
+        Tras publicar, X deja la pestana en `/home` (o en el compositor) y los
+        PRIMEROS articulos del timeline suelen incluir el post recien hecho. Se
+        escanea ese timeline SIN navegar (barato, ~1-3s) buscando un
+        `a[href*='/status/']` cuya URL sea de la PROPIA cuenta
+        (`/<usuario>/status/`; tambien el handle real si el bot lo conoce) y, si
+        `texto_publicado` viene, se exige que el articulo contenga sus primeros
+        ~20 caracteres (evita confundir un post viejo con el nuevo).
+
+        Devuelve la URL sin query string, o None si no aparece en `timeout`.
+        Nunca lanza.
+        """
+        if not self.driver:
+            return None
+        propios = self._handles_propios()
+        if not propios:
+            return None
+        try:
+            referencia = " ".join(str(texto_publicado or "").split())[:20]
+        except Exception:
+            referencia = ""
+        try:
+            fin = self._ahora() + max(0.2, float(timeout))
+        except Exception:
+            fin = self._ahora() + 3.0
+        while True:
+            try:
+                articulos = self.driver.find_elements(
+                    By.CSS_SELECTOR, "article[data-testid='tweet']"
+                )
+            except Exception:
+                articulos = []
+            for articulo in (articulos or [])[:4]:
+                try:
+                    if self._es_tweet_fijado(articulo):
+                        continue
+                    if referencia:
+                        contenido = " ".join((articulo.text or "").split())
+                        if referencia.lower() not in contenido.lower():
+                            continue
+                    for enlace in articulo.find_elements(
+                        By.CSS_SELECTOR, "a[href*='/status/']"
+                    ):
+                        href = str(enlace.get_attribute("href") or "").strip()
+                        m = self._RE_URL_STATUS.match(href)
+                        if not m:
+                            continue
+                        if m.group(1).lstrip("@").lower() not in propios:
+                            continue
+                        return href.split("?")[0].split("#")[0].rstrip("/")
+                except Exception:
+                    continue
+            try:
+                if self._ahora() >= fin:
+                    return None
+            except Exception:
+                return None
+            try:
+                time.sleep(0.25)
+            except Exception:
+                return None
+
     def _obtener_ultimo_enlace(self, usuario: str) -> Optional[str]:
         try:
             try:
@@ -1788,7 +1880,11 @@ class TwitterBot:
                 logger.warning(
                     f"Carga lenta de {self.base_url}/{usuario}; sigo con esperas explicitas"
                 )
-            time.sleep(4)
+            # La espera fija de 4s se cambio por: esperar a que exista el
+            # articulo (hasta 5s) + una pausa corta para que el timeline pinte
+            # la publicacion recien hecha.
+            self._esperar_article_tweet(timeout=5)
+            time.sleep(random.uniform(0.3, 0.6))
             
             tweets = self.driver.find_elements(By.CSS_SELECTOR, "article[data-testid='tweet']")
             
@@ -1979,10 +2075,12 @@ class TwitterBot:
         fallback truthy si se publico pero no se pudo extraer la URL, o `None`
         si la publicacion fallo.
 
-        `buscar_url=False` omite visitar el perfil para extraer la URL (cuesta
-        ~10-15s y datos de proxy por cada post): para campanas masivas basta la
-        verificacion real de la publicacion. En ese caso `ultima_url_publicada`
-        queda vacia y se devuelve `True`.
+        `buscar_url=False` omite buscar la URL (cuesta datos de proxy por cada
+        post): para campanas masivas basta la verificacion real de la
+        publicacion. En ese caso `ultima_url_publicada` queda vacia y se
+        devuelve `True`. Con `buscar_url=True` se intenta PRIMERO la ruta rapida
+        (`_obtener_enlace_reciente_timeline`, sin navegar) y, si no hay link, se
+        visita el perfil (`_obtener_ultimo_enlace`).
         """
         if not self.driver:
             if not self.login_con_cookies():
@@ -2111,7 +2209,13 @@ class TwitterBot:
                 self.ultima_url_publicada = ""
                 return True
 
-            url = self._obtener_ultimo_enlace(self.usuario)
+            # Ruta RAPIDA (~1-3s): el post recien publicado suele estar en los
+            # primeros articulos del timeline actual (X aterriza en /home o
+            # /compose) y no hace falta navegar. Solo si falla se visita el
+            # perfil (`_obtener_ultimo_enlace`, ~5-10s).
+            url = self._obtener_enlace_reciente_timeline(contenido)
+            if not url:
+                url = self._obtener_ultimo_enlace(self.usuario)
             self.ultima_url_publicada = url or ""
             return url or True   # True como fallback truthy si no se pudo obtener la URL
         
@@ -3718,6 +3822,7 @@ try {
         queda en `self.ultimo_error`).
         """
         self.ultimo_error = ""
+        self.ultima_url_publicada = ""
 
         if not (url or "").strip():
             self.ultimo_error = "falta la URL del tweet a responder"
@@ -3911,8 +4016,10 @@ try {
                 time.sleep(3)
 
             url_respuesta = self._obtener_url_respuesta(url)
-            if url_respuesta:
-                self.ultima_url_publicada = url_respuesta
+            # La URL de la RESPUESTA queda tambien en `ultima_url_publicada`
+            # (respaldo del motor); si no se pudo capturar, se deja vacia para
+            # no arrastrar la URL de una accion anterior.
+            self.ultima_url_publicada = url_respuesta or ""
             logger.info(
                 f"perf @{self.usuario}: total={self._ahora() - t_inicio:.1f}s (urls=1)"
             )
@@ -4830,9 +4937,12 @@ try {
         """Hace RT (simple o con cita) de las URLs recibidas.
 
         Para la distribucion horaria se usa con UNA sola URL: hace exactamente
-        un RT y devuelve `{"exitos": 1, "urls": [<url>]}` (el RT simple no crea
-        una URL nueva; se registra la del perfil de la cuenta que retwittea).
-        Con varias URLs mantiene el recorrido secuencial en el mismo navegador.
+        un RT y devuelve `{"exitos": 1, "urls": []}` (el RT simple NO crea una
+        publicacion propia, asi que no genera link; la tabla lo etiqueta).
+        En las CITAS si se intenta capturar la URL del post de la cita (ruta
+        rapida del timeline y, si falla, el perfil); si no se puede, `urls`
+        queda sin esa entrada. Con varias URLs mantiene el recorrido secuencial
+        en el mismo navegador.
 
         Verifica cada publicacion REALMENTE (estado `unretweet` en RT simple y
         `_verificar_publicacion()` en citas) antes de contar el exito, por lo
@@ -4921,9 +5031,10 @@ try {
                         f"El tweet ya estaba retwitteado, se cuenta como exito: {url}"
                     )
                     resultados["exitos"] += 1
-                    url_perfil = f"https://twitter.com/{usuario}"
-                    resultados["urls"].append(url_perfil)
-                    self.ultima_url_publicada = url_perfil
+                    # RT simple: no genera publicacion propia => SIN link (antes
+                    # se agregaba el perfil de la cuenta, que no es una
+                    # publicacion).
+                    self.ultima_url_publicada = ""
                     time.sleep(random.uniform(0.2, 0.5))
                     continue
 
@@ -5035,16 +5146,21 @@ try {
                 logger.info(f"RT exitoso: {url}")
                 
                 if mensaje_cita:
-                    url_publicada = self._obtener_ultimo_enlace(self.usuario)
+                    # Cita: intentar la URL del POST DE LA CITA por la ruta
+                    # rapida (timeline actual, sin navegar) y, solo si falla,
+                    # por el perfil.
+                    url_publicada = self._obtener_enlace_reciente_timeline(
+                        mensaje
+                    )
+                    if not url_publicada:
+                        url_publicada = self._obtener_ultimo_enlace(self.usuario)
                     if url_publicada:
                         resultados["urls"].append(url_publicada)
                         self.ultima_url_publicada = url_publicada
                 else:
-                    # El RT simple no genera un post propio: se enlaza el
-                    # perfil de la cuenta que retwittea, no el tweet original.
-                    url_perfil = f"https://twitter.com/{usuario}"
-                    resultados["urls"].append(url_perfil)
-                    self.ultima_url_publicada = url_perfil
+                    # El RT simple no genera un post propio: sin URL de
+                    # publicacion (antes se enlazaba el perfil de la cuenta).
+                    self.ultima_url_publicada = ""
                 
                 time.sleep(random.uniform(0.4, 1.2))
             

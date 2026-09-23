@@ -1,4 +1,5 @@
 import io
+import unicodedata
 
 import streamlit as st
 from datetime import datetime
@@ -9,7 +10,136 @@ from web.ui import cabecera, stat, divider
 
 
 # Columnas de la "tabla de exitos" (mismo orden en pantalla y en el Excel).
-COLUMNAS_EXITOS = ("Fecha", "Usuario", "Tipo", "URL publicación")
+COLUMNAS_EXITOS = ("Fecha", "Usuario", "Tipo", "Resultado", "Link")
+
+# Resultado por rol canonico: (etiqueta con link, etiqueta base sin link).
+_ETIQUETAS_RESULTADO = {
+    "cita": ("Cita (RT con cita)", "Cita"),
+    "hashtags": ("Post", "Post"),
+    "comentario": ("Comentario", "Comentario"),
+}
+
+# Roles que NO generan link publicable: etiqueta fija y link SIEMPRE vacio.
+_RESULTADOS_FIJOS = {
+    "rt": "RT simple (no genera link)",
+    "like": "Like (no genera link)",
+}
+
+_SUFIJO_SIN_LINK = " (link no capturado)"
+
+
+def _es_url_post(url) -> bool:
+    """True solo si `url` es un enlace http(s) a un POST (contiene /status/).
+
+    Descarta perfiles ("https://twitter.com/usuario"), cadenas vacias, None,
+    anchors y basura sin esquema http(s). Nunca lanza.
+    """
+    try:
+        texto = str(url or "").strip()
+        if not texto:
+            return False
+        bajo = texto.lower()
+        if not bajo.startswith(("http://", "https://")):
+            return False
+        if "/status/" not in bajo:
+            return False
+        # Debe quedar un id tras "/status/" (descarta ".../status/" pelado).
+        resto = bajo.split("/status/", 1)[1]
+        return bool(resto.strip(" /?#\t\r\n"))
+    except Exception:
+        return False
+
+
+def _normalizar_tipo_local(tipo) -> str:
+    """Fallback local de `core.registro.normalizar_rol_cuota`.
+
+    Minusculas, sin acentos ni guiones; devuelve el rol canonico
+    (hashtags/cita/rt/comentario/like) o el texto limpio si no lo reconoce.
+    """
+    texto = str(tipo or "").strip().lower()
+    for separador in ("_", "-", ".", "/", ",", ";", "(", ")", "[", "]"):
+        texto = texto.replace(separador, " ")
+    texto = "".join(
+        caracter
+        for caracter in unicodedata.normalize("NFKD", texto)
+        if not unicodedata.combining(caracter)
+    )
+    tokens = texto.split()
+    if not tokens:
+        return ""
+    if any(token.startswith("cita") or token.startswith("quote") for token in tokens):
+        return "cita"
+    if any(token.startswith("hashtag") or token.startswith("mencion") for token in tokens):
+        return "hashtags"
+    if any(
+        token
+        in (
+            "post",
+            "posts",
+            "publicacion",
+            "publicaciones",
+            "mantenimiento",
+            "calentamiento",
+            "hilo",
+            "hilos",
+        )
+        or token.startswith("publicac")
+        for token in tokens
+    ):
+        return "hashtags"
+    if any(
+        token.startswith("coment")
+        or token in ("reply", "responder", "respuesta", "respuestas")
+        for token in tokens
+    ):
+        return "comentario"
+    if any(
+        token == "rt" or token.startswith("retweet") or token.startswith("repost")
+        for token in tokens
+    ):
+        return "rt"
+    if any(token in ("like", "likes", "megusta") for token in tokens):
+        return "like"
+    return " ".join(tokens)
+
+
+def _normalizar_tipo(tipo) -> str:
+    """Rol canonico de un tipo de accion (`core.registro` o fallback local)."""
+    try:
+        from core.registro import normalizar_rol_cuota
+
+        return normalizar_rol_cuota(tipo)
+    except Exception:
+        return _normalizar_tipo_local(tipo)
+
+
+def _resultado_accion(tipo, url) -> tuple:
+    """Devuelve `(resultado, link)` para una accion de la tabla de exitos.
+
+    - cita/quote -> "Cita (RT con cita)"; post/hashtags/publicacion/
+      mantenimiento/calentamiento/hilo -> "Post"; comentario/respuesta/reply ->
+      "Comentario". Si la categoria genera link y `url` es un post valido
+      (`_es_url_post`) se devuelve la URL; si no, "(link no capturado)".
+    - rt/retweet/repost -> "RT simple (no genera link)" y link SIEMPRE "".
+    - like -> "Like (no genera link)" y link SIEMPRE "" (aunque la URL
+      historica apunte al tweet likeado).
+    - Tipo desconocido -> el tipo tal cual (o "Accion") y, sin link,
+      "(link no capturado)".
+
+    Nunca lanza.
+    """
+    try:
+        link = str(url or "").strip() if _es_url_post(url) else ""
+        rol = _normalizar_tipo(tipo)
+        if rol in _RESULTADOS_FIJOS:
+            return _RESULTADOS_FIJOS[rol], ""
+        if rol in _ETIQUETAS_RESULTADO:
+            etiqueta, base = _ETIQUETAS_RESULTADO[rol]
+            return (etiqueta, link) if link else (base + _SUFIJO_SIN_LINK, "")
+        base = str(tipo or "").strip() or "Acción"
+        return (base, link) if link else (base + _SUFIJO_SIN_LINK, "")
+    except Exception:
+        return (str(tipo or "").strip() or "Acción", "")
 
 
 def _es_fila_vacia(fila: dict) -> bool:
@@ -30,7 +160,7 @@ def _filas_con_separacion(filas: list[dict]) -> list[dict]:
 
     Args:
         filas: lista de dicts con los exitos ("Fecha", "Usuario", "Tipo",
-            "URL publicación"). Nunca lanza.
+            "Resultado", "Link"). Nunca lanza.
 
     Returns:
         Nueva lista (no modifica la original) con los exitos en orden y las
@@ -173,22 +303,35 @@ def render(usuario: dict):
     except TypeError:
         # Compatibilidad mientras core/registro.py no tenga el parámetro:
         estados_ok = {"exito", "exitoso", "ok"}
-        acciones = [
-            a for a in obtener_acciones(limit=200)
-            if (a.estado or "").strip().lower() in estados_ok
-        ][:50]
+        try:
+            acciones = [
+                a for a in obtener_acciones(limit=200)
+                if (getattr(a, "estado", "") or "").strip().lower() in estados_ok
+            ][:50]
+        except Exception:
+            acciones = []
+    except Exception:
+        acciones = []
     if acciones:
         filas = []
         for a in acciones:
+            tipo = getattr(a, "tipo", "") or ""
+            resultado, link = _resultado_accion(
+                tipo, getattr(a, "url_publicacion", "") or ""
+            )
+            fecha = getattr(a, "fecha", None)
             filas.append({
-                "Fecha": a.fecha.strftime("%Y-%m-%d %H:%M") if a.fecha else "",
-                "Usuario": a.usuario,
-                "Tipo": a.tipo,
-                "URL publicación": a.url_publicacion or "",
+                "Fecha": fecha.strftime("%Y-%m-%d %H:%M") if fecha else "",
+                "Usuario": getattr(a, "usuario", "") or "",
+                "Tipo": tipo,
+                "Resultado": resultado,
+                "Link": link,
             })
         filas_mostradas = _filas_con_separacion(filas)
         st.caption("✅ Solo se muestran las acciones exitosas; las fallidas no se incluyen.")
-        st.dataframe(filas_mostradas, use_container_width=True)
+        st.dataframe(filas_mostradas, use_container_width=True, column_config={
+            "Link": st.column_config.LinkColumn("Link", display_text="🔗 Abrir"),
+        })
         datos_excel = _excel_exitos_bytes(filas_mostradas)
         if datos_excel:
             st.download_button(
@@ -203,9 +346,5 @@ def render(usuario: dict):
                 "No se pudo generar el Excel (openpyxl no disponible). "
                 "Puedes descargar el CSV desde el menú del dataframe."
             )
-        # además muestra los enlaces clicables de las acciones exitosas con URL
-        for a in acciones:
-            if a.url_publicacion:
-                st.markdown(f"🔗 @{a.usuario} — [{a.tipo}] [ver post]({a.url_publicacion})")
     else:
         st.info("Aún no hay acciones registradas.")

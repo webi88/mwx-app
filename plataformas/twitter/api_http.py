@@ -421,6 +421,11 @@ class TwitterAPI:
         self.usuario = usuario
         self.cookies_path = resolver_ruta(f"data/cookies/twitter/{usuario}.pkl")
         self.session = None
+        # URL de la ultima PUBLICACION creada por esta instancia (CreateTweet):
+        # `https://x.com/<usuario>/status/<id>` cuando la respuesta GraphQL trae
+        # el id; "" si no (rt/like NO crean tweet y los fallos tampoco). El motor
+        # la lee tras `accion_rapida` para registrar el link real en Reportes.
+        self.ultima_url_publicada = ""
         self.bearer_token = "AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs=1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA"
         # Presupuesto total de red de la instancia (API_TIMEOUT_SEG, default
         # 10s): `_post_json` lo respeta por peticion para que una accion no
@@ -1186,6 +1191,34 @@ class TwitterAPI:
         except Exception:
             return False
 
+    @staticmethod
+    def _id_tweet_creado(data) -> str:
+        """Id del tweet creado por CreateTweet ('' si la respuesta no lo trae).
+
+        Acepta el `rest_id` directo y el anidado `tweet.rest_id` (variantes de
+        la respuesta GraphQL). Nunca lanza.
+        """
+        try:
+            if not isinstance(data, dict) or data.get("errors"):
+                return ""
+            resultado = (
+                data.get("data", {})
+                .get("create_tweet", {})
+                .get("tweet_results", {})
+                .get("result", {})
+            )
+            if not isinstance(resultado, dict):
+                return ""
+            valor = resultado.get("rest_id")
+            if valor:
+                return str(valor)
+            anidado = resultado.get("tweet")
+            if isinstance(anidado, dict) and anidado.get("rest_id"):
+                return str(anidado["rest_id"])
+            return ""
+        except Exception:
+            return ""
+
     def _registrar_fallo_api(self, grupo: str, status, data) -> None:
         """Alimenta disyuntor/bloqueo por cuenta con un fallo DURO.
 
@@ -1213,6 +1246,7 @@ class TwitterAPI:
         omite si su disyuntor esta abierto o si ya no queda presupuesto.
         Alimenta el disyuntor del grupo "rt" con los fallos duros. Nunca lanza.
         """
+        self.ultima_url_publicada = ""
         if not self.session and not self._cargar_cookies():
             return False
 
@@ -1278,9 +1312,9 @@ class TwitterAPI:
         (idempotente). Alimenta el disyuntor del grupo "like" con los fallos
         duros. Nunca lanza.
         """
+        self.ultima_url_publicada = ""
         if not self.session and not self._cargar_cookies():
             return False
-
         t0 = time.time()
         try:
             tweet_id = self._extraer_tweet_id(tweet_url)
@@ -1327,10 +1361,15 @@ class TwitterAPI:
           `attachment_url`).
         - Si vienen ambos, gana la respuesta.
 
+        Deja la URL real del tweet creado en `self.ultima_url_publicada`
+        (`https://x.com/<usuario>/status/<id>`) cuando la respuesta GraphQL trae
+        el id; si no, `""` (el motor registrara "link no capturado").
+
         Devuelve True/False y NUNCA lanza (403/429/422 y cualquier error de X
         => False: el motor cae a Selenium).
         """
         texto = (texto or "").strip()
+        self.ultima_url_publicada = ""
         if not texto:
             return False
         if not self.session and not self._cargar_cookies():
@@ -1369,6 +1408,14 @@ class TwitterAPI:
                     f"{motivo}"
                 )
             else:
+                # Exponer la URL de la publicacion si X devolvio el id (el
+                # motor la registra en Reportes); si no, queda "".
+                tweet_id = self._id_tweet_creado(data)
+                self.ultima_url_publicada = (
+                    f"https://x.com/{self.usuario}/status/{tweet_id}"
+                    if tweet_id
+                    else ""
+                )
                 logger.info(f"Tweet por API para {self.usuario}")
                 _breaker_registrar_exito("tweet")
             logger.debug(
@@ -1399,6 +1446,9 @@ class TwitterAPI:
         (para medir en campana). Nunca lanza.
         """
         rol = (rol or "").strip().lower()
+        # URL de la ultima publicacion de ESTA accion: la fija `crear_tweet`
+        # cuando X devuelve el id; rt/like y los fallos la dejan vacia.
+        self.ultima_url_publicada = ""
         t0 = time.time()
         grupo = _grupo_rol(rol)
         if grupo:

@@ -133,6 +133,36 @@ def _normalizar_menciones(valor: str) -> list[str]:
     return menciones
 
 
+# URL de PUBLICACION real: host twitter.com/x.com + `/status/<id>`. El perfil
+# de la cuenta (`https://twitter.com/<usuario>`, sin `/status/`) NO es una
+# publicacion y se descarta (antes se registraba como link del RT simple o de
+# la cita sin URL capturada).
+_RE_URL_PUBLICACION = re.compile(
+    r"^https?://(?:[a-z0-9-]+\.)*(?:twitter\.com|x\.com)/[^/?#]+/status/\d+",
+    re.IGNORECASE,
+)
+
+
+def _url_publicada_valida(url, usuario: str = "") -> str:
+    """URL de publicacion limpia, o "" si no es valida (nunca el perfil).
+
+    Solo acepta http(s) de `twitter.com`/`x.com` con `/status/<id>`; limpia
+    query y fragmento. El perfil de `usuario`
+    (`https://twitter.com/<usuario>` / `https://x.com/<usuario>`), el ancla, una
+    basura cualquiera o un `None` devuelven `""`: `RegistroAccion.url_publicacion`
+    JAMAS debe llevar el ancla ni un perfil. `usuario` se acepta por contrato
+    (compatibilidad de firma; el descarte de perfiles lo hace el regex al exigir
+    `/status/<id>`). Nunca lanza.
+    """
+    try:
+        texto = str(url or "").strip()
+        if not texto or not _RE_URL_PUBLICACION.match(texto):
+            return ""
+        return texto.split("?")[0].split("#")[0].rstrip("/")
+    except Exception:
+        return ""
+
+
 MENSAJE_SIN_SESION = (
     "sin sesión: sin .pkl, cookies_json/auth_token ni password; "
     "brandea o carga credenciales antes de activar"
@@ -3448,6 +3478,19 @@ class MotorActivacion:
         logger.warning(f"Login fallido para @{usuario}: {motivo}")
         return False, _detalle_login_fallido(motivo)
 
+    def _capturar_url_post(self) -> bool:
+        """True si se debe capturar la URL real de posts/citas (`CAPTURAR_URL_POST`).
+
+        Default 1 (activado): `publicar_tweet`/la cita buscan el link del
+        timeline actual (~1-3s) y solo si falla visitan el perfil (~5-10s).
+        `CAPTURAR_URL_POST=0` fuerza `buscar_url=False` (maxima velocidad, sin
+        links: la tabla de Reportes mostrara "link no capturado"). Nunca lanza.
+        """
+        try:
+            return _env_activo("CAPTURAR_URL_POST", True)
+        except Exception:
+            return True
+
     def _accion_en_bot(self, bot, cuenta, rol: str, texto: str,
                        dar_like: bool, url_objetivo: str) -> tuple:
         """Ejecuta la accion del rol en un bot con la sesion ya lista.
@@ -3457,6 +3500,12 @@ class MotorActivacion:
         pool de pestañas y el camino clasico publiquen igual. Nunca lanza:
         cualquier error se reporta como fallo.
 
+        La URL registrada por rol cumple las reglas de Reportes:
+        - cita: link del POST DE LA CITA (nunca el ancla; "" si no se capturo);
+        - hashtags/post: link del post publicado ("" si no);
+        - comentario: link de la RESPUESTA (nunca el ancla; "" si no);
+        - rt simple y like: "" SIEMPRE (no generan link).
+
         Devuelve una tupla de 5 elementos:
         (usuario, rol, exito, detalle, url).
         """
@@ -3464,7 +3513,7 @@ class MotorActivacion:
             if rol == "like":
                 return (
                     cuenta.usuario, rol, False,
-                    "like sin soporte por API en este momento", url_objetivo,
+                    "like sin soporte por API en este momento", "",
                 )
 
             if rol == "cita":
@@ -3476,7 +3525,10 @@ class MotorActivacion:
                 )
                 ok = res.get("exitos", 0) > 0
                 urls_pub = res.get("urls") or []
-                url_publicada = urls_pub[0] if urls_pub else url_objetivo
+                # NUNCA el ancla: si la cita no capturo su URL, queda "".
+                url_publicada = _url_publicada_valida(
+                    urls_pub[0] if urls_pub else "", cuenta.usuario
+                )
                 detalle = "ok" if ok else (
                     _detalle_con_sesion(getattr(bot, "ultimo_error", ""))
                     or "sin exito"
@@ -3490,13 +3542,9 @@ class MotorActivacion:
                     dar_like=dar_like,
                 )
                 ok = res.get("exitos", 0) > 0
-                urls_pub = res.get("urls") or []
-                # El RT simple no genera un post propio: `solo_retwittear`
-                # ya devuelve el perfil de quien retwittea, no el tweet original.
-                url_publicada = (
-                    urls_pub[0] if urls_pub
-                    else f"https://twitter.com/{cuenta.usuario}"
-                )
+                # El RT simple no genera un post propio: SIN link (la tabla lo
+                # etiqueta). Antes se guardaba el perfil o el ancla.
+                url_publicada = ""
                 detalle = "ok" if ok else (
                     _detalle_con_sesion(getattr(bot, "ultimo_error", ""))
                     or "sin exito"
@@ -3506,16 +3554,28 @@ class MotorActivacion:
             if rol == "comentario":
                 if not (texto or "").strip():
                     return (
-                        cuenta.usuario, rol, False, "sin texto asignado",
-                        url_objetivo,
+                        cuenta.usuario, rol, False, "sin texto asignado", "",
                     )
                 responder = getattr(bot, "responder_tweet", None)
                 if responder is None:
                     return (
                         cuenta.usuario, rol, False, "sin soporte de respuesta",
-                        url_objetivo,
+                        "",
                     )
-                ok = bool(responder(url_objetivo, texto))
+                res = responder(url_objetivo, texto)
+                ok = bool(res)
+                if isinstance(res, str):
+                    # `responder_tweet` devuelve la URL de la RESPUESTA como
+                    # str; True (truthy no-str) = publico pero sin URL, y se
+                    # usa `ultima_url_publicada` como respaldo.
+                    url_publicada = _url_publicada_valida(res, cuenta.usuario)
+                elif ok:
+                    url_publicada = _url_publicada_valida(
+                        getattr(bot, "ultima_url_publicada", "") or "",
+                        cuenta.usuario,
+                    )
+                else:
+                    url_publicada = ""
                 if ok:
                     detalle = "comentario publicado"
                 else:
@@ -3524,15 +3584,20 @@ class MotorActivacion:
                     # concreta (renovar cookies/login); no es suspension. Las
                     # respuestas limitadas del tweet ancla se reportan claras.
                     detalle = _detalle_comentario(motivo)
-                return (cuenta.usuario, rol, ok, detalle[:120], url_objetivo)
+                return (cuenta.usuario, rol, ok, detalle[:120], url_publicada)
 
             # rol == "hashtags"
-            res = bot.publicar_tweet(texto, buscar_url=False)
+            res = bot.publicar_tweet(
+                texto, buscar_url=self._capturar_url_post()
+            )
             ok = bool(res)
             if isinstance(res, str):
-                url_publicada = res
+                url_publicada = _url_publicada_valida(res, cuenta.usuario)
             elif ok:
-                url_publicada = getattr(bot, "ultima_url_publicada", "") or ""
+                url_publicada = _url_publicada_valida(
+                    getattr(bot, "ultima_url_publicada", "") or "",
+                    cuenta.usuario,
+                )
             else:
                 url_publicada = ""
             if ok:
@@ -3545,7 +3610,7 @@ class MotorActivacion:
         except Exception as e:
             logger.error(f"Error en @{cuenta.usuario} (rol {rol}): {e}")
             detalle = _detalle_con_sesion(f"{type(e).__name__}: {e}")
-            return (cuenta.usuario, rol, False, detalle[:120], url_objetivo)
+            return (cuenta.usuario, rol, False, detalle[:120], "")
 
     def _procesar_suspension_cuenta(self, cuenta, bot, detalle="") -> bool:
         """Desactiva la cuenta SOLO si la suspension es real (nunca lanza).
@@ -3679,7 +3744,11 @@ class MotorActivacion:
             )
             ok = res.get("exitos", 0) > 0
             urls_pub = res.get("urls") or []
-            url_publicada = urls_pub[0] if urls_pub else ""
+            # Solo una publicacion real con `/status/`; nunca el ancla ni el
+            # perfil (cuando la cita no capturo su URL queda "").
+            url_publicada = _url_publicada_valida(
+                urls_pub[0] if urls_pub else "", cuenta.usuario
+            )
             if ok:
                 resultado = (cuenta.usuario, True, "ok", url_publicada)
             else:
@@ -3753,7 +3822,11 @@ class MotorActivacion:
             )
 
             ok = res.get("exitos", 0) > 0
-            url_publicada = (res.get("urls") or [""])[0] if res.get("urls") else ""
+            urls_pub = res.get("urls") or []
+            # Cita: solo el link del POST DE LA CITA; si no se capturo, "".
+            url_publicada = _url_publicada_valida(
+                urls_pub[0] if urls_pub else "", cuenta.usuario
+            )
             if ok:
                 detalle_final = "ok"
                 return (cuenta.usuario, True, "ok", url_publicada)
@@ -3939,7 +4012,8 @@ class MotorActivacion:
         try:
             from plataformas.twitter.api_http import TwitterAPI
 
-            accion_rapida = getattr(TwitterAPI(cuenta.usuario), "accion_rapida", None)
+            api = TwitterAPI(cuenta.usuario)
+            accion_rapida = getattr(api, "accion_rapida", None)
             if not callable(accion_rapida):
                 return None
             try:
@@ -3957,12 +4031,17 @@ class MotorActivacion:
             if not ok:
                 return None
             logger.debug(f"{rol}: API para @{cuenta.usuario}")
-            if rol == "rt":
-                url_publicada = f"https://twitter.com/{cuenta.usuario}"
-            elif rol in ("like", "cita", "comentario"):
-                url_publicada = url_objetivo
-            else:
+            # URL por rol (reglas de Reportes): rt/like NO generan link; los
+            # roles que publican texto usan la URL expuesta por la API
+            # (`ultima_url_publicada`, id del tweet creado) validada; si la API
+            # no la expone, "" (JAMAS el ancla `url_objetivo`).
+            if rol in ("rt", "like"):
                 url_publicada = ""
+            else:
+                url_publicada = _url_publicada_valida(
+                    getattr(api, "ultima_url_publicada", "") or "",
+                    cuenta.usuario,
+                )
             return (cuenta.usuario, rol, True, f"{rol} via API", url_publicada)
         except Exception as e:
             logger.debug(
@@ -4049,10 +4128,11 @@ class MotorActivacion:
                 return resultado_api
             if rol == "like":
                 # "like" solo tiene ruta HTTP: sin soporte Selenium aqui, jamas
-                # debe caer al flujo de hashtags (publicaria un post).
+                # debe caer al flujo de hashtags (publicaria un post). Sin link
+                # (el like no genera publicacion).
                 return (
                     cuenta.usuario, rol, False,
-                    "like sin soporte por API en este momento", url_objetivo,
+                    "like sin soporte por API en este momento", "",
                 )
 
             # --- Selenium: pestaña persistente del pool si esta disponible. ---
@@ -4086,7 +4166,7 @@ class MotorActivacion:
                     detalle_accion = str(detalle_sesion or "")
                     return (
                         cuenta.usuario, rol, False,
-                        detalle_sesion[:120], url_objetivo,
+                        detalle_sesion[:120], "",
                     )
                 resultado_accion = self._accion_en_bot(
                     bot, cuenta, rol, texto, dar_like, url_objetivo
@@ -4109,7 +4189,7 @@ class MotorActivacion:
             detalle = _detalle_con_sesion(f"{type(e).__name__}: {e}")
             return (
                 cuenta.usuario, rol, False,
-                detalle[:120], url_objetivo,
+                detalle[:120], "",
             )
 
     def _ejecutar_accion_rol(self, cuenta: Cuenta, rol: str, urls: list[str],

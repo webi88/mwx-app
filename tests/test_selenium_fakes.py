@@ -31,6 +31,10 @@ sin Chrome, los casos reales de Railway:
     `account/access` o formulario VISIBLE) ya NO se declara "Login exitoso":
     cae a `login_con_cookies_json()` y, si tampoco hay cookies validas,
     devuelve False con error de sesion expirada y SIN marcar `cuenta_suspendida`.
+  - Captura de la URL REAL para Reportes: `_obtener_enlace_reciente_timeline`
+    (ruta rapida sin navegar, solo la propia cuenta y con el texto pedido);
+    `publicar_tweet(buscar_url=True)` la usa antes del perfil; la cita de
+    `solo_retwittear` tambien; el RT simple NO genera link (`urls=[]`).
 
 Uso:
     .venv/Scripts/python.exe tests/run_tests.py
@@ -105,6 +109,7 @@ class FakeElement:
         occluded=False,
         visible=True,
         click_falla=False,
+        href=None,
     ):
         self.driver = driver
         self.tag = tag
@@ -114,6 +119,7 @@ class FakeElement:
         self.occluded = occluded
         self.visible = visible
         self.click_falla = click_falla
+        self.href = href
         self.hijos = []
         self.seleccionado = False
         self.click_count = 0
@@ -153,6 +159,8 @@ class FakeElement:
             return self.text
         if nombre == "value":
             return self._texto
+        if nombre == "href":
+            return self.href
         if nombre == "id":
             return getattr(self, "id", None)
         return None
@@ -840,6 +848,7 @@ def test_pausa_humana_publicar_tweet(check):
     bot._abrir_compositor = lambda: FakeElement(driver)
     bot._pegar_texto = lambda editor, texto: eventos.append(("pegar", texto))
     bot._verificar_publicacion = lambda: True
+    bot._obtener_enlace_reciente_timeline = lambda texto_publicado="", timeout=3.0: ""
     bot._obtener_ultimo_enlace = lambda usuario: ""
 
     def spy_boton(timeout=10, texto=""):
@@ -983,6 +992,7 @@ def test_cita_prefiere_dialogo(check):
     bot._esperar_editor_visible = spy_editor
     bot._pegar_texto = lambda editor, texto: eventos.append(("pegar", texto))
     bot._verificar_publicacion = lambda: True
+    bot._obtener_enlace_reciente_timeline = lambda texto_publicado="", timeout=3.0: ""
     bot._obtener_ultimo_enlace = lambda usuario: ""
 
     def spy_boton_post():
@@ -1012,6 +1022,257 @@ def test_cita_prefiere_dialogo(check):
         str(eventos),
     )
     _comprobar_pausa_humana(check, "pausa cita", eventos, uniformes)
+
+
+# --------------------------------------------------------------------------- #
+# Reportes: captura de la URL real de la publicacion (ruta rapida del timeline)
+# --------------------------------------------------------------------------- #
+def _articulo_con_enlace(driver, texto, href):
+    """Articulo fake con un enlace `/status/` (hijo) y su texto."""
+    articulo = FakeElement(driver, texto=texto)
+    articulo.hijos = [
+        FakeElement(driver, tag="a", contenteditable=False, href=href)
+    ]
+    return articulo
+
+
+def test_enlace_reciente_timeline(check):
+    print("URL real: ruta rapida del timeline (propia cuenta + texto)")
+    driver = FakeDriver()
+    ajeno = _articulo_con_enlace(
+        driver, "Hola mundo este es mi post de hoy",
+        "https://x.com/otra_cuenta/status/999",
+    )
+    propio = _articulo_con_enlace(
+        driver, "Hola mundo este es mi post de hoy",
+        "https://x.com/cuenta_test/status/123?s=20",
+    )
+    driver.editores = [ajeno, propio]
+    bot = bot_con_driver(driver)
+    url = bot._obtener_enlace_reciente_timeline(
+        "Hola mundo este es mi post", timeout=0.0
+    )
+    check(
+        "timeline: encuentra el link de la PROPIA cuenta (no el ajeno)",
+        url == "https://x.com/cuenta_test/status/123",
+        repr(url),
+    )
+    check(
+        "timeline: limpia el query string",
+        url is not None and "?" not in url,
+        repr(url),
+    )
+
+    driver2 = FakeDriver()
+    driver2.editores = [
+        _articulo_con_enlace(
+            driver2, "Otro contenido anterior",
+            "https://x.com/cuenta_test/status/111",
+        )
+    ]
+    bot2 = bot_con_driver(driver2)
+    url2 = bot2._obtener_enlace_reciente_timeline(
+        "Texto nuevo que no esta", timeout=0.0
+    )
+    check(
+        "timeline: rechaza el articulo sin el texto pedido",
+        url2 is None,
+        repr(url2),
+    )
+
+    driver3 = FakeDriver()
+    driver3.editores = [
+        _articulo_con_enlace(
+            driver3, "Post del handle nuevo",
+            "https://twitter.com/HandleReal/status/55",
+        )
+    ]
+    bot3 = bot_con_driver(driver3)
+    bot3.handle_actual = "HandleReal"
+    url3 = bot3._obtener_enlace_reciente_timeline(
+        "Post del handle nuevo", timeout=0.0
+    )
+    check(
+        "timeline: acepta el handle real conocido",
+        url3 == "https://twitter.com/HandleReal/status/55",
+        repr(url3),
+    )
+
+    driver4 = FakeDriver()
+    driver4.editores = [
+        _articulo_con_enlace(
+            driver4, "Post mio", "https://x.com/cuenta_test"
+        )
+    ]
+    bot4 = bot_con_driver(driver4)
+    check(
+        "timeline: un perfil no es link de publicacion",
+        bot4._obtener_enlace_reciente_timeline("Post mio", timeout=0.0) is None,
+    )
+
+    bot5 = bot_con_driver(None)
+    bot5.driver = None
+    check(
+        "timeline: sin driver devuelve None (nunca lanza)",
+        bot5._obtener_enlace_reciente_timeline("x", timeout=0.0) is None,
+    )
+
+
+def _stubs_publicar(bot, driver, timeline, perfil, llamadas):
+    """Stubs minimos de `publicar_tweet` para aislar la busqueda de URL."""
+    bot.base_url = "https://x.com"
+    bot._detectar_limite_cuenta = lambda: False
+    bot._abrir_compositor = lambda: FakeElement(driver)
+    bot._pegar_texto = lambda editor, texto: None
+    bot._verificar_publicacion = lambda: True
+    bot._esperar_boton_post_habilitado = lambda timeout=10, texto="": FakeBoton()
+    bot._obtener_enlace_reciente_timeline = (
+        lambda texto_publicado="", timeout=3.0: timeline
+    )
+
+    def _perfil(usuario):
+        llamadas["perfil"] += 1
+        return perfil
+
+    bot._obtener_ultimo_enlace = _perfil
+
+
+def test_publicar_tweet_ruta_rapida(check):
+    print("URL real: publicar_tweet usa el timeline antes del perfil")
+    llamadas = {"perfil": 0}
+    driver = FakeDriver()
+    bot = bot_con_driver(driver)
+    _stubs_publicar(
+        bot, driver, "https://x.com/cuenta_test/status/321", "", llamadas
+    )
+    resultado = bot.publicar_tweet("Texto con enlace")
+    check(
+        "publicar_tweet: devuelve la URL del timeline",
+        resultado == "https://x.com/cuenta_test/status/321",
+        repr(resultado),
+    )
+    check(
+        "publicar_tweet: NO visita el perfil si hubo link rapido",
+        llamadas["perfil"] == 0,
+        str(llamadas),
+    )
+    check(
+        "publicar_tweet: ultima_url_publicada = link del timeline",
+        bot.ultima_url_publicada == "https://x.com/cuenta_test/status/321",
+        repr(bot.ultima_url_publicada),
+    )
+
+    llamadas2 = {"perfil": 0}
+    driver2 = FakeDriver()
+    bot2 = bot_con_driver(driver2)
+    _stubs_publicar(
+        bot2, driver2, "", "https://x.com/cuenta_test/status/777", llamadas2
+    )
+    resultado2 = bot2.publicar_tweet("Texto sin timeline")
+    check(
+        "publicar_tweet: cae al perfil si no hay link rapido",
+        resultado2 == "https://x.com/cuenta_test/status/777",
+        repr(resultado2),
+    )
+    check(
+        "publicar_tweet: el fallback SI visita el perfil",
+        llamadas2["perfil"] == 1,
+        str(llamadas2),
+    )
+
+    llamadas3 = {"perfil": 0}
+    driver3 = FakeDriver()
+    bot3 = bot_con_driver(driver3)
+    _stubs_publicar(bot3, driver3, "no-debe-usarse", "no-debe-usarse", llamadas3)
+    resultado3 = bot3.publicar_tweet("Texto rapido", buscar_url=False)
+    check(
+        "publicar_tweet: buscar_url=False no busca ningun link",
+        resultado3 is True
+        and llamadas3["perfil"] == 0
+        and bot3.ultima_url_publicada == "",
+        f"{resultado3!r} {llamadas3} {bot3.ultima_url_publicada!r}",
+    )
+
+
+def test_solo_retwittear_cita_ruta_rapida(check):
+    print("URL real: la cita usa el timeline antes del perfil")
+    driver = FakeDriver()
+    bot = bot_con_driver(driver)
+    bot._recuperar_interstitial = lambda url: "ok"
+    bot._detectar_limite_cuenta = lambda: False
+    bot._esperar_article_tweet = lambda timeout=8: None
+    bot._hay_muro_login = lambda: False
+    bot._buscar_boton_retweet = lambda: FakeBoton()
+    bot._buscar_opcion_quote = lambda: FakeBoton()
+    bot._esperar_editor_visible = lambda **kw: FakeElement(driver)
+    bot._pegar_texto = lambda editor, texto: None
+    bot._verificar_publicacion = lambda: True
+    bot._buscar_boton_post = lambda: FakeBoton()
+    llamadas = {"perfil": 0}
+    bot._obtener_enlace_reciente_timeline = (
+        lambda texto_publicado="", timeout=3.0: "https://x.com/cuenta_test/status/888"
+    )
+
+    def _perfil(usuario):
+        llamadas["perfil"] += 1
+        return ""
+
+    bot._obtener_ultimo_enlace = _perfil
+    resultado = bot.solo_retwittear(
+        ["https://x.com/alguien/status/1"],
+        "cuenta_test",
+        mensaje_cita="Cita con link",
+    )
+    check(
+        "cita: urls trae el link del POST DE LA CITA",
+        resultado.get("urls") == ["https://x.com/cuenta_test/status/888"],
+        str(resultado),
+    )
+    check(
+        "cita: no visita el perfil si el timeline da el link",
+        llamadas["perfil"] == 0,
+        str(llamadas),
+    )
+
+
+class _WaitFalso:
+    """Reemplazo de `WebDriverWait` para la rama de RT simple."""
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def until(self, *args, **kwargs):
+        return FakeBoton()
+
+
+def test_solo_retwittear_rt_sin_link(check):
+    print("URL real: RT simple no genera link")
+    driver = FakeDriver()
+    bot = bot_con_driver(driver)
+    bot._recuperar_interstitial = lambda url: "ok"
+    bot._detectar_limite_cuenta = lambda: False
+    bot._esperar_article_tweet = lambda timeout=8: None
+    bot._hay_muro_login = lambda: False
+    bot._unretweet_visible = lambda: False
+    bot._buscar_boton_retweet = lambda: FakeBoton()
+    bot._esperar_rt_confirmado = lambda: True
+    with mock.patch(
+        "plataformas.twitter.selenium_bot.WebDriverWait", _WaitFalso
+    ):
+        resultado = bot.solo_retwittear(
+            ["https://x.com/alguien/status/1"], "cuenta_test"
+        )
+    check("RT simple: reportado como exitoso", resultado.get("exitos") == 1, str(resultado))
+    check(
+        "RT simple: SIN entrada en urls (no genera link)",
+        resultado.get("urls") == [],
+        str(resultado),
+    )
+    check(
+        "RT simple: ultima_url_publicada vacia",
+        bot.ultima_url_publicada == "",
+        repr(bot.ultima_url_publicada),
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -1617,6 +1878,10 @@ def run(check):
         test_pegar_texto_reintento_mask(check)
         test_publicar_tweet_ciclo_limpio(check)
         test_publicar_tweet_ciclo_limpio_una_vez(check)
+        test_enlace_reciente_timeline(check)
+        test_publicar_tweet_ruta_rapida(check)
+        test_solo_retwittear_cita_ruta_rapida(check)
+        test_solo_retwittear_rt_sin_link(check)
 
 
 if __name__ == "__main__":
