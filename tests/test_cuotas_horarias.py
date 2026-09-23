@@ -41,6 +41,7 @@ import activaciones.cuotas as cuotas_mod  # noqa: E402
 import activaciones.motor as motor_mod  # noqa: E402
 from activaciones.cuotas import CuotasHorarias  # noqa: E402
 from activaciones.motor import MotorActivacion  # noqa: E402
+from core.config import settings  # noqa: E402
 
 
 # --------------------------------------------------------------------------- #
@@ -60,13 +61,23 @@ def _parches(*cambios):
             setattr(objeto, nombre, valor)
 
 
-def _preparar(cuotas, usuarios, base=None):
-    """`preparar` con la consulta a BD parcheada (base sintetica)."""
-    with _parches((
-        cuotas_mod,
-        "contar_acciones_por_usuario",
-        lambda *a, **k: dict(base or {}),
-    )):
+def _preparar(cuotas, usuarios, base=None, base_dia=None):
+    """`preparar` con las consultas a BD parcheadas (bases sinteticas).
+
+    Parchea la base horaria Y la diaria (capa nueva) para no tocar la BD real.
+    """
+    with _parches(
+        (
+            cuotas_mod,
+            "contar_acciones_por_usuario",
+            lambda *a, **k: dict(base or {}),
+        ),
+        (
+            cuotas_mod,
+            "contar_acciones_dia_por_usuario",
+            lambda *a, **k: dict(base_dia or {}),
+        ),
+    ):
         cuotas.preparar(usuarios)
 
 
@@ -217,11 +228,18 @@ def test_cuotas_basicas(check):
 
     resumen = cuotas.resumen()
     check(
-        "resumen trae limites/ventana/acciones/reservas",
+        "resumen trae limites/ventana/acciones/reservas y la capa diaria",
         set(resumen) == {
             "limites", "ventana_min", "acciones_exitosas", "reservas_activas",
+            "diarias",
         },
         f"({sorted(resumen)})",
+    )
+    check(
+        "resumen: capa diaria con limite y ventana",
+        resumen["diarias"].get("limite") == settings.limite_acciones_dia
+        and resumen["diarias"].get("ventana_min") == settings.limite_dia_ventana_min,
+        f"({resumen['diarias']})",
     )
     check("resumen: ventana 60 y exitos acumulados",
           resumen["ventana_min"] == 60 and resumen["acciones_exitosas"] == 1,
@@ -504,6 +522,8 @@ def _run_e2e(motor, cuentas, accion_fake, registros):
         (motor_mod, "registrar_accion",
          lambda *a, **k: registros.append(a)),
         (cuotas_mod, "contar_acciones_por_usuario",
+         lambda *a, **k: {}),
+        (cuotas_mod, "contar_acciones_dia_por_usuario",
          lambda *a, **k: {}),
     ):
         return motor.ejecutar_por_roles(

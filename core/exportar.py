@@ -28,6 +28,7 @@ COLUMNAS_CUENTAS = (
     ("personalidad", "Personalidad"),
     ("perfil_personalidad", "Perfil_Personalidad"),
     ("rol_activacion", "Rol_Activacion"),
+    ("tier_calidad", "Tier_Calidad"),
     ("banner_path", "Banner_Portada"),
 )
 

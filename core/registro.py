@@ -34,6 +34,15 @@ ACCIONES_POR_ROL = {
 # Tipo canonico con el que se registra una accion de cada rol.
 TIPOS_REGISTRO_ROL = {"hashtags": "post", "cita": "cita", "rt": "rt", "comentario": "comentario"}
 
+# Tipos de RegistroAccion que cuentan para el TOPE DIARIO TOTAL por cuenta:
+# union deduplicada de TODOS los tipos de ACCIONES_POR_ROL (se conserva el
+# orden de aparicion). El tope diario NO distingue roles: suma por igual
+# posts/hashtags/publicaciones/mantenimiento/calentamiento/hilos, citas/quotes,
+# RTs/retweets/reposts y comentarios/respuestas/replies.
+ACCIONES_OPERATIVAS = tuple(
+    dict.fromkeys(tipo for tipos in ACCIONES_POR_ROL.values() for tipo in tipos)
+)
+
 
 def registrar_accion(
     usuario: str,
@@ -216,6 +225,25 @@ def limite_por_rol(rol) -> int:
         return 0
 
 
+def limite_acciones_dia() -> int:
+    """Tope DIARIO total de acciones EXITOSAS por cuenta (0 = sin tope).
+
+    Lee `settings.limite_acciones_dia`; devuelve 0 si el interruptor
+    `settings.limite_diario_activo` esta apagado o si el valor es invalido/<=0
+    (mismos patrones tolerantes que `limite_por_rol`: nunca lanza). El tope no
+    distingue roles: la suma es sobre ACCIONES_OPERATIVAS.
+    """
+    try:
+        if not getattr(settings, "limite_diario_activo", True):
+            return 0
+        valor = getattr(settings, "limite_acciones_dia", 0)
+        limite = int(valor)
+        return limite if limite > 0 else 0
+    except Exception as e:
+        logger.warning(f"Error obteniendo limite diario de acciones: {e}")
+        return 0
+
+
 def _ventana_minutos(minutos) -> int:
     """Ventana efectiva en minutos: `minutos` > 0 o settings.limite_ventana_min.
 
@@ -232,6 +260,25 @@ def _ventana_minutos(minutos) -> int:
     except (TypeError, ValueError):
         por_defecto = 60
     return por_defecto if por_defecto > 0 else 60
+
+
+def _ventana_dia_minutos(minutos) -> int:
+    """Ventana efectiva del tope diario: `minutos` > 0 o settings.limite_dia_ventana_min.
+
+    Es un helper PROPIO (no reusa `_ventana_minutos`, cuyo default es 60):
+    valores None, <= 0 o no numericos caen a settings.limite_dia_ventana_min
+    (1440 si tampoco ese valor fuese valido)."""
+    try:
+        valor = int(minutos)
+    except (TypeError, ValueError):
+        valor = 0
+    if valor > 0:
+        return valor
+    try:
+        por_defecto = int(getattr(settings, "limite_dia_ventana_min", 1440))
+    except (TypeError, ValueError):
+        por_defecto = 1440
+    return por_defecto if por_defecto > 0 else 1440
 
 
 def contar_acciones_recientes(usuario: str, rol: str, minutos: int = 60) -> int:
@@ -322,3 +369,141 @@ def contar_acciones_por_usuario(usuarios, minutos: int = 60) -> dict:
     except Exception as e:
         logger.warning(f"Error contando acciones por usuario: {e}")
         return {}
+
+
+# --------------------------------------------------------------------------- #
+# Tope diario total por cuenta (sin distinguir rol)
+# --------------------------------------------------------------------------- #
+def contar_acciones_dia(usuario: str, minutos: int = None) -> int:
+    """Cuenta las acciones OPERATIVAS EXITOSAS de `usuario` en la ventana diaria.
+
+    Una sola consulta agregada (COUNT) sobre RegistroAccion: estado exitoso,
+    fecha dentro de la ventana y tipo en ACCIONES_OPERATIVAS. `minutos` None,
+    <= 0 o no numerico usa settings.limite_dia_ventana_min (1440 = 24 h); un
+    `minutos` explicito > 0 manda. Nunca lanza: ante cualquier error -> 0.
+    """
+    try:
+        if not usuario:
+            return 0
+        desde = datetime.utcnow() - timedelta(minutes=_ventana_dia_minutos(minutos))
+        with get_db_session() as db:
+            resultado = (
+                db.query(func.count(RegistroAccion.id))
+                .filter(
+                    RegistroAccion.usuario == str(usuario),
+                    RegistroAccion.estado.in_(ESTADOS_EXITO),
+                    RegistroAccion.fecha >= desde,
+                    RegistroAccion.tipo.in_(ACCIONES_OPERATIVAS),
+                )
+                .scalar()
+            )
+            return int(resultado or 0)
+    except Exception as e:
+        logger.warning(f"Error contando acciones del dia ({usuario}): {e}")
+        return 0
+
+
+def contar_acciones_dia_por_usuario(usuarios, minutos: int = None) -> dict:
+    """Cuenta acciones OPERATIVAS EXITOSAS por usuario con UNA consulta agrupada.
+
+    Agrupa por usuario (`usuario, COUNT(id)`) filtrando por la lista de
+    usuarios, estado exitoso, la ventana diaria (`_ventana_dia_minutos`) y
+    tipo en ACCIONES_OPERATIVAS. Devuelve {usuario: total} solo con entradas
+    > 0; lista vacia/None -> {} y ante cualquier error -> {} (nunca lanza).
+    """
+    try:
+        if usuarios is None:
+            return {}
+        if isinstance(usuarios, str):
+            usuarios = [usuarios]
+        lista = [str(usuario) for usuario in usuarios if usuario]
+        if not lista:
+            return {}
+        desde = datetime.utcnow() - timedelta(minutes=_ventana_dia_minutos(minutos))
+        with get_db_session() as db:
+            filas = (
+                db.query(
+                    RegistroAccion.usuario,
+                    func.count(RegistroAccion.id),
+                )
+                .filter(
+                    RegistroAccion.usuario.in_(lista),
+                    RegistroAccion.estado.in_(ESTADOS_EXITO),
+                    RegistroAccion.fecha >= desde,
+                    RegistroAccion.tipo.in_(ACCIONES_OPERATIVAS),
+                )
+                .group_by(RegistroAccion.usuario)
+                .all()
+            )
+        resultado = {}
+        for usuario, conteo in filas:
+            total = int(conteo or 0)
+            if total > 0:
+                resultado[str(usuario)] = total
+        return resultado
+    except Exception as e:
+        logger.warning(f"Error contando acciones del dia por usuario: {e}")
+        return {}
+
+
+# --------------------------------------------------------------------------- #
+# "Agotada por hoy": tope diario alcanzado (LIMITE_DIARIO_POR_CUENTA)
+# --------------------------------------------------------------------------- #
+def _tope_dia_efectivo(limite=None) -> int:
+    """Tope diario efectivo en acciones: `limite` explicito > 0 manda.
+
+    Si no, usa `limite_acciones_dia()` (que respeta
+    `settings.limite_diario_activo` y `settings.limite_acciones_dia`,
+    alimentado por `LIMITE_DIARIO_POR_CUENTA` / alias legado
+    `LIMITE_ACCIONES_DIA`). 0 = sin tope. Nunca lanza."""
+    try:
+        valor = int(limite)
+    except (TypeError, ValueError):
+        valor = 0
+    if valor > 0:
+        return valor
+    return limite_acciones_dia()
+
+
+def esta_agotada_dia(usuario: str, limite: int = None) -> bool:
+    """True si la cuenta esta "Agotada por hoy".
+
+    "Agotada por hoy" = alcanzo `LIMITE_DIARIO_POR_CUENTA`
+    (`settings.limite_acciones_dia`) acciones OPERATIVAS EXITOSAS en las
+    ultimas 24 h (`LIMITE_DIA_VENTANA_MIN` = 1440 min). Un `limite` explicito
+    > 0 manda sobre settings; si el tope efectivo es 0 (desactivado o
+    ilimitado) devuelve False sin consultar. Ante cualquier error -> False
+    (nunca lanza)."""
+    try:
+        tope = _tope_dia_efectivo(limite)
+        if tope <= 0:
+            return False
+        return contar_acciones_dia(usuario) >= tope
+    except Exception as e:
+        logger.warning(f"Error verificando tope diario ({usuario}): {e}")
+        return False
+
+
+def usuarios_agotados_dia(usuarios, limite: int = None) -> set:
+    """Subconjunto de `usuarios` que estan "Agotada por hoy".
+
+    "Agotada por hoy" = alcanzo `LIMITE_DIARIO_POR_CUENTA`
+    (`settings.limite_acciones_dia`) acciones OPERATIVAS EXITOSAS en las
+    ultimas 24 h (`LIMITE_DIA_VENTANA_MIN` = 1440 min). Usa UNA sola consulta
+    agrupada (`contar_acciones_dia_por_usuario`). Un `limite` explicito > 0
+    manda sobre settings; si el tope efectivo es 0 (desactivado o ilimitado)
+    devuelve un set vacio SIN consultar la BD. Lista vacia/None -> set();
+    ante cualquier error -> set() (nunca lanza)."""
+    try:
+        tope = _tope_dia_efectivo(limite)
+        if tope <= 0:
+            return set()
+        conteos = contar_acciones_dia_por_usuario(usuarios)
+        return {
+            str(usuario)
+            for usuario, total in conteos.items()
+            if int(total) >= tope
+        }
+    except Exception as e:
+        logger.warning(f"Error listando cuentas agotadas del dia: {e}")
+        return set()

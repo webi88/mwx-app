@@ -3296,6 +3296,363 @@ def solo_hashtags_pedidos(texto: str, tags, semilla: int = 0) -> str:
         return original
 
 
+# ===================================================================== #
+# VALIDACION RIGUROSA del hashtag (pedido del dueño): el hashtag pedido
+# debe quedar NATURAL EN MEDIO de la oracion y el texto final NO puede
+# superar 100 caracteres. Se expone `validar_texto_hashtag` (diagnostico) y
+# `garantizar_texto_hashtag` (pipeline determinista que SIEMPRE cumple).
+# ===================================================================== #
+
+# Articulos, determinantes y preposiciones que NO pueden quedar pegados justo
+# antes de un hashtag. El bug historico fue insertarlo ENTRE el articulo y su
+# sustantivo ("el orgullo #Mexico nacional"): ademas del token inmediatamente
+# anterior, se detecta cuando el hashtag parte la frase
+# "articulo/determinante + sustantivo".
+_PALABRAS_ANTES_HASHTAG = frozenset({
+    "el", "la", "los", "las",
+    "un", "una", "unos", "unas",
+    "este", "esta", "estos", "estas",
+    "ese", "esa", "esos", "esas",
+    "del", "al", "de",
+})
+
+_RE_TAG_TOKEN = re.compile(r"#[A-Za-z0-9ÁÉÍÓÚÜÑáéíóúüñ_]+")
+_RE_SOLO_PALABRA = re.compile(r"[A-Za-zÁÉÍÓÚÜÑáéíóúüñ]+")
+_PUNTUACION_CLAUSULA = ".!?,;:"
+
+# Plantillas minimas de ULTIMO recurso: hashtag tras dos puntos (limite de
+# clausula), dentro de la ventana central y con texto COMPLETO a ambos lados.
+# `{tag}` se sustituye por el grupo pedido (1..n hashtags).
+_PLANTILLAS_GARANTIA_HASHTAG = (
+    "Una reflexion: {tag} Gracias.",
+    "Sobre lo que tenemos: {tag} Sigamos.",
+    "Una opinion breve: {tag} Buen dia.",
+)
+
+
+def _tokens_antes_hashtag(texto, inicio: int) -> tuple:
+    """Devuelve ``(ultimo, penultimo)`` token de la clausula previa al hashtag.
+
+    Con un limite de clausula (puntuacion o salto de linea) justo antes del
+    hashtag devuelve ``("", "")`` porque ahi SI es natural. Nunca lanza.
+    """
+    try:
+        antes = str(texto or "")[: max(0, int(inicio))]
+    except Exception:
+        return "", ""
+    if not antes:
+        return "", ""
+    if re.search(r"[\n\r][ \t]*$", antes):
+        return "", ""
+    recortado = antes.rstrip()
+    if not recortado:
+        return "", ""
+    if recortado[-1] in ".,;:!?)»”’\"'":
+        return "", ""
+    fragmento = re.split(r"[.!?,;:\n\r]+", recortado)[-1]
+    palabras = _RE_SOLO_PALABRA.findall(fragmento)
+    if not palabras:
+        return "", ""
+    ultimo = palabras[-1].lower()
+    penultimo = palabras[-2].lower() if len(palabras) >= 2 else ""
+    return ultimo, penultimo
+
+
+def validar_texto_hashtag(texto, hashtags, limite: int = 100) -> dict:
+    """Valida ``texto`` contra las reglas duras de hashtags del proyecto.
+
+    Reglas duras:
+    * Deben estar TODOS los hashtags pedidos (normalizados con ``#`` y
+      comparados case-insensitive) y NINGUN otro hashtag.
+    * Cada hashtag pedido NO puede ser el inicio ni el final del texto y su
+      posicion debe caer dentro de la ventana central 15%-85% del largo.
+    * PROHIBIDO que el token inmediatamente anterior sea articulo,
+      determinante o preposicion (`_PALABRAS_ANTES_HASHTAG`); tambien se
+      marca cuando el hashtag parte la frase "articulo + sustantivo"
+      (bug historico: ``"el orgullo #Mexico nacional"``).
+    * ``len(texto) <= limite`` y el texto no puede terminar en hashtag.
+
+    Devuelve un dict con ``ok``, ``largo``, ``dentro_limite``,
+    ``hashtags_pedidos``, ``hashtags_presentes``, ``hashtags_faltantes``,
+    ``hashtags_ajenos``, ``en_medio`` y ``problemas`` (lista de strings
+    legibles en espanol). Nunca lanza: ante entradas invalidas devuelve el
+    diagnostico con ``ok=False`` (o ``True`` si no habia nada que validar).
+
+    Sin hashtags pedidos no se exige ninguno (retrocompatible); solo se
+    validan el largo y que el texto no termine en hashtag.
+    """
+    problemas: list = []
+
+    def _agregar(msg: str) -> None:
+        if msg not in problemas:
+            problemas.append(msg)
+
+    try:
+        t = str(texto or "")
+    except Exception:
+        t = ""
+    largo = len(t)
+    try:
+        limite = max(1, int(limite))
+    except (TypeError, ValueError):
+        limite = _MAX_LARGO_HASHTAG
+
+    pedidos = _normalizar_hashtags_pedidos(hashtags)
+    claves_pedidas = {p.lower() for p in pedidos}
+    tokens = [
+        (m.group(0), m.start(), m.end()) for m in _RE_TAG_TOKEN.finditer(t)
+    ]
+    claves_en_texto = {tok.lower() for tok, _ini, _fin in tokens}
+
+    presentes = [p for p in pedidos if p.lower() in claves_en_texto]
+    faltantes = [p for p in pedidos if p.lower() not in claves_en_texto]
+
+    ajenos: list = []
+    if pedidos:
+        vistos_ajenos: set = set()
+        for tok, _ini, _fin in tokens:
+            clave = tok.lower()
+            if clave not in claves_pedidas and clave not in vistos_ajenos:
+                vistos_ajenos.add(clave)
+                ajenos.append(tok)
+
+    dentro_limite = largo <= limite
+    if not dentro_limite:
+        _agregar(
+            f"El texto supera el limite de {limite} caracteres "
+            f"(largo={largo})."
+        )
+    if faltantes:
+        _agregar(f"Faltan hashtags pedidos: {', '.join(faltantes)}.")
+    if ajenos:
+        _agregar(f"Hay hashtags no pedidos: {', '.join(ajenos)}.")
+
+    termina_en_hashtag = bool(t) and _hashtag_al_final(t)
+    if termina_en_hashtag:
+        _agregar("El texto termina en hashtag (prohibido).")
+
+    en_medio = bool(pedidos) and not faltantes
+    for tok, ini, _fin in tokens:
+        if tok.lower() not in claves_pedidas:
+            continue
+        if ini == 0:
+            _agregar(f"{tok} esta al inicio del texto (prohibido).")
+            en_medio = False
+            continue
+        fraccion = (ini / largo) if largo else 0.0
+        if fraccion < 0.15 or fraccion > 0.85:
+            _agregar(
+                f"{tok} queda fuera de la ventana central 15%-85% "
+                f"(posicion {ini} de {largo})."
+            )
+            en_medio = False
+        if termina_en_hashtag:
+            en_medio = False
+        ultimo, penultimo = _tokens_antes_hashtag(t, ini)
+        if ultimo in _PALABRAS_ANTES_HASHTAG:
+            _agregar(
+                f"{tok} esta pegado a un articulo/determinante "
+                f"('... {ultimo} {tok}')."
+            )
+        elif penultimo in _PALABRAS_ANTES_HASHTAG:
+            _agregar(
+                f"{tok} parte la frase entre '{penultimo}' y su sustantivo "
+                f"(ejemplo prohibido: 'el orgullo #Mexico nacional')."
+            )
+
+    return {
+        "ok": not problemas,
+        "largo": largo,
+        "dentro_limite": dentro_limite,
+        "hashtags_pedidos": list(pedidos),
+        "hashtags_presentes": presentes,
+        "hashtags_faltantes": faltantes,
+        "hashtags_ajenos": ajenos,
+        "en_medio": en_medio,
+        "problemas": problemas,
+    }
+
+
+def _forzar_grupo_hashtags(texto: str, pedidos) -> str:
+    """Asegura que TODOS los ``pedidos`` esten en ``texto`` (best effort).
+
+    Si falta alguno, quita todos los hashtags, inserta el grupo COMPLETO EN
+    MEDIO con `colocar_hashtag_en_medio` (restaurando la grafia exacta pedida)
+    y limpia espacios. Nunca lanza.
+    """
+    t = str(texto or "").strip()
+    if not t or not pedidos:
+        return t
+    try:
+        if all(str(p).lower() in t.lower() for p in pedidos):
+            return t
+        base = _limpiar_espacios_y_saltos(_RE_TAG_TOKEN.sub(" ", t))
+        if not base:
+            base = "Una opinion breve"
+        primero = str(pedidos[0])
+        grupo = " ".join(str(p) for p in pedidos)
+        try:
+            colocado = colocar_hashtag_en_medio(base, hashtag=primero)
+        except Exception:
+            colocado = f"{base} {primero}".strip()
+        colocado = _reemplazar_tag_exacto(colocado, primero, grupo)
+        return _limpiar_espacios_y_saltos(colocado) or t
+    except Exception:
+        return t
+
+
+def _reubicar_grupo_hashtags(texto: str, pedidos, limite: int) -> str:
+    """Reubica el grupo COMPLETO de ``pedidos`` en el mejor punto natural.
+
+    Prefiere insertarlo tras un cierre de frase (``. ! ? , ; :`` o salto de
+    linea) cercano al medio y evita el token anterior prohibido; devuelve el
+    primer candidato que pasa `validar_texto_hashtag` o ``""``. Nunca lanza.
+    """
+    t = str(texto or "").strip()
+    if not t or not pedidos:
+        return ""
+    grupo = " ".join(str(p) for p in pedidos)
+    try:
+        limite = max(20, int(limite))
+    except (TypeError, ValueError):
+        limite = _MAX_LARGO_HASHTAG
+    try:
+        base = _limpiar_espacios_y_saltos(_RE_TAG_TOKEN.sub(" ", t))
+        if not base:
+            return ""
+        presupuesto = max(20, limite - len(grupo) - 2)
+        if len(base) > presupuesto:
+            base = _cortar_texto_a_limite(base, presupuesto)
+            base = _limpiar_espacios_y_saltos(base)
+        if not base:
+            return ""
+
+        puntos: set = set()
+        for m in re.finditer(r"[.!?,;:]+\s*|\n+\s*", base):
+            puntos.add(m.end())
+        for m in re.finditer(r"\s+", base):
+            puntos.add(m.start())
+
+        mitad = len(base) / 2.0
+        candidatos = []
+        for pos in puntos:
+            if pos <= 0 or pos >= len(base):
+                continue
+            izq = base[:pos].rstrip()
+            der = base[pos:].lstrip()
+            if not izq or not der:
+                continue
+            tras_cierre = izq[-1] in _PUNTUACION_CLAUSULA
+            ultimo, penultimo = _tokens_antes_hashtag(base, pos)
+            pegado = (
+                not tras_cierre
+                and (
+                    ultimo in _PALABRAS_ANTES_HASHTAG
+                    or penultimo in _PALABRAS_ANTES_HASHTAG
+                )
+            )
+            # 1) tras cierre de frase; 2) espacio con token previo seguro;
+            # 3) espacio "pegado" a articulo (solo como ultimo recurso).
+            prioridad = 0 if tras_cierre else (2 if pegado else 1)
+            candidatos.append((prioridad, abs(pos - mitad), pos))
+        candidatos.sort()
+
+        for _prioridad, _dist, pos in candidatos:
+            candidato = _limpiar_espacios_y_saltos(
+                f"{base[:pos].rstrip()} {grupo} {base[pos:].lstrip()}"
+            )
+            if not candidato:
+                continue
+            if len(candidato) > limite:
+                candidato = _acotar_limite(candidato, limite)
+            if validar_texto_hashtag(candidato, pedidos, limite).get("ok"):
+                return candidato
+        return ""
+    except Exception:
+        return ""
+
+
+def garantizar_texto_hashtag(
+    texto, hashtags, limite: int = 100, semilla: int = 0
+) -> str:
+    """Devuelve SIEMPRE un texto valido con los hashtags pedidos.
+
+    Pipeline determinista (nunca lanza):
+    1. Aplica lo existente: `solo_hashtags_pedidos` (quita ajenos y conserva
+       la grafia exacta), garantiza el grupo completo EN MEDIO y acota a
+       ``limite`` con `_acotar_limite`/`_recortar_limite_hashtag`.
+    2. Valida con `validar_texto_hashtag`; si aun no cumple, reubica el grupo
+       tras el cierre de frase (``. ! ? , ; :`` o salto de linea) mas cercano
+       al medio.
+    3. Si sigue sin cumplir (p. ej. texto vacio o sin ningun limite natural),
+       reconstruye con una plantilla local que SI cumple todas las reglas.
+    4. Ante cualquier error devuelve el mejor texto posible limpio.
+
+    Sin hashtags pedidos conserva el comportamiento clasico: solo limita el
+    largo y evita terminar en hashtag (NUNCA inventa hashtags).
+    """
+    try:
+        limite = max(20, int(limite))
+    except (TypeError, ValueError):
+        limite = _MAX_LARGO_HASHTAG
+    try:
+        pedidos = _normalizar_hashtags_pedidos(hashtags)
+    except Exception:
+        pedidos = []
+    try:
+        t = str(texto or "").strip()
+    except Exception:
+        t = ""
+
+    try:
+        if not pedidos:
+            if len(t) > limite:
+                t = _acotar_limite(t, limite)
+            if t and _hashtag_al_final(t):
+                t = _con_hashtag_en_medio(t) or t
+            return t
+
+        # 1) Pipeline existente.
+        try:
+            t = solo_hashtags_pedidos(t, pedidos, semilla) or t
+        except Exception:
+            pass
+        t = _forzar_grupo_hashtags(t, pedidos)
+        t = _acotar_limite(t, limite)
+        if validar_texto_hashtag(t, pedidos, limite).get("ok"):
+            return t
+
+        # 2) Reubicacion natural tras el cierre de frase mas cercano al medio.
+        reubicado = _reubicar_grupo_hashtags(t, pedidos, limite)
+        if reubicado and validar_texto_hashtag(
+            reubicado, pedidos, limite
+        ).get("ok"):
+            return reubicado
+
+        # 3) Plantillas minimas locales que SI cumplen.
+        grupo = " ".join(pedidos)
+        for plantilla in _PLANTILLAS_GARANTIA_HASHTAG:
+            candidato = _limpiar_espacios_y_saltos(
+                plantilla.replace("{tag}", grupo)
+            )
+            if len(candidato) > limite:
+                candidato = _acotar_limite(candidato, limite)
+            if validar_texto_hashtag(candidato, pedidos, limite).get("ok"):
+                return candidato
+
+        # 4) Mejor esfuerzo.
+        return reubicado or _limpiar_espacios_y_saltos(t)
+    except Exception as e:
+        logger.error(f"Error garantizando texto de hashtag: {e}")
+        try:
+            limpio = _limpiar_espacios_y_saltos(str(texto or ""))
+            if len(limpio) > limite:
+                limpio = _acotar_limite(limpio, limite)
+            return limpio
+        except Exception:
+            return ""
+
+
 def _plantillas_hashtags(registro: str = "", perfil: str = "") -> tuple:
     """Plantillas locales del rol hashtags para el (registro, perfil) dado.
 
@@ -3649,14 +4006,28 @@ def generar_textos_hashtags_por_cuenta(
             # Signos de apertura: activista/ciudadana nunca "¿"/"¡" (IA
             # incluida); politica conserva los signos correctos.
             t = _quitar_signos_por_registro(t, registro)
-            # Ultima pasada: solo el subset pedido, en medio, y <= 240 chars.
+            # Ultima pasada: solo el subset pedido, en medio, y <= 100 chars.
             t = _ajustar(t, i * 1000 + j + 313)
             t = _acotar(t)
+            # VALIDACION RIGUROSA (dueño): PASO FINAL de TODO texto (venga de
+            # la IA, del fallback local o de cualquier recorte): el hashtag
+            # pedido queda NATURAL EN MEDIO y el largo no supera los 100.
+            t = garantizar_texto_hashtag(
+                t, subset or tags,
+                limite=_MAX_LARGO_HASHTAG,
+                semilla=i * 1000 + j + 6161,
+            )
             if t in vistos:
-                # El recorte pudo colisionar: se varía y se vuelve a acotar.
+                # El recorte/garantia pudo colisionar: se varía y se
+                # re-garantiza el texto alterno.
                 alterno = _variar_hasta_unico(t, vistos)
                 alterno = _ajustar(alterno, i * 1000 + j + 4919)
                 alterno = _acotar(alterno)
+                alterno = garantizar_texto_hashtag(
+                    alterno, subset or tags,
+                    limite=_MAX_LARGO_HASHTAG,
+                    semilla=i * 1000 + j + 7919,
+                )
                 if alterno and alterno not in vistos:
                     t = alterno
             vistos.add(t)

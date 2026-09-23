@@ -372,6 +372,233 @@ def _roles_objetivo(cuentas: list, usuarios: list | None,
     }
 
 
+# ============================ TIERS, CURVA Y CUOTAS ============================
+
+def _limite_diario_config() -> int:
+    """Tope diario por cuenta (`LIMITE_DIARIO_POR_CUENTA`); 0 = sin tope.
+
+    Lee la configuracion existente (`core.registro.limite_acciones_dia`), sin
+    escribir envs nuevas. Tolerante si el core es viejo: nunca lanza."""
+    try:
+        from core.registro import limite_acciones_dia
+
+        return int(limite_acciones_dia() or 0)
+    except Exception:
+        return 0
+
+
+def _valor_metrica(valor):
+    """Normaliza un valor del resumen para `st.metric` (listas -> conteo)."""
+    if valor is None:
+        return 0
+    if isinstance(valor, (list, tuple, set, dict)):
+        return len(valor)
+    return valor
+
+
+def _metricas_tier_curva(resultados: dict) -> list:
+    """Metricas OPCIONALES de curva/tiers/cuotas que traiga el resumen.
+
+    Solo agrega la metrica si la clave existe en el resumen del motor (asi la
+    pagina sigue funcionando con motores viejos que no devuelven esas claves).
+    """
+    res = resultados or {}
+    metricas = []
+    if "curva_aceleracion" in res:
+        metricas.append(
+            ("🚀 Curva", "Sí" if res.get("curva_aceleracion") else "No")
+        )
+    if "curva_fase1_min" in res:
+        metricas.append(
+            ("🚀 Fase 1 (min)", _valor_metrica(res.get("curva_fase1_min")))
+        )
+    if "fase_actual" in res:
+        metricas.append(("🚀 Fase final", f"{res.get('fase_actual')}/2"))
+    if "cascada_urls" in res:
+        metricas.append(
+            ("🔗 Cascada URLs", _valor_metrica(res.get("cascada_urls")))
+        )
+    if "tier2_hashtags_omitidas" in res:
+        metricas.append(
+            (
+                "🧱 Tier 2 sin hashtags",
+                _valor_metrica(res.get("tier2_hashtags_omitidas")),
+            )
+        )
+    if "rotadas_por_cuota_dia" in res:
+        metricas.append(
+            ("♻️ Rotadas a respaldo", _valor_metrica(res.get("rotadas_por_cuota_dia")))
+        )
+    if "agotadas_dia" in res:
+        metricas.append(
+            ("🛑 Agotadas por hoy", _valor_metrica(res.get("agotadas_dia")))
+        )
+    if "reserva_usada" in res:
+        metricas.append(
+            ("🛡️ Reserva usada", _valor_metrica(res.get("reserva_usada")))
+        )
+    if "reserva_disponible" in res:
+        metricas.append(
+            ("🛡️ Reserva disponible", _valor_metrica(res.get("reserva_disponible")))
+        )
+    return metricas
+
+
+def _bloqueo_tier2_hashtags(filas, usuarios=None, solo_roles=None,
+                            aleatorio: bool = False) -> list:
+    """Mensajes bloqueantes de las cuentas Tier 2 con rol efectivo hashtags.
+
+    Aplica los mismos filtros que la campana (`_cuentas_objetivo` + roles
+    permitidos por `solo_roles`) y devuelve los mensajes de
+    `core.tiers.error_rol_tier` (vacio = la campana puede lanzarse). Con
+    `aleatorio=True` devuelve []: el motor sortea sin hashtags para Tier 2.
+    Nunca lanza (si el core es viejo devuelve [])."""
+    if aleatorio:
+        return []
+    try:
+        from core.registro import normalizar_rol_cuota
+        from web.operaciones.cuentas import _errores_tier2_hashtags
+    except Exception:
+        return []
+
+    objetivo = _cuentas_objetivo(filas, usuarios)
+    permitidos = None
+    if solo_roles:
+        permitidos = {
+            normalizar_rol_cuota(rol)
+            for rol in solo_roles
+            if str(rol or "").strip()
+        }
+
+    candidatas = []
+    for fila in objetivo:
+        rol = normalizar_rol_cuota((fila or {}).get("rol_activacion"))
+        if not rol:
+            continue
+        if permitidos is not None and rol not in permitidos:
+            continue
+        if rol != "hashtags":
+            continue
+        candidatas.append(fila)
+    try:
+        return _errores_tier2_hashtags(candidatas)
+    except Exception:
+        return []
+
+
+def _excluidos_cita(cuentas: list, cantidad, todas_cuentas: bool) -> set:
+    """Cuentas que probablemente use la pestana Cita masiva (para la reserva).
+
+    Aproximacion documentada: sin cantidad (o con "todas las cuentas") el flujo
+    clasico usa todas las activas; con cantidad > 0, las primeras N (el motor
+    las recorre en orden alfabetico). Las cuentas de respaldo son las que NO
+    caen aqui."""
+    usuarios = [
+        str(f.get("usuario") or "") for f in (cuentas or []) if f.get("usuario")
+    ]
+    try:
+        n = int(cantidad or 0)
+    except (TypeError, ValueError):
+        n = 0
+    if todas_cuentas or n <= 0:
+        return set(usuarios)
+    return set(usuarios[:n])
+
+
+def _tiene_sesion_cuenta(cuenta) -> bool:
+    """True si la cuenta tiene una sesion reutilizable (auth_token/cookies).
+
+    Mismo criterio del calentamiento: `auth_token`, `cookies_json` con
+    contenido o `cookies_path` con archivo existente. Nunca lanza."""
+    try:
+        if str(getattr(cuenta, "auth_token", "") or "").strip():
+            return True
+        cookies_json = getattr(cuenta, "cookies_json", "")
+        if cookies_json:
+            if isinstance(cookies_json, str):
+                return bool(cookies_json.strip())
+            return bool(cookies_json)
+        ruta = str(getattr(cuenta, "cookies_path", "") or "").strip()
+        if not ruta:
+            return False
+        from core.config import resolver_ruta
+
+        return os.path.isfile(resolver_ruta(ruta))
+    except Exception:
+        return False
+
+
+def _seleccionar_reserva(candidatos, excluidos=None, maximo: int = 50,
+                         rng=None) -> list:
+    """Baraja y limita las cuentas de respaldo (helper PURO y testeable).
+
+    Limpia '@'/vacios/duplicados (case-insensitive), descarta los `excluidos`
+    (la seleccion principal de la campana) y baraja con `rng` (default:
+    `random`). Devuelve hasta `maximo` usuarios (tope default 50 si el valor
+    viene invalido/<=0)."""
+    import random as _random
+
+    generador = rng or _random
+    vistos, limpios = set(), []
+    for usuario in candidatos or []:
+        nombre = str(usuario or "").strip().lstrip("@")
+        if not nombre:
+            continue
+        clave = nombre.lower()
+        if clave in vistos:
+            continue
+        vistos.add(clave)
+        limpios.append(nombre)
+
+    excluidos_norm = {
+        str(u).strip().lstrip("@").lower()
+        for u in (excluidos or [])
+        if str(u).strip()
+    }
+    disponibles = [u for u in limpios if u.lower() not in excluidos_norm]
+    try:
+        generador.shuffle(disponibles)
+    except Exception:
+        pass
+    try:
+        tope = int(maximo)
+    except (TypeError, ValueError):
+        tope = 50
+    if tope <= 0:
+        tope = 50
+    return disponibles[:tope]
+
+
+def _cargar_reserva_usuarios(excluidos=None, seccion=None, maximo: int = 50) -> list:
+    """Cuentas twitter activas CON sesion que NO estan en la seleccion principal.
+
+    Mismo filtro de seccion si `seccion` viene ("" / None = sin filtro),
+    barajadas y limitadas a `maximo`. Se usan como respaldo cuando una cuenta
+    agota su cuota diaria. Nunca lanza: ante cualquier error devuelve []."""
+    try:
+        from core.database import get_db_session
+        from core.models import Cuenta
+        from core.secciones import normalizar_seccion
+
+        with get_db_session() as db:
+            cuentas = (
+                db.query(Cuenta)
+                .filter(Cuenta.plataforma == "twitter", Cuenta.activa == True)
+                .order_by(Cuenta.usuario)
+                .all()
+            )
+        candidatos = []
+        for c in cuentas:
+            if seccion and normalizar_seccion(getattr(c, "seccion", "")) != seccion:
+                continue
+            if not _tiene_sesion_cuenta(c):
+                continue
+            candidatos.append(str(getattr(c, "usuario", "") or ""))
+        return _seleccionar_reserva(candidatos, excluidos=excluidos, maximo=maximo)
+    except Exception:
+        return []
+
+
 # ============================ PROGRESO EN VIVO ============================
 
 def _formato_tiempo(segundos) -> str:
@@ -516,6 +743,7 @@ def _lanzar_con_progreso(lanzar, motor, duracion_min: int, repetir: bool) -> dic
         exitosas = int(snap.get("exitosas") or 0)
         fallidas = int(snap.get("fallidas") or 0)
         ronda_actual = int(snap.get("ronda_actual") or 1)
+        fase_actual = snap.get("fase_actual")
         transcurrido = max(0.0, time.monotonic() - inicio)
         ritmo = (hechas / transcurrido * 60.0) if transcurrido > 0 else 0.0
 
@@ -531,12 +759,18 @@ def _lanzar_con_progreso(lanzar, motor, duracion_min: int, repetir: bool) -> dic
             avance = min(1.0, hechas / max(1, referencia))
             tiempo_txt = f"⏳ Transcurrido {_formato_tiempo(transcurrido)}"
 
+        # Curva de Aceleracion: el motor reporta `fase_actual` (1 o 2) en el
+        # snapshot; se muestra junto a la ronda y los contadores.
+        linea_curva = ""
+        if fase_actual not in (None, ""):
+            linea_curva = f" · 🚀 Fase {fase_actual}/2 de la curva"
+
         barra.progress(avance, text=tiempo_txt)
         metricas.markdown(
             f"**🔄 Ronda {ronda_actual}** · ✅ {exitosas} exitosas · "
             f"❌ {fallidas} fallidas · 🧮 {hechas} hechas · "
             f"⚡ {hechas} acciones · {ritmo:.1f}/min ≈ {ritmo * 60.0:.0f}/h · "
-            f"{tiempo_txt}"
+            f"{tiempo_txt}{linea_curva}"
         )
 
         eventos = snap.get("eventos") or []
@@ -595,6 +829,69 @@ def _soporta_kwarg(func, nombre: str) -> bool:
     return any(
         p.kind == inspect.Parameter.VAR_KEYWORD for p in parametros.values()
     )
+
+
+def _caption_cuota_diaria() -> None:
+    """Caption del tope diario vigente (lee la config existente, sin envs)."""
+    limite = _limite_diario_config()
+    if limite > 0:
+        st.caption(
+            f"Tope diario por cuenta: **{limite} acciones** "
+            "(`LIMITE_DIARIO_POR_CUENTA`). Al alcanzarlo, la cuenta pasa a "
+            "'Agotada por hoy' y (si hay respaldo) rota a otra."
+        )
+    else:
+        st.caption(
+            "Tope diario por cuenta: **sin tope** "
+            "(`LIMITE_DIARIO_POR_CUENTA=0`)."
+        )
+
+
+def _parametros_curva_reserva(func, curva: bool, curva_fase1, reserva_activa: bool,
+                              reserva_usuarios) -> dict:
+    """Kwargs opcionales de curva/reserva SOLO si `func` (el motor) los acepta.
+
+    Devuelve el dict para llamar al motor sin romper versiones viejas:
+      - `curva_aceleracion=True` + `curva_fase1_min=N` si el checkbox esta
+        activo Y el motor soporta los kwargs; si no, `st.warning` sin bloquear.
+      - `reserva_usuarios=[...]` si la rotacion esta activa Y hay candidatas Y
+        el motor soporta el kwarg; sin candidatas muestra un caption (no
+        bloquea).
+    Nunca lanza."""
+    parametros = {}
+    try:
+        if curva:
+            if _soporta_kwarg(func, "curva_aceleracion"):
+                parametros["curva_aceleracion"] = True
+                if _soporta_kwarg(func, "curva_fase1_min"):
+                    parametros["curva_fase1_min"] = int(curva_fase1)
+            else:
+                st.warning(
+                    "🚀 Este motor todavía no soporta la Curva de Aceleración; "
+                    "la campaña se lanzará sin ella."
+                )
+
+        lista_reserva = [
+            str(u).strip()
+            for u in (reserva_usuarios or [])
+            if str(u).strip()
+        ]
+        if reserva_activa:
+            if not lista_reserva:
+                st.caption(
+                    "🛡️ Sin cuentas de respaldo disponibles con los filtros "
+                    "actuales; la campaña no se bloquea."
+                )
+            elif _soporta_kwarg(func, "reserva_usuarios"):
+                parametros["reserva_usuarios"] = lista_reserva
+            else:
+                st.warning(
+                    "🛡️ Este motor todavía no soporta cuentas de respaldo; se "
+                    "ignora la reserva."
+                )
+    except Exception:
+        pass
+    return parametros
 
 
 def _lanzar_con_progreso_o_limpiar(lanzar, motor, duracion_min: int, repetir: bool,
@@ -781,6 +1078,12 @@ def _cargar_cuentas_con_roles() -> list:
     from core.secciones import normalizar_seccion
 
     try:
+        from core.tiers import normalizar_tier
+    except Exception:
+        def normalizar_tier(valor):
+            return ""
+
+    try:
         with get_db_session() as db:
             cuentas = (
                 db.query(Cuenta)
@@ -800,6 +1103,9 @@ def _cargar_cuentas_con_roles() -> list:
                     "grupo": c.grupo or "",
                     "rol_activacion": normalizar_rol_activacion(
                         getattr(c, "rol_activacion", "")
+                    ),
+                    "tier_calidad": normalizar_tier(
+                        getattr(c, "tier_calidad", "")
                     ),
                 }
                 for c in cuentas
@@ -880,6 +1186,8 @@ def _mostrar_resultados_roles(resultados: dict):
         metricas.append(
             ("🪪 Sin registro (saltadas)", resultados.get("sin_registro", 0))
         )
+    # Metricas opcionales de la curva/tiers/cuotas (solo si el motor las trae).
+    metricas.extend(_metricas_tier_curva(resultados))
     for col, (etiqueta, valor) in zip(st.columns(len(metricas)), metricas):
         col.metric(etiqueta, valor)
 
@@ -1270,6 +1578,54 @@ def _cita_masiva():
             key="act_dur",
         )
 
+    st.markdown("#### 🚀 Estrategia")
+    curva = st.checkbox(
+        "🚀 Estrategia: Curva de Aceleración",
+        value=False,
+        key="act_curva",
+        help=(
+            "Arranca con pocas cuentas (Fase 1) y acelera el volumen en la "
+            "Fase 2: la campaña se ve más orgánica y evita ráfagas que X "
+            "castiga. Se combina con la rotación a cuentas de respaldo."
+        ),
+    )
+    curva_fase1 = 15
+    if curva:
+        curva_fase1 = st.number_input(
+            "Fase 1 (min)",
+            min_value=1,
+            max_value=60,
+            value=15,
+            step=1,
+            key="act_curva_fase1",
+            help="Duración de la primera fase de la curva (1-60 min).",
+        )
+
+    with st.expander("🛡️ Cuotas diarias y respaldo", expanded=False):
+        reserva_rotar = st.checkbox(
+            "♻️ Rotar a cuentas de respaldo al agotar la cuota diaria",
+            value=True,
+            key="act_reserva_rotar",
+            help=(
+                "Cuando una cuenta alcanza su tope diario ('Agotada por hoy'), "
+                "el motor la sustituye por una cuenta de respaldo con sesión "
+                "válida para no frenar la campaña."
+            ),
+        )
+        reserva_max = st.number_input(
+            "Máx. cuentas de respaldo",
+            min_value=1,
+            max_value=200,
+            value=50,
+            step=1,
+            key="act_reserva_max",
+            help=(
+                "Tope de cuentas de respaldo que se pasan al motor: activas, "
+                "con sesión, fuera de esta campaña y de la misma sección."
+            ),
+        )
+        _caption_cuota_diaria()
+
     with st.expander(
         "📰 Contexto desde noticias (opcional, solo trasfondo)", expanded=False
     ):
@@ -1468,7 +1824,24 @@ def _cita_masiva():
 
         from activaciones.motor import MotorActivacion
 
+        # Cuentas de respaldo (misma sección, activas, con sesión y fuera de
+        # la selección principal) SOLO si la rotación está activa.
+        reserva_usuarios = []
+        if reserva_rotar:
+            reserva_usuarios = _cargar_reserva_usuarios(
+                excluidos=_excluidos_cita(cuentas_activas, cantidad, todas_cuentas),
+                seccion=(secciones_param[0] if secciones_param else None),
+                maximo=int(reserva_max),
+            )
+
         motor = MotorActivacion(max_concurrente=int(navegadores))
+        parametros_extra = _parametros_curva_reserva(
+            motor.ejecutar,
+            curva,
+            curva_fase1,
+            reserva_rotar,
+            reserva_usuarios,
+        )
         resultados = _lanzar_con_opciones_velocidad(
             lambda cb: motor.ejecutar(
                 urls=urls,
@@ -1488,6 +1861,7 @@ def _cita_masiva():
                 secciones=secciones_param,
                 porcentaje_min_ronda=int(pct_min),
                 porcentaje_max_ronda=int(pct_max),
+                **parametros_extra,
             ),
             motor,
             duracion_min=int(duracion_min),
@@ -1516,6 +1890,8 @@ def _cita_masiva():
             metricas.append(
                 ("🪪 Sin registro (saltadas)", resultados.get("sin_registro", 0))
             )
+        # Metricas opcionales de la curva/tiers/cuotas (solo si el motor las trae).
+        metricas.extend(_metricas_tier_curva(resultados))
         for col, (etiqueta, valor) in zip(st.columns(len(metricas)), metricas):
             col.metric(etiqueta, valor)
 
@@ -1581,6 +1957,9 @@ def _por_roles():
     st.markdown("### 👥 Cuentas objetivo")
     seleccion = _selector_masivo(cuentas, "act_roles_selector")
     usuarios_sel = [f.get("usuario") for f in seleccion if f.get("usuario")]
+    filas_por_usuario = {
+        str(f.get("usuario") or ""): f for f in cuentas if f.get("usuario")
+    }
 
     # ---------------- Reparto por porcentajes ----------------
     # El usuario elige las cuentas (selector de arriba, p. ej. modo Filtro ->
@@ -1591,6 +1970,11 @@ def _por_roles():
         "Elige la sección en el selector de arriba (modo **Filtro**, p. ej. "
         "**Libertad**), define cuánto hace cada rol y aplica el reparto: la "
         "campaña usará el rol guardado de cada cuenta."
+    )
+    st.caption(
+        "🛡️ **Tiers**: las cuentas **Tier 2 (Volumen/Aged)** no pueden recibir "
+        "el rol **Hashtags y menciones** (el reparto y el lanzamiento lo "
+        "bloquean); solo hacen RT, Cita o Comentario."
     )
     claves_pct = {
         "cita": "act_roles_pct_cita",
@@ -1644,14 +2028,31 @@ def _por_roles():
                 "porcentajes."
             )
         else:
-            resumen = []
-            for rol in ORDEN_ROLES:
-                n_rol = _actualizar_roles(reparto_preview[rol], rol)
-                resumen.append(f"{etiqueta_rol_activacion(rol)}: {n_rol}")
-            st.session_state["act_roles_pct_msg"] = (
-                "🎚️ Reparto por porcentajes → " + " · ".join(resumen)
-            )
-            st.rerun()
+            # VALIDACION BLOQUEANTE: ninguna cuenta Tier 2 puede terminar con
+            # el rol "hashtags"; si el reparto lo intenta, no se aplica NADA.
+            filas_hashtags = [
+                filas_por_usuario.get(u) or {"usuario": u}
+                for u in reparto_preview["hashtags"]
+            ]
+            errores_tier = _bloqueo_tier2_hashtags(filas_hashtags, aleatorio=False)
+            if errores_tier:
+                st.error(
+                    "🚫 **Reparto bloqueado**: una cuenta Tier 2 (Volumen/Aged) "
+                    "no puede tener el rol 'hashtags'. **No se aplicó ningún "
+                    "cambio.**\n\n"
+                    + "\n".join(f"- {mensaje}" for mensaje in errores_tier)
+                    + "\n\nAjusta los porcentajes (deja Hashtags solo para "
+                    "Tier 1) y vuelve a aplicar."
+                )
+            else:
+                resumen = []
+                for rol in ORDEN_ROLES:
+                    n_rol = _actualizar_roles(reparto_preview[rol], rol)
+                    resumen.append(f"{etiqueta_rol_activacion(rol)}: {n_rol}")
+                st.session_state["act_roles_pct_msg"] = (
+                    "🎚️ Reparto por porcentajes → " + " · ".join(resumen)
+                )
+                st.rerun()
     mensaje_pct = st.session_state.pop("act_roles_pct_msg", "")
     if mensaje_pct:
         st.success(mensaje_pct)
@@ -1685,11 +2086,29 @@ def _por_roles():
                 st.warning("Selecciona al menos una cuenta para asignarle rol.")
             else:
                 codigo = normalizar_rol_activacion(opcion_rol)
-                n = _actualizar_roles(usuarios_sel, codigo)
-                st.success(
-                    f"✅ Rol «{etiqueta_rol_activacion(codigo)}» asignado a {n} cuenta(s)."
-                )
-                st.rerun()
+                errores_tier = []
+                if codigo == "hashtags":
+                    # Misma regla bloqueante que en el reparto por porcentajes.
+                    filas_sel = [
+                        filas_por_usuario.get(u) or {"usuario": u}
+                        for u in usuarios_sel
+                    ]
+                    errores_tier = _bloqueo_tier2_hashtags(
+                        filas_sel, aleatorio=False
+                    )
+                if errores_tier:
+                    st.error(
+                        "🚫 **Rol bloqueado**: una cuenta Tier 2 (Volumen/Aged) "
+                        "no puede tener el rol 'hashtags'. **No se asignó "
+                        "nada.**\n\n"
+                        + "\n".join(f"- {mensaje}" for mensaje in errores_tier)
+                    )
+                else:
+                    n = _actualizar_roles(usuarios_sel, codigo)
+                    st.success(
+                        f"✅ Rol «{etiqueta_rol_activacion(codigo)}» asignado a {n} cuenta(s)."
+                    )
+                    st.rerun()
 
         # ---------------- Conteos y subcuentas ----------------
         st.markdown("#### 📊 Subcuentas por rol (reparto actual)")
@@ -1816,6 +2235,54 @@ def _por_roles():
         "Duración (min)", min_value=1, max_value=360, value=60, step=5,
         key="act_roles_dur",
     )
+
+    st.markdown("#### 🚀 Estrategia")
+    curva = st.checkbox(
+        "🚀 Estrategia: Curva de Aceleración",
+        value=False,
+        key="act_roles_curva",
+        help=(
+            "Arranca con pocas cuentas (Fase 1) y acelera el volumen en la "
+            "Fase 2: la campaña se ve más orgánica y evita ráfagas que X "
+            "castiga. Se combina con la rotación a cuentas de respaldo."
+        ),
+    )
+    curva_fase1 = 15
+    if curva:
+        curva_fase1 = st.number_input(
+            "Fase 1 (min)",
+            min_value=1,
+            max_value=60,
+            value=15,
+            step=1,
+            key="act_roles_curva_fase1",
+            help="Duración de la primera fase de la curva (1-60 min).",
+        )
+
+    with st.expander("🛡️ Cuotas diarias y respaldo", expanded=False):
+        reserva_rotar = st.checkbox(
+            "♻️ Rotar a cuentas de respaldo al agotar la cuota diaria",
+            value=True,
+            key="act_roles_reserva_rotar",
+            help=(
+                "Cuando una cuenta alcanza su tope diario ('Agotada por hoy'), "
+                "el motor la sustituye por una cuenta de respaldo con sesión "
+                "válida para no frenar la campaña."
+            ),
+        )
+        reserva_max = st.number_input(
+            "Máx. cuentas de respaldo",
+            min_value=1,
+            max_value=200,
+            value=50,
+            step=1,
+            key="act_roles_reserva_max",
+            help=(
+                "Tope de cuentas de respaldo que se pasan al motor: activas, "
+                "con sesión, fuera de esta campaña y de la misma sección."
+            ),
+        )
+        _caption_cuota_diaria()
 
     with st.expander("⚙️ Opciones avanzadas (ya vienen configuradas)", expanded=False):
         st.caption(
@@ -2108,6 +2575,26 @@ def _por_roles():
         else:
             solo_roles_param = list(ORDEN_ROLES) if solo_con_rol else None
 
+        # VALIDACION BLOQUEANTE de tiers: con roles FIJOS, ninguna cuenta
+        # Tier 2 puede quedarse con el rol "hashtags". Se avisa con
+        # `error_rol_tier` y NO se lanza la campaña (el usuario debe corregir).
+        errores_tier = _bloqueo_tier2_hashtags(
+            base_objetivo,
+            usuarios_param,
+            solo_roles_param,
+            aleatorio=False,
+        )
+        if errores_tier:
+            st.error(
+                "🚫 **No se lanzó la campaña**: una cuenta Tier 2 (Volumen/"
+                "Aged) tiene el rol 'hashtags', que le está PROHIBIDO.\n\n"
+                + "\n".join(f"- {mensaje}" for mensaje in errores_tier)
+                + "\n\nCorrige el rol con «🎚️ Reparto por porcentajes» "
+                "(asígnale RT/Cita/Comentario) o cambia su tier, y vuelve a "
+                "lanzar."
+            )
+            return
+
         material_posts = (
             str(hashtags or "").strip()
             or contexto_manual
@@ -2154,12 +2641,34 @@ def _por_roles():
 
         from activaciones.motor import MotorActivacion
 
+        # Cuentas de respaldo (misma sección, activas, con sesión y fuera de
+        # la selección principal) SOLO si la rotación está activa.
+        reserva_usuarios = []
+        if reserva_rotar:
+            excluidos_reserva = set(usuarios_sel)
+            if todas_cuentas:
+                excluidos_reserva = {
+                    str(f.get("usuario") or "") for f in base_objetivo
+                }
+            reserva_usuarios = _cargar_reserva_usuarios(
+                excluidos=excluidos_reserva,
+                seccion=(secciones_param[0] if secciones_param else None),
+                maximo=int(reserva_max),
+            )
+
         motor = MotorActivacion(max_concurrente=int(navegadores))
         # El motor viejo no acepta `pausa_comentario_url_seg`: se comprueba la
         # firma para pasar el kwarg solo si existe (la pagina nunca falla).
         pausa_kwargs = {}
         if _soporta_kwarg(motor.ejecutar_por_roles, "pausa_comentario_url_seg"):
             pausa_kwargs["pausa_comentario_url_seg"] = int(pausa_comentario)
+        parametros_extra = _parametros_curva_reserva(
+            motor.ejecutar_por_roles,
+            curva,
+            curva_fase1,
+            reserva_rotar,
+            reserva_usuarios,
+        )
         resultados = _lanzar_con_opciones_velocidad(
             lambda cb: motor.ejecutar_por_roles(
                 urls=urls,
@@ -2185,6 +2694,7 @@ def _por_roles():
                 porcentaje_min_ronda=int(pct_min),
                 porcentaje_max_ronda=int(pct_max),
                 **pausa_kwargs,
+                **parametros_extra,
             ),
             motor,
             duracion_min=int(duracion_min),

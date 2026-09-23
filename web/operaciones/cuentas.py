@@ -57,6 +57,7 @@ TABS = [
     "🏷️ Nombres",
     "⏸️ Estado",
     "🗑️ Eliminar",
+    "🏅 Tiers",
     "📷 Fotos",
     "🛡️ Anti-detección",
     "🔄 Sincronizar desde X",
@@ -67,7 +68,7 @@ TABS = [
     "📤 Exportar",
 ]
 
-# Agrupación de las 15 pestañas en 3 MODOS (radio superior). Reduce el ruido
+# Agrupación de las 17 pestañas en 3 MODOS (radio superior). Reduce el ruido
 # visual sin quitar ninguna pestaña: cada una aparece en UN solo modo y `TABS`
 # (exportado, lo usa web/app.py para validar ?tab=) se conserva intacto.
 MODOS_TABS = {
@@ -76,6 +77,7 @@ MODOS_TABS = {
         "🔎 Validar",
         "⏸️ Estado",
         "🗑️ Eliminar",
+        "🏅 Tiers",
         "📋 Inventario",
         "📤 Exportar",
     ],
@@ -124,6 +126,152 @@ def _abreviar(texto, maximo: int = 40) -> str:
     if len(texto) <= maximo:
         return texto
     return texto[: maximo - 1] + "…"
+
+
+# ===================== TIERS DE CALIDAD Y CUOTA DIARIA =====================
+
+def _normalizar_tier_seguro(valor) -> str:
+    """Tier canónico ("tier1"/"tier2"/"") tolerante a un core viejo.
+
+    Importa `core.tiers.normalizar_tier` de forma perezosa: si el entorno no
+    trae el módulo (o algo falla), devuelve "" y la UI sigue funcionando."""
+    try:
+        from core.tiers import normalizar_tier
+
+        return normalizar_tier(valor)
+    except Exception:
+        return ""
+
+
+def _etiqueta_tier_segura(valor) -> str:
+    """Etiqueta legible del tier ("Tier 1 (Líder/Boosted)", ...) o ""."""
+    try:
+        from core.tiers import etiqueta_tier
+
+        return etiqueta_tier(valor)
+    except Exception:
+        return ""
+
+
+def _etiqueta_tier_badge(valor) -> str:
+    """Badge de Tier para el inventario y las tablas.
+
+    Tier 1 -> "🏅 Tier 1 (Líder/Boosted)"; Tier 2 -> "🧱 Tier 2 (Volumen/Aged)";
+    vacío/desconocido -> "—". Nunca lanza."""
+    codigo = _normalizar_tier_seguro(valor)
+    etiqueta = _etiqueta_tier_segura(codigo)
+    if codigo == "tier1":
+        return f"🏅 {etiqueta}" if etiqueta else "🏅 Tier 1"
+    if codigo == "tier2":
+        return f"🧱 {etiqueta}" if etiqueta else "🧱 Tier 2"
+    return "—"
+
+
+def _normalizar_rol_cuota_seguro(valor) -> str:
+    """Rol efectivo de cuota ("hashtags"/"cita"/...) tolerante a core viejo."""
+    try:
+        from core.registro import normalizar_rol_cuota
+
+        return normalizar_rol_cuota(valor)
+    except Exception:
+        return str(valor or "").strip().lower()
+
+
+def _fila_como_cuenta(fila: dict):
+    """Vista mínima (por atributos) de una fila del inventario para core.tiers."""
+    from types import SimpleNamespace
+
+    datos = fila or {}
+    return SimpleNamespace(
+        usuario=str(datos.get("usuario") or ""),
+        handle_actual=str(datos.get("handle_actual") or ""),
+        tier_calidad=str(datos.get("tier_calidad") or ""),
+        rol_activacion=datos.get("rol_activacion") or "",
+    )
+
+
+def _errores_tier2_hashtags(filas) -> list:
+    """Mensajes bloqueantes de las filas Tier 2 con rol efectivo "hashtags".
+
+    Devuelve la lista de `core.tiers.error_rol_tier` (vacía si ninguna
+    incumple). "post"/"mantenimiento"/"publicacion" cuentan como "hashtags"
+    porque se normalizan con `core.registro.normalizar_rol_cuota`. Nunca
+    lanza: si core.tiers no existe, devuelve []."""
+    try:
+        from core.tiers import error_rol_tier
+    except Exception:
+        return []
+    errores = []
+    for fila in filas or []:
+        if _normalizar_rol_cuota_seguro((fila or {}).get("rol_activacion")) != (
+            "hashtags"
+        ):
+            continue
+        try:
+            mensaje = error_rol_tier(_fila_como_cuenta(fila), "hashtags")
+        except Exception:
+            mensaje = ""
+        if mensaje:
+            errores.append(mensaje)
+    return errores
+
+
+def _etiqueta_cuota_dia(usado, limite) -> str:
+    """Columna "Cuota hoy": `usado/limite` o "sin tope" (nunca agotada).
+
+    Con tope (>0) y `usado >= limite` agrega "· 🔴 Agotada por hoy". Con tope 0
+    (sin límite diario) siempre muestra "sin tope"."""
+    try:
+        usado_int = int(usado or 0)
+    except (TypeError, ValueError):
+        usado_int = 0
+    try:
+        limite_int = int(limite or 0)
+    except (TypeError, ValueError):
+        limite_int = 0
+    if limite_int <= 0:
+        return "sin tope"
+    texto = f"{usado_int}/{limite_int}"
+    if usado_int >= limite_int:
+        texto += " · 🔴 Agotada por hoy"
+    return texto
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _cuotas_dia_por_usuarios(usuarios: tuple) -> dict:
+    """Cuota diaria por usuario con UNA consulta agrupada (caché 60 s).
+
+    Devuelve `{"limite": int, "usados": {usuario: acciones_exitosas}}` con
+    `core.registro.contar_acciones_dia_por_usuario` (una sola consulta) y
+    `core.registro.limite_acciones_dia()` (0 = sin tope). Tolerante a un core
+    viejo: ante cualquier error devuelve `{"limite": 0, "usados": {}}`."""
+    limite = 0
+    usados = {}
+    try:
+        from core.registro import (
+            contar_acciones_dia_por_usuario,
+            limite_acciones_dia,
+        )
+
+        limite = int(limite_acciones_dia() or 0)
+        conteos = contar_acciones_dia_por_usuario(list(usuarios or ())) or {}
+        usados = {
+            str(usuario): int(total or 0) for usuario, total in conteos.items()
+        }
+    except Exception:
+        limite, usados = 0, {}
+    return {"limite": limite, "usados": usados}
+
+
+def _cuota_dia_usuario(usuario, cuotas) -> str:
+    """Texto de la columna "Cuota hoy" para un usuario y el dict de cuotas."""
+    try:
+        usados = (cuotas or {}).get("usados") or {}
+        limite = int((cuotas or {}).get("limite") or 0)
+        usado = int(usados.get(str(usuario), 0) or 0)
+    except Exception:
+        usado, limite = 0, 0
+    return _etiqueta_cuota_dia(usado, limite)
 
 
 def _opciones_filtro_seccion(incluir_todas: bool = True) -> list:
@@ -371,6 +519,15 @@ def _listar_cuentas(status_filtro: str = OPCION_TODAS, seccion_filtro=None) -> l
                         "personalidad": (
                             getattr(c, "personalidad", "") or ""
                         ).strip(),
+                        "tier_calidad": _normalizar_tier_seguro(
+                            getattr(c, "tier_calidad", "")
+                        ),
+                        "tier_etiqueta": _etiqueta_tier_badge(
+                            getattr(c, "tier_calidad", "")
+                        ),
+                        "rol_activacion": _normalizar_rol_cuota_seguro(
+                            getattr(c, "rol_activacion", "")
+                        ),
                     }
                 )
     except Exception as e:
@@ -640,6 +797,33 @@ def _asignar_tipo_cuenta(usuarios, codigo: str) -> int:
         )
     _listar_cuentas.clear()
     return cambiadas
+
+
+def _asignar_tier(usuarios, codigo: str) -> int:
+    """UPDATE masivo de `Cuenta.tier_calidad`; devuelve cuántas filas cambió.
+
+    `codigo` se normaliza con `core.tiers.normalizar_tier` ("" = quitar tier).
+    Tolerante a un modelo/BD viejo sin la columna: ante cualquier error avisa
+    en la UI y devuelve 0 (nunca deja la escritura a medias)."""
+    usuarios = [u for u in (usuarios or []) if u]
+    if not usuarios:
+        return 0
+    valor = _normalizar_tier_seguro(codigo)
+    try:
+        with get_db_session() as db:
+            cambiadas = (
+                db.query(Cuenta)
+                .filter(
+                    Cuenta.plataforma == "twitter",
+                    Cuenta.usuario.in_(usuarios),
+                )
+                .update({Cuenta.tier_calidad: valor}, synchronize_session=False)
+            )
+        _listar_cuentas.clear()
+        return cambiadas
+    except Exception as e:
+        st.error(f"No se pudo asignar el tier (¿modelo/BD vieja?): {e}")
+        return 0
 
 
 def _asignar_perfil_personalidad(
@@ -4276,6 +4460,127 @@ def _tab_anti_deteccion():
         )
 
 
+def _tab_tiers():
+    """Asignación de tiers de calidad (Tier 1 / Tier 2) con validación bloqueante.
+
+    Regla de negocio centralizada en `core.tiers`: una cuenta Tier 2 tiene
+    PROHIBIDO el rol efectivo "hashtags" (posts originales). Al intentar
+    asignar Tier 2 a una cuenta con ese rol el sistema NO escribe nada y
+    muestra `error_rol_tier(...)` (nunca auto-corrige en silencio)."""
+    st.markdown("### 🏅 Tiers de calidad")
+    st.caption(
+        "**Tier 1 (Líder/Boosted)**: cuentas fuertes; SÍ pueden publicar posts "
+        "originales con hashtags. **Tier 2 (Volumen/Aged)**: cuentas de "
+        "volumen; tienen PROHIBIDO el rol «Hashtags y menciones» y solo hacen "
+        "RT, Cita o Comentario. El bloqueo también aplica al reparto de roles "
+        "y al lanzar campañas."
+    )
+
+    todas = _listar_cuentas(OPCION_TODAS)
+
+    conteos = {"tier1": 0, "tier2": 0, "": 0}
+    for fila in todas:
+        clave = _normalizar_tier_seguro(fila.get("tier_calidad")) or ""
+        conteos[clave] = conteos.get(clave, 0) + 1
+
+    columnas = st.columns(3)
+    columnas[0].metric("🏅 Tier 1", conteos.get("tier1", 0))
+    columnas[1].metric("🧱 Tier 2", conteos.get("tier2", 0))
+    columnas[2].metric(OPCION_SIN_ASIGNAR, conteos.get("", 0))
+
+    st.markdown("---")
+
+    if todas:
+        try:
+            from core.roles import etiqueta_rol_activacion
+        except Exception:
+            def etiqueta_rol_activacion(valor):
+                return str(valor or "") or "Sin rol"
+
+        tabla = [
+            {
+                "usuario": f["usuario"],
+                "handle_actual": f.get("handle_actual") or f["usuario"],
+                "seccion": f.get("seccion_etiqueta") or OPCION_SIN_ASIGNAR,
+                "rol efectivo": etiqueta_rol_activacion(f.get("rol_activacion")),
+                "tier": _etiqueta_tier_badge(f.get("tier_calidad")),
+                "status": f.get("status", ""),
+            }
+            for f in todas
+        ]
+        st.dataframe(tabla, use_container_width=True)
+    else:
+        st.info("No hay cuentas de Twitter en la base de datos.")
+
+    st.markdown("---")
+    st.markdown("#### 💾 Asignación de tiers")
+
+    if not todas:
+        st.info("No hay cuentas de Twitter para asignar.")
+        return
+
+    seleccion = _selector_masivo(todas, "tier_selector")
+    descripcion_sel = st.session_state.get("tier_selector_descripcion", "")
+    if descripcion_sel:
+        st.caption(f"Se aplicará el cambio con: {descripcion_sel}")
+
+    col_t1, col_t2, col_quitar = st.columns(3)
+    with col_t1:
+        btn_tier1 = st.button(
+            "🏅 Asignar Tier 1",
+            use_container_width=True,
+            key="btn_tier1",
+        )
+    with col_t2:
+        btn_tier2 = st.button(
+            "🧱 Asignar Tier 2",
+            use_container_width=True,
+            key="btn_tier2",
+        )
+    with col_quitar:
+        btn_quitar = st.button(
+            "➖ Quitar tier",
+            use_container_width=True,
+            key="btn_tier_quitar",
+        )
+
+    def _aplicar_tier(codigo: str, etiqueta: str):
+        if not seleccion:
+            st.warning("Selecciona al menos una cuenta.")
+            return
+        if codigo == "tier2":
+            # BLOQUEO: Tier 2 + rol efectivo "hashtags" es una combinación
+            # inválida. Se avisa con `error_rol_tier` y NO se escribe nada.
+            errores = _errores_tier2_hashtags(seleccion)
+            if errores:
+                st.error(
+                    "🚫 **No se puede asignar Tier 2** a una cuenta con el rol "
+                    "efectivo 'hashtags' (Tier 2 tiene PROHIBIDO publicar posts "
+                    "originales). **Sistema no modificado.**\n\n"
+                    + "\n".join(f"- {mensaje}" for mensaje in errores)
+                    + "\n\nCorrige el rol (asigna RT/Cita/Comentario) o usa "
+                    "Tier 1."
+                )
+                return
+        usuarios = [f["usuario"] for f in seleccion]
+        try:
+            actualizadas = _asignar_tier(usuarios, codigo)
+            _flash(
+                f"{etiqueta} asignado a {actualizadas} cuenta(s). "
+                f"{descripcion_sel}"
+            )
+            st.rerun()
+        except Exception as e:
+            st.error(f"No se pudo asignar el tier: {e}")
+
+    if btn_tier1:
+        _aplicar_tier("tier1", "🏅 Tier 1 (Líder/Boosted)")
+    if btn_tier2:
+        _aplicar_tier("tier2", "🧱 Tier 2 (Volumen/Aged)")
+    if btn_quitar:
+        _aplicar_tier("", "Sin tier")
+
+
 def _tab_inventario():
     st.markdown("### 📋 Inventario de cuentas (Twitter)")
     st.caption(
@@ -4340,6 +4645,15 @@ def _tab_inventario():
         f"Mostrando {len(filas)} cuenta(s) con el filtro de registro actual."
     )
 
+    # Cuota diaria: UNA consulta agrupada (cacheada 60s) por render para todos
+    # los usuarios listados; tolerante si el core es viejo.
+    try:
+        cuotas_dia = _cuotas_dia_por_usuarios(
+            tuple(str(f.get("usuario") or "") for f in filas)
+        )
+    except Exception:
+        cuotas_dia = {"limite": 0, "usados": {}}
+
     # Separadores visuales por registro: politica / activista / ciudadana +
     # sin definir, cada uno con su conteo y su subtabla (incluye el grupo
     # operativo como 'sin grupo' cuando viene vacio, sin forzar 'A').
@@ -4358,6 +4672,9 @@ def _tab_inventario():
                 "nombre_mostrado": f["nombre_mostrado"],
                 "seccion": f["seccion_etiqueta"],
                 "tipo": f["tipo_etiqueta"],
+                "tier": f.get("tier_etiqueta") or _etiqueta_tier_badge(
+                    f.get("tier_calidad")
+                ),
                 "grupo": f.get("grupo_etiqueta") or "sin grupo",
                 "nombre_propuesto": f["nombre_propuesto"],
                 "handle_propuesto": f["handle_propuesto"],
@@ -4365,6 +4682,7 @@ def _tab_inventario():
                 "avatar": "Sí" if f.get("avatar") else "No",
                 "portada": "Sí" if f.get("banner") else "No",
                 "status": f["status"],
+                "cuota_hoy": _cuota_dia_usuario(f["usuario"], cuotas_dia),
                 "email": f["email"],
                 "last_checked": f["last_checked"],
                 "cookies": f["cookies"],
@@ -4501,6 +4819,7 @@ def render(usuario):
         "🏷️ Nombres": _tab_nombres,
         "⏸️ Estado": _tab_estado,
         "🗑️ Eliminar": _tab_eliminar,
+        "🏅 Tiers": _tab_tiers,
         "📷 Fotos": _tab_fotos,
         "🛡️ Anti-detección": _tab_anti_deteccion,
         "🔄 Sincronizar desde X": _tab_sincronizar,

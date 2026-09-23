@@ -16,6 +16,11 @@ minutos para que el motor no supere los limites por hora de X:
   workers jamas pasen el limite a la vez: ``reservar`` y ``liberar`` son
   atomicos bajo un ``threading.RLock``.
 
+Ademas lleva un TOPE DIARIO TOTAL por cuenta (independiente del rol): la suma
+de acciones OPERATIVAS EXITOSAS en la ventana diaria (``LIMITE_DIARIO_POR_CUENTA``,
+default 12). Un uso `>=` al tope marca la cuenta como "Agotada por hoy" y el
+motor la retira/rota por una reserva.
+
 Todas las funciones son tolerantes a fallos: envuelven su cuerpo en
 ``try/except`` y devuelven el default (``True`` en ``rol_permitido``,
 ``False`` en ``reservar``, listas/dicts vacios en el resto) sin lanzar jamas.
@@ -25,6 +30,7 @@ import time
 
 from core.config import settings
 from core.registro import (
+    contar_acciones_dia_por_usuario,
     contar_acciones_por_usuario,
     limite_por_rol,
     normalizar_rol_cuota,
@@ -52,9 +58,14 @@ class CuotasHorarias:
     ``liberar(..., exito=False)`` devuelve el cupo sin consumirlo y
     ``liberar(..., exito=True)`` lo consume (suma a ``exitos_campana``).
     Un limite ``<= 0`` significa ILIMITADO (siempre permite y siempre reserva).
+
+    La capa DIARIA (parametros al final) funciona igual pero sin distinguir
+    rol: ``limite_dia <= 0`` o ``activo_dia=False`` = ILIMITADO diario
+    (comportamiento identico al de antes de existir la capa diaria).
     """
 
-    def __init__(self, limites=None, minutos=None, max_aviso_seg=60):
+    def __init__(self, limites=None, minutos=None, max_aviso_seg=60,
+                 limite_dia=None, minutos_dia=None, activo_dia=None):
         """Crea el contador.
 
         Args:
@@ -65,15 +76,27 @@ class CuotasHorarias:
                 ``settings.limite_ventana_min`` (y 60 si tampoco es valido).
             max_aviso_seg: segundos minimos entre dos avisos de cuota agotada
                 de la MISMA cuenta (default 60); ``0`` avisa siempre.
+            limite_dia: tope DIARIO total por cuenta; ``None`` usa
+                ``settings.limite_acciones_dia`` y ``<= 0`` = sin tope.
+            minutos_dia: ventana diaria en minutos; ``None`` usa
+                ``settings.limite_dia_ventana_min`` (default 1440).
+            activo_dia: interruptor de la capa diaria; ``None`` usa
+                ``settings.limite_diario_activo``. ``False`` = ilimitado.
         """
         self._lock = threading.RLock()
         self._limites = self._construir_limites(limites)
         self._minutos = self._normalizar_minutos(minutos)
         self._max_aviso_seg = self._normalizar_aviso(max_aviso_seg)
+        self._limite_dia = self._normalizar_limite_dia(limite_dia)
+        self._minutos_dia = self._normalizar_minutos_dia(minutos_dia)
+        self._activo_dia = self._normalizar_activo_dia(activo_dia)
         self._base: dict = {}
         self._exitos: dict = {}
         self._reservas: dict = {}
         self._ultimo_aviso: dict = {}
+        self._base_dia: dict = {}
+        self._exitos_dia: dict = {}
+        self._reservas_dia: dict = {}
 
     # ------------------------------------------------------------------ #
     # Construccion / normalizacion
@@ -137,6 +160,46 @@ class CuotasHorarias:
         return valor if valor >= 0 else 60.0
 
     @staticmethod
+    def _normalizar_limite_dia(limite_dia) -> int:
+        """Tope diario efectivo: ``limite_dia`` > 0 o el de settings.
+
+        ``None``/invalido/``<= 0`` cae a ``settings.limite_acciones_dia``
+        (0 = sin tope). Nunca lanza."""
+        try:
+            if limite_dia is None:
+                valor = int(getattr(settings, "limite_acciones_dia", 0))
+            else:
+                valor = int(limite_dia)
+        except (TypeError, ValueError):
+            valor = 0
+        return valor if valor > 0 else 0
+
+    @staticmethod
+    def _normalizar_minutos_dia(minutos_dia) -> int:
+        """Ventana diaria efectiva: ``minutos_dia`` > 0 o la de settings."""
+        try:
+            valor = int(minutos_dia) if minutos_dia is not None else 0
+        except (TypeError, ValueError):
+            valor = 0
+        if valor > 0:
+            return valor
+        try:
+            por_defecto = int(getattr(settings, "limite_dia_ventana_min", 1440))
+        except (TypeError, ValueError):
+            por_defecto = 1440
+        return por_defecto if por_defecto > 0 else 1440
+
+    @staticmethod
+    def _normalizar_activo_dia(activo_dia) -> bool:
+        """Interruptor de la capa diaria (default el de settings)."""
+        if activo_dia is None:
+            try:
+                return bool(getattr(settings, "limite_diario_activo", True))
+            except Exception:
+                return True
+        return bool(activo_dia)
+
+    @staticmethod
     def _clave(usuario, rol):
         """Par ``(usuario, rol_canonico)`` o ``None`` si falta alguno."""
         texto = str(usuario or "").strip()
@@ -164,16 +227,42 @@ class CuotasHorarias:
         except Exception:
             return 0
 
+    def _dia_activo(self) -> bool:
+        """True si el tope diario esta encendido (interruptor y limite > 0)."""
+        try:
+            return bool(self._activo_dia) and int(self._limite_dia) > 0
+        except Exception:
+            return False
+
+    def _usado_dia_locked(self, usuario) -> int:
+        """``base_dia + exitos_dia + reservas_dia``; REQUIERE el lock tomado."""
+        texto = str(usuario or "").strip()
+        if not texto:
+            return 0
+        return (
+            int(self._base_dia.get(texto, 0))
+            + int(self._exitos_dia.get(texto, 0))
+            + int(self._reservas_dia.get(texto, 0))
+        )
+
+    def _clave_dia(self, usuario):
+        """Usuario canonico de la capa diaria o "" si viene vacio/None."""
+        try:
+            return str(usuario or "").strip()
+        except Exception:
+            return ""
+
     # ------------------------------------------------------------------ #
     # API publica
     # ------------------------------------------------------------------ #
     def preparar(self, usuarios) -> None:
-        """Carga la base desde la BD para ``usuarios`` (re-llamable).
+        """Carga la base (horaria y diaria) desde la BD para ``usuarios``.
 
-        Reemplaza SOLO ``_base`` con ``contar_acciones_por_usuario`` (una
-        consulta agrupada); ``exitos_campana`` y ``reservas_en_vuelo`` se
-        conservan. Ante cualquier error deja ``_base`` como estaba (nunca
-        lanza).
+        Reemplaza SOLO ``_base`` con ``contar_acciones_por_usuario`` y
+        ``_base_dia`` con ``contar_acciones_dia_por_usuario`` (UNA consulta
+        agrupada cada una); ``exitos_campana``/``reservas_en_vuelo`` y sus
+        equivalentes diarios se conservan. Ante cualquier error deja la base
+        correspondiente como estaba (nunca lanza).
         """
         try:
             if usuarios is None:
@@ -182,6 +271,10 @@ class CuotasHorarias:
                 lista = [usuarios]
             else:
                 lista = [u for u in usuarios]
+        except Exception:
+            lista = []
+        # --- Base horaria por (usuario, rol) ---
+        try:
             base = contar_acciones_por_usuario(lista, self._minutos)
             if not isinstance(base, dict):
                 base = {}
@@ -203,14 +296,38 @@ class CuotasHorarias:
                 self._base = normalizada
         except Exception:
             pass
+        # --- Base diaria total por usuario (una sola consulta agrupada) ---
+        try:
+            base_dia = contar_acciones_dia_por_usuario(lista, self._minutos_dia)
+            if not isinstance(base_dia, dict):
+                base_dia = {}
+            normalizada_dia: dict = {}
+            for usuario, conteo in base_dia.items():
+                try:
+                    total = int(conteo or 0)
+                except (TypeError, ValueError):
+                    total = 0
+                if total > 0:
+                    normalizada_dia[str(usuario)] = total
+            with self._lock:
+                self._base_dia = normalizada_dia
+        except Exception:
+            pass
 
     def rol_permitido(self, usuario, rol) -> bool:
-        """True si la cuenta aun tiene cupo para ese rol (limite <= 0 = libre)."""
+        """True si la cuenta aun tiene cupo para ese rol (limite <= 0 = libre).
+
+        Respeta el TOPE DIARIO total: si la cuenta esta "Agotada por hoy",
+        ningun rol queda permitido (False para todos)."""
         try:
             with self._lock:
                 clave = self._clave(usuario, rol)
                 if clave is None:
                     return True
+                if self._dia_activo() and (
+                    self._usado_dia_locked(clave[0]) >= int(self._limite_dia)
+                ):
+                    return False
                 limite = int(self._limites.get(clave[1], 0))
                 if limite <= 0:
                     return True
@@ -248,28 +365,42 @@ class CuotasHorarias:
     def reservar(self, usuario, rol) -> bool:
         """Reserva ATOMICA de un cupo; False si ya no hay (o par invalido).
 
-        Con limite ``<= 0`` (ilimitado) siempre reserva; con limite > 0 exige
-        ``usado < limite``. Contar la reserva como uso es lo que evita que dos
-        workers pasen el limite en paralelo.
+        Exige cupo horario del rol Y cupo diario total: si la cuenta esta
+        "Agotada por hoy" (`base_dia + exitos_dia + reservas_dia >= limite_dia`)
+        NO reserva, sin importar el rol. La reserva diaria se cuenta APARTE de
+        la horaria y ambas se cierran en `liberar`. Con limite ``<= 0``
+        (ilimitado) siempre reserva; con limite > 0 exige ``usado < limite``.
+        Contar la reserva como uso es lo que evita que dos workers pasen el
+        limite en paralelo.
         """
         try:
             with self._lock:
                 clave = self._clave(usuario, rol)
                 if clave is None:
                     return False
+                usuario_dia = clave[0]
+                if self._dia_activo() and (
+                    self._usado_dia_locked(usuario_dia) >= int(self._limite_dia)
+                ):
+                    return False
                 limite = int(self._limites.get(clave[1], 0))
                 if limite > 0 and self._usado_locked(clave) >= limite:
                     return False
                 self._reservas[clave] = int(self._reservas.get(clave, 0)) + 1
+                if self._dia_activo():
+                    self._reservas_dia[usuario_dia] = (
+                        int(self._reservas_dia.get(usuario_dia, 0)) + 1
+                    )
                 return True
         except Exception:
             return False
 
     def liberar(self, usuario, rol, exito: bool) -> None:
-        """Cierra una reserva: la devuelve o la convierte en exito.
+        """Cierra AMBAS reservas (horaria y diaria): las devuelve o las consume.
 
-        Siempre descuenta la reserva (nunca por debajo de 0) y, solo con
-        ``exito=True``, suma la accion a ``exitos_campana`` (consume cupo).
+        Siempre descuenta las reservas (nunca por debajo de 0) y, solo con
+        ``exito=True``, suma la accion a ``exitos_campana`` (horaria) y a
+        ``exitos_dia`` (total diario).
         """
         try:
             with self._lock:
@@ -281,10 +412,47 @@ class CuotasHorarias:
                     self._reservas[clave] = en_vuelo - 1
                 else:
                     self._reservas.pop(clave, None)
+                usuario_dia = clave[0]
+                en_vuelo_dia = int(self._reservas_dia.get(usuario_dia, 0))
+                if en_vuelo_dia > 1:
+                    self._reservas_dia[usuario_dia] = en_vuelo_dia - 1
+                else:
+                    self._reservas_dia.pop(usuario_dia, None)
                 if exito:
                     self._exitos[clave] = int(self._exitos.get(clave, 0)) + 1
+                    self._exitos_dia[usuario_dia] = (
+                        int(self._exitos_dia.get(usuario_dia, 0)) + 1
+                    )
         except Exception:
             pass
+
+    def agotado_dia(self, usuario) -> bool:
+        """True si la cuenta alcanzo el tope diario total ("Agotada por hoy").
+
+        Con el tope desactivado o ``limite_dia <= 0`` devuelve False (sin
+        consultar nada). Nunca lanza.
+        """
+        try:
+            if not self._dia_activo():
+                return False
+            texto = self._clave_dia(usuario)
+            if not texto:
+                return False
+            with self._lock:
+                return self._usado_dia_locked(texto) >= int(self._limite_dia)
+        except Exception:
+            return False
+
+    def uso_dia(self, usuario) -> dict:
+        """Estado diario de una cuenta: ``{"usado": n, "limite": m}``."""
+        try:
+            texto = self._clave_dia(usuario)
+            with self._lock:
+                usado = self._usado_dia_locked(texto) if texto else 0
+                limite = int(self._limite_dia) if self._dia_activo() else 0
+            return {"usado": usado, "limite": limite}
+        except Exception:
+            return {"usado": 0, "limite": 0}
 
     def agotado(self, usuario, candidatos) -> bool:
         """True si hay candidatos y NINGUNO tiene cupo; sin candidatos False."""
@@ -339,9 +507,21 @@ class CuotasHorarias:
             return 0
 
     def resumen(self) -> dict:
-        """Resumen agregado de la campana (nunca lanza)."""
+        """Resumen agregado de la campana (nunca lanza).
+
+        Incluye ``diarias`` con el tope diario efectivo, su ventana y el uso
+        total (base + exitos + reservas en vuelo de todas las cuentas).
+        """
         try:
             with self._lock:
+                usuarios_dia = (
+                    set(self._base_dia)
+                    | set(self._exitos_dia)
+                    | set(self._reservas_dia)
+                )
+                usado_total = sum(
+                    self._usado_dia_locked(usuario) for usuario in usuarios_dia
+                )
                 return {
                     "limites": dict(self._limites),
                     "ventana_min": int(self._minutos),
@@ -351,6 +531,11 @@ class CuotasHorarias:
                     "reservas_activas": sum(
                         int(valor) for valor in self._reservas.values()
                     ),
+                    "diarias": {
+                        "limite": int(self._limite_dia) if self._dia_activo() else 0,
+                        "ventana_min": int(self._minutos_dia),
+                        "usado_total": int(usado_total),
+                    },
                 }
         except Exception:
             return {
@@ -358,4 +543,5 @@ class CuotasHorarias:
                 "ventana_min": 60,
                 "acciones_exitosas": 0,
                 "reservas_activas": 0,
+                "diarias": {"limite": 0, "ventana_min": 1440, "usado_total": 0},
             }

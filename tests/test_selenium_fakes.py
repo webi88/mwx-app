@@ -21,6 +21,12 @@ sin Chrome, los casos reales de Railway:
   - `navegar_tolerante` / `_recuperar_interstitial`: hasta DOS refrescos para
     la pagina de error generica de X; NUNCA el refresh adicional para el
     challenge anti-bot (Cloudflare), login o driver roto.
+  - Blindaje del compositor: `_abrir_compositor` hace una ULTIMA fase para la
+    pagina de error/interstitial (refresh corto + reintento directo de
+    `/compose/post`); `_pegar_texto` re-destruye el mask y reescribe UNA vez si
+    el overlay bloquea la escritura; `publicar_tweet` hace UN ciclo limpio
+    (refresh + recomponer) ante fallos transitorios, en info/debug (nunca
+    `logger.error`) y sin tocar los mensajes de contrato del motor.
   - `login_con_cookies` (.pkl): un muro de login (URL `login`/`/i/flow`/
     `account/access` o formulario VISIBLE) ya NO se declara "Login exitoso":
     cae a `login_con_cookies_json()` y, si tampoco hay cookies validas,
@@ -202,6 +208,10 @@ class FakeDriver:
         self.masks = []
         self.mask_presente = False
         self.js_falla = False
+        # Cuantas veces FALLA el JS de destruccion del mask (0 = ninguna):
+        # simula el renderer que no responde a `document.querySelectorAll...`
+        # y luego se recupera (blindaje del compositor).
+        self.mask_js_falla = 0
         self.send_keys_escribe = True
         self.send_keys_lanza = False
         self.actionchains_escribe = True
@@ -247,6 +257,9 @@ class FakeDriver:
         if "document.readyState" in script:
             return "complete"
         if "data-testid" in script and ".remove()" in script:
+            if self.mask_js_falla > 0:
+                self.mask_js_falla -= 1
+                raise WebDriverException("JS de mask roto (test)")
             # JS exacto de `_pegar_texto`: destruye la capa `data-testid="mask"`.
             self.eventos.append(("destruir_mask",))
             self.masks = []
@@ -1276,6 +1289,312 @@ def test_login_pkl_muro_de_login(check):
     )
 
 
+# --------------------------------------------------------------------------- #
+# Blindaje del compositor: recuperacion final de interstitial + reintento limpio
+# --------------------------------------------------------------------------- #
+class LoggerFalso:
+    """Captura las llamadas al `logger` del modulo (sin tocar loguru global).
+
+    Al parchear `plataformas.twitter.selenium_bot.logger`, cualquier nivel
+    invocado queda en `self.llamadas[nivel]`. Permite verificar que los
+    reintentos MANEJADOS (transitorios) no llaman `logger.error` ni
+    `logger.exception`.
+    """
+
+    def __init__(self):
+        self.llamadas = {
+            "debug": [],
+            "info": [],
+            "warning": [],
+            "error": [],
+            "exception": [],
+            "success": [],
+        }
+
+    def __getattr__(self, nombre):
+        lista = self.llamadas.setdefault(nombre, [])
+
+        def _registrar(mensaje="", *args, **kwargs):
+            lista.append(str(mensaje))
+            return None
+
+        return _registrar
+
+
+@contextlib.contextmanager
+def _logger_falso():
+    """Parchea el `logger` del bot por `LoggerFalso` durante el bloque."""
+    logger_falso = LoggerFalso()
+    with mock.patch("plataformas.twitter.selenium_bot.logger", logger_falso):
+        yield logger_falso
+
+
+def test_abrir_compositor_reintento_final(check):
+    print("Blindaje: pagina de error en rutas 1-2 -> refresh + reintento final")
+    driver = FakeDriver()
+    editor = FakeElement(driver, contenteditable=True)
+    driver.page_source = "something went wrong"
+    driver.editores = []
+
+    def get_scripted(url):
+        driver.get_calls.append(url)
+        # La ruta clasica sirve la SPA real en el REINTENTO FINAL (2do get).
+        if url.endswith("/compose/post") and driver.get_calls.count(url) >= 2:
+            driver.page_source = ""
+            driver.editores = [editor]
+
+    driver.get = get_scripted
+    bot = bot_con_driver(driver)
+    bot.base_url = "https://x.com"
+    bot._hay_muro_login = lambda: False
+    bot._navegar_home_tolerante = lambda: None
+
+    with _logger_falso() as log:
+        resultado = bot._abrir_compositor()
+
+    check(
+        "reintento final: devuelve el editor de /compose/post",
+        resultado is editor,
+    )
+    check(
+        "reintento final: el ULTIMO get fue /compose/post",
+        driver.get_calls[-1] == "https://x.com/compose/post",
+        str(driver.get_calls),
+    )
+    check(
+        "reintento final: UN refresh extra (4 en total: 2 rutas + /home + final)",
+        driver.refresh_calls == 4,
+        str(driver.refresh_calls),
+    )
+    check(
+        "reintento final: sin logger.error durante la recuperacion",
+        log.llamadas["error"] == [],
+        str(log.llamadas["error"]),
+    )
+
+
+class EditorBloqueadoPorMask(FakeElement):
+    """Editor cuyo `send_keys` falla MIENTRAS la capa mask siga montada.
+
+    El mask del modal tapa el editor y su `send_keys` no llega (real:
+    `ElementNotInteractableException`); al destruir la mascara el editor vuelve
+    a aceptar la escritura. Es el caso que dispara el reintento limpio de
+    `_pegar_texto`.
+    """
+
+    def send_keys(self, *args):
+        if self.driver.mask_presente:
+            raise ElementNotInteractableException("mask bloquea el editor (test)")
+        return super().send_keys(*args)
+
+
+def test_pegar_texto_reintento_mask(check):
+    print("Blindaje: mask que intercepta -> re-destruir y reescribir UNA vez")
+    driver = FakeDriver()
+    driver.mask_presente = True
+    driver.masks = [object()]
+    driver.mask_js_falla = 1  # el primer JS de destruccion falla (renderer)
+    editor = EditorBloqueadoPorMask(driver, contenteditable=True)
+    driver.editores = [editor]
+    copias = []
+
+    with _logger_falso() as log, _pyperclip_falso(
+        copias, lanzar=False, driver=driver
+    ), _actionchains_falso(driver, escribir=False):
+        bot = bot_con_driver(driver)
+        bot._pegar_texto(editor, "Texto con mask")
+
+    check(
+        "mask retry: el texto termino en el editor (send_keys)",
+        editor._texto == "Texto con mask",
+        repr(editor._texto),
+    )
+    check(
+        "mask retry: se re-destruyo la mascara (2 JS: inicial + limpio)",
+        len(
+            [
+                s
+                for s, _ in driver.js_calls
+                if "data-testid" in s and ".remove()" in s
+            ]
+        )
+        == 2,
+        str([s for s, _ in driver.js_calls if ".remove()" in s]),
+    )
+    check(
+        "mask retry: se uso send_keys en UNA llamada (eventos reales)",
+        ("send_keys", ("Texto con mask",)) in driver.eventos,
+        str(driver.eventos),
+    )
+    check(
+        "mask retry: sin metodos silenciosos (ni CDP insertText)",
+        all(cmd != "Input.insertText" for cmd, _ in driver.cdp_calls),
+        str(driver.cdp_calls),
+    )
+    check(
+        "mask retry: sin document.execCommand",
+        all("execCommand" not in s for s, _ in driver.js_calls),
+    )
+    check("mask retry: pyperclip nunca se uso", copias == [], str(copias))
+    check(
+        "mask retry: sin logger.error durante el reintento manejado",
+        log.llamadas["error"] == [],
+        str(log.llamadas["error"]),
+    )
+
+    # Fallo TOTAL con mask (el JS de destruccion nunca funciona): se conserva
+    # el mensaje exacto y jamas se hace mas de UN reintento limpio.
+    driver2 = FakeDriver()
+    driver2.js_falla = True
+    driver2.mask_presente = True
+    driver2.masks = [object()]
+    editor2 = EditorBloqueadoPorMask(driver2, contenteditable=True)
+    driver2.editores = [editor2]
+    with _logger_falso() as log2, _actionchains_falso(
+        driver2, escribir=False
+    ), _pyperclip_falso([], lanzar=True):
+        bot2 = bot_con_driver(driver2)
+        try:
+            bot2._pegar_texto(editor2, "nada")
+            error = None
+        except Exception as e:  # noqa: BLE001
+            error = str(e)
+    check(
+        "mask retry fallido: mensaje final exacto",
+        error == "no se pudo escribir el texto en el editor de X",
+        repr(error),
+    )
+    check(
+        "mask retry fallido: maximo 2 JS de destruccion (1 ciclo)",
+        len(
+            [
+                s
+                for s, _ in driver2.js_calls
+                if "data-testid" in s and ".remove()" in s
+            ]
+        )
+        == 2,
+        str([s for s, _ in driver2.js_calls if ".remove()" in s]),
+    )
+    check(
+        "mask retry fallido: sin logger.error",
+        log2.llamadas["error"] == [],
+        str(log2.llamadas["error"]),
+    )
+
+
+def test_publicar_tweet_ciclo_limpio(check):
+    print("Blindaje: fallo transitorio -> UN ciclo limpio y silencioso")
+    driver = FakeDriver()
+    bot = bot_con_driver(driver)
+    bot.base_url = "https://x.com"
+    bot._detectar_limite_cuenta = lambda: False
+    eventos = []
+    refrescos = []
+    intentos = {"compositor": 0}
+
+    def abrir_compositor():
+        intentos["compositor"] += 1
+        if intentos["compositor"] == 1:
+            raise Exception(
+                "compositor no disponible (pagina de error de X) "
+                "(url=https://x.com/compose/post title=X login=False "
+                "error=something went wrong)"
+            )
+        return FakeElement(driver)
+
+    bot._abrir_compositor = abrir_compositor
+    bot._pegar_texto = lambda editor, texto: eventos.append(("pegar", texto))
+    bot._refresh_corto = lambda timeout=5.0: refrescos.append(timeout)
+    bot._verificar_publicacion = lambda: True
+    bot._esperar_boton_post_habilitado = lambda timeout=10, texto="": FakeBoton()
+
+    with _logger_falso() as log, mock.patch("time.sleep", GrabadorSleep(eventos)):
+        resultado = bot.publicar_tweet("Texto de prueba", buscar_url=False)
+
+    check("ciclo limpio: la publicacion termina OK", resultado is True, repr(resultado))
+    check(
+        "ciclo limpio: _abrir_compositor se intento 2 veces",
+        intentos["compositor"] == 2,
+        str(intentos["compositor"]),
+    )
+    check(
+        "ciclo limpio: UN solo refresh corto de 3s",
+        refrescos == [3.0],
+        str(refrescos),
+    )
+    check(
+        "ciclo limpio: reescribio el texto tras el refresh",
+        ("pegar", "Texto de prueba") in eventos,
+        str(eventos),
+    )
+    check(
+        "ciclo limpio: sin logger.error en el reintento manejado",
+        log.llamadas["error"] == [],
+        str(log.llamadas["error"]),
+    )
+
+
+def test_publicar_tweet_ciclo_limpio_una_vez(check):
+    print("Blindaje: fallo total de escritura -> un solo ciclo y contrato")
+    driver = FakeDriver()
+    bot = bot_con_driver(driver)
+    bot.base_url = "https://x.com"
+    bot._detectar_limite_cuenta = lambda: False
+    editor = FakeElement(driver)
+    intentos = {"compositor": 0, "pegar": 0}
+    refrescos = []
+
+    def abrir_compositor():
+        intentos["compositor"] += 1
+        return editor
+
+    def pegar_texto(editor_arg, texto):
+        intentos["pegar"] += 1
+        raise Exception("no se pudo escribir el texto en el editor de X")
+
+    bot._abrir_compositor = abrir_compositor
+    bot._pegar_texto = pegar_texto
+    bot._refresh_corto = lambda timeout=5.0: refrescos.append(timeout)
+    bot._esperar_boton_post_habilitado = lambda timeout=10, texto="": FakeBoton()
+
+    with _logger_falso() as log, mock.patch("time.sleep", GrabadorSleep([])):
+        resultado = bot.publicar_tweet("Texto de prueba", buscar_url=False)
+
+    check("fallo total: devuelve None", resultado is None, repr(resultado))
+    check(
+        "fallo total: 2 intentos de compositor (1 ciclo)",
+        intentos["compositor"] == 2,
+        str(intentos),
+    )
+    check(
+        "fallo total: 2 intentos de pegado (1 ciclo)",
+        intentos["pegar"] == 2,
+        str(intentos),
+    )
+    check(
+        "fallo total: UN solo refresh corto (sin mas ciclos)",
+        refrescos == [3.0],
+        str(refrescos),
+    )
+    check(
+        "fallo total: ultimo_error conserva el mensaje de contrato",
+        "no se pudo escribir el texto en el editor de X"
+        in (bot.ultimo_error or ""),
+        bot.ultimo_error,
+    )
+    check(
+        "fallo total: logger.error no se usa para el transitorio",
+        log.llamadas["error"] == [],
+        str(log.llamadas["error"]),
+    )
+    check(
+        "fallo total: el fallo definitivo se registra (exception)",
+        len(log.llamadas["exception"]) == 1,
+        str(log.llamadas["exception"]),
+    )
+
+
 def run(check):
     """Ejecuta los checks de este archivo con el `check` del runner."""
     with _sin_esperas():
@@ -1294,6 +1613,10 @@ def run(check):
         test_navegar_tolerante_p1(check)
         test_recuperar_interstitial(check)
         test_login_pkl_muro_de_login(check)
+        test_abrir_compositor_reintento_final(check)
+        test_pegar_texto_reintento_mask(check)
+        test_publicar_tweet_ciclo_limpio(check)
+        test_publicar_tweet_ciclo_limpio_una_vez(check)
 
 
 if __name__ == "__main__":

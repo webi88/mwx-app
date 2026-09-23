@@ -1,5 +1,5 @@
 from pydantic_settings import BaseSettings
-from pydantic import Field
+from pydantic import AliasChoices, Field
 from typing import Optional
 import os
 from pathlib import Path
@@ -150,6 +150,31 @@ class Settings(BaseSettings):
         default=True,
         env="CUOTAS_HORARIAS_ACTIVO",
         validation_alias="CUOTAS_HORARIAS_ACTIVO",
+    )
+
+    # Tope DIARIO total por cuenta (anti-banderas de X): maximo de acciones
+    # OPERATIVAS EXITOSAS por cuenta (posts, citas, RTs y comentarios, sin
+    # importar el rol) dentro de la ventana diaria configurada. 0 = ilimitado.
+    # `LIMITE_DIARIO_POR_CUENTA` es el nombre PRINCIPAL (pedido del dueño);
+    # `LIMITE_ACCIONES_DIA` sigue aceptandose como alias legado (y el nombre
+    # del campo en minusculas). pydantic-settings v2 ignora `env=` en Field:
+    # el alias efectivo es `validation_alias`.
+    limite_acciones_dia: int = Field(
+        default=12,
+        env="LIMITE_ACCIONES_DIA",
+        validation_alias=AliasChoices(
+            "LIMITE_DIARIO_POR_CUENTA",
+            "LIMITE_ACCIONES_DIA",
+            "limite_acciones_dia",
+        ),
+    )
+    limite_dia_ventana_min: int = Field(default=1440, env="LIMITE_DIA_VENTANA_MIN")
+    # Mismo patron que limite_cuotas_activo: `validation_alias` es el nombre
+    # efectivo de la variable de entorno en pydantic-settings v2.
+    limite_diario_activo: bool = Field(
+        default=True,
+        env="CUOTAS_DIARIAS_ACTIVO",
+        validation_alias="CUOTAS_DIARIAS_ACTIVO",
     )
 
     # Alertas

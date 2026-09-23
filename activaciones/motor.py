@@ -14,6 +14,7 @@ import inspect
 import os
 import random
 import re
+import sys
 import time
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -81,6 +82,26 @@ def _parsear_tokens(valor: str) -> list[str]:
     return [t for t in re.split(r"[,\s]+", str(valor).strip()) if t]
 
 
+def _ram_max_mb() -> int:
+    """RAM maxima del proceso en MB, o -1 si `resource` no esta disponible.
+
+    En Linux (`resource.getrusage`) `ru_maxrss` viene en KB; en macOS en bytes
+    (se normaliza igual). Nunca lanza: en Windows el modulo `resource` no
+    existe y se devuelve -1.
+    """
+    try:
+        import resource
+
+        valor = float(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+        if sys.platform == "darwin":
+            valor = valor / (1024.0 * 1024.0)
+        else:
+            valor = valor / 1024.0
+        return int(valor)
+    except Exception:
+        return -1
+
+
 def _normalizar_hashtags(valor: str) -> list[str]:
     """Devuelve hashtags con '#' garantizado, sin duplicados ni vacios."""
     tags, vistos = [], set()
@@ -122,9 +143,17 @@ MENSAJE_SOLO_PASSWORD = (
     "campañas rápidas"
 )
 
-# Resultado de una accion NO ejecutada por cuota horaria agotada (`ok=None`):
-# no es exito ni fallo, no registra nada en la BD y no dispara callback.
+# Resultado de una accion NO ejecutada por cuota horaria/DIARIA agotada
+# (`ok=None`): no es exito ni fallo, no registra nada en la BD y no dispara
+# callback.
 MENSAJE_CUOTA_AGOTADA = "cuota agotada: la cuenta alcanzo sus limites por hora"
+
+# Resultado de una accion NO ejecutada porque el TIER de la cuenta prohibe el
+# rol (Tier 2 jamas publica hashtags/posts originales): tampoco es exito ni
+# fallo y jamas toca la BD.
+MENSAJE_TIER2_SIN_ROL = (
+    "tier 2 sin rol permitido: solo RT/Cita/Comentario (no publica hashtags)"
+)
 
 
 def _avisar_cuota_agotada_log(cuotas, usuario) -> bool:
@@ -670,6 +699,54 @@ def _sugerencia_registro(n: int) -> str:
     )
 
 
+def _tier_cuenta(cuenta) -> str:
+    """Tier normalizado de una cuenta ("tier1"/"tier2"/""); import perezoso.
+
+    Tolerante: si `core.tiers` no esta disponible o la cuenta es rara,
+    devuelve "" (sin tier, se comporta como volumen sin restriccion).
+    """
+    try:
+        from core.tiers import tier_de_cuenta
+
+        return tier_de_cuenta(cuenta)
+    except Exception:
+        return ""
+
+
+def _es_tier2(cuenta) -> bool:
+    """True si la cuenta es Tier 2 (Volumen/Aged). Nunca lanza."""
+    try:
+        from core.tiers import es_tier2
+
+        return bool(es_tier2(cuenta))
+    except Exception:
+        return False
+
+
+def _tier_permitido(cuenta, rol) -> bool:
+    """True si el tier de la cuenta permite ese rol (import perezoso).
+
+    False SOLO si es Tier 2 y el rol normalizado es "hashtags" (incluye
+    post/publicacion/mantenimiento/calentamiento/hilo). Ante cualquier fallo
+    devuelve True (no bloquear por un import roto)."""
+    try:
+        from core.tiers import rol_permitido_tier
+
+        return bool(rol_permitido_tier(cuenta, rol))
+    except Exception:
+        return True
+
+
+def _error_tier(cuenta, rol) -> str:
+    """Mensaje bloqueante del tier ("" si el rol esta permitido); nunca lanza."""
+    try:
+        from core.tiers import error_rol_tier
+
+        return str(error_rol_tier(cuenta, rol) or "")
+    except Exception:
+        return ""
+
+
 def _filtrar_por_seccion(cuentas: list, secciones) -> list:
     """Filtra cuentas por seccion canonica (CI/IP/LIB/JUS...).
 
@@ -769,6 +846,29 @@ def _normalizar_rol_sorteo(valor) -> str:
             "respuesta", "respuestas", "reply", "replies",
         ):
             rol = "comentario"
+    return rol
+
+
+def _rol_efectivo_cuenta(cuenta) -> str:
+    """Rol canonico de una cuenta para AGRUPAR, con alias "post"->hashtags.
+
+    `core.roles.normalizar_rol_activacion` solo conoce los 4 roles canonicos;
+    mucha data historica trae "post", "mantenimiento", "hilo", "respuesta" o
+    "reply". El alias se resuelve con `_normalizar_rol_sorteo`, de modo que
+    Tier 2 con "post" cae en el grupo hashtags y el blindaje por tier tambien
+    lo cubre. Rol desconocido -> "" (sin rol). Nunca lanza.
+    """
+    try:
+        rol = normalizar_rol_activacion(getattr(cuenta, "rol_activacion", ""))
+    except Exception:
+        rol = ""
+    if not rol:
+        try:
+            rol = _normalizar_rol_sorteo(
+                getattr(cuenta, "rol_activacion", "")
+            )
+        except Exception:
+            rol = ""
     return rol
 
 
@@ -1069,17 +1169,20 @@ class _Pestana:
 
     Guarda el `TwitterBot` (Chrome) abierto, la cuenta que atiende ahora
     (`usuario`), cuantas acciones lleva desde el ultimo cambio de cuenta
-    (`acciones`) y si algun worker la tiene tomada (`ocupada`).
+    (`acciones`) y si algun worker la tiene tomada (`ocupada`). `creada` es el
+    `time.monotonic()` de su creacion real (reciclado por EDAD ademas de por
+    acciones: `PESTANA_MAX_MINUTOS`).
     """
 
-    __slots__ = ("bot", "usuario", "acciones", "ocupada")
+    __slots__ = ("bot", "usuario", "acciones", "ocupada", "creada")
 
     def __init__(self, bot=None, usuario: str = "", acciones: int = 0,
-                 ocupada: bool = False):
+                 ocupada: bool = False, creada=None):
         self.bot = bot
         self.usuario = str(usuario or "")
         self.acciones = int(acciones or 0)
         self.ocupada = bool(ocupada)
+        self.creada = time.monotonic() if creada is None else float(creada)
 
 
 class MotorActivacion:
@@ -1094,6 +1197,7 @@ class MotorActivacion:
             "fallidas": 0,
             "omitidas": 0,
             "ronda_actual": 1,
+            "fase_actual": 1,
             "eventos": [],
         }
         # Sistema de Cuotas Inteligente por Hora: lo prepara cada campana
@@ -1142,6 +1246,12 @@ class MotorActivacion:
         self._pestana_max_acciones = _env_int(
             "PESTANA_MAX_ACCIONES", 40, minimo=1
         )
+        # Reciclado por EDAD de la pestaña persistente: ademas de
+        # `PESTANA_MAX_ACCIONES`, una pestaña que cumple `PESTANA_MAX_MINUTOS`
+        # minutos se cierra y se recrea (default 20; 0 = sin limite de edad).
+        self._pestana_max_minutos = _env_int(
+            "PESTANA_MAX_MINUTOS", 20, minimo=0
+        )
         self._pestana_espera_seg = _env_int(
             "PESTANA_ESPERA_SEG", 180, minimo=0
         )
@@ -1150,6 +1260,18 @@ class MotorActivacion:
         self._pestanas_cond = threading.Condition(self._pestanas_lock)
         self._pestanas_creadas = 0
         self._pestanas_recicladas = 0
+        # CURVA DE ACELERACION ("modo explosion"): fase 1 solo Tier 1, fase 2
+        # el resto tras `curva_fase1_min` minutos; las URLs publicadas por
+        # Tier 1 en fase 1 cascada a los RT/citas/comentarios de fase 2.
+        self._curva_activa = False
+        self._curva_fase1_seg = 0.0
+        self._curva_fase2_t0 = None
+        self._urls_fase1: list = []
+        self._cascada_usadas: set = set()
+        # Tier de cada cuenta de la campana (usuario -> "tier1"/"tier2"/"")
+        self._tier_de: dict = {}
+        # Cuentas Tier 2 que `_obtener_cuentas_por_rol` excluyo por defensa.
+        self._tier2_filtradas_rol: list = []
 
     _VENTANA_RECURSOS_SEG = 30.0
 
@@ -1370,6 +1492,7 @@ class MotorActivacion:
             reserva.usuario = str(getattr(cuenta, "usuario", "") or "")
             reserva.acciones = 0
             reserva.ocupada = True
+            reserva.creada = time.monotonic()
             with self._pestanas_cond:
                 if reserva not in self._pestanas:
                     # El pool se cerro mientras se creaba (campaña terminada o
@@ -1430,9 +1553,10 @@ class MotorActivacion:
     def _liberar_pestana(self, pestana, exito: bool) -> None:
         """Devuelve la pestaña al pool (o la recicla si toca).
 
-        Suma una accion; si alcanzo `PESTANA_MAX_ACCIONES` o el driver murio,
-        descarta la pestaña (y la cuenta como reciclada); si no, la marca
-        libre. SIEMPRE despierta a los workers que esperan cupo. Nunca lanza.
+        Suma una accion; si alcanzo `PESTANA_MAX_ACCIONES`, supero
+        `PESTANA_MAX_MINUTOS` de EDAD o el driver murio, descarta la pestaña (y
+        la cuenta como reciclada); si no, la marca libre. SIEMPRE despierta a
+        los workers que esperan cupo. Nunca lanza.
         """
         reciclar = False
         try:
@@ -1444,6 +1568,15 @@ class MotorActivacion:
                 try:
                     if pestana.acciones >= int(self._pestana_max_acciones):
                         reciclar = True
+                except Exception:
+                    pass
+                try:
+                    if int(self._pestana_max_minutos) > 0:
+                        edad = time.monotonic() - float(
+                            getattr(pestana, "creada", time.monotonic())
+                        )
+                        if edad >= int(self._pestana_max_minutos) * 60:
+                            reciclar = True
                 except Exception:
                     pass
                 try:
@@ -1599,19 +1732,37 @@ class MotorActivacion:
                 f"X y {transitorios} por fallos transitorios de navegacion "
                 f"(NINGUNA desactivada en la BD)"
             )
+        # Claves SIEMPRE presentes (aunque la campana no haya usado la funcion):
+        # blindaje por tier, rotacion de reservas, curva y cascada de URLs.
+        resumen.setdefault("tier2_hashtags_omitidas", 0)
+        resumen.setdefault("tier2_hashtags_usuarios", [])
+        resumen.setdefault("tier2_sin_rol", 0)
+        resumen.setdefault("tier2_sin_rol_usuarios", [])
+        resumen.setdefault("rotadas_por_cuota_dia", 0)
+        resumen.setdefault("agotadas_dia", 0)
+        resumen.setdefault("reserva_usada", 0)
+        resumen.setdefault("reserva_disponible", 0)
+        resumen.setdefault("curva_aceleracion", False)
+        resumen.setdefault("curva_fase1_min", 0)
+        resumen.setdefault("fase_actual", int(self.progreso.get("fase_actual", 1) or 1))
+        try:
+            resumen["cascada_urls"] = len(self._cascada_usadas)
+        except Exception:
+            resumen["cascada_urls"] = 0
         return resumen
 
     def _n_workers(self) -> int:
-        """Trabajadores del pool de rondas: env `MAX_WORKERS`.
+        """Trabajadores del pool de rondas: env `MAX_WORKERS` acotada a [1, 32].
 
         Default `max(12, max_browsers)`: las acciones API corren en paralelo
         sin Chrome (~1-2s) y los fallbacks quedan limitados por el gate de
-        navegadores. Un valor raro en la env se ignora (nunca lanza).
+        navegadores. Un valor raro en la env se ignora (nunca lanza) y el
+        valor de env jamas pasa de 32 para no explotar hilos.
         """
         try:
             valor = os.environ.get("MAX_WORKERS")
             if valor is not None and str(valor).strip():
-                return max(1, int(float(str(valor).strip())))
+                return max(1, min(32, int(float(str(valor).strip()))))
         except Exception:
             pass
         try:
@@ -1642,6 +1793,427 @@ class MotorActivacion:
                 f"({type(e).__name__}: {e}); se sigue sin limites"
             )
             self._cuotas = None
+
+    # ------------------------------------------------------------------ #
+    # Tiers + cuota diaria + curva + reservas (capa nueva)
+    # ------------------------------------------------------------------ #
+    def _reset_curva_campana(self) -> None:
+        """Reinicia el estado de curva/cascada/tiers de una campana nueva.
+
+        Se llama al inicio de cada campana (antes de usar cualquier dato de la
+        anterior): `_urls_fase1`, `_cascada_usadas`, `_tier_de` y la fase.
+        Nunca lanza.
+        """
+        try:
+            self._curva_activa = False
+            self._curva_fase1_seg = 0.0
+            self._curva_fase2_t0 = None
+            with self._lock:
+                self._urls_fase1 = []
+                self._cascada_usadas = set()
+                self._tier_de = {}
+                self._tier2_filtradas_rol = []
+                self.progreso["fase_actual"] = 1
+        except Exception:
+            pass
+
+    def _registrar_tiers(self, cuentas) -> None:
+        """Guarda el tier de cada cuenta de la campana (`_tier_de`)."""
+        for cuenta in (cuentas or []):
+            try:
+                usuario = str(getattr(cuenta, "usuario", "") or "").strip()
+                if usuario:
+                    self._tier_de[usuario] = _tier_cuenta(cuenta)
+            except Exception:
+                pass
+
+    def _configurar_curva(self, cuentas, curva_aceleracion, curva_fase1_min,
+                          duracion_min, resumen) -> tuple:
+        """Activa la curva de aceleracion si la campana tiene Tier 1.
+
+        Reglas:
+        - Sin `curva_aceleracion` la curva queda desactivada (comportamiento
+          normal). `curva_fase1_min` None -> env `CURVA_FASE1_MIN` (default 15).
+        - Sin NINGUNA cuenta Tier 1 en la campana: se desactiva con WARNING y
+          la campana sigue normal (no se queda vacia).
+        - Si `duracion_min <= fase1_min`: fase1 = max(1, duracion_min // 3)
+          con WARNING.
+
+        Devuelve `(activa, fase1_min)` y escribe `curva_aceleracion` /
+        `curva_fase1_min` en `resumen`. Nunca lanza.
+        """
+        try:
+            fase1 = curva_fase1_min
+            if fase1 is None:
+                fase1 = _env_int("CURVA_FASE1_MIN", 15, minimo=1)
+            fase1 = max(1, int(fase1))
+        except Exception:
+            fase1 = 15
+        try:
+            duracion = max(1, int(duracion_min or 0))
+        except Exception:
+            duracion = 1
+        try:
+            resumen["curva_aceleracion"] = bool(curva_aceleracion)
+            resumen["curva_fase1_min"] = fase1 if curva_aceleracion else 0
+        except Exception:
+            pass
+        if not curva_aceleracion:
+            return False, fase1
+        try:
+            tier1 = [c for c in (cuentas or []) if _tier_cuenta(c) == "tier1"]
+        except Exception:
+            tier1 = []
+        if not tier1:
+            logger.warning(
+                "Activacion: curva de aceleracion solicitada pero la campana "
+                "no tiene cuentas Tier 1; se DESACTIVA y la campana sigue en "
+                "modo normal (ninguna cuenta Tier 2 se queda fuera)"
+            )
+            try:
+                resumen["curva_aceleracion"] = False
+                resumen["curva_fase1_min"] = 0
+            except Exception:
+                pass
+            return False, fase1
+        if duracion <= fase1:
+            nuevo = max(1, duracion // 3)
+            logger.warning(
+                f"Activacion: duracion ({duracion} min) <= fase 1 "
+                f"({fase1} min); se ajusta la fase 1 a {nuevo} min"
+            )
+            fase1 = nuevo
+        try:
+            self._curva_activa = True
+            self._curva_fase1_seg = float(fase1) * 60.0
+            self._curva_fase2_t0 = time.monotonic() + self._curva_fase1_seg
+            resumen["curva_aceleracion"] = True
+            resumen["curva_fase1_min"] = fase1
+        except Exception:
+            self._curva_activa = False
+            return False, fase1
+        logger.info(
+            f"Activacion: curva de aceleracion activa (fase 1 solo Tier 1 "
+            f"durante {fase1} min; fase 2 despues)"
+        )
+        return True, fase1
+
+    def _elegibilidad_curva(self, activa: bool):
+        """Callable `usuario -> bool` del GATE de fase (None si no hay curva).
+
+        Se evalua al INICIAR CADA RONDA: en fase 1 solo cuentas Tier 1; al
+        pasar `curva_fase1_min` minutos todas son elegibles (fase 2). Actualiza
+        `progreso["fase_actual"]` en cada evaluacion. Nunca lanza.
+        """
+        if not activa:
+            return None
+
+        def _elegible(usuario) -> bool:
+            try:
+                fase = (
+                    2
+                    if time.monotonic() >= float(self._curva_fase2_t0)
+                    else 1
+                )
+            except Exception:
+                fase = 2
+            try:
+                with self._lock:
+                    self.progreso["fase_actual"] = fase
+            except Exception:
+                pass
+            if fase == 1:
+                return self._tier_de.get(str(usuario)) == "tier1"
+            return True
+
+        return _elegible
+
+    def _en_fase2(self) -> bool:
+        """True si la curva esta activa y ya empezo la fase 2. Nunca lanza."""
+        try:
+            if not self._curva_activa or self._curva_fase2_t0 is None:
+                return False
+            return time.monotonic() >= float(self._curva_fase2_t0)
+        except Exception:
+            return False
+
+    def _urls_efectivas_rol(self, rol, urls):
+        """URLs objetivo de un rol: cascada de fase 1 si esta disponible.
+
+        En fase 2, para `rt`/`cita`/`comentario`, si hay URLs publicadas por
+        Tier 1 en fase 1 (`self._urls_fase1`) se usan como objetivo; si no, se
+        cae a las URLs de la campana. Nunca lanza.
+        """
+        try:
+            if rol not in ("rt", "cita", "comentario"):
+                return urls
+            if not self._en_fase2():
+                return urls
+            with self._lock:
+                fase1 = list(self._urls_fase1)
+            return fase1 if fase1 else urls
+        except Exception:
+            return urls
+
+    def _capturar_url_fase1(self, usuario, rol, url) -> None:
+        """Guarda una URL publicada EXITOSAMENTE por Tier 1 en fase 1.
+
+        Solo roles `hashtags`/`post` (posts originales), URLs no vacias y que
+        no sean el PERFIL del propio usuario (los RT devuelven
+        `https://twitter.com/<usuario>`, sin `/status/`); cap de 50. Nunca
+        lanza.
+        """
+        try:
+            rol_norm = "hashtags" if str(rol or "") == "post" else str(rol or "")
+            if rol_norm != "hashtags":
+                return
+            if self._tier_de.get(str(usuario or "")) != "tier1":
+                return
+            url = str(url or "").strip()
+            if not url:
+                return
+            usuario_txt = str(usuario or "").strip().lower()
+            url_limpia = url.rstrip("/").lower()
+            if usuario_txt and url_limpia in (
+                f"https://twitter.com/{usuario_txt}",
+                f"https://x.com/{usuario_txt}",
+            ):
+                return
+            with self._lock:
+                if url not in self._urls_fase1 and len(self._urls_fase1) < 50:
+                    self._urls_fase1.append(url)
+        except Exception:
+            pass
+
+    def _marcar_cascada(self, url) -> None:
+        """Anota que una URL de fase 1 se uso como objetivo (fase 2)."""
+        try:
+            url = str(url or "").strip()
+            if not url or not self._en_fase2():
+                return
+            with self._lock:
+                if url in self._urls_fase1:
+                    self._cascada_usadas.add(url)
+        except Exception:
+            pass
+
+    def _preparar_reservas(self, reserva_usuarios, principales, secciones=None,
+                           solo_con_registro: bool = False) -> list:
+        """Carga las cuentas de RESPALDO de la campana (sin abrir navegador).
+
+        Acepta usuarios (str, con o sin '@') o Cuentas ya construidas. Filtra
+        activas y con sesion (helpers existentes), quita duplicadas y las que
+        ya estan en la campana, respeta `solo_con_registro` y el tope
+        `RESERVA_MAX_CUENTAS` (env, default 50). `None`/vacio = comportamiento
+        actual exacto (sin reservas). Nunca lanza.
+        """
+        try:
+            if not reserva_usuarios:
+                return []
+            if isinstance(reserva_usuarios, str):
+                lista = [reserva_usuarios]
+            else:
+                lista = list(reserva_usuarios)
+        except Exception:
+            return []
+        directas, nombres = [], []
+        for entrada in lista:
+            try:
+                if isinstance(entrada, str):
+                    texto = entrada.strip().lstrip("@")
+                    if texto:
+                        nombres.append(texto)
+                elif entrada is not None:
+                    try:
+                        if getattr(entrada, "activa", True) is False:
+                            continue
+                    except Exception:
+                        pass
+                    directas.append(entrada)
+            except Exception:
+                continue
+        cargadas: list = []
+        if nombres:
+            try:
+                cargadas = self._obtener_cuentas_por_rol(
+                    usuarios=nombres, secciones=secciones
+                )
+            except Exception:
+                cargadas = []
+        ya_en_campana = set()
+        for cuenta in (principales or []):
+            try:
+                ya_en_campana.add(
+                    str(getattr(cuenta, "usuario", "") or "").strip().lower()
+                )
+            except Exception:
+                pass
+        reservas, vistas = [], set()
+        for cuenta in list(directas) + list(cargadas or []):
+            try:
+                usuario = str(getattr(cuenta, "usuario", "") or "").strip()
+            except Exception:
+                continue
+            clave = usuario.lower()
+            if not usuario or clave in ya_en_campana or clave in vistas:
+                continue
+            vistas.add(clave)
+            reservas.append(cuenta)
+        con_sesion, _sin = _partir_por_sesion(reservas)
+        if solo_con_registro:
+            con_sesion, _sin_reg = _partir_por_registro(con_sesion)
+        tope = _env_int("RESERVA_MAX_CUENTAS", 50, minimo=0)
+        return con_sesion[:tope]
+
+    def _rotar_agotadas_dia(self, activos, reservas, rol_de,
+                            roles_aleatorios: bool, resumen,
+                            grupos_ejec=None) -> int:
+        """Retira cuentas "Agotadas por hoy" y las sustituye 1:1 por reservas.
+
+        - `activos`: lista MUTABLE en la que participan las cuentas (se retiran
+          y se agregan las sustitutas).
+        - `reservas`: lista MUTABLE de Cuentas de respaldo aun sin usar.
+        - `rol_de`: {usuario: rol} de modo fijo (la reserva toma ESE rol); en
+          modo aleatorio se ignora (la reserva entra libre al sorteo).
+        - Una reserva Tier 2 JAMAS sustituye un rol hashtags: se busca otra
+          reserva y, si no hay, la cuenta agotada queda retirada.
+        - `grupos_ejec`: grupos por rol de modo fijo (se actualizan con la
+          sustituta y se quita la cuenta retirada).
+
+        Suma `agotadas_dia` (cuentas retiradas) y `rotadas_por_cuota_dia`
+        (sustituciones 1:1 completadas) y refresca `reserva_usada` /
+        `reserva_disponible`. Devuelve cuantas sustituciones hizo; nunca lanza.
+        """
+        sustituciones = 0
+        try:
+            cuotas = self._cuotas
+            if cuotas is None or not activos:
+                return 0
+            for cuenta in list(activos):
+                try:
+                    usuario = str(getattr(cuenta, "usuario", "") or "")
+                    if not usuario or not cuotas.agotado_dia(usuario):
+                        continue
+                    rol_requerido = (
+                        "" if roles_aleatorios else str(rol_de.get(usuario, "") or "")
+                    )
+                    sustituta = None
+                    for i, reserva in enumerate(list(reservas)):
+                        try:
+                            permitida = roles_aleatorios or _tier_permitido(
+                                reserva, rol_requerido or ""
+                            )
+                        except Exception:
+                            permitida = roles_aleatorios
+                        if not permitida:
+                            continue
+                        try:
+                            reservas.remove(reserva)
+                        except ValueError:
+                            continue
+                        sustituta = reserva
+                        break
+                    try:
+                        activos.remove(cuenta)
+                    except ValueError:
+                        pass
+                    if not roles_aleatorios and grupos_ejec is not None:
+                        try:
+                            grupos_ejec.get(rol_requerido, []).remove(cuenta)
+                        except Exception:
+                            pass
+                        rol_de.pop(usuario, None)
+                    self._tier_de.pop(usuario, None)
+                    resumen["agotadas_dia"] = int(
+                        resumen.get("agotadas_dia", 0) or 0
+                    ) + 1
+                    if sustituta is None:
+                        logger.info(
+                            f"Activacion: @{usuario} agotada por hoy; se retira "
+                            f"sin sustituta (no hay reserva con rol compatible)"
+                        )
+                        continue
+                    activos.append(sustituta)
+                    nuevo_usuario = str(
+                        getattr(sustituta, "usuario", "") or ""
+                    )
+                    if not roles_aleatorios:
+                        if grupos_ejec is not None and rol_requerido in grupos_ejec:
+                            grupos_ejec[rol_requerido].append(sustituta)
+                        if rol_requerido:
+                            rol_de[nuevo_usuario] = rol_requerido
+                    self._tier_de[nuevo_usuario] = _tier_cuenta(sustituta)
+                    sustituciones += 1
+                    resumen["rotadas_por_cuota_dia"] = int(
+                        resumen.get("rotadas_por_cuota_dia", 0) or 0
+                    ) + 1
+                    logger.info(
+                        f"Activacion: @{usuario} agotada por hoy; entra la "
+                        f"reserva @{nuevo_usuario}"
+                        + (f" (rol {rol_requerido})" if rol_requerido else "")
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"Activacion: no se pudo rotar la cuenta agotada: "
+                        f"{type(e).__name__}: {e}"
+                    )
+        except Exception as e:
+            logger.warning(
+                f"Activacion: rotacion de reservas fallo "
+                f"({type(e).__name__}: {e})"
+            )
+        finally:
+            try:
+                resumen["reserva_disponible"] = len(reservas or [])
+                resumen["reserva_usada"] = int(
+                    resumen.get("reserva_usada", 0) or 0
+                ) + sustituciones
+            except Exception:
+                pass
+        return sustituciones
+
+    def _contar_tier2_sin_rol(self, usuario, resumen) -> None:
+        """Suma (una sola vez) una cuenta Tier 2 sin rol permitido. Nunca lanza."""
+        try:
+            usuario = str(usuario or "").strip()
+            if not usuario:
+                return
+            with self._lock:
+                usuarios = resumen.setdefault("tier2_sin_rol_usuarios", [])
+                if not isinstance(usuarios, list):
+                    usuarios = []
+                    resumen["tier2_sin_rol_usuarios"] = usuarios
+                if usuario in usuarios:
+                    return
+                usuarios.append(usuario)
+                resumen["tier2_sin_rol"] = int(
+                    resumen.get("tier2_sin_rol", 0) or 0
+                ) + 1
+        except Exception:
+            pass
+
+    def _loguear_rendimiento(self, inicio, resumen) -> None:
+        """INFO de `acciones/min` al terminar y RAM max del proceso si aplica.
+
+        `acciones` = exitosas + fallidas (las omitidas no son trabajo real).
+        La RAM solo se reporta si `resource` esta disponible (Railway/Linux).
+        Nunca lanza.
+        """
+        try:
+            segundos = max(0.001, float(time.monotonic()) - float(inicio))
+            hechas = (
+                int((resumen or {}).get("exitosas", 0) or 0)
+                + int((resumen or {}).get("fallidas", 0) or 0)
+            )
+            logger.info(
+                f"Activacion: {hechas} acciones en {segundos / 60.0:.1f} min "
+                f"({hechas / segundos * 60.0:.1f} acciones/min)"
+            )
+            ram = _ram_max_mb()
+            if ram >= 0:
+                logger.info(f"Activacion: RAM max del proceso {ram} MB")
+        except Exception:
+            pass
 
     def _avisar_cuota_agotada(self, usuario) -> bool:
         """Avisa (throttle de 1/min por cuenta) que la cuenta agoto sus cuotas.
@@ -1813,6 +2385,7 @@ class MotorActivacion:
                 "fallidas": self.progreso.get("fallidas", 0),
                 "omitidas": self.progreso.get("omitidas", 0),
                 "ronda_actual": self.progreso.get("ronda_actual", 1),
+                "fase_actual": self.progreso.get("fase_actual", 1),
                 "eventos": list(eventos) if isinstance(eventos, list) else [],
             }
 
@@ -1868,10 +2441,36 @@ class MotorActivacion:
             permitidos.discard("")
             if not permitidos:
                 return []
-            cuentas = [
-                c for c in cuentas
-                if normalizar_rol_activacion(c.rol_activacion) in permitidos
-            ]
+            finales, filtradas = [], []
+            for c in cuentas:
+                try:
+                    # Alias ("post" -> hashtags, "respuesta"/"reply" ->
+                    # comentario) para que el filtro tambien cubra data vieja.
+                    rol_c = _rol_efectivo_cuenta(c)
+                except Exception:
+                    rol_c = ""
+                if rol_c not in permitidos:
+                    continue
+                # Defensa extra: Tier 2 jamas entra en un filtro de hashtags
+                # (aunque su rol guardado lo diga).
+                if _tier_permitido(c, rol_c):
+                    finales.append(c)
+                else:
+                    filtradas.append(str(c.usuario))
+            cuentas = finales
+            if filtradas:
+                try:
+                    actuales = list(getattr(self, "_tier2_filtradas_rol", []) or [])
+                    self._tier2_filtradas_rol = sorted(
+                        set(actuales) | set(filtradas)
+                    )
+                except Exception:
+                    pass
+                logger.warning(
+                    f"Activacion: {len(filtradas)} cuenta(s) Tier 2 con rol "
+                    f"prohibido ({'/'.join(filtradas[:5])}...) quedan fuera "
+                    f"del filtro por rol (NO se desactivan en la BD)"
+                )
 
         return cuentas
 
@@ -1963,8 +2562,11 @@ class MotorActivacion:
         reducen a las que aun tienen cupo (`cuotas.viables`); si ninguna
         queda, la cuenta recibe "" (sin accion) y se avisa con
         `cuotas.avisar_agotada` (helper de modulo, este metodo es estatico).
-        Con `cuotas=None` el comportamiento es EXACTO al de antes. Nunca
-        lanza.
+        Con `cuotas=None` el comportamiento es EXACTO al de antes.
+
+        TIER: a una cuenta Tier 2 se le quitan SIEMPRE las opciones prohibidas
+        (`hashtags`/`post`/...); si se queda sin opciones, recibe "" SIN aviso
+        de cuota (el llamador la cuenta en `tier2_sin_rol`). Nunca lanza.
         """
         roles = {}
         previos = roles_previos if isinstance(roles_previos, dict) else {}
@@ -1975,13 +2577,19 @@ class MotorActivacion:
         for cuenta in (cuentas or []):
             try:
                 usuario = cuenta.usuario
-                opciones_cuenta = opciones
+                # Tier 2 jamas recibe un rol prohibido (hashtags/post/...).
+                opciones_cuenta = [
+                    r for r in opciones if _tier_permitido(cuenta, r)
+                ]
                 if cuotas is not None:
-                    opciones_cuenta = cuotas.viables(usuario, opciones)
-                    if not opciones_cuenta:
-                        roles[usuario] = ""
+                    viables = cuotas.viables(usuario, opciones_cuenta)
+                    if opciones_cuenta and not viables:
+                        # La opcion existe a nivel tier pero no hay cupo.
                         _avisar_cuota_agotada_log(cuotas, usuario)
-                        continue
+                    opciones_cuenta = viables
+                if not opciones_cuenta:
+                    roles[usuario] = ""
+                    continue
                 previo = previos.get(usuario)
                 candidatos = [
                     r for r in opciones_cuenta if r != previo
@@ -2177,7 +2785,11 @@ class MotorActivacion:
                 tags=tags,
             ))
 
-        cuentas_hashtags = list(grupos_ejec.get("hashtags") or [])
+        cuentas_hashtags = [
+            c
+            for c in (grupos_ejec.get("hashtags") or [])
+            if _tier_permitido(c, "hashtags")
+        ]
         if cuentas_hashtags:
             # Campanas sin tweet ancla: el contexto de noticias raspadas por
             # la IA hace de "texto base" para el fallback local (posts reales
@@ -2418,7 +3030,8 @@ class MotorActivacion:
     def _bucle_rondas(self, procesables: list, duracion_min: int,
                       generar_textos, ejecutar_uno, reportar,
                       cooldown_min: float = 0, porcentaje_min_ronda=40,
-                      porcentaje_max_ronda=90) -> int:
+                      porcentaje_max_ronda=90, elegibilidad=None,
+                      sustituir=None) -> int:
         """Ejecuta acciones en rondas hasta agotar `duracion_min`.
 
         Worker-pool con cola compartida: `self._n_workers()` trabajadores
@@ -2446,6 +3059,16 @@ class MotorActivacion:
         turno esta en descanso se mueve al final del orden de la ronda y se
         toma la siguiente; si todas las revisadas descansan, el worker suelta
         el lock, duerme 2-5s y reintenta mientras quede tiempo.
+
+        `elegibilidad(usuario) -> bool` (opcional, curva de aceleracion): se
+        evalua al INICIAR CADA RONDA (incluida la 1); el subconjunto aleatorio
+        se calcula SOLO entre las cuentas elegibles. Si no queda ninguna, la
+        ronda NO avanza ni genera textos y los workers duermen 1-2s esperando
+        el cambio de fase (eso no cuenta como fallo ni omision).
+
+        `sustituir()` (opcional): se invoca al iniciar cada ronda para que el
+        llamador rote cuentas agotadas por reservas (puede mutar `procesables`
+        en sitio). Nunca lanza (sus errores se loguean).
         """
         try:
             minutos = max(0, int(duracion_min or 0))
@@ -2476,26 +3099,48 @@ class MotorActivacion:
                 return False
             return (time.monotonic() - ultima) < cooldown_seg
 
-        def _iniciar_ronda_locked() -> None:
+        def _iniciar_ronda_locked() -> bool:
+            """Arranca una ronda; False si el GATE no deja elegibles.
+
+            REQUIERE el `lock` local tomado. Con `sustituir` rota cuentas y
+            con `elegibilidad` filtra el subconjunto (fase de la curva). Si no
+            hay elegibles, no incrementa la ronda ni genera textos: los
+            workers duermen y reintentan.
+            """
+            if sustituir is not None:
+                try:
+                    sustituir()
+                except Exception as e:
+                    logger.error(
+                        f"Activacion (rondas): sustitucion de reservas fallo: "
+                        f"{type(e).__name__}: {e}"
+                    )
+            elegibles = [
+                c for c in procesables if not self._sesion_caida(c.usuario)
+            ]
+            if elegibilidad is not None:
+                filtrados = []
+                for candidata in elegibles:
+                    try:
+                        permitida = bool(elegibilidad(candidata.usuario))
+                    except Exception:
+                        permitida = True
+                    if permitida:
+                        filtrados.append(candidata)
+                elegibles = filtrados
+            if not elegibles:
+                return False
             estado["ronda"] += 1
             with self._lock:
                 self.progreso["ronda_actual"] = estado["ronda"]
-            k = _calcular_k_ronda(len(procesables), min_pct, max_pct)
-            if k >= len(procesables):
-                subset = list(procesables)
+            k = _calcular_k_ronda(len(elegibles), min_pct, max_pct)
+            if k >= len(elegibles):
+                subset = list(elegibles)
             else:
                 try:
-                    subset = random.sample(procesables, k)
+                    subset = random.sample(elegibles, k)
                 except Exception:
-                    subset = list(procesables)
-            # Las cuentas omitidas (sesion caida, rechazo de X o transitorios
-            # agotados) NO vuelven a entrar en ninguna ronda: sus cookies no
-            # reviven solas y solo quemarian intentos.
-            subset = [c for c in subset if not self._sesion_caida(c.usuario)]
-            if not subset:
-                subset = [
-                    c for c in procesables if not self._sesion_caida(c.usuario)
-                ]
+                    subset = list(elegibles)
             random.shuffle(subset)
             estado["orden"] = subset
             estado["cursor"] = 0
@@ -2518,13 +3163,17 @@ class MotorActivacion:
                 textos = generado
             estado["textos"] = textos if isinstance(textos, dict) else {}
             estado["roles"] = roles if isinstance(roles, dict) else {}
+            return True
 
         def _tomar_cuenta_locked():
-            """Toma (cuenta, texto, rol) o None si todas descansan; con lock."""
+            """Toma (cuenta, texto, rol) o None si todas descansan/espera gate."""
             orden = estado["orden"]
-            if estado["cursor"] >= len(orden):
-                _iniciar_ronda_locked()
+            if not orden or estado["cursor"] >= len(orden):
+                if not _iniciar_ronda_locked():
+                    return None
                 orden = estado["orden"]
+                if not orden:
+                    return None
             revisados = 0
             while revisados < len(orden):
                 if estado["cursor"] >= len(orden):
@@ -2896,6 +3545,7 @@ class MotorActivacion:
             from plataformas.twitter.selenium_bot import TwitterBot
 
             url = random.choice(urls)
+            self._marcar_cascada(url)
 
             # --- API PRIMERO: sin navegador. ---
             resultado_api = self._probar_api_rol(cuenta, "cita", url, texto, dar_like)
@@ -2988,7 +3638,12 @@ class MotorActivacion:
             if retardo > 0:
                 time.sleep(retardo)
 
-            resultado = self._intentar_quote_rt(cuenta, urls, texto, dar_like)
+            # Cascada de fase 1 (curva): la cita apunta a las URLs publicadas
+            # por Tier 1 si ya empezo la fase 2.
+            urls_efectivas = self._urls_efectivas_rol("cita", urls)
+            resultado = self._intentar_quote_rt(
+                cuenta, urls_efectivas, texto, dar_like
+            )
             if not resultado[1]:
                 detalle = resultado[2]
                 if _es_error_recursos(detalle):
@@ -3005,7 +3660,7 @@ class MotorActivacion:
                     )
                     time.sleep(pausa)
                     resultado = self._intentar_quote_rt(
-                        cuenta, urls, texto, dar_like
+                        cuenta, urls_efectivas, texto, dar_like
                     )
             if not resultado[1]:
                 self._registrar_sesion_caida(resultado[0], resultado[2])
@@ -3172,6 +3827,9 @@ class MotorActivacion:
                 url_objetivo = self._url_objetivo_rol(cuenta, rol, urls)
                 if not url_objetivo:
                     return (cuenta.usuario, rol, False, "sin URL objetivo", "")
+                # Cascada: si el objetivo vino de las URLs de fase 1, se anota
+                # para el contador `cascada_urls` del resumen.
+                self._marcar_cascada(url_objetivo)
 
             if rol == "comentario":
                 espero = self._esperar_turno_comentario(url_objetivo)
@@ -3267,6 +3925,9 @@ class MotorActivacion:
         """
         cuotas = self._cuotas
         rol_norm = "hashtags" if rol == "post" else (rol or "")
+        # Cascada de fase 1 (curva): rt/cita/comentario apuntan a las URLs
+        # publicadas por Tier 1 si ya empezo la fase 2; si no, a las de siempre.
+        urls_efectivas = self._urls_efectivas_rol(rol_norm, urls)
         reservado = False
         if cuotas is not None:
             if not rol_norm:
@@ -3291,7 +3952,7 @@ class MotorActivacion:
                 time.sleep(retardo)
 
             resultado = self._intentar_accion_rol(
-                cuenta, rol, urls, texto, dar_like
+                cuenta, rol, urls_efectivas, texto, dar_like
             )
             if not resultado[2]:
                 detalle = resultado[3]
@@ -3310,7 +3971,7 @@ class MotorActivacion:
                     )
                     time.sleep(pausa)
                     resultado = self._intentar_accion_rol(
-                        cuenta, rol, urls, texto, dar_like
+                        cuenta, rol, urls_efectivas, texto, dar_like
                     )
             if not resultado[2]:
                 # Sesion caida (cookies vencidas/sin credenciales): se omite en
@@ -3347,6 +4008,9 @@ class MotorActivacion:
         secciones=None,
         porcentaje_min_ronda=40,
         porcentaje_max_ronda=90,
+        reserva_usuarios=None,
+        curva_aceleracion: bool = False,
+        curva_fase1_min=None,
     ) -> dict:
         """Lanza la campaña completa (wrapper del flujo real).
 
@@ -3354,16 +4018,23 @@ class MotorActivacion:
         terminar (exito, salida temprana o excepcion) y agrega al resumen las
         claves `modo_pestana`, `pestanas_creadas` y `pestanas_recicladas`.
         La logica vive en `_ejecutar_campana` (misma firma).
+
+        `reserva_usuarios`: cuentas de RESPALDO (usuarios o Cuentas) que
+        sustituyen 1:1 a las "Agotadas por hoy". `curva_aceleracion`/
+        `curva_fase1_min`: modo explosion (fase 1 solo Tier 1).
         """
+        inicio = time.monotonic()
         try:
             resumen = self._ejecutar_campana(
                 urls, texto_base, cantidad_cuentas, tags, grupo, dar_like,
                 duracion_min, cohortes, n_hashtags, narrativa, entrenamiento,
                 callback, hashtags, solo_con_registro, repetir, secciones,
                 porcentaje_min_ronda, porcentaje_max_ronda,
+                reserva_usuarios, curva_aceleracion, curva_fase1_min,
             )
         finally:
             self._cerrar_pestanas()
+        self._loguear_rendimiento(inicio, resumen)
         return self._con_claves_pestana(resumen)
 
     def _ejecutar_campana(
@@ -3386,6 +4057,9 @@ class MotorActivacion:
         secciones=None,
         porcentaje_min_ronda=40,
         porcentaje_max_ronda=90,
+        reserva_usuarios=None,
+        curva_aceleracion: bool = False,
+        curva_fase1_min=None,
     ) -> dict:
         """Lanza la campaña completa.
 
@@ -3403,10 +4077,15 @@ class MotorActivacion:
           vacio o None = todas.
         - porcentaje_min_ronda/porcentaje_max_ronda: con `repetir=True`, rango
           de cuentas por ronda (estricto: mas del minimo, menos que todas).
+        - reserva_usuarios: cuentas de RESPALDO (str o Cuentas) que sustituyen
+          1:1 a las "Agotadas por hoy" (tope diario).
+        - curva_aceleracion/curva_fase1_min: "modo explosion": fase 1 solo
+          Tier 1; fase 2 (Tier 2 y sin tier) tras `curva_fase1_min` minutos.
         """
         # Cuotas horarias: cada campana arranca limpia y las prepara con las
         # cuentas que realmente van a ejecutar (mas abajo).
         self._cuotas = None
+        self._reset_curva_campana()
         with self._lock:
             self.progreso["ronda_actual"] = 1
         cuentas = self._obtener_cuentas(
@@ -3493,9 +4172,32 @@ class MotorActivacion:
             )
             return self._claves_cuotas(resumen_vacio)
 
-        # Con cuentas ejecutables: preparar el contador de cuotas horarias
-        # (base desde la BD + reservas de esta campana).
-        self._preparar_cuotas([c.usuario for c in con_sesion])
+        # Con cuentas ejecutables: reservas de respaldo, tiers, cuotas
+        # horarias+diarias (base desde la BD) y curva de aceleracion.
+        reservas = self._preparar_reservas(
+            reserva_usuarios, con_sesion, secciones=secciones,
+            solo_con_registro=solo_con_registro,
+        )
+        self._registrar_tiers(list(con_sesion) + list(reservas))
+        self._preparar_cuotas(
+            [c.usuario for c in con_sesion] + [c.usuario for c in reservas]
+        )
+        claves_dinamicas = {
+            "reserva_disponible": len(reservas),
+            "reserva_usada": 0,
+            "agotadas_dia": 0,
+            "rotadas_por_cuota_dia": 0,
+        }
+        curva_activa, fase1_min = self._configurar_curva(
+            con_sesion, curva_aceleracion, curva_fase1_min, duracion_min,
+            claves_dinamicas,
+        )
+        if not repetir and reservas:
+            # Una sola pasada: la sustitucion de las ya agotadas se hace ANTES
+            # de encolar (1:1; en cita masiva todas las cuentas van a "cita").
+            self._rotar_agotadas_dia(
+                con_sesion, reservas, {}, True, claves_dinamicas
+            )
 
         tags_pedidos = _normalizar_hashtags(hashtags)
 
@@ -3513,6 +4215,7 @@ class MotorActivacion:
                 "sugerencia_registro": sugerencia_registro,
                 "rondas": 0,
                 "omitidas_por_cuota": 0,
+                **claves_dinamicas,
             }
 
             usados: dict = {}
@@ -3550,6 +4253,9 @@ class MotorActivacion:
 
             def _reportar_ronda(resultado, ronda):
                 usuario_res, ok, detalle, url = resultado
+                if ok:
+                    # Cascada: URL publicada por Tier 1 en fase 1 (cita).
+                    self._capturar_url_fase1(usuario_res, "cita", url)
                 if ok is None:
                     # Omitida por cuota agotada: no es exito ni fallo, no se
                     # registra en la BD y no dispara callback.
@@ -3603,7 +4309,20 @@ class MotorActivacion:
                 _reportar_ronda,
                 porcentaje_min_ronda=porcentaje_min_ronda,
                 porcentaje_max_ronda=porcentaje_max_ronda,
+                elegibilidad=self._elegibilidad_curva(curva_activa),
+                sustituir=(
+                    lambda: self._rotar_agotadas_dia(
+                        con_sesion, reservas, {}, True, resumen
+                    )
+                ),
             )
+            try:
+                fase = 2 if self._en_fase2() else 1
+                with self._lock:
+                    self.progreso["fase_actual"] = fase
+                resumen["fase_actual"] = fase
+            except Exception:
+                pass
             logger.info(
                 f"Activacion finalizada (rondas): {resumen['exitosas']} exitosas, "
                 f"{resumen['fallidas']} fallidas en {resumen['rondas']} ronda(s) "
@@ -3612,16 +4331,98 @@ class MotorActivacion:
             )
             return self._claves_cuotas(resumen)
 
-        # Un pool por grupo (registro, perfil): cada cuenta publica una cita con
-        # su propio estilo. La narrativa viaja solo como trasfondo.
-        asignaciones = self._asignar_variaciones_cita(
-            con_sesion,
-            texto_base,
-            narrativa=narrativa,
-            entrenamiento=entrenamiento,
-            tags=tags_pedidos,
-        )
-        bloques = self._distribuir_cohortes(con_sesion, duracion_min, cohortes)
+        # --- Una sola pasada (con curva: DOS etapas secuenciales) ---------- #
+        # Omitidas por cuota horaria/diaria ANTES de encolar (la garantia
+        # atomica la da la reserva interna de `_quote_rt_una_cuenta`).
+        omitidas_por_cuota = 0
+
+        def _pasada_simple(cuentas_pasada, duracion_pasada):
+            """Ejecuta una pasada de quote-RTs sobre `cuentas_pasada`."""
+            nonlocal omitidas_por_cuota
+            if not cuentas_pasada:
+                return
+            # Un pool por grupo (registro, perfil): cada cuenta publica una cita
+            # con su propio estilo. La narrativa viaja solo como trasfondo.
+            asignaciones = self._asignar_variaciones_cita(
+                cuentas_pasada,
+                texto_base,
+                narrativa=narrativa,
+                entrenamiento=entrenamiento,
+                tags=tags_pedidos,
+            )
+            try:
+                duracion_efectiva = max(1, int(duracion_pasada or 1))
+            except Exception:
+                duracion_efectiva = 1
+            bloques = self._distribuir_cohortes(
+                list(cuentas_pasada), duracion_efectiva, cohortes
+            )
+            intervalo_cohorte = max(
+                1, (duracion_efectiva * 60) // max(cohortes, 1)
+            )
+            # El ThreadPoolExecutor ya limita la concurrencia; el retardo solo
+            # distribuye los INICIOS a lo largo de la ventana para no disparar
+            # todas las cuentas al mismo tiempo.
+            with ThreadPoolExecutor(max_workers=self.max_concurrente) as pool_exec:
+                futuros = []
+                for idx, bloque in enumerate(bloques):
+                    for cuenta in bloque:
+                        if (
+                            self._cuotas is not None
+                            and not self._cuotas.rol_permitido(cuenta.usuario, "cita")
+                        ):
+                            self._avisar_cuota_agotada(cuenta.usuario)
+                            with self._lock:
+                                self.progreso["omitidas"] = (
+                                    self.progreso.get("omitidas", 0) + 1
+                                )
+                            omitidas_por_cuota += 1
+                            continue
+                        retardo = idx * intervalo_cohorte + random.uniform(0, 15)
+                        futuros.append((retardo, pool_exec.submit(
+                            self._quote_rt_una_cuenta, cuenta, urls,
+                            asignaciones.get(cuenta.usuario, ""), dar_like,
+                            retardo
+                        ), cuenta.usuario))
+
+                # Recoger resultados en orden de arranque (los retardos ya
+                # fueron aplicados al submit via scheduling del pool).
+                for retardo, futuro, usuario in sorted(futuros, key=lambda x: x[0]):
+                    try:
+                        usuario_res, ok, detalle, url = futuro.result()
+                    except Exception as e:
+                        usuario_res, ok, detalle, url = usuario, False, str(e)[:80], ""
+
+                    if ok:
+                        self._capturar_url_fase1(usuario_res, "cita", url)
+                    if ok is None:
+                        # Omitida por cuota agotada (carrera con otro worker).
+                        with self._lock:
+                            self.progreso["omitidas"] = (
+                                self.progreso.get("omitidas", 0) + 1
+                            )
+                        omitidas_por_cuota += 1
+                        continue
+
+                    with self._lock:
+                        self.progreso["hechas"] += 1
+                        if ok:
+                            self.progreso["exitosas"] += 1
+                        else:
+                            self.progreso["fallidas"] += 1
+                        self._registrar_evento_locked(
+                            usuario_res, ok, detalle, 1, "cita", url
+                        )
+                        registrar_accion(
+                            usuario_res,
+                            tipo_registro_rol("cita"),
+                            "exito" if ok else "fallido",
+                            url,
+                            detalle,
+                        )
+                        resultados.append({"usuario": usuario_res, "ok": ok, "detalle": detalle, "url": url})
+                        if callback:
+                            callback(self.progreso["hechas"], len(cuentas), usuario_res, ok)
 
         logger.info(
             f"Activacion masiva: {len(con_sesion)} cuentas con sesión "
@@ -3629,72 +4430,47 @@ class MotorActivacion:
             f"{cohortes} cohortes, {duracion_min} min, concurrencia {self.max_concurrente}"
         )
 
-        intervalo_cohorte = max(1, (duracion_min * 60) // max(cohortes, 1))
-
-        # Omitidas por cuota horaria ANTES de encolar (la garantia atomica la
-        # da la reserva interna de `_quote_rt_una_cuenta`).
-        omitidas_por_cuota = 0
-
-        # El ThreadPoolExecutor ya limita la concurrencia; el retardo solo
-        # distribuye los INICIOS a lo largo de la ventana para no disparar
-        # todas las cuentas al mismo tiempo.
-        with ThreadPoolExecutor(max_workers=self.max_concurrente) as pool_exec:
-            futuros = []
-            for idx, bloque in enumerate(bloques):
-                for cuenta in bloque:
-                    if (
-                        self._cuotas is not None
-                        and not self._cuotas.rol_permitido(cuenta.usuario, "cita")
-                    ):
-                        self._avisar_cuota_agotada(cuenta.usuario)
-                        with self._lock:
-                            self.progreso["omitidas"] = (
-                                self.progreso.get("omitidas", 0) + 1
-                            )
-                        omitidas_por_cuota += 1
-                        continue
-                    retardo = idx * intervalo_cohorte + random.uniform(0, 15)
-                    futuros.append((retardo, pool_exec.submit(
-                        self._quote_rt_una_cuenta, cuenta, urls,
-                        asignaciones[cuenta.usuario], dar_like, retardo
-                    ), cuenta.usuario))
-
-            # Recoger resultados en orden de arranque (los retardos ya fueron
-            # aplicados al momento de submit via scheduling natural del pool).
-            for retardo, futuro, usuario in sorted(futuros, key=lambda x: x[0]):
+        fase_final = 2 if self._en_fase2() else 1
+        if curva_activa:
+            # DOS ETAPAS secuenciales: primero Tier 1 (fase 1, acotada por
+            # `fase1_min`) y despues Tier 2 + sin tier (fase 2). Misma
+            # concurrencia y mismos reportes que el flujo normal.
+            tier1_pasada = [
+                c for c in con_sesion
+                if self._tier_de.get(str(c.usuario)) == "tier1"
+            ]
+            resto_pasada = [
+                c for c in con_sesion
+                if self._tier_de.get(str(c.usuario)) != "tier1"
+            ]
+            if tier1_pasada and resto_pasada:
                 try:
-                    usuario_res, ok, detalle, url = futuro.result()
-                except Exception as e:
-                    usuario_res, ok, detalle, url = usuario, False, str(e)[:80], ""
-
-                if ok is None:
-                    # Omitida por cuota agotada (carrera con otro worker).
                     with self._lock:
-                        self.progreso["omitidas"] = (
-                            self.progreso.get("omitidas", 0) + 1
-                        )
-                    omitidas_por_cuota += 1
-                    continue
-
-                with self._lock:
-                    self.progreso["hechas"] += 1
-                    if ok:
-                        self.progreso["exitosas"] += 1
-                    else:
-                        self.progreso["fallidas"] += 1
-                    self._registrar_evento_locked(
-                        usuario_res, ok, detalle, 1, "cita", url
+                        self.progreso["fase_actual"] = 1
+                    _pasada_simple(
+                        tier1_pasada,
+                        max(1, min(int(duracion_min or 1), int(fase1_min))),
                     )
-                    registrar_accion(
-                        usuario_res,
-                        tipo_registro_rol("cita"),
-                        "exito" if ok else "fallido",
-                        url,
-                        detalle,
+                    with self._lock:
+                        self.progreso["fase_actual"] = 2
+                    # La fase 2 REAL empieza aqui (aunque la etapa 1 haya
+                    # terminado antes del reloj): la cascada de URLs de Tier 1
+                    # ya aplica a los rt/cita de la etapa 2.
+                    self._curva_fase2_t0 = time.monotonic() - 1.0
+                    _pasada_simple(
+                        resto_pasada,
+                        max(1, int(duracion_min or 1) - int(fase1_min)),
                     )
-                    resultados.append({"usuario": usuario_res, "ok": ok, "detalle": detalle, "url": url})
-                    if callback:
-                        callback(self.progreso["hechas"], len(cuentas), usuario_res, ok)
+                    fase_final = 2
+                except Exception as e:
+                    logger.error(
+                        f"Activacion: error en las etapas de la curva "
+                        f"({type(e).__name__}: {e}); se continua"
+                    )
+            else:
+                _pasada_simple(con_sesion, duracion_min)
+        else:
+            _pasada_simple(con_sesion, duracion_min)
 
         resumen = {
             "exitosas": self.progreso["exitosas"],
@@ -3709,6 +4485,8 @@ class MotorActivacion:
             "sugerencia_registro": sugerencia_registro,
             "rondas": 1,
             "omitidas_por_cuota": omitidas_por_cuota,
+            "fase_actual": fase_final,
+            **claves_dinamicas,
         }
         logger.info(
             f"Activacion finalizada: {resumen['exitosas']} exitosas, "
@@ -3741,6 +4519,9 @@ class MotorActivacion:
         porcentaje_min_ronda=40,
         porcentaje_max_ronda=90,
         pausa_comentario_url_seg: float = 15.0,
+        reserva_usuarios=None,
+        curva_aceleracion: bool = False,
+        curva_fase1_min=None,
     ) -> dict:
         """Campaña masiva dividida en subcuentas por rol (wrapper del flujo).
 
@@ -3748,7 +4529,13 @@ class MotorActivacion:
         terminar (exito, salida temprana o excepcion) y agrega al resumen las
         claves `modo_pestana`, `pestanas_creadas` y `pestanas_recicladas`.
         La logica vive en `_ejecutar_por_roles_campana` (misma firma).
+
+        `reserva_usuarios`: cuentas de RESPALDO (usuarios o Cuentas) que
+        sustituyen 1:1 a las "Agotadas por hoy" (Tier 2 jamas sustituye un rol
+        hashtags). `curva_aceleracion`/`curva_fase1_min`: modo explosion
+        (fase 1 solo Tier 1).
         """
+        inicio = time.monotonic()
         try:
             resumen = self._ejecutar_por_roles_campana(
                 urls, texto_base, hashtags, menciones, dar_like, duracion_min,
@@ -3756,9 +4543,11 @@ class MotorActivacion:
                 callback, contexto, solo_con_registro, repetir, roles_aleatorios,
                 cooldown_min, secciones, porcentaje_min_ronda,
                 porcentaje_max_ronda, pausa_comentario_url_seg,
+                reserva_usuarios, curva_aceleracion, curva_fase1_min,
             )
         finally:
             self._cerrar_pestanas()
+        self._loguear_rendimiento(inicio, resumen)
         return self._con_claves_pestana(resumen)
 
     def _ejecutar_por_roles_campana(
@@ -3784,6 +4573,9 @@ class MotorActivacion:
         porcentaje_min_ronda=40,
         porcentaje_max_ronda=90,
         pausa_comentario_url_seg: float = 15.0,
+        reserva_usuarios=None,
+        curva_aceleracion: bool = False,
+        curva_fase1_min=None,
     ) -> dict:
         """Campaña masiva dividida en subcuentas por rol.
 
@@ -3827,6 +4619,14 @@ class MotorActivacion:
           dirigidos a la MISMA URL ancla (0 = sin pausa); el hueco se reserva
           antes de abrir el navegador y solo afecta al rol "comentario" (no
           frena citas/RTs/hashtags ni comentarios a otras URLs).
+        - TIER: las cuentas Tier 2 NO pueden publicar hashtags/posts (modo fijo
+          se excluyen y se cuentan en `tier2_hashtags_omitidas`; en modo
+          aleatorio nunca les toca ese rol). Jamas se desactivan en la BD.
+        - `reserva_usuarios`: cuentas de RESPALDO (usuarios o Cuentas) que
+          sustituyen 1:1 a las "Agotadas por hoy" (Tier 2 jamas sustituye un
+          rol hashtags).
+        - `curva_aceleracion`/`curva_fase1_min`: "modo explosion": fase 1 solo
+          Tier 1; fase 2 (Tier 2 y sin tier) tras `curva_fase1_min` minutos.
         - Cohortes temporales + delay aleatorio y concurrencia limitada,
           igual que `ejecutar()`.
         - Nunca lanza: cada cuenta fallida se reporta en `detalles`.
@@ -3834,6 +4634,7 @@ class MotorActivacion:
         # Cuotas horarias: cada campana arranca limpia y las prepara con las
         # cuentas ejecutables (mas abajo).
         self._cuotas = None
+        self._reset_curva_campana()
         urls = [str(u).strip() for u in (urls or []) if str(u).strip()]
         try:
             cooldown_val = max(0.0, float(cooldown_min or 0))
@@ -3901,6 +4702,7 @@ class MotorActivacion:
 
         grupos = {"cita": [], "hashtags": [], "comentario": [], "rt": []}
         sin_rol_usuarios = []
+        tier2_hashtags_usuarios: list = []
         if roles_aleatorios:
             # El rol guardado no filtra: cada cuenta recibe un rol sorteado en
             # cada ronda (los roles posibles ya se validaron arriba).
@@ -3908,22 +4710,47 @@ class MotorActivacion:
             rol_de: dict = {}
         else:
             for cuenta in cuentas:
-                rol = normalizar_rol_activacion(
-                    getattr(cuenta, "rol_activacion", "")
-                )
+                # Rol canonico con alias ("post"/"mantenimiento"/"hilo" ->
+                # "hashtags", "respuesta"/"reply" -> "comentario"): asi Tier 2
+                # con "post" tambien cae en el blindaje de hashtags.
+                rol = _rol_efectivo_cuenta(cuenta)
                 if rol in grupos:
                     grupos[rol].append(cuenta)
                 else:
                     sin_rol_usuarios.append(cuenta.usuario)
+
+            # TIER: las cuentas Tier 2 con rol efectivo "hashtags" (incluye
+            # "post"/"mantenimiento"/"hilo", que normalizan a hashtags) se
+            # EXCLUYEN antes de abrir navegador. NO se desactivan en la BD:
+            # solo se omiten de la campaña y se reportan en `tier2_hashtags_*`.
+            permitidas_tier = []
+            for cuenta in grupos["hashtags"]:
+                if _tier_permitido(cuenta, "hashtags"):
+                    permitidas_tier.append(cuenta)
+                else:
+                    usuario_omitido = str(cuenta.usuario)
+                    tier2_hashtags_usuarios.append(usuario_omitido)
+                    logger.warning(
+                        f"Activacion por roles: @{usuario_omitido} es Tier 2 y "
+                        f"el rol 'hashtags' esta PROHIBIDO para su tier; se "
+                        f"omite sin abrir navegador (NO se desactiva en la "
+                        f"BD). {_error_tier(cuenta, 'hashtags')}"
+                    )
+            grupos["hashtags"] = permitidas_tier
+            # Defensa extra: cuentas que `_obtener_cuentas_por_rol` ya filtro
+            # por el mismo motivo (solo_roles=["hashtags"]).
+            for usuario_filtrado in list(
+                getattr(self, "_tier2_filtradas_rol", []) or []
+            ):
+                if usuario_filtrado not in tier2_hashtags_usuarios:
+                    tier2_hashtags_usuarios.append(usuario_filtrado)
 
             procesables = (
                 grupos["cita"] + grupos["hashtags"]
                 + grupos["comentario"] + grupos["rt"]
             )
             rol_de = {
-                cuenta.usuario: normalizar_rol_activacion(
-                    getattr(cuenta, "rol_activacion", "")
-                )
+                cuenta.usuario: _rol_efectivo_cuenta(cuenta)
                 for cuenta in procesables
             }
         ejecutables, sin_sesion = _partir_por_sesion(procesables)
@@ -3967,6 +4794,10 @@ class MotorActivacion:
             "cooldown_min": cooldown_val,
             "pausa_comentario_url_seg": pausa_comentario_val,
             "omitidas_por_cuota": 0,
+            "tier2_hashtags_omitidas": len(tier2_hashtags_usuarios),
+            "tier2_hashtags_usuarios": list(tier2_hashtags_usuarios),
+            "tier2_sin_rol": 0,
+            "tier2_sin_rol_usuarios": [],
         }
         for cuenta in sin_sesion:
             rol = rol_de.get(cuenta.usuario, "")
@@ -4008,9 +4839,27 @@ class MotorActivacion:
             for cuenta in ejecutables
         }
 
-        # Con cuentas ejecutables: preparar el contador de cuotas horarias
-        # (base desde la BD + reservas de esta campana).
-        self._preparar_cuotas([c.usuario for c in ejecutables])
+        # Con cuentas ejecutables: reservas de respaldo, tiers, cuotas
+        # horarias+diarias (base desde la BD) y curva de aceleracion.
+        reservas = self._preparar_reservas(
+            reserva_usuarios, ejecutables, secciones=secciones,
+            solo_con_registro=solo_con_registro,
+        )
+        self._registrar_tiers(list(ejecutables) + list(reservas))
+        self._preparar_cuotas(
+            [c.usuario for c in ejecutables] + [c.usuario for c in reservas]
+        )
+        claves_dinamicas = {
+            "reserva_disponible": len(reservas),
+            "reserva_usada": 0,
+            "agotadas_dia": 0,
+            "rotadas_por_cuota_dia": 0,
+        }
+        curva_activa, fase1_min = self._configurar_curva(
+            ejecutables, curva_aceleracion, curva_fase1_min, duracion_min,
+            claves_dinamicas,
+        )
+        resumen.update(claves_dinamicas)
 
         logger.info(
             f"Activacion por roles: {len(ejecutables)} cuentas con sesión "
@@ -4019,6 +4868,7 @@ class MotorActivacion:
             f"sin_sesion={len(sin_sesion)}), "
             f"{len(urls)} urls, {cohortes} cohortes, {duracion_min} min, "
             f"navegadores {self.max_concurrente}, trabajadores {self._n_workers()}"
+            + (f", reservas {len(reservas)}" if reservas else "")
         )
 
         with self._lock:
@@ -4028,6 +4878,7 @@ class MotorActivacion:
                 "fallidas": len(sin_sesion),
                 "omitidas": 0,
                 "ronda_actual": 1,
+                "fase_actual": 1,
                 "eventos": [],
             }
         for cuenta in sin_sesion:
@@ -4079,6 +4930,19 @@ class MotorActivacion:
                         cuotas=self._cuotas,
                     )
                     roles_ultimos.update(roles_ronda)
+                    for candidata in base:
+                        if roles_ronda.get(candidata.usuario, ""):
+                            continue
+                        if not _es_tier2(candidata):
+                            continue
+                        if any(
+                            _tier_permitido(candidata, r)
+                            for r in roles_sortear
+                        ):
+                            continue
+                        self._contar_tier2_sin_rol(
+                            candidata.usuario, resumen
+                        )
                     grupos_ronda = self._grupos_desde_roles(
                         base, roles_ronda
                     )
@@ -4100,9 +4964,12 @@ class MotorActivacion:
                 if usuarios is None:
                     grupos_ronda = grupos_ejec
                 else:
+                    # Se parte de `grupos_ejec` (no de `cuentas`) para que las
+                    # reservas que sustituyeron cuentas agotadas ya esten
+                    # incluidas en la ronda.
                     grupos_ronda = {
-                        rol: [c for c in cuentas if c.usuario in deseados]
-                        for rol, cuentas in grupos_ejec.items()
+                        rol: [c for c in lista if c.usuario in deseados]
+                        for rol, lista in grupos_ejec.items()
                     }
                 if self._cuotas is not None:
                     # Filtra (SIN mutar `grupos_ejec`) las cuentas sin cupo del
@@ -4138,12 +5005,18 @@ class MotorActivacion:
 
             def _ejecutar_una_rol(cuenta, texto, rol=""):
                 rol_efectivo = rol or rol_por_usuario.get(cuenta.usuario, "")
-                if self._cuotas is not None and not rol_efectivo:
-                    # Cuenta sin cupo en modo aleatorio: no abre nada.
-                    return (
-                        cuenta.usuario, rol_efectivo, None,
-                        MENSAJE_CUOTA_AGOTADA, "",
+                if not rol_efectivo:
+                    # Sin rol efectivo: la cuenta no tiene cupo (modo aleatorio
+                    # con cuotas) o es Tier 2 sin ningun rol permitido. JAMAS
+                    # abre navegador; sin este guard caeria al flujo hashtags.
+                    sin_rol_tier = _es_tier2(cuenta) and not any(
+                        _tier_permitido(cuenta, r) for r in roles_sortear
                     )
+                    detalle = (
+                        MENSAJE_TIER2_SIN_ROL if sin_rol_tier
+                        else MENSAJE_CUOTA_AGOTADA
+                    )
+                    return (cuenta.usuario, rol_efectivo, None, detalle, "")
                 try:
                     return self._ejecutar_accion_rol(
                         cuenta, rol_efectivo, urls, texto, dar_like, 0
@@ -4156,16 +5029,24 @@ class MotorActivacion:
 
             def _reportar_rol(resultado, ronda):
                 usuario_res, rol_res, ok, detalle, url = resultado
+                if ok:
+                    # Cascada: URL publicada por Tier 1 en fase 1.
+                    self._capturar_url_fase1(usuario_res, rol_res, url)
                 if ok is None:
-                    # Omitida por cuota agotada: no es exito ni fallo, no se
-                    # registra en la BD, no genera evento ni callback.
+                    # Omitida (cuota agotada o Tier 2 sin rol permitido): no es
+                    # exito ni fallo, no se registra en la BD, no genera evento
+                    # ni callback.
                     with self._lock:
                         self.progreso["omitidas"] = (
                             self.progreso.get("omitidas", 0) + 1
                         )
-                        resumen["omitidas_por_cuota"] = (
-                            resumen.get("omitidas_por_cuota", 0) + 1
-                        )
+                    if str(detalle) == MENSAJE_TIER2_SIN_ROL:
+                        self._contar_tier2_sin_rol(usuario_res, resumen)
+                    else:
+                        with self._lock:
+                            resumen["omitidas_por_cuota"] = (
+                                resumen.get("omitidas_por_cuota", 0) + 1
+                            )
                     return
                 with self._lock:
                     self.progreso["hechas"] += 1
@@ -4212,7 +5093,22 @@ class MotorActivacion:
                 cooldown_min=cooldown_val,
                 porcentaje_min_ronda=porcentaje_min_ronda,
                 porcentaje_max_ronda=porcentaje_max_ronda,
+                elegibilidad=self._elegibilidad_curva(curva_activa),
+                sustituir=(
+                    lambda: self._rotar_agotadas_dia(
+                        ejecutables, reservas, rol_por_usuario,
+                        bool(roles_aleatorios), resumen,
+                        None if roles_aleatorios else grupos_ejec,
+                    )
+                ),
             )
+            try:
+                fase = 2 if self._en_fase2() else 1
+                with self._lock:
+                    self.progreso["fase_actual"] = fase
+                resumen["fase_actual"] = fase
+            except Exception:
+                pass
             logger.info(
                 f"Activacion por roles finalizada (rondas): "
                 f"{resumen['exitosas']} exitosas, {resumen['fallidas']} fallidas "
@@ -4222,106 +5118,206 @@ class MotorActivacion:
             )
             return self._claves_cuotas(resumen)
 
-        # --- Pool de textos por rol (una sola ronda) ---
-        if roles_aleatorios:
-            roles_una = self._asignar_roles_aleatorios(
-                ejecutables, roles_sortear, cuotas=self._cuotas
-            )
-            grupos_ejec_una = self._grupos_desde_roles(ejecutables, roles_una)
-        else:
-            roles_una = dict(rol_por_usuario)
-            grupos_ejec_una = grupos_ejec
-        asignaciones = self._generar_textos_por_rol(
-            grupos_ejec_una,
-            texto_base,
-            hashtags=hashtags,
-            menciones=menciones,
-            narrativa=narrativa,
-            entrenamiento=entrenamiento,
-            contexto=contexto,
-            ancla_textos=ancla_textos,
+        # --- Una sola pasada (con curva: DOS etapas secuenciales) ---------- #
+        # Rotacion previa de las "Agotadas por hoy" (1:1, mismo rol en modo
+        # fijo; una reserva Tier 2 jamas sustituye hashtags).
+        self._rotar_agotadas_dia(
+            ejecutables, reservas, rol_por_usuario,
+            bool(roles_aleatorios), resumen,
+            None if roles_aleatorios else grupos_ejec,
         )
 
-        bloques = self._distribuir_cohortes(ejecutables, duracion_min, cohortes)
+        omitidas_por_cuota = 0
 
-        with ThreadPoolExecutor(max_workers=self.max_concurrente) as pool_exec:
-            futuros = []
-            for idx, bloque in enumerate(bloques):
-                for cuenta in bloque:
-                    rol = roles_una.get(cuenta.usuario, "")
-                    if (
-                        self._cuotas is not None
-                        and not self._cuotas.rol_permitido(cuenta.usuario, rol or "")
+        def _pasada_rol_simple(cuentas_pasada, duracion_pasada):
+            """Ejecuta UNA pasada por roles sobre `cuentas_pasada`."""
+            nonlocal omitidas_por_cuota
+            if not cuentas_pasada:
+                return
+            if roles_aleatorios:
+                roles_pasada = self._asignar_roles_aleatorios(
+                    cuentas_pasada, roles_sortear, cuotas=self._cuotas
+                )
+                for candidata in cuentas_pasada:
+                    if roles_pasada.get(candidata.usuario, ""):
+                        continue
+                    if not _es_tier2(candidata):
+                        continue
+                    if any(
+                        _tier_permitido(candidata, r) for r in roles_sortear
                     ):
-                        # Omitida ANTES de encolar (la garantia atomica la da
-                        # la reserva interna de `_ejecutar_accion_rol`).
-                        self._avisar_cuota_agotada(cuenta.usuario)
+                        continue
+                    self._contar_tier2_sin_rol(candidata.usuario, resumen)
+                grupos_pasada = self._grupos_desde_roles(
+                    cuentas_pasada, roles_pasada
+                )
+            else:
+                deseados_pasada = {c.usuario for c in cuentas_pasada}
+                roles_pasada = {
+                    c.usuario: rol_por_usuario.get(c.usuario, "")
+                    for c in cuentas_pasada
+                }
+                grupos_pasada = {
+                    rol: [c for c in lista if c.usuario in deseados_pasada]
+                    for rol, lista in grupos_ejec.items()
+                }
+            asignaciones = self._generar_textos_por_rol(
+                grupos_pasada,
+                texto_base,
+                hashtags=hashtags,
+                menciones=menciones,
+                narrativa=narrativa,
+                entrenamiento=entrenamiento,
+                contexto=contexto,
+                ancla_textos=ancla_textos,
+            )
+            try:
+                duracion_efectiva = max(1, int(duracion_pasada or 1))
+            except Exception:
+                duracion_efectiva = 1
+            bloques = self._distribuir_cohortes(
+                list(cuentas_pasada), duracion_efectiva, cohortes
+            )
+            intervalo_pasada = max(
+                1, (duracion_efectiva * 60) // max(cohortes, 1)
+            )
+            with ThreadPoolExecutor(max_workers=self.max_concurrente) as pool_exec:
+                futuros = []
+                for idx, bloque in enumerate(bloques):
+                    for cuenta in bloque:
+                        rol = roles_pasada.get(cuenta.usuario, "")
+                        if not rol:
+                            # Sin rol efectivo: cuota agotada (modo aleatorio)
+                            # o Tier 2 sin ningun rol permitido. No abre nada.
+                            with self._lock:
+                                self.progreso["omitidas"] = (
+                                    self.progreso.get("omitidas", 0) + 1
+                                )
+                            if _es_tier2(cuenta) and not any(
+                                _tier_permitido(cuenta, r)
+                                for r in roles_sortear
+                            ):
+                                self._contar_tier2_sin_rol(
+                                    cuenta.usuario, resumen
+                                )
+                            else:
+                                omitidas_por_cuota += 1
+                            continue
+                        if (
+                            self._cuotas is not None
+                            and not self._cuotas.rol_permitido(
+                                cuenta.usuario, rol or ""
+                            )
+                        ):
+                            # Omitida ANTES de encolar (la garantia atomica la
+                            # da la reserva interna de `_ejecutar_accion_rol`).
+                            self._avisar_cuota_agotada(cuenta.usuario)
+                            with self._lock:
+                                self.progreso["omitidas"] = (
+                                    self.progreso.get("omitidas", 0) + 1
+                                )
+                            omitidas_por_cuota += 1
+                            continue
+                        retardo = idx * intervalo_pasada + random.uniform(0, 15)
+                        futuros.append((retardo, pool_exec.submit(
+                            self._ejecutar_accion_rol, cuenta, rol, urls,
+                            asignaciones.get(cuenta.usuario, ""), dar_like,
+                            retardo,
+                        ), cuenta.usuario))
+
+                for retardo, futuro, usuario in sorted(futuros, key=lambda x: x[0]):
+                    try:
+                        usuario_res, rol_res, ok, detalle, url = futuro.result()
+                    except Exception as e:
+                        usuario_res = usuario
+                        rol_res = roles_pasada.get(usuario, "")
+                        ok, detalle, url = False, str(e)[:80], ""
+
+                    if ok:
+                        self._capturar_url_fase1(usuario_res, rol_res, url)
+                    if ok is None:
+                        # Omitida (cuota o Tier 2 sin rol permitido): no es
+                        # exito ni fallo ni toca la BD.
                         with self._lock:
                             self.progreso["omitidas"] = (
                                 self.progreso.get("omitidas", 0) + 1
                             )
-                            resumen["omitidas_por_cuota"] = (
-                                resumen.get("omitidas_por_cuota", 0) + 1
-                            )
+                        if str(detalle) == MENSAJE_TIER2_SIN_ROL:
+                            self._contar_tier2_sin_rol(usuario_res, resumen)
+                        else:
+                            omitidas_por_cuota += 1
                         continue
-                    retardo = idx * intervalo_cohorte + random.uniform(0, 15)
-                    futuros.append((retardo, pool_exec.submit(
-                        self._ejecutar_accion_rol, cuenta, rol, urls,
-                        asignaciones.get(cuenta.usuario, ""), dar_like, retardo,
-                    ), cuenta.usuario))
 
-            for retardo, futuro, usuario in sorted(futuros, key=lambda x: x[0]):
-                try:
-                    usuario_res, rol_res, ok, detalle, url = futuro.result()
-                except Exception as e:
-                    usuario_res = usuario
-                    rol_res = roles_una.get(usuario, "")
-                    ok, detalle, url = False, str(e)[:80], ""
-
-                if ok is None:
-                    # Omitida por cuota agotada (carrera con otro worker).
                     with self._lock:
-                        self.progreso["omitidas"] = (
-                            self.progreso.get("omitidas", 0) + 1
+                        self.progreso["hechas"] += 1
+                        self.progreso["exitosas" if ok else "fallidas"] += 1
+                        resumen["exitosas" if ok else "fallidas"] += 1
+                        if rol_res in resumen["por_rol"]:
+                            if roles_aleatorios:
+                                resumen["por_rol"][rol_res]["total"] += 1
+                            resumen["por_rol"][rol_res][
+                                "exitosas" if ok else "fallidas"
+                            ] += 1
+                        self._registrar_evento_locked(
+                            usuario_res, ok, detalle, 1, rol_res, url
                         )
-                        resumen["omitidas_por_cuota"] = (
-                            resumen.get("omitidas_por_cuota", 0) + 1
+                        registrar_accion(
+                            usuario_res,
+                            tipo_registro_rol(rol_res),
+                            "exito" if ok else "fallido",
+                            url,
+                            detalle,
                         )
-                    continue
+                        resumen["detalles"].append({
+                            "usuario": usuario_res,
+                            "rol": rol_res,
+                            "ok": ok,
+                            "detalle": detalle,
+                            "url": url,
+                        })
+                        if callback:
+                            callback(
+                                self.progreso["hechas"], len(procesables),
+                                usuario_res, ok,
+                            )
 
+        fase_final = 2 if self._en_fase2() else 1
+        if curva_activa:
+            # DOS ETAPAS secuenciales: primero Tier 1 (fase 1, acotada por
+            # `fase1_min`) y despues Tier 2 + sin tier (fase 2). Misma
+            # concurrencia y mismos reportes que el flujo normal.
+            tier1_pasada = [
+                c for c in ejecutables
+                if self._tier_de.get(str(c.usuario)) == "tier1"
+            ]
+            resto_pasada = [
+                c for c in ejecutables
+                if self._tier_de.get(str(c.usuario)) != "tier1"
+            ]
+            if tier1_pasada and resto_pasada:
                 with self._lock:
-                    self.progreso["hechas"] += 1
-                    self.progreso["exitosas" if ok else "fallidas"] += 1
-                    resumen["exitosas" if ok else "fallidas"] += 1
-                    if rol_res in resumen["por_rol"]:
-                        if roles_aleatorios:
-                            resumen["por_rol"][rol_res]["total"] += 1
-                        resumen["por_rol"][rol_res][
-                            "exitosas" if ok else "fallidas"
-                        ] += 1
-                    self._registrar_evento_locked(
-                        usuario_res, ok, detalle, 1, rol_res, url
-                    )
-                    registrar_accion(
-                        usuario_res,
-                        tipo_registro_rol(rol_res),
-                        "exito" if ok else "fallido",
-                        url,
-                        detalle,
-                    )
-                    resumen["detalles"].append({
-                        "usuario": usuario_res,
-                        "rol": rol_res,
-                        "ok": ok,
-                        "detalle": detalle,
-                        "url": url,
-                    })
-                    if callback:
-                        callback(
-                            self.progreso["hechas"], len(procesables),
-                            usuario_res, ok,
-                        )
+                    self.progreso["fase_actual"] = 1
+                _pasada_rol_simple(
+                    tier1_pasada,
+                    max(1, min(int(duracion_min or 1), int(fase1_min))),
+                )
+                with self._lock:
+                    self.progreso["fase_actual"] = 2
+                # La fase 2 REAL empieza aqui (aunque la etapa 1 haya terminado
+                # antes del reloj): la cascada de URLs de Tier 1 ya aplica.
+                self._curva_fase2_t0 = time.monotonic() - 1.0
+                _pasada_rol_simple(
+                    resto_pasada,
+                    max(1, int(duracion_min or 1) - int(fase1_min)),
+                )
+                fase_final = 2
+            else:
+                _pasada_rol_simple(list(ejecutables), duracion_min)
+        else:
+            _pasada_rol_simple(list(ejecutables), duracion_min)
 
+        resumen["omitidas_por_cuota"] = omitidas_por_cuota
+        resumen["fase_actual"] = fase_final
         logger.info(
             f"Activacion por roles finalizada: {resumen['exitosas']} exitosas, "
             f"{resumen['fallidas']} fallidas de {resumen['total']} "
@@ -4407,6 +5403,7 @@ class MotorActivacion:
 
         La logica vive en `_ejecutar_campana_3_3_3_impl` (misma firma).
         """
+        inicio = time.monotonic()
         try:
             resumen = self._ejecutar_campana_3_3_3_impl(
                 urls_rt, urls_comentarios, textos_posts_por_cuenta,
@@ -4415,6 +5412,7 @@ class MotorActivacion:
             )
         finally:
             self._cerrar_pestanas()
+        self._loguear_rendimiento(inicio, resumen)
         return self._con_claves_pestana(resumen)
 
     def _ejecutar_campana_3_3_3_impl(
@@ -4451,6 +5449,7 @@ class MotorActivacion:
         # Cuotas horarias: cada campana arranca limpia y las prepara con las
         # cuentas ejecutables (mas abajo).
         self._cuotas = None
+        self._reset_curva_campana()
         try:
             urls_rt_limpias = [
                 str(u).strip() for u in (urls_rt or []) if str(u or "").strip()
@@ -4526,6 +5525,7 @@ class MotorActivacion:
                 "fallidas": 0,
                 "omitidas": 0,
                 "ronda_actual": 1,
+                "fase_actual": 1,
                 "eventos": [],
             }
 

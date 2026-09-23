@@ -90,6 +90,11 @@ class Cuenta(Base):
     # (casual de un renglon con faltas intencionales). Se reparte equitativo
     # entre las cuentas; ver core/perfiles.py.
     perfil_personalidad = Column(String(20), default="")
+    # Tier de calidad de la cuenta: "tier1" (Líder/Boosted; puede publicar
+    # posts originales con hashtags) o "tier2" (Volumen/Aged; PROHIBIDO el rol
+    # "hashtags", solo RT/Cita/Comentario). "" = sin clasificar (sin
+    # restriccion). Ver core/tiers.py.
+    tier_calidad = Column(String(20), default="")
     fecha_creacion = Column(DateTime, default=datetime.utcnow)
     totp_secret = Column(String(100), default="")
     email_password = Column(String(200), default="")

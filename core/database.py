@@ -136,6 +136,7 @@ NUEVAS_COLUMNAS_CUENTAS = {
     "personalidad": "TEXT",
     "rol_activacion": "VARCHAR(20) DEFAULT ''",
     "perfil_personalidad": "VARCHAR(20) DEFAULT ''",
+    "tier_calidad": "VARCHAR(20) DEFAULT ''",
     "totp_secret": "VARCHAR(100) DEFAULT ''",
     "email_password": "VARCHAR(200) DEFAULT ''",
     "auth_token": "VARCHAR(200) DEFAULT ''",

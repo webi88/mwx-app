@@ -1994,6 +1994,7 @@ class TwitterBot:
             return None
         
         t_inicio = self._ahora()
+        tiempos = {"compose": t_inicio, "escribir": t_inicio}
         try:
             # Compositor de POST NUEVO: prueba /compose/post, /compose/tweet y
             # el boton "Nuevo post" de /home, y distingue la sesion caida o
@@ -2001,28 +2002,55 @@ class TwitterBot:
             # `_abrir_compositor`). El editor devuelto es SIEMPRE visible
             # (evita escribir en un composer oculto que deja el boton Post
             # deshabilitado).
+            def _preparar_borrador() -> str:
+                """Abre el compositor y deja el contenido escrito (sin pulsar Post)."""
+                try:
+                    editor = self._abrir_compositor()
+                except Exception as e_compositor:
+                    # Sesion CDP invalida: UN fallback a login lento y UN reintento.
+                    if not (
+                        self._sesion_cdp
+                        and self._es_error_fatal_compositor(e_compositor)
+                        and self._revivir_sesion_cdp()
+                    ):
+                        raise
+                    editor = self._abrir_compositor()
+                tiempos["compose"] = self._ahora()
+
+                texto = self._recortar_para_x(self._reorganizar_hashtags(contenido))
+                self._pegar_texto(editor, texto)
+
+                if imagen_path and os.path.exists(imagen_path):
+                    self._subir_imagen(imagen_path)
+
+                time.sleep(random.uniform(0.15, 0.35))
+                tiempos["escribir"] = self._ahora()
+                return texto
+
             try:
-                editor = self._abrir_compositor()
-            except Exception as e_compositor:
-                # Sesion CDP invalida: UN fallback a login lento y UN reintento.
-                if not (
-                    self._sesion_cdp
-                    and self._es_error_fatal_compositor(e_compositor)
-                    and self._revivir_sesion_cdp()
+                contenido = _preparar_borrador()
+            except Exception as e_borrador:
+                # Blindaje: fallo TRANSITORIO del compositor/escritura (pagina
+                # de error o interstitial de X, editor bloqueado por la mascara
+                # del modal). Nada se publico todavia, asi que UN CICLO LIMPIO
+                # completo (refresh corto + recomponer + reescribir) es seguro.
+                # Sesion caida, anti-bot y driver roto NO se reintentan (los
+                # reconoce el motor). Mientras el reintento funcione todo queda
+                # en info/debug: sin errores ruidosos en la consola de Railway.
+                if (
+                    not self._es_fallo_transitorio_compositor(e_borrador)
+                    or not self.esta_vivo()
                 ):
                     raise
-                editor = self._abrir_compositor()
-            t_compose = self._ahora()
-            
-            contenido = self._reorganizar_hashtags(contenido)
-            contenido = self._recortar_para_x(contenido)
-            self._pegar_texto(editor, contenido)
-            
-            if imagen_path and os.path.exists(imagen_path):
-                self._subir_imagen(imagen_path)
-            
-            time.sleep(random.uniform(0.15, 0.35))
-            t_escribir = self._ahora()
+                logger.info(
+                    f"compositor/escritura con fallo transitorio @{self.usuario} "
+                    f"({type(e_borrador).__name__}: {e_borrador}); ciclo limpio "
+                    "(refresh corto + recomponer)"
+                )
+                self._refresh_corto(3)
+                contenido = _preparar_borrador()
+            t_compose = tiempos["compose"]
+            t_escribir = tiempos["escribir"]
 
             # Pausa humana: el tiempo que una persona tarda en releer el tuit
             # antes de enviarlo. Ademas, da margen a que X procese los eventos
@@ -2835,6 +2863,42 @@ class TwitterBot:
             return False
         return "página de error" in texto or "pagina de error" in texto
 
+    # Fallos TRANSITORIOS y SEGUROS del compositor/escritura (nada se publico
+    # todavia) que merecen UN ciclo limpio en `publicar_tweet` (refresh corto +
+    # recomponer + reescribir). Los rechazos de X y los problemas de
+    # sesion/anti-bot/driver NO estan aqui: esos se reportan tal cual.
+    _FALLOS_TRANSITORIOS_COMPOSITOR = (
+        "no se pudo escribir el texto en el editor de x",
+        "no se pudo limpiar",
+    )
+
+    @classmethod
+    def _es_fallo_transitorio_compositor(cls, error) -> bool:
+        """True si el fallo de compositor/escritura merece UN ciclo limpio.
+
+        Cubre SOLO fallos transitorios y seguros (nada se envio a X): la
+        pagina de error/interstitial generica de X ("compositor no disponible
+        (pagina de error de X)", "compositor de X no cargo") y no haber podido
+        escribir el texto por el bloqueo de la mascara del modal ("no se pudo
+        escribir el texto en el editor de X", "editor de X con borrador que no
+        se pudo limpiar"). NO cubre sesion caida, anti-bot ni driver roto:
+        `publicar_tweet` los propaga (el motor los reconoce) porque un refresh
+        no los arregla.
+        """
+        try:
+            texto = str(error or "").lower()
+        except Exception:
+            return False
+        if any(senal in texto for senal in cls._ERRORES_FATALES_COMPOSITOR):
+            return False
+        if "anti-bot" in texto or "cloudflare" in texto:
+            return False
+        if cls._es_fallo_pagina_error(error):
+            return True
+        if "compositor de x no cargo" in texto:
+            return True
+        return any(senal in texto for senal in cls._FALLOS_TRANSITORIOS_COMPOSITOR)
+
     # Selectores del compositor de X. El `data-testid` es el principal; los
     # contenteditables quedan como respaldo por si X cambia el testid.
     _EDITOR_SELECTORES = (
@@ -3279,6 +3343,12 @@ try {
         total (`_PRESUPUESTO_COMPOSITOR` ~38s) recorta las esperas para no
         eternizarse y los gets van acotados con `_get_acotado` (~20s).
 
+        Si las 3 rutas fallaron con la pagina de error/interstitial de X y aun
+        queda presupuesto, hay una ULTIMA fase acotada: `_refresh_corto(3)` en
+        la pestaña + UN reintento directo de `/compose/post` con esperas cortas
+        (<=8s/4s). Es SOLO para ese fallo transitorio: login, sesion caida,
+        anti-bot y driver roto se propagan antes (nunca se enmascaran).
+
         Un challenge anti-bot (Cloudflare en `/account/access`, "Just a
         moment...") lanza "X pidió verificación anti-bot (Cloudflare); no se
         pudo abrir el compositor": el motor lo trata como sesion caida de la
@@ -3292,6 +3362,10 @@ try {
         `_esperar_editor_visible`.
         """
         inicio = time.time()
+        # True si alguna ruta fallo por la pagina de error/interstitial de X:
+        # habilita la ULTIMA fase de recuperacion (refresh corto + reintento
+        # directo de /compose/post) antes del fallo controlado.
+        fallo_pagina_error = False
 
         def restante() -> float:
             """Segundos que quedan del presupuesto total (nunca negativo)."""
@@ -3448,6 +3522,7 @@ try {
                     # la pestaña por /home con `navegar_tolerante` (absorbe el
                     # interstitial de X) y se prueba la SIGUIENTE ruta con el
                     # presupuesto restante en vez de fallar de inmediato.
+                    fallo_pagina_error = True
                     logger.warning(
                         f"pagina de error de X persistente en {ruta}; "
                         "refresh tolerante por /home y siguiente ruta"
@@ -3494,6 +3569,8 @@ try {
             except Exception as e:
                 if self._es_error_fatal_compositor(e):
                     raise
+                if self._es_fallo_pagina_error(e):
+                    fallo_pagina_error = True
                 logger.warning(f"Compositor no disponible en /home: {e}")
                 if (
                     intento == 1
@@ -3508,6 +3585,61 @@ try {
             if intento == 1 and self._frase_error_pagina() and restante() > 1.0:
                 continue
             break
+
+        # 4) ULTIMA fase de recuperacion (fallos TRANSITORIOS): las 3 rutas
+        # cayeron en la pagina de error/interstitial de X y aun queda
+        # presupuesto. UN `_refresh_corto(3)` en la pestaña + UN reintento
+        # directo de /compose/post con esperas cortas (<=8s/4s). Login, sesion
+        # caida, anti-bot y driver roto NO llegan hasta aqui (se propagan
+        # antes), asi que este reintento jamas los enmascara y el exito de las
+        # rutas normales no cambia.
+        if (fallo_pagina_error or self._frase_error_pagina()) and restante() > 2.0:
+            logger.info(
+                "compositor: pagina de error/interstitial de X persistente; "
+                "refresh corto + reintento final de /compose/post"
+            )
+            self._refresh_corto(3)
+            try:
+                self._get_acotado(f"{self.base_url}/compose/post")
+                self._esperar_documento_listo(timeout=min(3, max(0.2, restante())))
+                self._verificar_anti_bot_compositor()
+                if self._hay_muro_login():
+                    raise Exception(
+                        "sesión de X expirada o inválida: se pidió login al "
+                        f"abrir el compositor ({self._diagnostico_pagina()})"
+                    )
+                if (
+                    self._frase_error_pagina()
+                    and self._primer_editor_visible() is None
+                ):
+                    logger.info(
+                        "compositor: la pagina de error de X sigue tras el "
+                        "reintento final"
+                    )
+                else:
+                    editor = esperar_compositor(
+                        min(8.0, restante()),
+                        min(4.0, max(0.0, restante() - min(8.0, restante()))),
+                    )
+                    if editor is not None:
+                        logger.info(
+                            "compositor abierto via /compose/post "
+                            "(reintento final)"
+                        )
+                        return editor
+            except (WebDriverException, MaxRetryError):
+                # Driver muerto: que el motor descarte la pestaña.
+                raise
+            except Exception as e:
+                if self._es_error_fatal_compositor(e):
+                    # Sesion caida: no hay nada mas que hacer.
+                    raise
+                # El anti-bot manda: no es sesion confirmada ni suspension.
+                self._verificar_anti_bot_compositor()
+                logger.info(
+                    "compositor: reintento final sin editor "
+                    f"({type(e).__name__}: {e})"
+                )
 
         if self._frase_error_pagina() and self._primer_editor_visible() is None:
             raise Exception(
@@ -4169,6 +4301,52 @@ try {
             f"({self._largo_editor(elemento)} chars)"
         )
 
+    def _destruir_mascara_modal(self) -> bool:
+        """Destruye TODAS las capas `[data-testid="mask"]` del modal.
+
+        Ghostban: la capa `mask` del modal interceptaba el clic del editor y
+        obligaba a usar insercion silenciosa por CDP/JS (que X detecta). Se
+        elimina ANTES de limpiar/escribir y tambien en el reintento limpio si
+        React la vuelve a montar. Absorbe CUALQUIER excepcion del renderer
+        (`TimeoutException`/`WebDriverException` transitorios incluidos) a
+        DEBUG: nunca lanza, nunca usa `logger.error`; si el JS falla, el
+        pegado continua con la red de seguridad de `_esperar_mask_desaparezca`.
+        Devuelve True si el JS corrio sin excepcion.
+        """
+        try:
+            self.driver.execute_script(
+                "document.querySelectorAll('[data-testid=\"mask\"]')"
+                ".forEach(e => e.remove());"
+            )
+            return True
+        except Exception as e:
+            logger.debug(
+                f"No se pudo destruir la capa mask del modal "
+                f"({type(e).__name__}: {e}); se continua con el pegado"
+            )
+            return False
+
+    def _hay_mask_modal(self) -> bool:
+        """True si hay alguna capa `[data-testid="mask"]` montada. Nunca lanza.
+
+        Si el `is_displayed()` del elemento falla (nodo raro del renderer) se
+        asume PRESENTE: es mejor un reintento limpio de mas que rendirse con el
+        editor tapado.
+        """
+        try:
+            elementos = self.driver.find_elements(
+                By.CSS_SELECTOR, "[data-testid='mask']"
+            )
+        except Exception:
+            return False
+        for el in elementos:
+            try:
+                if el.is_displayed():
+                    return True
+            except Exception:
+                return True
+        return bool(elementos)
+
     def _pegar_texto(self, elemento, texto: str):
         """Escribe `texto` en el editor con EVENTOS REALES de teclado.
 
@@ -4197,6 +4375,13 @@ try {
         se lanza `"editor de X con borrador que no se pudo limpiar (N chars)"`
         (nada se publico: fallo seguro para el motor).
 
+        Si la secuencia completa falla y hay mascara presente o el editor quedo
+        bloqueado por un overlay, se hace UN reintento limpio (una sola
+        pasada): re-destruir TODAS las capas `mask`, esperar <=1s, re-localizar
+        el editor visible y reintentar la MISMA secuencia (send_keys ->
+        ActionChains, eventos reales de teclado). El resto de fallos conserva
+        el mensaje exacto `"no se pudo escribir el texto en el editor de X"`.
+
         El DOM de X (React) se re-renderiza y el `WebElement` guardado puede
         quedar viejo (`StaleElementReferenceException`), perdiendo el intento:
         cada metodo tiene hasta 2 pasadas y, si el elemento queda viejo, se
@@ -4216,16 +4401,10 @@ try {
         # de `send_keys` y obligaba a usar insercion silenciosa por CDP/JS, que
         # X SI detecta como automatizacion (oculta los posts). Se destruye
         # ANTES de limpiar/escribir; si el JS falla, el pegado continua con la
-        # red de seguridad de `_intentar`/`_esperar_mask_desaparezca`.
-        try:
-            self.driver.execute_script(
-                "document.querySelectorAll('[data-testid=\"mask\"]').forEach(e => e.remove());"
-            )
-        except Exception as e:
-            logger.debug(
-                f"No se pudo destruir la capa mask del modal "
-                f"({type(e).__name__}: {e}); se continua con el pegado"
-            )
+        # red de seguridad de `_intentar`/`_esperar_mask_desaparezca`. Absorbe
+        # los TimeoutException/WebDriverException transitorios del renderer
+        # (solo DEBUG, nunca ERROR).
+        self._destruir_mascara_modal()
 
         estado = {"elemento": elemento}
 
@@ -4239,10 +4418,10 @@ try {
             except Exception:
                 return False
 
-        def _relocalizar() -> bool:
+        def _relocalizar(timeout: float = 5.0) -> bool:
             """Re-localiza el editor visible actual; True si hay uno fresco."""
             try:
-                fresco = self._buscar_editor_visible_actual()
+                fresco = self._buscar_editor_visible_actual(timeout=timeout)
             except Exception:
                 fresco = None
             if fresco is None:
@@ -4389,6 +4568,42 @@ try {
                     return True
             return False
 
+        def _bloqueo_de_overlay() -> bool:
+            """True si una mascara/overlay explica el fallo de escritura.
+
+            El mask del modal puede volver a montarse (React) o tapar el centro
+            del editor (`elementFromPoint`) aunque el nodo no figure en el
+            arbol: en ambos casos merece UN reintento limpio. Nunca lanza.
+            """
+            if self._hay_mask_modal():
+                return True
+            try:
+                if self._editor_no_ocluido(estado["elemento"]) is False:
+                    return True
+            except Exception:
+                pass
+            return False
+
+        def _reintento_limpio_tras_bloqueo() -> bool:
+            """UN reintento limpio si la mascara/overlay bloqueo la escritura.
+
+            Re-destruye TODAS las capas `[data-testid="mask"]` (absorbiendo
+            cualquier excepcion del renderer), espera <=1s, re-localiza el
+            editor VISIBLE y reintenta la MISMA secuencia de escritura (eventos
+            reales de teclado). Devuelve True si el texto quedo; el flujo jamas
+            hace mas de UNA pasada.
+            """
+            if not _bloqueo_de_overlay():
+                return False
+            logger.info(
+                "editor de X bloqueado por la mascara del modal; reintento "
+                "limpio (destruir mask + re-localizar + reescribir)"
+            )
+            self._destruir_mascara_modal()
+            _esperar_mask_desaparezca(1.0)
+            _relocalizar(timeout=1.0)
+            return _escribir_con_metodos()
+
         # P0: ANTES de escribir, VACIAR el editor. X restaura el borrador del
         # composer entre intentos (misma cuenta/pestaña) y el pegado lo
         # ACUMULABA (1800-2600 chars > 280: el boton Post quedaba deshabilitado
@@ -4397,7 +4612,10 @@ try {
         self._limpiar_editor_x(estado["elemento"])
 
         if not _escribir_con_metodos():
-            raise Exception("no se pudo escribir el texto en el editor de X")
+            # Blindaje extra: si el mask volvio a montarse o el editor quedo
+            # bloqueado por un overlay, UN reintento limpio antes de rendirse.
+            if not _reintento_limpio_tras_bloqueo():
+                raise Exception("no se pudo escribir el texto en el editor de X")
 
         # P0: el borrador puede restaurarse DESPUES de la limpieza (React) y
         # colarse junto al texto nuevo. Si el editor quedo con restos, se
