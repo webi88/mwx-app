@@ -508,6 +508,268 @@ def test_asignar_ia(check):
 
 
 # --------------------------------------------------------------------------- #
+# (d2) es_handle_generico + proteccion anti-sobrescritura
+# --------------------------------------------------------------------------- #
+def test_handle_generico(check):
+    print("(d2) es_handle_generico: basura de proveedor vs identidad humana")
+    for handle in (
+        "Katiaforbx7m",
+        "GoodWinsnvn",
+        "khawajaGjdgi",
+        "Sajtiagosal21",
+        "qwrtyps12x",
+    ):
+        check(
+            f"handle {handle!r} -> generico",
+            gi.es_handle_generico(handle) is True,
+            repr(gi.es_handle_generico(handle)),
+        )
+    for handle in (
+        "UnidosMovCDMX",
+        "Barrio_naranja",
+        "VozLibertad",
+        "JusticiaYa",
+        "AnalisisIP",
+        "ConsultoriaDatos",
+        "MariaLopez",
+        "lupita_hdz",
+        "4T_puntodos",
+        "NeraFarner",
+        "Unidos en Movimiento",
+        "Katia",
+        "",
+        None,
+    ):
+        check(
+            f"handle {handle!r} -> humano/legitimo (no generico)",
+            gi.es_handle_generico(handle) is False,
+            repr(gi.es_handle_generico(handle)),
+        )
+    check(
+        "handle: entrada rara (objeto) no lanza y devuelve False",
+        gi.es_handle_generico(object()) is False,
+        repr(gi.es_handle_generico(object())),
+    )
+
+    check(
+        "_cuenta_protegida: handle_actual humano protege",
+        gi._cuenta_protegida(
+            _cuenta("u1", handle_actual="UnidosMovCDMX")
+        )[0]
+        is True,
+    )
+    check(
+        "_cuenta_protegida: nombre_mostrado humano protege aunque el handle sea basura",
+        gi._cuenta_protegida(
+            _cuenta(
+                "u2",
+                handle_actual="Katiaforbx7m",
+                nombre_mostrado="Lupita Hernández",
+            )
+        )
+        == (True, "nombre_mostrado", "Lupita Hernández"),
+    )
+    check(
+        "_cuenta_protegida: propuesta previa tambien protege",
+        gi._cuenta_protegida(
+            _cuenta("u3", handle_actual="GoodWinsnvn", handle_propuesto="VozLibertad")
+        )
+        == (True, "propuesta", "VozLibertad"),
+    )
+    check(
+        "_cuenta_protegida: handle basura sin nombre no protege",
+        gi._cuenta_protegida(
+            _cuenta("u4", handle_actual="GoodWinsnvn", nombre_mostrado="GoodWinsnvn")
+        )
+        == (False, "", ""),
+    )
+    check(
+        "_cuenta_protegida: cuenta sin datos no protege",
+        gi._cuenta_protegida(_cuenta("u5", handle_actual="")) == (False, "", ""),
+    )
+
+
+def test_proteccion_asignar(check):
+    print("(d3) asignar_propuestas: protege brandeadas y omite su generacion")
+
+    cuentas = [
+        _cuenta(
+            "humana_handle",
+            handle_actual="UnidosMovCDMX",
+            nombre_mostrado="Unidos en Movimiento",
+            tipo_cuenta="politica",
+            seccion="IP",
+        ),
+        _cuenta(
+            "humana_nombre",
+            handle_actual="Katiaforbx7m",
+            nombre_mostrado="Lupita Hernández",
+            tipo_cuenta="activista",
+            seccion="LIB",
+        ),
+        _cuenta(
+            "con_propuesta",
+            handle_actual="",
+            nombre_mostrado="",
+            handle_propuesto="VozLibertad",
+        ),
+        _cuenta(
+            "generica_ip",
+            handle_actual="GoodWinsnvn",
+            nombre_mostrado="GoodWinsnvn",
+            tipo_cuenta="politica",
+            seccion="IP",
+        ),
+        _cuenta(
+            "generica_lib",
+            handle_actual="khawajaGjdgi",
+            tipo_cuenta="activista",
+            seccion="LIB",
+        ),
+        _cuenta(
+            "generica_ciud",
+            handle_actual="",
+            tipo_cuenta="ciudadana",
+            seccion="JUS",
+        ),
+    ]
+    usuarios = [c.usuario for c in cuentas]
+    with _bd_falsa(_FakeDB(cuentas)), mock.patch.object(
+        gi, "_openai_disponible", lambda: False
+    ):
+        res = gi.asignar_propuestas(usuarios, dry_run=True, proteger_brandeadas=True)
+        res_sin = gi.asignar_propuestas(usuarios, dry_run=True)
+
+    check(
+        "proteccion: total es el de la lista recibida",
+        res.get("total") == 6,
+        f"total={res.get('total')}",
+    )
+    check(
+        "proteccion: 3 omitidas y 3 propuestas",
+        res.get("omitidas_protegidas") == 3 and res.get("ok") == 3,
+        f"omitidas={res.get('omitidas_protegidas')} ok={res.get('ok')} "
+        f"errores={res.get('errores')}",
+    )
+    check(
+        "proteccion: protegidas_usuarios exacto",
+        set(res.get("protegidas_usuarios") or [])
+        == {"humana_handle", "humana_nombre", "con_propuesta"},
+        repr(res.get("protegidas_usuarios")),
+    )
+    detalle = {
+        (d.get("usuario"), d.get("campo")): d.get("valor")
+        for d in res.get("protegidas_detalle") or []
+        if isinstance(d, dict)
+    }
+    check(
+        "proteccion: detalle con campo/valor por cuenta",
+        detalle.get(("humana_handle", "handle_actual")) == "UnidosMovCDMX"
+        and detalle.get(("humana_nombre", "nombre_mostrado")) == "Lupita Hernández"
+        and detalle.get(("con_propuesta", "propuesta")) == "VozLibertad",
+        repr(res.get("protegidas_detalle")),
+    )
+    check(
+        "proteccion: las genericas SI reciben propuesta",
+        {p.get("usuario") for p in res.get("propuestas") or []}
+        == {"generica_ip", "generica_lib", "generica_ciud"},
+        repr([p.get("usuario") for p in res.get("propuestas") or []]),
+    )
+    check(
+        "proteccion: sin el flag todas se procesan (retrocompatible)",
+        res_sin.get("ok") == 6
+        and res_sin.get("omitidas_protegidas") == 0
+        and not res_sin.get("protegidas_usuarios"),
+        f"ok={res_sin.get('ok')} omitidas={res_sin.get('omitidas_protegidas')}",
+    )
+
+
+# --------------------------------------------------------------------------- #
+# (d4) cruce registro + seccion (grupos y prompt)
+# --------------------------------------------------------------------------- #
+def test_cruce_registro_seccion(check):
+    print("(d4) cruce registro+seccion: grupos por (tipo, seccion, registro) y prompt")
+
+    capturas = []
+
+    def _lote_captura(cantidad, tipo, seccion, contexto, evitar, rng=random, registro=""):
+        capturas.append((tipo, seccion, registro))
+        return []
+
+    cuentas = [
+        _cuenta(
+            "politica_ip",
+            handle_actual="GoodWinsnvn",
+            tipo_cuenta="politica",
+            seccion="IP",
+        ),
+        _cuenta(
+            "activista_lib",
+            handle_actual="khawajaGjdgi",
+            tipo_cuenta="activista",
+            seccion="LIB",
+        ),
+        _cuenta(
+            "ciudadana_jus",
+            handle_actual="",
+            tipo_cuenta="ciudadana",
+            seccion="JUS",
+        ),
+    ]
+    with _bd_falsa(_FakeDB(cuentas)), mock.patch.object(
+        gi, "_openai_disponible", lambda: True
+    ), mock.patch.object(gi, "_pedir_openai_lote", _lote_captura):
+        res = gi.asignar_propuestas([c.usuario for c in cuentas], dry_run=True)
+
+    check(
+        "cruce: politica+IP -> (movimiento, IP, politica)",
+        ("movimiento", "IP", "politica") in capturas,
+        repr(capturas),
+    )
+    check(
+        "cruce: activista+LIB -> (persona, LIB, activista)",
+        ("persona", "LIB", "activista") in capturas,
+        repr(capturas),
+    )
+    check(
+        "cruce: ciudadana IGNORA su seccion -> (persona, '', ciudadana)",
+        ("persona", "", "ciudadana") in capturas,
+        repr(capturas),
+    )
+    check(
+        "cruce: las 3 cuentas reciben propuesta",
+        res.get("ok") == 3,
+        f"ok={res.get('ok')} errores={res.get('errores')}",
+    )
+
+    p_ip = gi._construir_prompt(5, "persona", "IP", "", set(), registro="politica")
+    p_lib = gi._construir_prompt(5, "persona", "LIB", "", set(), registro="activista")
+    p_ciud = gi._construir_prompt(5, "persona", "JUS", "", set(), registro="ciudadana")
+    check(
+        "prompt IP+politica: AnalisisIP/ConsultoriaDatos/MANDAN",
+        all(k in p_ip for k in ("AnalisisIP", "ConsultoriaDatos", "MANDAN")),
+        repr([k for k in ("AnalisisIP", "ConsultoriaDatos", "MANDAN") if k not in p_ip]),
+    )
+    check(
+        "prompt LIB+activista: VozLibertad/JusticiaYa",
+        all(k in p_lib for k in ("VozLibertad", "JusticiaYa")),
+        repr([k for k in ("VozLibertad", "JusticiaYa") if k not in p_lib]),
+    )
+    check(
+        "prompt ciudadana: no menciona la seccion de la cuenta",
+        "Contexto de seccion" not in p_ciud and "JUS" not in p_ciud.replace(
+            "LIB/JUS", ""
+        ),
+        f"seccion_en_prompt={'Contexto de seccion' in p_ciud}",
+    )
+    check(
+        "prompt ciudadana: regla explicita de ignorar seccion",
+        "ciudadana" in p_ciud.lower() and "IGNORA" in p_ciud,
+        repr(p_ciud[-200:]),
+    )
+
+
+# --------------------------------------------------------------------------- #
 # (e) aplicar_propuestas_en_lote
 # --------------------------------------------------------------------------- #
 def test_aplicar_lote(check):
@@ -744,6 +1006,9 @@ def run(check):
     test_partido_local(check)
     test_asignar_mixto(check)
     test_asignar_ia(check)
+    test_handle_generico(check)
+    test_proteccion_asignar(check)
+    test_cruce_registro_seccion(check)
     test_aplicar_lote(check)
     test_ia_disponible(check)
 

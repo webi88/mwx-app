@@ -1694,22 +1694,84 @@ def _a_int(valor) -> int:
         return 0
 
 
-def _llamar_asignar_propuestas(func, usuarios, tipo, seccion, contexto=""):
-    """Llama `asignar_propuestas` pasando `contexto` solo si el backend lo acepta.
+def _llamar_asignar_propuestas(
+    func, usuarios, tipo, seccion, contexto="", proteger_brandeadas=None
+):
+    """Llama `asignar_propuestas` pasando solo los kwargs que el backend acepta.
 
-    Fallback para firmas viejas: si el backend aún no tiene el parámetro
-    `contexto` se omite, y si lanza `TypeError` al recibirlo se reintenta sin
-    él (la UI no se rompe mientras el backend se actualiza en paralelo)."""
+    Fallback para firmas viejas: `contexto` y `proteger_brandeadas` se omiten
+    si el backend no los tiene, y si lanza `TypeError` al recibirlos se
+    reintenta sin ellos (la UI no se rompe mientras el backend se actualiza en
+    paralelo). `proteger_brandeadas=None` significa "no enviar el kwarg"."""
     kwargs = {"tipo": tipo, "seccion": seccion, "dry_run": False}
     if contexto and _soporta_kwargs(func, ("contexto",)):
         kwargs["contexto"] = contexto
+    if proteger_brandeadas is not None and _soporta_kwargs(
+        func, ("proteger_brandeadas",)
+    ):
+        kwargs["proteger_brandeadas"] = bool(proteger_brandeadas)
     try:
         return func(usuarios, **kwargs)
     except TypeError:
+        # Reintento tolerante: quita UN kwarg opcional por vuelta (primero el
+        # nuevo, después el clásico) para firmas intermedias que aceptan el
+        # parámetro pero lo rechazan en runtime.
+        if "proteger_brandeadas" in kwargs:
+            kwargs.pop("proteger_brandeadas", None)
+            try:
+                return func(usuarios, **kwargs)
+            except TypeError:
+                pass
         if "contexto" in kwargs:
             kwargs.pop("contexto", None)
             return func(usuarios, **kwargs)
         raise
+
+
+def _detalle_protegidas(usuarios, detalle):
+    """Lista legible de cuentas omitidas por protección de identidad.
+
+    `usuarios`: nombres omitidos; `detalle`: filas opcionales con
+    `{"usuario", "campo", "valor"}` (campo/valor que ya parecía brandeado)."""
+    usuarios = [str(u).strip().lstrip("@") for u in (usuarios or []) if str(u).strip()]
+    usuarios = list(dict.fromkeys(usuarios))
+    if usuarios:
+        st.markdown(
+            "Cuentas omitidas: " + ", ".join(f"`@{u}`" for u in usuarios[:100])
+        )
+    detalles = [d for d in (detalle or []) if isinstance(d, dict)]
+    for fila in detalles[:100]:
+        usuario = str(fila.get("usuario") or "?").strip().lstrip("@") or "?"
+        campo = str(fila.get("campo") or "").strip()
+        valor = str(fila.get("valor") or "").strip()
+        partes = [f"`@{usuario}`"]
+        if campo:
+            partes.append(campo)
+        if valor:
+            partes.append(f"«{valor}»")
+        st.markdown("- " + " — ".join(partes))
+    if not usuarios and not detalles:
+        st.caption("El backend no detalló qué cuentas se omitieron.")
+
+
+def _banner_protegidas_pendientes():
+    """Banner persistente (sobrevive al `st.rerun()`) de la última generación.
+
+    Se apoya en `st.session_state["nom_protegidas"]`, que guarda el resumen de
+    `omitidas_protegidas`/`protegidas_usuarios`/`protegidas_detalle` de la
+    última generación de propuestas."""
+    resumen = st.session_state.get("nom_protegidas") or {}
+    count = _a_int(resumen.get("count"))
+    if count <= 0:
+        return
+    st.warning(
+        f"🛡️ Protección de identidad: {count} cuenta(s) fueron omitidas en "
+        "esta generación porque ya parecían brandeadas."
+    )
+    with st.expander(
+        f"🛡️ Cuentas omitidas para proteger su identidad ({count})"
+    ):
+        _detalle_protegidas(resumen.get("usuarios"), resumen.get("detalle"))
 
 
 def _tab_nombres():
@@ -1806,6 +1868,17 @@ def _tab_nombres():
         ),
     )
 
+    proteger_brandeadas = st.checkbox(
+        "🛡️ Proteger cuentas ya brandeadas",
+        value=True,
+        key="nom_proteger_brandeadas",
+        help=(
+            "Si está activo, se omiten las cuentas cuyo @handle_actual o "
+            "nombre_mostrado ya parezca humano/legítimo (o que ya tengan "
+            "propuesta), para no sobrescribir su identidad."
+        ),
+    )
+
     if st.button(
         "✨ Generar propuestas",
         type="primary",
@@ -1831,6 +1904,7 @@ def _tab_nombres():
                         tipo_codigo,
                         seccion_ctx,
                         contexto_generar,
+                        proteger_brandeadas=bool(proteger_brandeadas),
                     )
                 _listar_cuentas.clear()
                 c1, c2, c3, c4 = st.columns(4)
@@ -1854,6 +1928,41 @@ def _tab_nombres():
                     )
                 if descripcion_sel:
                     st.caption(f"Generado con: {descripcion_sel}")
+
+                # Cuentas omitidas por protección de identidad: se guardan en
+                # session_state porque el st.rerun() de abajo descarta lo
+                # pintado en este run; el banner del paso 3️⃣ las re-muestra.
+                omitidas = _a_int(res.get("omitidas_protegidas"))
+                if omitidas:
+                    protegidas_usuarios = [
+                        str(u).strip().lstrip("@")
+                        for u in (res.get("protegidas_usuarios") or [])
+                        if str(u).strip()
+                    ]
+                    protegidas_detalle = [
+                        dict(d)
+                        for d in (res.get("protegidas_detalle") or [])
+                        if isinstance(d, dict)
+                    ]
+                    st.session_state["nom_protegidas"] = {
+                        "count": omitidas,
+                        "usuarios": list(dict.fromkeys(protegidas_usuarios)),
+                        "detalle": protegidas_detalle,
+                    }
+                    st.warning(
+                        f"🛡️ {omitidas} cuenta(s) omitida(s) para proteger su "
+                        "identidad actual."
+                    )
+                    with st.expander(
+                        f"🛡️ Cuentas omitidas para proteger su identidad "
+                        f"({omitidas})"
+                    ):
+                        _detalle_protegidas(
+                            protegidas_usuarios, protegidas_detalle
+                        )
+                else:
+                    st.session_state.pop("nom_protegidas", None)
+
                 _flash(
                     f"Propuestas generadas: {res.get('ok', 0)}/"
                     f"{res.get('total', 0)} cuenta(s)."
@@ -1867,6 +1976,8 @@ def _tab_nombres():
     # ---------------- Tabla editable ----------------
     st.markdown("---")
     st.markdown("#### 3️⃣ Revisa y guarda las propuestas")
+    _banner_protegidas_pendientes()
+
     con_propuesta = [
         f
         for f in _listar_cuentas(OPCION_TODAS)

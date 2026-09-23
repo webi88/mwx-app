@@ -12,6 +12,7 @@ Los perfiles de redaccion (formal/ciudadano/popular) viven en
 formato obligatorio que se agrega al prompt.
 """
 import re
+import unicodedata
 
 from core.perfiles import normalizar_perfil
 
@@ -254,6 +255,22 @@ def bloque_estilo_perfil(perfil: str, comentario: bool = False) -> str:
 
 # Instrucciones por tema para el mantenimiento organico de cuentas.
 # "personalidad" es un texto libre generado por otro modulo (cuentas/).
+def _instruccion_tema(titulo: str, guias) -> str:
+    """Instruccion compacta y ESPECIFICA de un tema cotidiano (nunca generica).
+
+    Formato: "TEMA: <titulo>." + 1-2 guias propias + la guia comun de tono
+    (cotidiano y cercano, sin inventar datos verificables ni meterse en
+    politica). Se usa para construir ``_INSTRUCCIONES_TEMA`` sin duplicar texto.
+    """
+    lineas = [f"TEMA: {titulo}."]
+    lineas.extend(f"- {g}" for g in guias)
+    lineas.append(
+        "- Tono cotidiano, cercano y en primera persona; SIN inventar datos "
+        "verificables ni meterse en política."
+    )
+    return "\n".join(lineas)
+
+
 _INSTRUCCIONES_TEMA = {
     "azteca": (
         "TEMA: AZTECA / CULTURA PREHISPANICA.\n"
@@ -281,37 +298,549 @@ _INSTRUCCIONES_TEMA = {
     ),
 }
 
-TEMAS_MANTENIMIENTO = ("azteca", "dia", "tendencias", "gustos")
+# Temas NUEVOS (mas de 30 cotidianos y seguros): cada uno con su instruccion
+# propia. El orden del tuple alterna FAMILIAS de vocabulario para que los
+# textos consecutivos de una misma cuenta (temas rotativos) nunca caigan en la
+# misma familia (y por tanto no compartan palabras clave).
+_INSTRUCCIONES_TEMA.update({
+    "trafico": _instruccion_tema(
+        "TRAFICO / TRASLADOS VIALES",
+        (
+            "Habla del trafico y los traslados cotidianos (horas pico, "
+            "avenidas, esperas) con humor o resignacion, en primera persona.",
+            "Puedes compartir un truco del trayecto o recomendar salir "
+            "temprano; nada de cifras ni datos oficiales.",
+        ),
+    ),
+    "clima": _instruccion_tema(
+        "CLIMA / TIEMPO DEL DIA",
+        (
+            "Comenta el clima del dia (calor, frio, viento, cielo) y como te "
+            "afecta en lo cotidiano.",
+            "Evita pronosticos o datos exactos: habla de lo que sientes y de "
+            "los planes que cambian.",
+        ),
+    ),
+    "comida": _instruccion_tema(
+        "COMIDA Y ANTOJOS",
+        (
+            "Habla de antojos, platillos de casa y comida cotidiana con gusto "
+            "y cercania.",
+            "Puedes preguntar por el platillo favorito de la gente o contar que "
+            "se te antojo hoy.",
+        ),
+    ),
+    "series": _instruccion_tema(
+        "SERIES Y TELEVISION",
+        (
+            "Comenta series, capitulos o maratones recientes y pide "
+            "recomendaciones sin destripar tramas.",
+            "Tono de sobremesa: que estas viendo, que te engancho y que verias "
+            "otra vez.",
+        ),
+    ),
+    "lunes": _instruccion_tema(
+        "LUNES / INICIO DE SEMANA",
+        (
+            "Habla del inicio de semana con humor: flojera, cafe, pendientes y "
+            "ganas de arrancar.",
+            "Mantente en la vida diaria: el lunes es tema de animo, no de "
+            "politica.",
+        ),
+    ),
+    "insomnio": _instruccion_tema(
+        "INSOMNIO / NO PODER DORMIR",
+        (
+            "Comenta las noches sin dormir, el celular a deshoras o la mente "
+            "dando vueltas.",
+            "Tono honesto y ligero; puedes preguntar que hace la gente cuando "
+            "no puede dormir.",
+        ),
+    ),
+    "futbol": _instruccion_tema(
+        "FUTBOL / PELOTA",
+        (
+            "Habla de futbol como pasion cotidiana: partidos, porras, jugadas y "
+            "recuerdos.",
+            "Sin datos ni resultados inventados: mejor la emocion, la porra y "
+            "lo que se vive en casa.",
+        ),
+    ),
+    "memes": _instruccion_tema(
+        "MEMES / HUMOR DIGITAL",
+        (
+            "Conversa sobre memes y humor de internet: lo que te dio risa hoy o "
+            "el meme que anda en el grupo.",
+            "Tono ligero y respetuoso; nada de burlas a personas ni temas "
+            "sensibles.",
+        ),
+    ),
+    "motivacion": _instruccion_tema(
+        "MOTIVACION / ANIMO",
+        (
+            "Comparte animo y frases motivacionales propias para empezar el dia "
+            "o seguir adelante.",
+            "Habla desde lo personal: un aprendizaje, un proposito o una meta "
+            "pequena.",
+        ),
+    ),
+    "mascotas": _instruccion_tema(
+        "MASCOTAS",
+        (
+            "Habla de perros, gatos o mascotas de casa: travesuras, paseos y "
+            "compania.",
+            "Tono tierno y cotidiano; puedes preguntar por las mascotas de la "
+            "gente.",
+        ),
+    ),
+    "cafe": _instruccion_tema(
+        "CAFE / RITUAL DE LA MANANA",
+        (
+            "Habla del cafe y su ritual diario: el de la manana, la platica, el "
+            "descanso.",
+            "Puedes preguntar como lo toman o contar el momento del dia en que "
+            "mas sabe.",
+        ),
+    ),
+    "musica": _instruccion_tema(
+        "MUSICA / CANCIONES",
+        (
+            "Comenta musica y canciones que te acompanan: generos, recuerdos, "
+            "playlists.",
+            "Pide recomendaciones o cuenta que cancion no te cansas de "
+            "escuchar.",
+        ),
+    ),
+    "vecinos": _instruccion_tema(
+        "VECINOS / CONVIVENCIA",
+        (
+            "Habla de la vida con los vecinos: convivencia, ruidos, favores y "
+            "detalles.",
+            "Tono amable, sin conflictos ni quejas fuertes.",
+        ),
+    ),
+    "transporte": _instruccion_tema(
+        "TRANSPORTE PUBLICO",
+        (
+            "Comenta el transporte publico del dia a dia: camiones, metro, bici "
+            "o caminatas.",
+            "Tono de experiencia propia; sin tarifas ni cifras.",
+        ),
+    ),
+    "filas": _instruccion_tema(
+        "FILAS Y ESPERAS",
+        (
+            "Habla de las filas y esperas cotidianas (banco, super, tramites) "
+            "con humor.",
+            "Puedes contar un truco para hacer la espera mas amena.",
+        ),
+    ),
+    "calor": _instruccion_tema(
+        "CALOR / TEMPORADA",
+        (
+            "Comenta el calor de la temporada y como lo llevas: sombra, agua, "
+            "ventilador.",
+            "Tono de queja amable y cotidiana; sin datos meteorologicos.",
+        ),
+    ),
+    "lluvia": _instruccion_tema(
+        "LLUVIA",
+        (
+            "Habla de la lluvia: lo que cambio el plan, el olor a tierra y los "
+            "charcos.",
+            "Tono sensorial y cercano; puedes preguntar si a la gente le gusta "
+            "la lluvia.",
+        ),
+    ),
+    "finde": _instruccion_tema(
+        "FIN DE SEMANA",
+        (
+            "Celebra o planea el fin de semana: descanso, salida, familia o "
+            "casa.",
+            "Pregunta a la gente por sus planes sin prometer eventos.",
+        ),
+    ),
+    "deportes": _instruccion_tema(
+        "DEPORTES / EJERCICIO",
+        (
+            "Habla de deportes en general (correr, bici, basquet, gimnasio) "
+            "como parte del dia.",
+            "Comparte animo y habitos; sin marcas ni datos verificables.",
+        ),
+    ),
+    "recuerdos": _instruccion_tema(
+        "RECUERDOS / INFANCIA",
+        (
+            "Comparte recuerdos bonitos de la infancia, la escuela o el barrio.",
+            "Tono nostalgico y calido; invita a la gente a contar los suyos.",
+        ),
+    ),
+    "escuela": _instruccion_tema(
+        "ESCUELA / ESTUDIO",
+        (
+            "Habla de la escuela y el estudio: clases, examenes, amigos y "
+            "aprendizajes.",
+            "Puedes recordar tu epoca escolar o animar a quien estudia.",
+        ),
+    ),
+    "trabajo": _instruccion_tema(
+        "TRABAJO / CHAMBA",
+        (
+            "Comenta la vida laboral cotidiana: pendientes, juntas y orgullo "
+            "por el esfuerzo.",
+            "Tono cercano y humano; sin mencionar empresas ni puestos "
+            "concretos.",
+        ),
+    ),
+    "home_office": _instruccion_tema(
+        "HOME OFFICE / TRABAJO DESDE CASA",
+        (
+            "Habla del trabajo desde casa: pijama, cafe, pausas y convivencia.",
+            "Tono relajado y honesto sobre sus ventajas y retos.",
+        ),
+    ),
+    "super": _instruccion_tema(
+        "SUPER / MERCADO",
+        (
+            "Comenta la ida al super o al mercado: la lista, los precios y lo "
+            "que se antojo.",
+            "Sin cifras ni marcas: habla de la experiencia y de los antojos.",
+        ),
+    ),
+    "cocina": _instruccion_tema(
+        "COCINA / RECETAS DE CASA",
+        (
+            "Habla de cocinar en casa: recetas sencillas, olores y lo que se te "
+            "quemo.",
+            "Puedes compartir un truco de cocina o preguntar que se cocina hoy.",
+        ),
+    ),
+    "postres": _instruccion_tema(
+        "POSTRES / PAN DULCE",
+        (
+            "Habla de postres y pan dulce: lo dulce de la tarde, el antojo y la "
+            "sobremesa.",
+            "Tono goloso y alegre; pregunta por el postre favorito.",
+        ),
+    ),
+    "tacos": _instruccion_tema(
+        "TACOS / ANTOJITOS",
+        (
+            "Habla de tacos y antojitos mexicanos como plan cotidiano.",
+            "Tono sabroso y de barrio; sin resenar locales concretos.",
+        ),
+    ),
+    "netflix": _instruccion_tema(
+        "NETFLIX / PLATAFORMAS",
+        (
+            "Comenta lo que estas viendo en plataformas: estrenos, maratones y "
+            "recomendaciones.",
+            "Sin destripar tramas ni inventar titulos: habla de generos y "
+            "sensaciones.",
+        ),
+    ),
+    "videojuegos": _instruccion_tema(
+        "VIDEOJUEGOS / PARTIDAS",
+        (
+            "Habla de videojuegos y partidas: retos, nostalgia y jugar con "
+            "amigos.",
+            "Puedes preguntar a que juega la gente o recordar un juego clasico.",
+        ),
+    ),
+    "podcast": _instruccion_tema(
+        "PODCAST / AUDIO",
+        (
+            "Comenta podcasts que escuchas: temas, voces y momentos para "
+            "oirlos.",
+            "Recomienda sin inventar nombres: habla del tipo de contenido.",
+        ),
+    ),
+    "libros": _instruccion_tema(
+        "LIBROS / LECTURA",
+        (
+            "Habla de libros y lectura: lo que estas leyendo, generos y frases "
+            "que te marcaron.",
+            "Sin citar textualmente; comparte que te hace sentir leer.",
+        ),
+    ),
+    "viajes": _instruccion_tema(
+        "VIAJES / VACACIONES",
+        (
+            "Habla de viajes y ganas de conocer: planes, maletas y lugares "
+            "sonados.",
+            "Sin datos turisticos exactos; mejor la ilusion y los preparativos.",
+        ),
+    ),
+    "carretera": _instruccion_tema(
+        "CARRETERA / CAMINO",
+        (
+            "Comenta los viajes por carretera: paisajes, paradas y musica a "
+            "todo volumen.",
+            "Tono aventurero y cotidiano; sin rutas ni cifras.",
+        ),
+    ),
+    "playa": _instruccion_tema(
+        "PLAYA / MAR",
+        (
+            "Habla de la playa: el mar, la arena, el descanso y la familia.",
+            "Tono fresco y relajado; sin promociones turisticas.",
+        ),
+    ),
+    "barrio": _instruccion_tema(
+        "BARRIO / COLONIA",
+        (
+            "Habla del barrio o la colonia: calles, negocios, gente y "
+            "tradiciones.",
+            "Tono de pertenencia y carino; sin conflictos ni politica.",
+        ),
+    ),
+    "familia": _instruccion_tema(
+        "FAMILIA / CASA",
+        (
+            "Comenta la vida en familia: comidas, platicas, apoyo y rutinas.",
+            "Tono calido; puedes compartir un momento familiar sencillo.",
+        ),
+    ),
+    "abuelos": _instruccion_tema(
+        "ABUELOS / MAYORES",
+        (
+            "Habla de los abuelos y los mayores: ensenanzas, historias y "
+            "carino.",
+            "Tono respetuoso y nostalgico; invita a valorar a los mayores.",
+        ),
+    ),
+    "amistad": _instruccion_tema(
+        "AMISTAD / AMIGOS",
+        (
+            "Habla de la amistad: amigas y amigos, platicas y apoyo en las "
+            "buenas y en las malas.",
+            "Tono cercano; puedes dedicar el texto a alguien sin usar "
+            "@menciones.",
+        ),
+    ),
+})
+
+# Temas de mantenimiento (una sola fuente de verdad). Orden pensado para que
+# los temas CONSECUTIVOS sean de familias de vocabulario DISTINTAS: con la
+# rotacion por (cuenta, texto) los dos textos de una misma cuenta nunca caen
+# en la misma familia. El orden NO debe aleatorizarse: `web/operaciones/posts.py`
+# etiqueta el plan con `temas[(i * n + j) % len(temas)]` y debe coincidir.
+TEMAS_MANTENIMIENTO = (
+    # Legacy (retrocompatibilidad; sus instrucciones no cambian)
+    "azteca",
+    "trafico",
+    "clima",
+    "comida",
+    "series",
+    "lunes",
+    "futbol",
+    "memes",
+    "motivacion",
+    "mascotas",
+    "dia",
+    "transporte",
+    "calor",
+    "cafe",
+    "netflix",
+    "insomnio",
+    "deportes",
+    "gustos",
+    "filas",
+    "lluvia",
+    "super",
+    "videojuegos",
+    "finde",
+    "tendencias",
+    "carretera",
+    "cocina",
+    "podcast",
+    "escuela",
+    "musica",
+    "vecinos",
+    "postres",
+    "libros",
+    "trabajo",
+    "barrio",
+    "tacos",
+    "home_office",
+    "familia",
+    "amistad",
+    "playa",
+    "recuerdos",
+    "viajes",
+    "abuelos",
+)
 
 
 def _normalizar_tema(tema: str = "") -> str:
-    """Normaliza el nombre del tema (minusculas, sin acentos y con alias)."""
-    t = (tema or "").strip().lower()
-    for acentuada, plana in (
-        ("í", "i"), ("á", "a"), ("é", "e"), ("ó", "o"), ("ú", "u"),
-    ):
-        t = t.replace(acentuada, plana)
+    """Normaliza el nombre del tema (minusculas, sin acentos y con alias).
+
+    Robusto a variantes reales: quita acentos/diacriticos con ``unicodedata``,
+    colapsa separadores y acepta alias, plurales y sinonimos cotidianos
+    ("tráfico"->trafico, "clima local"->clima, "antojo"/"antojos"->comida,
+    "series de tv"/"tv"->series, "no puedo dormir"->insomnio, "fútbol"->futbol,
+    "frases"/"motivacionales"->motivacion, "perros"/"gatos"->mascotas,
+    "home office"->home_office, etc.). Los temas personalizados desconocidos
+    se devuelven normalizados; "" si no queda nada util.
+    """
+    raw = str(tema or "").strip().lower()
+    if not raw:
+        return ""
+    plano = unicodedata.normalize("NFKD", raw)
+    plano = "".join(c for c in plano if not unicodedata.combining(c))
+    plano = plano.replace("ñ", "n")
+    plano = re.sub(r"[^a-z0-9]+", " ", plano).strip()
+    if not plano:
+        return ""
     alias = {
+        # legacy
         "prehispanico": "azteca",
         "prehispanica": "azteca",
         "mexica": "azteca",
+        "mexicas": "azteca",
         "aztecas": "azteca",
+        "tenochtitlan": "azteca",
+        "raices": "azteca",
         "actualidad": "dia",
         "diario": "dia",
         "efemerides": "dia",
         "tendencia": "tendencias",
         "trending": "tendencias",
+        "viral": "tendencias",
         "gusto": "gustos",
         "cotidiano": "gustos",
         "intereses": "gustos",
+        "hobbies": "gustos",
+        "pasatiempos": "gustos",
+        # trafico / traslados
+        "traficos": "trafico",
+        "trafico vehicular": "trafico",
+        # clima
+        "clima local": "clima",
+        "tiempo": "clima",
+        "pronostico": "clima",
+        # comida / antojos
+        "comidas": "comida",
+        "antojo": "comida",
+        "antojos": "comida",
+        "comida de casa": "comida",
+        # series / tv
+        "serie": "series",
+        "series de tv": "series",
+        "serie de tv": "series",
+        "tv": "series",
+        "television": "series",
+        # lunes / descanso
+        "inicio de semana": "lunes",
+        "comienzo de semana": "lunes",
+        # insomnio
+        "no puedo dormir": "insomnio",
+        "desveladas": "insomnio",
+        "desvelo": "insomnio",
+        # futbol
+        "fut": "futbol",
+        "partido": "futbol",
+        # memes
+        "meme": "memes",
+        "humor": "memes",
+        # motivacion
+        "motivacional": "motivacion",
+        "motivacionales": "motivacion",
+        "frases": "motivacion",
+        "frases motivacionales": "motivacion",
+        "inspiracion": "motivacion",
+        "animo": "motivacion",
+        # mascotas
+        "mascota": "mascotas",
+        "perros": "mascotas",
+        "perro": "mascotas",
+        "gatos": "mascotas",
+        "gato": "mascotas",
+        "michis": "mascotas",
+        # cafe / musica / vecinos
+        "cafecito": "cafe",
+        "desayuno": "cafe",
+        "canciones": "musica",
+        "cancion": "musica",
+        "vecino": "vecinos",
+        "vecindad": "vecinos",
+        # transporte / filas
+        "transporte publico": "transporte",
+        "camion": "transporte",
+        "camiones": "transporte",
+        "metro": "transporte",
+        "pesero": "transporte",
+        "fila": "filas",
+        # calor / lluvia
+        "calorones": "calor",
+        "lluvias": "lluvia",
+        "llover": "lluvia",
+        "llueve": "lluvia",
+        "temporal": "lluvia",
+        # finde / deportes / recuerdos
+        "fin de semana": "finde",
+        "deporte": "deportes",
+        "gimnasio": "deportes",
+        "correr": "deportes",
+        "recuerdo": "recuerdos",
+        "memoria": "recuerdos",
+        "infancia": "recuerdos",
+        # escuela / trabajo / home office
+        "clases": "escuela",
+        "tarea": "escuela",
+        "estudiar": "escuela",
+        "universidad": "escuela",
+        "chamba": "trabajo",
+        "oficina": "trabajo",
+        "home office": "home_office",
+        "homeoffice": "home_office",
+        "teletrabajo": "home_office",
+        "trabajo desde casa": "home_office",
+        # super / cocina / postres / tacos
+        "mercado": "super",
+        "mandado": "super",
+        "despensa": "super",
+        "abarrotes": "super",
+        "cocinar": "cocina",
+        "receta": "cocina",
+        "recetas": "cocina",
+        "postre": "postres",
+        "pan dulce": "postres",
+        "taco": "tacos",
+        "taquitos": "tacos",
+        "antojitos": "tacos",
+        # pantallas / juegos
+        "streaming": "netflix",
+        "videojuego": "videojuegos",
+        "juegos": "videojuegos",
+        "gaming": "videojuegos",
+        "podcasts": "podcast",
+        "libro": "libros",
+        "lectura": "libros",
+        "leer": "libros",
+        # viajes / carretera / playa
+        "viaje": "viajes",
+        "vacaciones": "viajes",
+        "camino": "carretera",
+        "mar": "playa",
+        # barrio / familia / abuelos / amistad
+        "colonia": "barrio",
+        "familiar": "familia",
+        "abuelo": "abuelos",
+        "abuela": "abuelos",
+        "amigos": "amistad",
+        "amigas": "amistad",
     }
-    return alias.get(t, t)
+    return alias.get(plano, plano.replace(" ", "_"))
 
 
 def instrucciones_tema(tema: str = "") -> str:
     """Devuelve las instrucciones del tema pedido ('' si no hay tema).
 
-    Reutilizable por otros modulos para no duplicar los textos.
+    Reutilizable por otros modulos para no duplicar los textos. Todos los
+    temas de ``TEMAS_MANTENIMIENTO`` tienen instruccion PROPIA; el texto
+    generico "TEMA A TRATAR: ..." queda SOLO para temas personalizados
+    desconocidos.
     """
     clave = _normalizar_tema(tema)
     if not clave:
@@ -871,3 +1400,412 @@ def get_prompt_resumen_ejecutivo() -> str:
         "- Devuelve ÚNICAMENTE el resumen, sin títulos, etiquetas ni comentarios "
         "extra."
     )
+
+
+# --------------------------------------------------------------------------- #
+# Identidades (nombres y @) por contexto: Seccion + Registro + tipo.
+# `cuentas/generador_identidades.py` importa `get_prompt_identidades_contexto`
+# para inyectar estas reglas cruzadas en su prompt de generacion masiva.
+# --------------------------------------------------------------------------- #
+_IDENTIDADES_HEADER = (
+    "REGLAS DE IDENTIDAD POR CONTEXTO (MANDAN SOBRE EL TIPO BASE CUANDO "
+    "APLIQUEN):\n"
+)
+
+_PROHIBICIONES_IDENTIDAD = (
+    "PROHIBICIONES GLOBALES: nada de siglas ni nombres de partidos (MC, "
+    "Morena, PAN, PRI, PRD, PVEM, PT, PES) ni de políticos famosos; los "
+    "handles deben ser válidos para X (4-15 caracteres, solo letras, números y "
+    "guion bajo, sin acentos, sin espacios y sin '@').\n"
+)
+
+_REGLA_IDENT_CIUDADANA = (
+    "REGISTRO CIUDADANA (IGNORA LA SECCION, CUALQUIERA QUE SEA): los nombres "
+    "deben ser de personas mexicanas 100% reales y coloquiales (estilo Faker "
+    "es_MX; p. ej. \"Lupita Hernández\", \"Juan Pérez\", \"María López\"); los "
+    "handles van con nombre + apellido o nombre + inicial (p. ej. "
+    "\"LupitaHernandez\", \"JuanP\"). PROHIBIDO el tono institucional, "
+    "corporativo o de causa social: se ignora la sección por completo y se "
+    "escribe como una persona común.\n"
+)
+
+_REGLA_IDENT_IP_POLITICA = (
+    "SECCIÓN IP (Institución Privada) + REGISTRO POLITICA: nombres y handles "
+    "FORMALES, corporativos o de analista serio; usa display names tipo "
+    "\"Análisis ...\", \"Consultoría ...\" o \"Centro de ...\"; handles sobrios "
+    "y profesionales (ejemplos válidos: @AnalisisIP, @ConsultoriaDatos); tono "
+    "institucional, técnico y mesurado. PROHIBIDO: siglas o nombres de "
+    "partidos y políticos famosos.\n"
+)
+
+_REGLA_IDENT_CI_POLITICA = (
+    "SECCIÓN CI (Ciudadanía) + REGISTRO POLITICA: tono institucional y cercano "
+    "a lo ciudadano; display names sobrios de institución cívica o colectivo "
+    "ciudadano (p. ej. \"Centro Cívico ...\", \"Ciudadanía Activa ...\", "
+    "\"Observatorio Ciudadano ...\"), sin simbología ni siglas de partidos.\n"
+)
+
+_REGLA_IDENT_LIB_POLITICA = (
+    "SECCIÓN LIB (Libertad) + REGISTRO POLITICA: institucional y formal con "
+    "sensibilidad por las libertades y los derechos; display names elegantes y "
+    "serios (p. ej. \"Centro por la Libertad ...\", \"Observatorio Libre "
+    "...\"); sin consignas partidistas ni nombres de políticos.\n"
+)
+
+_REGLA_IDENT_JUS_POLITICA = (
+    "SECCIÓN JUS (Justicia) + REGISTRO POLITICA: institucional y formal con "
+    "sensibilidad por la justicia, la legalidad y los derechos; display names "
+    "serios (p. ej. \"Centro de Justicia ...\", \"Observatorio Jurídico "
+    "...\"); sin consignas partidistas ni nombres de políticos.\n"
+)
+
+_REGLA_IDENT_POLITICA_GENERAL = (
+    "REGISTRO POLITICA (sin sección): nombres y handles formales e "
+    "institucionales, serios y mesurados, sin coloquialismos; PROHIBIDO siglas "
+    "o nombres de partidos y políticos famosos.\n"
+)
+
+_REGLA_IDENT_LIBJUS_ACTIVISTA = (
+    "SECCIÓN LIB/JUS + REGISTRO ACTIVISTA: seudónimos combativos o de causas "
+    "sociales, con fuerza; display names tipo \"Voz Libertad\", \"Justicia Ya\" "
+    "o \"Fuerza ...\"; handles con causa (ejemplos válidos: @VozLibertad, "
+    "@JusticiaYa); PROHIBIDO nombrar partidos o políticos.\n"
+)
+
+_REGLA_IDENT_IP_ACTIVISTA = (
+    "SECCIÓN IP (Institución Privada) + REGISTRO ACTIVISTA: la causa se expresa "
+    "de forma SERIA e institucional (analista o institución con causa), sin "
+    "agresividad ni consignas; display names tipo \"Centro de Análisis ...\" o "
+    "\"Consultoría con Causa ...\"; PROHIBIDO nombrar partidos o políticos.\n"
+)
+
+_REGLA_IDENT_CI_ACTIVISTA = (
+    "SECCIÓN CI (Ciudadanía) + REGISTRO ACTIVISTA: activismo ciudadano cercano "
+    "y movilizador; nombres de colectivo o de persona comprometida con la "
+    "causa, sin tono corporativo; PROHIBIDO nombrar partidos o políticos.\n"
+)
+
+_REGLA_IDENT_ACTIVISTA_GENERAL = (
+    "REGISTRO ACTIVISTA (sin sección): seudónimos combativos o de causa social, "
+    "cercanos y movilizadores; PROHIBIDO nombrar partidos o políticos.\n"
+)
+
+# Default sensato por seccion cuando NO hay registro definido (neutro).
+_REGLAS_IDENT_SECCION = {
+    "IP": (
+        "SECCIÓN IP (sin registro): identidades neutras corporativas o de "
+        "analista serio (p. ej. \"Análisis ...\", \"Consultoría ...\", "
+        "\"Centro de ...\"); nada de siglas o nombres de partidos ni políticos "
+        "famosos.\n"
+    ),
+    "CI": (
+        "SECCIÓN CI (sin registro): identidades neutras de ciudadanía "
+        "(personas o colectivos ciudadanos), cercanas y sin tono "
+        "partidista.\n"
+    ),
+    "LIB": (
+        "SECCIÓN LIB (sin registro): identidades neutras con sensibilidad por "
+        "la libertad y los derechos, sin agresividad ni tono partidista.\n"
+    ),
+    "JUS": (
+        "SECCIÓN JUS (sin registro): identidades neutras con sensibilidad por "
+        "la justicia y la legalidad, sin agresividad ni tono partidista.\n"
+    ),
+}
+
+# Reglas del tipo base. Las reglas de contexto de arriba MANDAN sobre ellas.
+_REGLAS_IDENT_TIPO = {
+    "partido": (
+        "TIPO SIMILITUD DE PARTIDO: conserva los COLORES y SÍMBOLOS cotidianos "
+        "(p. ej. Naranja, Guinda, Azul, Rojo, Amarillo, Sol, Marea, Corriente, "
+        "Faro, Bolillos) para EVOCAR una identidad política; NUNCA nombres ni "
+        "siglas de partidos (MC, Morena, PAN, PRI, PRD, PVEM, PT, PES) ni "
+        "políticos famosos; las reglas de contexto de arriba MANDAN sobre este "
+        "tipo base.\n"
+    ),
+    "movimiento": (
+        "TIPO MOVIMIENTO: vocabulario ciudadano y organizado (Ciudadanía, "
+        "Ciudad, Voces, Gente, Pueblo, Comunidad, Vecinos, Unión, Corazón), "
+        "variado y sin partidos; si las reglas de contexto de arriba mandan "
+        "otra cosa (p. ej. ciudadana = personas reales), el contexto tiene "
+        "prioridad.\n"
+    ),
+    "persona": (
+        "TIPO PERSONA: nombres humanos y coloquiales de personas mexicanas "
+        "reales, con handles de nombre + apellido o nombre + inicial; salvo que "
+        "las reglas de contexto de arriba manden otra cosa (p. ej. IP + "
+        "política o LIB/JUS + activista), en cuyo caso el contexto tiene "
+        "prioridad.\n"
+    ),
+    "mixto": (
+        "TIPO MIXTO: combina identidades de persona con similitudes de partido "
+        "o movimientos; a cada identidad le aplican las reglas de contexto y el "
+        "estilo del tipo que le toque.\n"
+    ),
+}
+
+_REGLA_IDENT_NEUTRA = (
+    "SIN CONTEXTO DE SECCIÓN/REGISTRO/TIPO: identidades neutras, variadas y "
+    "creíbles, sin tono partidista.\n"
+)
+
+
+def _texto_clave_identidades(valor) -> str:
+    """Pasa un valor a minúsculas sin acentos para comparar; nunca lanza."""
+    try:
+        texto = " ".join(str(valor or "").split()).lower()
+        plano = unicodedata.normalize("NFKD", texto)
+        return "".join(c for c in plano if not unicodedata.combining(c))
+    except Exception:
+        return ""
+
+
+def _seccion_identidad(valor) -> str:
+    """Código de sección (CI/IP/LIB/JUS) tolerante a fallos de normalización.
+
+    Normaliza con ``core.secciones.normalizar_seccion`` (import local dentro de
+    try/except); si core falla o no reconoce el valor, cae a palabras clave y,
+    como última red, usa el texto tal cual (la decisión final la toma quien
+    construye el bloque). Nunca lanza.
+    """
+    raw = str(valor or "").strip()
+    if not raw:
+        return ""
+    try:
+        from core.secciones import normalizar_seccion
+    except Exception:
+        normalizar_seccion = None
+    if normalizar_seccion is not None:
+        try:
+            codigo = normalizar_seccion(raw)
+            if codigo:
+                return codigo
+        except Exception:
+            pass
+    # Fallback tolerante: texto tal cual con ayuda de palabras clave
+    # ("Institución Privada" -> IP, "Libertad" -> LIB, "Justicia" -> JUS...).
+    clave = _texto_clave_identidades(raw)
+    codigos = {"ci": "CI", "ip": "IP", "lib": "LIB", "jus": "JUS"}
+    if clave in codigos:
+        return codigos[clave]
+    if "institucion" in clave or "privad" in clave:
+        return "IP"
+    if "libertad" in clave:
+        return "LIB"
+    if "justicia" in clave:
+        return "JUS"
+    if "ciudadan" in clave:
+        return "CI"
+    return raw
+
+
+def _registro_identidad(valor) -> str:
+    """Registro (politica/activista/ciudadana) tolerante a fallos de core.
+
+    Normaliza con ``core.registros.normalizar_tipo_cuenta`` (import local
+    dentro de try/except); si core falla, replica su orden de prioridad
+    (exactos de activista antes de los prefijos "ciudadan"/"politic"). Nunca
+    lanza.
+    """
+    raw = str(valor or "").strip()
+    if not raw:
+        return ""
+    try:
+        from core.registros import normalizar_tipo_cuenta
+    except Exception:
+        normalizar_tipo_cuenta = None
+    if normalizar_tipo_cuenta is not None:
+        try:
+            codigo = normalizar_tipo_cuenta(raw)
+            if codigo:
+                return codigo
+        except Exception:
+            pass
+    clave = _texto_clave_identidades(raw)
+    if clave in (
+        "ciudadania politica",
+        "ciudadano politico",
+        "activista",
+        "militante",
+        "simpatizante",
+        "tecnico",
+        "tecnico coloquial",
+    ):
+        return "activista"
+    if clave in ("politica", "politico", "institucional", "formal", "oficial"):
+        return "politica"
+    if "activis" in clave:
+        return "activista"
+    if "politic" in clave:
+        return "politica"
+    if "ciudadan" in clave or clave in (
+        "persona",
+        "real",
+        "informal",
+        "coloquial",
+    ):
+        return "ciudadana"
+    return raw
+
+
+def _normalizar_tipo_identidad(valor) -> str:
+    """Normaliza el tipo de identidad a partido/movimiento/persona/mixto.
+
+    Acepta los sinónimos del generador de identidades ("similitud", "guiño",
+    "color", "espectro"...). Devuelve "" si el valor no se reconoce; nunca
+    lanza.
+    """
+    clave = " ".join(
+        _texto_clave_identidades(valor).replace("_", " ").replace("-", " ").split()
+    )
+    if not clave:
+        return ""
+    alias = {
+        "partido": "partido",
+        "similitud": "partido",
+        "similitud de partido": "partido",
+        "similitud partido": "partido",
+        "guino": "partido",
+        "guino de partido": "partido",
+        "color": "partido",
+        "colores": "partido",
+        "espectro": "partido",
+        "movimiento": "movimiento",
+        "organizacion": "movimiento",
+        "colectivo": "movimiento",
+        "colectiva": "movimiento",
+        "persona": "persona",
+        "personas": "persona",
+        "humano": "persona",
+        "humana": "persona",
+        "nombre": "persona",
+        "nombres": "persona",
+        "mixto": "mixto",
+        "mixta": "mixto",
+    }
+    if clave in alias:
+        return alias[clave]
+    if (
+        "similitud" in clave
+        or "guino" in clave
+        or "espectro" in clave
+        or "color" in clave
+        or "partido" in clave
+    ):
+        return "partido"
+    if "movimiento" in clave:
+        return "movimiento"
+    if "persona" in clave:
+        return "persona"
+    if "mixto" in clave or "mixta" in clave:
+        return "mixto"
+    return ""
+
+
+def _recortar_contexto_identidad(contexto, limite: int = 300) -> str:
+    """Normaliza (espacios) y recorta el contexto adicional a ``limite``."""
+    try:
+        texto = " ".join(str(contexto or "").split())
+    except Exception:
+        return ""
+    if not texto:
+        return ""
+    if len(texto) > limite:
+        texto = texto[:limite].rstrip()
+    return texto
+
+
+def _construir_prompt_identidades(
+    seccion: str = "",
+    registro: str = "",
+    tipo: str = "",
+    contexto: str = "",
+) -> str:
+    """Arma el bloque de identidades; devuelve '' si nada aplica. Nunca lanza."""
+    sec = _seccion_identidad(seccion)
+    reg = _registro_identidad(registro)
+    tpo = _normalizar_tipo_identidad(tipo)
+    ctx = _recortar_contexto_identidad(contexto)
+
+    sec_valida = sec in ("CI", "IP", "LIB", "JUS")
+    reg_valido = reg in ("politica", "activista", "ciudadana")
+    tpo_valido = tpo in _REGLAS_IDENT_TIPO
+    if not (sec_valida or reg_valido or tpo_valido or ctx):
+        return ""
+
+    bloques = [_IDENTIDADES_HEADER, _PROHIBICIONES_IDENTIDAD]
+
+    regla = ""
+    if reg == "ciudadana":
+        # Regla obligatoria: el registro ciudadana IGNORA la seccion.
+        regla = _REGLA_IDENT_CIUDADANA
+    elif reg == "politica":
+        if sec == "IP":
+            regla = _REGLA_IDENT_IP_POLITICA
+        elif sec == "CI":
+            regla = _REGLA_IDENT_CI_POLITICA
+        elif sec == "LIB":
+            regla = _REGLA_IDENT_LIB_POLITICA
+        elif sec == "JUS":
+            regla = _REGLA_IDENT_JUS_POLITICA
+        else:
+            regla = _REGLA_IDENT_POLITICA_GENERAL
+    elif reg == "activista":
+        if sec in ("LIB", "JUS"):
+            # Regla obligatoria: LIB o JUS + activista = seudonimo combativo.
+            regla = _REGLA_IDENT_LIBJUS_ACTIVISTA
+        elif sec == "IP":
+            regla = _REGLA_IDENT_IP_ACTIVISTA
+        elif sec == "CI":
+            regla = _REGLA_IDENT_CI_ACTIVISTA
+        else:
+            regla = _REGLA_IDENT_ACTIVISTA_GENERAL
+    elif sec_valida:
+        # Default sensato por seccion cuando no hay registro (neutro).
+        regla = _REGLAS_IDENT_SECCION.get(sec, "")
+
+    if regla:
+        bloques.append(regla)
+    if tpo_valido:
+        bloques.append(_REGLAS_IDENT_TIPO[tpo])
+    if not regla and not tpo_valido and ctx:
+        bloques.append(_REGLA_IDENT_NEUTRA)
+    if ctx:
+        bloques.append(f"Contexto adicional (respétalo): {ctx}\n")
+
+    return "".join(bloques)
+
+
+def get_prompt_identidades_contexto(
+    seccion: str = "",
+    registro: str = "",
+    tipo: str = "",
+    contexto: str = "",
+) -> str:
+    """Bloque de REGLAS DE IDENTIDAD por contexto (Seccion + Registro + tipo).
+
+    Devuelve texto plano listo para concatenar a un prompt de identidades;
+    '' si no hay nada que aplicar. Nunca lanza.
+
+    Cruces obligatorios (los consume ``cuentas/generador_identidades.py``):
+        - IP + politica: nombres/handles FORMALES, corporativos o de analista
+          serio (``@AnalisisIP``, ``@ConsultoriaDatos``, display names
+          "Análisis ...", "Consultoría ...", "Centro de ...").
+        - LIB/JUS + activista: seudonimos combativos o de causa social
+          (``@VozLibertad``, ``@JusticiaYa``, display names "Voz Libertad",
+          "Justicia Ya", "Fuerza ...").
+        - ciudadana (cualquier seccion): IGNORA LA SECCION; personas mexicanas
+          100% reales y coloquiales (estilo Faker es_MX).
+
+    ``seccion`` se normaliza con ``core.secciones.normalizar_seccion``
+    (CI/IP/LIB/JUS) y ``registro`` con
+    ``core.registros.normalizar_tipo_cuenta`` (politica/activista/ciudadana),
+    con imports locales tolerantes a fallos (si fallan, se usa el texto tal
+    cual). ``tipo`` acepta "partido" (o similitud/guiño/color/espectro),
+    "movimiento", "persona" y "mixto". ``contexto`` no vacio se agrega como
+    linea "Contexto adicional (respétalo): ..." recortada a 300 caracteres.
+    """
+    try:
+        return _construir_prompt_identidades(seccion, registro, tipo, contexto)
+    except Exception:
+        return ""

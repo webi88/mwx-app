@@ -15,6 +15,7 @@ from core.perfiles import (
 from core.registros import normalizar_tipo_cuenta
 from ia.prompts import (
     REGLA_MAX_100,
+    TEMAS_MANTENIMIENTO,
     bloque_estilo_perfil,
     bloque_tweet_ancla,
     get_prompt_hashtags,
@@ -639,252 +640,1108 @@ def generar_pool_por_cuenta(
 # ===================================================================== #
 _MAX_PERFILES_POR_LLAMADA_MANTENIMIENTO = 15
 
-_TEMAS_MANTENIMIENTO = ("azteca", "dia", "tendencias", "gustos")
+# Temas de mantenimiento: UNA sola fuente de verdad (``ia.prompts``). El
+# fallback local solo se usa si el import no expusiera la constante.
+_TEMAS_MANTENIMIENTO_FALLBACK = (
+    "azteca",
+    "dia",
+    "tendencias",
+    "gustos",
+    "trafico",
+    "clima",
+    "comida",
+    "series",
+    "lunes",
+    "insomnio",
+    "futbol",
+    "memes",
+    "motivacion",
+    "mascotas",
+)
+try:
+    _TEMAS_MANTENIMIENTO = (
+        tuple(TEMAS_MANTENIMIENTO) or _TEMAS_MANTENIMIENTO_FALLBACK
+    )
+except Exception:
+    _TEMAS_MANTENIMIENTO = _TEMAS_MANTENIMIENTO_FALLBACK
 
-# Plantillas locales usadas cuando OpenAI falla o no alcanza.
-# Estructura: tema -> perfil -> plantillas. "generico" conserva las clasicas
-# (cuentas sin perfil definido). {nombre} se reemplaza por el nombre de la
-# cuenta si existe. Cada perfil respeta su formato:
-#   - formal: 3 bloques (Titulo / Descripcion / Conclusion) con doble enter.
-#   - ciudadano: 1-2 frases de analisis intermedio.
-#   - popular: 1 renglon casual con faltas intencionales (sin tildes,
-#     q/pa/xq/tons/k) que igual se entiende.
+# --------------------------------------------------------------------- #
+# Fallback local DINAMICO POR PARTES (Sujeto + Accion + Comentario).
+#
+# En vez de frases rigidas, el fallback ensambla textos con piezas de pools
+# grandes (>=30 sujetos, >=20 acciones y >=30 comentarios por perfil) mas las
+# piezas de la FAMILIA de vocabulario del tema; con eso se generan cientos de
+# combinaciones por perfil. Los pools se comparten entre perfiles y el TONO
+# lo aporta el ensamblado (formal/ciudadano/popular/generico).
+# --------------------------------------------------------------------- #
+
+# Sujetos neutros (aplican a cualquier tema; el tema aporta su familia).
+_SUJETOS_NEUTROS = (
+    "el dia de hoy",
+    "la semana que corre",
+    "la rutina de siempre",
+    "las horas de la tarde",
+    "la agenda apretada",
+    "los pendientes de casa",
+    "el paso de los dias",
+    "la vida diaria",
+    "las cosas sencillas",
+    "los planes de la tarde",
+    "el descanso merecido",
+    "la platica de sobremesa",
+    "los ratos libres",
+    "el andar de la semana",
+    "las pequenas alegrias",
+    "la manana de hoy",
+    "el ruido de la calle",
+    "la calma de la casa",
+    "los quehaceres",
+    "el tiempo libre",
+    "la tarde tranquila",
+    "los buenos ratos",
+    "las ganas de avanzar",
+    "los planes pendientes",
+    "la lista de tareas",
+    "el ritmo de la ciudad",
+    "las horas tranquilas",
+    "el dia a dia",
+    "los momentos simples",
+    "la jornada de hoy",
+    "los pequenos descansos",
+    "la energia del dia",
+)
+
+# Acciones neutras (verbos en primera/tercera persona, cotidianos).
+_ACCIONES_NEUTRAS = (
+    "me tomo por sorpresa",
+    "nos cambio el plan",
+    "me alegro la manana",
+    "nos hizo platicar un rato",
+    "me dejo pensando",
+    "nos reunio a todos",
+    "me saco una sonrisa",
+    "nos puso de buenas",
+    "me dio mucha risa",
+    "nos recordo lo importante",
+    "me lleno de energia",
+    "nos dejo una leccion",
+    "me hizo el dia",
+    "nos unio un poco mas",
+    "me trajo recuerdos",
+    "me quito el sueno",
+    "nos dio tema de platica",
+    "me puso a reflexionar",
+    "nos contagio el animo",
+    "me dejo buen sabor",
+    "nos hizo reir",
+    "me dio un respiro",
+)
+
+# Comentarios/remates neutros (cierres de opinion cotidianos).
+_COMENTARIOS_NEUTROS = (
+    "asi que hay que disfrutarlo",
+    "ojala se repita pronto",
+    "vale la pena aprovechar",
+    "no hay nada mejor",
+    "asi es la vida diaria",
+    "conviene ir con calma",
+    "todo suma al final",
+    "y asi vamos pasando",
+    "hay que cuidarlo",
+    "es parte de lo cotidiano",
+    "siempre queda algo bueno",
+    "mejor tomarlo con humor",
+    "lo importante es compartir",
+    "asi se aprende",
+    "nunca falta el detalle",
+    "hay que seguirle",
+    "con calma todo mejora",
+    "es cosa de actitud",
+    "y que siga la costumbre",
+    "vale la pena conversarlo",
+    "aqui seguimos",
+    "un gusto saberlo",
+    "dan ganas de repetir",
+    "que cosa tan cierta",
+    "se agradece el gesto",
+    "asi son las cosas",
+    "es otro rollo",
+    "para eso estan los amigos",
+    "y no es para menos",
+    "que tiempos aquellos",
+    "nadie se salva",
+    "la verdad se agradece",
+)
+
+# Extras de tono por perfil (se suman a los pools neutros).
+_SUJETOS_FORMAL_EXTRA = (
+    "la jornada que inicia",
+    "el balance del dia",
+    "las prioridades de la semana",
+    "el orden de las tareas",
+    "la agenda del dia",
+    "el proposito de la jornada",
+)
+_ACCIONES_FORMAL_EXTRA = (
+    "merece una mirada serena",
+    "invita a la reflexion",
+    "pide orden y calma",
+    "deja una ensenanza",
+    "conviene valorar",
+)
+_COMENTARIOS_FORMAL_EXTRA = (
+    "conviene mantener la calma y seguir adelante",
+    "es sano reconocer lo bueno de cada dia",
+    "reflexionar sobre lo cotidiano ayuda a ordenar prioridades",
+    "vale la pena mirar el dia con serenidad",
+    "la constancia tambien es una forma de cuidar el futuro",
+    "los pequenos avances construyen lo grande",
+)
+
+_SUJETOS_CIUDADANO_EXTRA = (
+    "la platica de la tarde",
+    "el pendiente de siempre",
+    "las cosas de la casa",
+    "la vuelta por el rumbo",
+    "los ratos de tranquilidad",
+    "el rato de descanso",
+)
+_ACCIONES_CIUDADANO_EXTRA = (
+    "me hizo sonreir sin querer",
+    "me ayudo a ordenar la cabeza",
+    "me dio un momento de paz",
+    "me recordo lo simple",
+    "me dejo con buen animo",
+)
+_COMENTARIOS_CIUDADANO_EXTRA = (
+    "no hay mejor plan que ese",
+    "me quedo con lo bueno",
+    "asi se disfruta mas",
+    "eso si se agradece",
+    "yo lo veo igual",
+    "me parece de lo mas normal",
+)
+
+_SUJETOS_POPULAR_EXTRA = (
+    "la banda de la cuadra",
+    "el cotorreo de siempre",
+    "la vuelta a la tienda",
+    "el rol de la tarde",
+    "los compas del rumbo",
+    "la loquera del dia",
+)
+_ACCIONES_POPULAR_EXTRA = (
+    "me saco de onda",
+    "me puso de buenas",
+    "me dio risa",
+    "me cayo bien",
+    "me movio el piso",
+)
+_COMENTARIOS_POPULAR_EXTRA = (
+    "ya con eso la armamos",
+    "asi me gusta la vida",
+    "pa que veas",
+    "y asi le seguimos",
+    "no hay bronca",
+    "todo relax",
+)
+
+_SUJETOS_GENERICO_EXTRA = (
+    "el dia a dia",
+    "las cosas que pasan",
+    "los ratos normales",
+    "la vida de todos los dias",
+    "los momentos de siempre",
+    "las vueltas de la vida",
+)
+_ACCIONES_GENERICO_EXTRA = (
+    "da para comentar",
+    "deja buen sabor",
+    "invita a la conversacion",
+    "se disfruta distinto",
+    "acerca a la gente",
+)
+_COMENTARIOS_GENERICO_EXTRA = (
+    "nunca cae mal un momento asi",
+    "estos ratos son los mejores",
+    "todo va sumando",
+    "asi es esto",
+    "mejor disfrutarlo",
+    "la vida sigue",
+)
+
+# POOLS POR PARTES por perfil (sujetos/acciones/comentarios). "generico"
+# aplica a cuentas sin perfil definido.
 _PLANTILLAS_MANTENIMIENTO = {
-    "azteca": {
-        "formal": (
-            "Nuestras raíces prehispánicas\n\n"
-            "La grandeza de México-Tenochtitlan se construyó con organización, "
-            "conocimiento y comunidad; sus aportes siguen presentes en nuestra "
-            "cultura.\n\n"
-            "Recordar de dónde venimos fortalece la identidad y el orgullo nacional.",
-            "El legado mexica\n\n"
-            "La astronomía, el arte y la herbolaria de nuestros antepasados son "
-            "testimonio de una civilización sofisticada y profunda.\n\n"
-            "Honrar esa memoria es reconocer la sabiduría que nos antecede.",
-            "Memoria viva\n\n"
-            "El Templo Mayor y los mercados prehispánicos recuerdan que México ya "
-            "era grande antes de la conquista.\n\n"
-            "Su historia merece difundirse con respeto y orgullo.",
+    "formal": {
+        "sujetos": _SUJETOS_NEUTROS + _SUJETOS_FORMAL_EXTRA,
+        "acciones": _ACCIONES_NEUTRAS + _ACCIONES_FORMAL_EXTRA,
+        "comentarios": _COMENTARIOS_NEUTROS + _COMENTARIOS_FORMAL_EXTRA,
+    },
+    "ciudadano": {
+        "sujetos": _SUJETOS_NEUTROS + _SUJETOS_CIUDADANO_EXTRA,
+        "acciones": _ACCIONES_NEUTRAS + _ACCIONES_CIUDADANO_EXTRA,
+        "comentarios": _COMENTARIOS_NEUTROS + _COMENTARIOS_CIUDADANO_EXTRA,
+    },
+    "popular": {
+        "sujetos": _SUJETOS_NEUTROS + _SUJETOS_POPULAR_EXTRA,
+        "acciones": _ACCIONES_NEUTRAS + _ACCIONES_POPULAR_EXTRA,
+        "comentarios": _COMENTARIOS_NEUTROS + _COMENTARIOS_POPULAR_EXTRA,
+    },
+    "generico": {
+        "sujetos": _SUJETOS_NEUTROS + _SUJETOS_GENERICO_EXTRA,
+        "acciones": _ACCIONES_NEUTRAS + _ACCIONES_GENERICO_EXTRA,
+        "comentarios": _COMENTARIOS_NEUTROS + _COMENTARIOS_GENERICO_EXTRA,
+    },
+}
+
+# Pools por partes para COMENTARIOS/RESPUESTAS: aperturas conversacionales y
+# remates (los remates reutilizan los comentarios neutros + familia del tema).
+_APERTURAS_COMENTARIO_FORMAL = (
+    "De acuerdo con el planteamiento",
+    "Punto valido",
+    "Reflexion necesaria",
+    "Buena aportacion",
+    "Coincido en lo general",
+    "Gracias por compartirlo",
+    "El tema da para mas",
+    "Lectura atenta",
+)
+_APERTURAS_COMENTARIO_CIUDADANO = (
+    "Buen punto",
+    "Totalmente de acuerdo",
+    "Interesante lo que dices",
+    "Asi es",
+    "Tienes razon",
+    "Vale la pena verlo asi",
+    "Me parece justo",
+    "Bien dicho",
+)
+_APERTURAS_COMENTARIO_POPULAR = (
+    "x2",
+    "jaja tienes razon",
+    "que bueno que lo dices",
+    "asi es",
+    "bien dicho",
+    "que buen punto",
+    "duro con eso",
+    "ya era hora",
+)
+_APERTURAS_COMENTARIO_GENERICO = (
+    "Buen punto",
+    "Interesante",
+    "De acuerdo",
+    "Vale la pena",
+    "Bien dicho",
+    "Gracias por compartir",
+    "Coincido",
+    "Buen aporte",
+)
+
+_PLANTILLAS_COMENTARIO = {
+    "formal": {
+        "aperturas": _APERTURAS_COMENTARIO_FORMAL,
+        "remates": tuple(_COMENTARIOS_NEUTROS),
+    },
+    "ciudadano": {
+        "aperturas": _APERTURAS_COMENTARIO_CIUDADANO,
+        "remates": tuple(_COMENTARIOS_NEUTROS),
+    },
+    "popular": {
+        "aperturas": _APERTURAS_COMENTARIO_POPULAR,
+        "remates": tuple(_COMENTARIOS_NEUTROS),
+    },
+    "generico": {
+        "aperturas": _APERTURAS_COMENTARIO_GENERICO,
+        "remates": tuple(_COMENTARIOS_NEUTROS),
+    },
+}
+_PLANTILLAS_MANTENIMIENTO["comentario"] = _PLANTILLAS_COMENTARIO
+
+# Familias de vocabulario del tema (piezas propias por familia).
+_PIEZAS_FAMILIA = {
+    "clima": {
+        "sujetos": (
+            "el calor de estas tardes",
+            "la lluvia que cayo ayer",
+            "el clima loco de la ciudad",
+            "las noches frescas",
+            "el sol a mediodia",
+            "el aire de la manana",
         ),
-        "ciudadano": (
-            "A veces se nos olvida que nuestra historia prehispánica sigue viva "
-            "en la comida, las palabras y las tradiciones de todos los días.",
-            "Los mexicas nos dejaron una ciudad enorme y bien organizada; saber "
-            "eso da orgullo y ganas de conocer más de nuestras raíces.",
-            "Me gusta pensar que parte de lo que somos viene de siglos de arte, "
-            "astronomía y comunidad; no es poca cosa.",
+        "acciones": (
+            "nos cambio el plan",
+            "me tomo por sorpresa",
+            "nos hizo buscar sombra",
+            "me dejo mojado",
+            "nos refresco el dia",
         ),
-        "popular": (
-            "q chido es recordar q nuestros abuelos ya sabían un buen, puro "
-            "orgullo mexica",
-            "los aztecas andaban bien adelantados pa su época, xq eso sí es cultura",
-            "tons si andas orgulloso de tus raíces, presume q es gratis",
-        ),
-        "generico": (
-            "Ayer me puse a pensar en todo lo que construyeron nuestros abuelos. "
-            "México-Tenochtitlan no se entiende sin su gente. Puro orgullo mexica.",
-            "El Templo Mayor sigue contándonos historias: cada piedra y cada ofrenda "
-            "son memoria viva de lo que fuimos y de lo que seguimos siendo.",
-            "No hay nada como recordar de dónde venimos: arte mexica, herbolaria, "
-            "mercados, palabra y comunidad. Raíces que siguen bien firmes.",
-            "Los mexicas medían el tiempo con el sol y las estrellas. Su sabiduría "
-            "sigue viva en nuestra memoria y en nuestras tradiciones.",
-            "Un chocolate caliente y una platica de historia: así sabe México. "
-            "Nuestras tradiciones ancestrales están más vivas que nunca.",
-            "La grandeza de México viene de siglos de sabiduría, astronomía, poesía "
-            "y organización. Recordarlo es un acto de orgullo y de identidad.",
+        "comentarios": (
+            "hay que adaptarse al tiempo",
+            "ojala se componga pronto",
+            "no queda mas que llevarlo con calma",
+            "asi esta la temporada",
+            "mejor salir preparado",
         ),
     },
-    "dia": {
-        "formal": (
-            "Buen día\n\n"
-            "La jornada comienza y conviene ordenar prioridades con calma, sin "
-            "perder el ánimo ni la claridad.\n\n"
-            "Que el esfuerzo de hoy acerque cada meta pendiente.",
-            "Agenda y actitud\n\n"
-            "Cada día trae pendientes, pero también oportunidades para avanzar y "
-            "aprender algo nuevo.\n\n"
-            "Cumplir con lo planeado también es una forma de cuidar el futuro.",
-            "Reflexión de la mañana\n\n"
-            "Las efemérides y la actualidad recuerdan que la historia también se "
-            "escribe en lo cotidiano.\n\n"
-            "Buen día a todas y todos.",
+    "comida": {
+        "sujetos": (
+            "el cafe de la manana",
+            "los tacos de la esquina",
+            "la comida de casa",
+            "el pan dulce del domingo",
+            "los antojos de la tarde",
+            "la receta de la abuela",
         ),
-        "ciudadano": (
-            "Buenos días, hoy toca levantarse con ánimo y sacar los pendientes "
-            "aunque la semana venga pesada.",
-            "¿Cómo va su día? Por acá ya con café en mano y ganas de que salgan "
-            "bien las cosas.",
-            "Hay días que empiezan lentos, pero con buena actitud todo se acomoda "
-            "mejor.",
+        "acciones": (
+            "me levanto el animo",
+            "nos junto en la mesa",
+            "me dio buen sabor",
+            "me dejo satisfecho",
+            "nos dio tema de platica",
         ),
-        "popular": (
-            "buenos días, a levantarse q la chamba no se hace sola",
-            "tons ya listos pa arrancar el día? yo ando en modo café",
-            "k tal ese ánimo? hoy sí se puede con todo",
-        ),
-        "generico": (
-            "Buenos días. Hoy toca levantarse con ánimo, cumplir la agenda y no "
-            "perder el humor. ¿Qué trae su día?",
-            "Se va la semana y queda la sensación de que hay mucho por hacer. "
-            "¿Cómo va su día, gente?",
-            "Hoy amaneció fresco y con buena vibra por acá. Aprovechen para sacar "
-            "eso que traen pendiente.",
-            "Las efemérides nos recuerdan que la historia también se escribe en lo "
-            "cotidiano. Buen día a todos.",
-            "El tráfico, la chamba y los pendientes... pero aquí seguimos. "
-            "¿Un café para arrancar?",
-            "Día de ordenar pendientes y proponerse algo nuevo. ¿Ustedes qué plan "
-            "traen para hoy?",
+        "comentarios": (
+            "no hay mejor plan",
+            "eso si se disfruta",
+            "vale la pena repetirlo",
+            "asi sabe mejor",
+            "me quedo con eso",
         ),
     },
-    "tendencias": {
-        "formal": (
-            "Conversación digital\n\n"
-            "Temas como los del momento muestran que la sociedad participa y opina "
-            "más allá del ruido.\n\n"
-            "Escuchar y contrastar información fortalece el debate público.",
-            "El debate de hoy\n\n"
-            "La conversación en redes refleja intereses legítimos de la ciudadanía "
-            "y merece analizarse con seriedad.\n\n"
-            "Participar con respeto eleva la calidad del intercambio.",
-            "Agenda pública\n\n"
-            "Lo que hoy domina la conversación digital también anticipa "
-            "preocupaciones reales de la gente.\n\n"
-            "Conviene informarse antes de opinar.",
+    "deportes": {
+        "sujetos": (
+            "el partido del fin de semana",
+            "la porra en la sala",
+            "los entrenamientos del equipo",
+            "la cancha del barrio",
+            "el juego de anoche",
+            "las carreras del domingo",
         ),
-        "ciudadano": (
-            "Se está hablando de ese tema en todos lados y la verdad vale la pena "
-            "escuchar las distintas opiniones.",
-            "¿Ya vieron lo que anda circulando hoy en redes? Está bueno el debate, "
-            "aunque hay de todo.",
-            "El tema del momento tiene a la gente dividida pero conversando, y eso "
-            "ya es avance.",
+        "acciones": (
+            "nos puso de pie",
+            "me dejo sin voz",
+            "nos unio a todos",
+            "me lleno de energia",
+            "me contagio la emocion",
         ),
-        "popular": (
-            "ya viste q andan diciendo? está bueno el chisme pero con respeto",
-            "tons de q se está hablando hoy? ando perdido en el timeline",
-            "las redes andan q arden jajaja k opinan ustedes?",
-        ),
-        "generico": (
-            "Vi que México está otra vez en la conversación. Cuéntenme, ¿de qué se "
-            "está hablando hoy en sus redes?",
-            "El tema del momento tiene a todos opinando. ¿Ustedes qué piensan de lo "
-            "que se está diciendo?",
-            "Las redes andan que arden hoy. ¿Ya vieron los memes que están "
-            "circulando?",
-            "Se puso de moda hablar de esto y se agradece la conversación. "
-            "¿Cuál es su opinión?",
-            "Lo que hoy está sonando en internet: música nueva, estrenos y un par "
-            "de sorpresas. ¿Qué me recomiendan?",
-            "El timeline está que no se puede con tanto contenido bueno. "
-            "¿Qué están viendo ustedes?",
+        "comentarios": (
+            "asi se vive la pasion",
+            "que buen ambiente",
+            "ojala se repita",
+            "eso es puro equipo",
+            "dan ganas de jugar",
         ),
     },
-    "gustos": {
-        "formal": (
-            "Cocina y memoria\n\n"
-            "La comida de casa conserva sabores e historias que ninguna moda "
-            "gastronómica puede sustituir.\n\n"
-            "Sentarse a la mesa también es un acto de identidad.",
-            "Fútbol y comunidad\n\n"
-            "Un partido reúne familias, amigos y vecinos alrededor de una misma "
-            "pasión.\n\n"
-            "Esos rituales cotidianos construyen pertenencia.",
-            "Música de siempre\n\n"
-            "Las canciones que heredamos de nuestros mayores acompañan momentos "
-            "que no vuelven.\n\n"
-            "Cuidar esa música es cuidar la memoria afectiva.",
+    "pantallas": {
+        "sujetos": (
+            "la serie que estoy viendo",
+            "el capitulo de anoche",
+            "las peliculas de siempre",
+            "el estreno del viernes",
+            "los videojuegos de la tarde",
+            "el podcast de la manana",
         ),
-        "ciudadano": (
-            "Unos tacos con la familia arreglan cualquier día pesado, la verdad.",
-            "¿Cuál es su canción de domingo? A mí me gana la música de antes.",
-            "Me encanta desconectar con buena comida y una platica larga con los "
-            "míos.",
+        "acciones": (
+            "me tuvo pegado a la pantalla",
+            "me sorprendio bastante",
+            "me dio risa",
+            "nos dejo comentando",
+            "me dejo pensando",
         ),
-        "popular": (
-            "unos taquitos y ya, pa q más",
-            "k rico es comer en casa, nada le gana",
-            "tons cuál es su rolita favorita? yo ando en modo cumbia",
+        "comentarios": (
+            "denme recomendaciones",
+            "valio la pena",
+            "asi se pasa el rato",
+            "no me lo esperaba",
+            "quiero ver mas",
         ),
-        "generico": (
-            "Partido, buena compañía y algo rico para botanear: no hay plan más "
-            "mexicano que ese.",
-            "No hay tristeza que aguante unos tacos a la hora correcta. "
-            "¿Cuáles son sus favoritos?",
-            "Me encanta la música de antes: José Alfredo, Juan Gabriel, Los Bukis. "
-            "¿Cuál es su canción de domingo?",
-            "Con esto de la tecnología hasta mi abuela pide videollamada. "
-            "El mundo cambió y uno sigue extrañando las cartas a mano.",
-            "Un viaje en carretera, una playlist y paisaje mexicano: plan perfecto "
-            "para desconectar.",
-            "La comida de casa sigue siendo el mejor restaurante del planeta. "
-            "¿Cuál es su platillo de la infancia?",
+    },
+    "calle": {
+        "sujetos": (
+            "el trafico de la manana",
+            "las filas del banco",
+            "el camion que no llega",
+            "las obras de la avenida",
+            "el metro a reventar",
+            "la gasolina otra vez",
+        ),
+        "acciones": (
+            "me quito tiempo",
+            "me puso a pensar",
+            "nos hizo esperar",
+            "me saco de quicio",
+            "me dio chance de leer",
+        ),
+        "comentarios": (
+            "hay que salir temprano",
+            "asi es esto",
+            "toca tener paciencia",
+            "mejor con musica",
+            "ya ni modo",
+        ),
+    },
+    "casa": {
+        "sujetos": (
+            "los vecinos de al lado",
+            "la familia reunida",
+            "la platica con mis abuelos",
+            "la cuadra donde creci",
+            "los domingos en casa",
+            "el barrio de siempre",
+        ),
+        "acciones": (
+            "me lleno de alegria",
+            "nos junto a todos",
+            "me trajo recuerdos",
+            "me dio tranquilidad",
+            "me regalo un buen rato",
+        ),
+        "comentarios": (
+            "eso es lo que vale",
+            "asi se vive mejor",
+            "que buenos momentos",
+            "nada como la familia",
+            "hay que cuidarlos",
+        ),
+    },
+    "mascotas": {
+        "sujetos": (
+            "mi perro jugueton",
+            "la gata de casa",
+            "el paseo con mi mascota",
+            "los michis del patio",
+            "mi lomito consentido",
+        ),
+        "acciones": (
+            "me espera con alegria",
+            "me saco a caminar",
+            "me dio ternura",
+            "me sigue a todos lados",
+            "me alegra las mananas",
+        ),
+        "comentarios": (
+            "son parte de la familia",
+            "que cosa tan linda",
+            "asi se alegra el dia",
+            "no hay mejor compania",
+            "merezco sus travesuras",
+        ),
+    },
+    "oficina": {
+        "sujetos": (
+            "el trabajo acumulado",
+            "las tareas de la escuela",
+            "la junta de la manana",
+            "el home office de hoy",
+            "los examenes de la semana",
+            "la chamba de siempre",
+        ),
+        "acciones": (
+            "me dejo ocupado",
+            "me puso a estudiar",
+            "me quito tiempo",
+            "me tuvo en la compu",
+            "me dio aprendizaje",
+        ),
+        "comentarios": (
+            "hay que organizarse",
+            "todo se saca",
+            "con calma avanza",
+            "eso tambien suma",
+            "un dia a la vez",
+        ),
+    },
+    "descanso": {
+        "sujetos": (
+            "las desveladas de la semana",
+            "el insomnio de ayer",
+            "los planes del fin de semana",
+            "la flojera del domingo",
+            "el descanso pendiente",
+        ),
+        "acciones": (
+            "me dejo cansado",
+            "me puso a pensar",
+            "me dio flojera",
+            "me recargo pilas",
+            "me ayudo a descansar",
+        ),
+        "comentarios": (
+            "hoy toca recuperarse",
+            "a dormir temprano",
+            "el cuerpo lo pide",
+            "nada como descansar",
+            "manana sera otro dia",
+        ),
+    },
+    "musica": {
+        "sujetos": (
+            "la musica de siempre",
+            "la cancion que no me cansa",
+            "los boleros del abuelo",
+            "la playlist del camino",
+            "el concierto del barrio",
+        ),
+        "acciones": (
+            "me acompano toda la tarde",
+            "me sube el animo",
+            "me trae recuerdos",
+            "me pone a bailar",
+            "me dio tranquilidad",
+        ),
+        "comentarios": (
+            "que buenas rolas",
+            "asi suena mejor el dia",
+            "pongan mas musica",
+            "no me canso de oirla",
+            "me encanta ese ritmo",
+        ),
+    },
+    "animo": {
+        "sujetos": (
+            "las ganas de salir adelante",
+            "los recuerdos bonitos",
+            "la amistad de anos",
+            "las metas del ano",
+            "los animos de la gente",
+        ),
+        "acciones": (
+            "me impulsan",
+            "me motivan",
+            "me acompanan",
+            "me dan fuerza",
+            "me llenan de ganas",
+        ),
+        "comentarios": (
+            "hay que seguir",
+            "todo llega a su tiempo",
+            "eso es lo que importa",
+            "nunca hay que rendirse",
+            "paso a paso",
+        ),
+    },
+    "humor": {
+        "sujetos": (
+            "los memes del grupo",
+            "la risa de los compas",
+            "el chisme del barrio",
+            "los videos chistosos",
+            "la carrilla entre amigos",
+        ),
+        "acciones": (
+            "me alegro el dia",
+            "me saco una carcajada",
+            "nos hizo reir",
+            "me quito el mal humor",
+            "me dibujo una sonrisa",
+        ),
+        "comentarios": (
+            "jajaja que bueno",
+            "asi se lleva la vida",
+            "no manches que risa",
+            "pasen mas memes",
+            "ya me rei bastante",
+        ),
+    },
+    "viajes": {
+        "sujetos": (
+            "el viaje del fin de semana",
+            "la carretera y el paisaje",
+            "la playa en temporada",
+            "las ganas de conocer",
+            "el pueblito de mis padres",
+        ),
+        "acciones": (
+            "me llena de ilusion",
+            "nos dio aventura",
+            "me relajo",
+            "me dejo recuerdos",
+            "me invita a planear",
+        ),
+        "comentarios": (
+            "hay que viajar mas",
+            "que ganas de escaparse",
+            "ojala pronto",
+            "eso si es descanso",
+            "me apunto",
+        ),
+    },
+    "generico": {
+        "sujetos": (
+            "el dia a dia",
+            "las cosas que pasan",
+            "la vida de todos los dias",
+            "los momentos simples",
+            "el andar de la gente",
+        ),
+        "acciones": (
+            "da para pensar",
+            "deja una ensenanza",
+            "invita a la conversacion",
+            "se disfruta distinto",
+            "acerca a la gente",
+        ),
+        "comentarios": (
+            "asi es la vida",
+            "hay que aprovechar",
+            "todo cuenta",
+            "un dia a la vez",
+            "mejor disfrutarlo",
         ),
     },
 }
 
-# Plantillas locales de COMENTARIO/RESPUESTA por perfil (breves y
-# conversacionales). "generico" aplica a cuentas sin perfil definido.
-_PLANTILLAS_COMENTARIO = {
-    "formal": (
-        "De acuerdo con el planteamiento\n\n"
-        "El argumento invita a reflexionar con seriedad sobre el tema.\n\n"
-        "Conviene mantener el debate informado.",
-        "Punto válido\n\n"
-        "La publicación aporta elementos que merecen considerarse con calma.\n\n"
-        "Gracias por abrir la conversación.",
-        "Reflexión necesaria\n\n"
-        "Es un tema que exige análisis y no solo reacciones inmediatas.\n\n"
-        "Ojalá se siga discutiendo con respeto.",
-        "Buena aportación\n\n"
-        "Comparto la importancia de mirar el asunto con profundidad.\n\n"
-        "Seguimos conversando.",
-    ),
-    "ciudadano": (
-        "Buen punto, la verdad es que el tema da para pensar y conversar más.",
-        "Totalmente de acuerdo, hace falta hablar de esto con calma.",
-        "Interesante lo que planteas, yo lo veo parecido aunque con matices.",
-        "Así es, ojalá más gente se sume a la conversación.",
-    ),
-    "popular": (
-        "x2, qué bueno que se hable de esto",
-        "jaja tienes razón, qué bueno que lo dices",
-        "qué bueno que alguien lo dice, ya era hora",
-        "qué buen punto, para eso están las redes.",
-    ),
-    "generico": (
-        "Buen punto, hace falta seguir hablando de esto.",
-        "Interesante lo que compartes, vale la pena conversarlo.",
-        "De acuerdo, ojalá se sume más gente a la conversación.",
-    ),
+# Tema -> familia de vocabulario (los temas legacy caen a "generico").
+_FAMILIA_POR_TEMA = {
+    "azteca": "generico",
+    "dia": "generico",
+    "tendencias": "generico",
+    "gustos": "generico",
+    "trafico": "calle",
+    "clima": "clima",
+    "comida": "comida",
+    "series": "pantallas",
+    "lunes": "descanso",
+    "insomnio": "descanso",
+    "futbol": "deportes",
+    "memes": "humor",
+    "motivacion": "animo",
+    "mascotas": "mascotas",
+    "cafe": "comida",
+    "musica": "musica",
+    "vecinos": "casa",
+    "transporte": "calle",
+    "filas": "calle",
+    "calor": "clima",
+    "lluvia": "clima",
+    "finde": "descanso",
+    "deportes": "deportes",
+    "recuerdos": "animo",
+    "escuela": "oficina",
+    "trabajo": "oficina",
+    "home_office": "oficina",
+    "super": "comida",
+    "cocina": "comida",
+    "postres": "comida",
+    "tacos": "comida",
+    "netflix": "pantallas",
+    "videojuegos": "pantallas",
+    "podcast": "pantallas",
+    "libros": "pantallas",
+    "viajes": "viajes",
+    "carretera": "viajes",
+    "playa": "viajes",
+    "barrio": "casa",
+    "familia": "casa",
+    "abuelos": "casa",
+    "amistad": "animo",
 }
+
+_INTENTOS_PLANTILLA_LOCAL = 40
+_INTENTOS_TEXTO_LOCAL = 25
+_MUESTRAS_PLANTILLAS = 8
+
+
+def _hash_estable(texto: str) -> int:
+    """Hash determinista (NO depende de PYTHONHASHSEED) para sembrar textos."""
+    h = 0
+    for ch in str(texto or ""):
+        h = (h * 131 + ord(ch)) & 0x7FFFFFFF
+    return h
+
+
+def _semilla_plantilla(i: int, j: int, usuario: str = "") -> int:
+    """Semilla estable por (cuenta, texto, usuario): 200 cuentas no comparten."""
+    try:
+        base = (int(i) + 1) * 100003 + (int(j) + 1) * 1009
+    except Exception:
+        base = 7
+    return (base * 31 + _hash_estable(usuario)) & 0x7FFFFFFF
+
+
+# Palabras de funcion/genericas que NO cuentan como "palabras clave" de
+# diversidad (todas de 5+ letras; las de <=4 quedan fuera por longitud).
+_STOPWORDS_DIVERSIDAD = frozenset({
+    "siempre", "nunca", "todos", "todas", "tengo", "tiene", "tienen",
+    "vamos", "nuestra", "nuestro", "nuestros", "nuestras", "estamos",
+    "estaba", "estaban", "despues", "tambien", "mucho", "mucha", "muchos",
+    "muchas", "poco", "pocos", "pocas", "otra", "otras", "otro", "otros",
+    "mejor", "mejora", "cosas", "cosa", "parte", "partes", "gente",
+    "puede", "pueden", "quiero", "quiere", "hacer", "hacemos", "hecho",
+    "hechos", "decir", "dice", "dicen", "luego", "donde", "cuando",
+    "porque", "aunque", "mismo", "misma", "mismos", "mismas", "sobre",
+    "entre", "desde", "hasta", "para", "como", "esto", "estas", "estos",
+    "esas", "esos", "aquel", "aquella", "aqui", "alla", "alli", "antes",
+    "ahora", "ayer", "manana", "tarde", "noche", "noches", "semana",
+    "punto", "puntos", "bueno", "buena", "buenas", "verdad", "diaria",
+    "diario",
+})
+
+
+def _palabras_clave(texto, minimo: int = 5) -> set:
+    """Palabras clave normalizadas (>= ``minimo`` letras, sin stopwords).
+
+    Normaliza a minusculas sin acentos/diacriticos ni signos y descarta las
+    palabras de funcion de ``_STOPWORDS_DIVERSIDAD``. Los hashtags/@menciones
+    cuentan por su palabra (``#HomeOffice`` -> ``homeoffice``). Es la base de
+    la garantia "cero palabras compartidas por cuenta" del fallback local.
+    Nunca lanza: ante cualquier error devuelve un set vacio.
+    """
+    try:
+        t = str(texto or "").lower()
+        plano = unicodedata.normalize("NFKD", t)
+        plano = "".join(c for c in plano if not unicodedata.combining(c))
+        plano = plano.replace("ñ", "n")
+        palabras = re.findall(r"[a-z0-9]+", plano)
+    except Exception:
+        return set()
+    try:
+        limite = max(1, int(minimo))
+    except (TypeError, ValueError):
+        limite = 5
+    return {
+        p for p in palabras
+        if len(p) >= limite and p not in _STOPWORDS_DIVERSIDAD
+    }
+
+
+def _familia_de_tema(tema: str) -> str:
+    """Familia de vocabulario del tema (tema vacio/desconocido -> generico)."""
+    try:
+        clave = _normalizar_tema(tema)
+    except Exception:
+        clave = ""
+    if not clave:
+        return "generico"
+    return _FAMILIA_POR_TEMA.get(clave, "generico")
+
+
+def _hashtag_de_tema(tema: str) -> str:
+    """Hashtag determinista del tema ('' si no hay): home_office -> #HomeOffice."""
+    try:
+        clave = _normalizar_tema(tema)
+    except Exception:
+        clave = ""
+    partes = re.findall(r"[a-z0-9]+", clave or "")
+    if not partes:
+        return ""
+    return "#" + "".join(p[:1].upper() + p[1:] for p in partes)
+
+
+# Hashtags de respaldo cuando el del tema choca con palabras ya usadas por la
+# misma cuenta (p. ej. tema "recuerdos" y un texto anterior que dijo
+# "me dejo recuerdos"): se elige uno determinista que no comparta palabras.
+_HASHTAGS_ALTERNOS = (
+    "#Comunidad",
+    "#Mexico",
+    "#Ciudad",
+    "#Pueblo",
+    "#Barrio",
+    "#Informacion",
+    "#Actualidad",
+    "#Opinion",
+    "#Conversacion",
+    "#Cultura",
+)
+
+
+def _hashtag_alternativo(evitar, semilla: int = 0) -> str:
+    """Hashtag de respaldo determinista sin palabras en ``evitar`` (nunca lanza)."""
+    try:
+        base = int(semilla)
+    except Exception:
+        base = 0
+    try:
+        usadas = set(evitar or ())
+    except Exception:
+        usadas = set()
+    total = len(_HASHTAGS_ALTERNOS)
+    for desplazamiento in range(total):
+        tag = _HASHTAGS_ALTERNOS[(base + desplazamiento) % total]
+        if not (_palabras_clave(tag) & usadas):
+            return tag
+    return _HASHTAGS_ALTERNOS[base % total]
+
+
+def _elegir_pieza(rng, perfil_key: str, familia: str, tipo: str) -> str:
+    """Elige una pieza del pool: prioriza la familia del tema sobre el perfil."""
+    fam = _PIEZAS_FAMILIA.get(familia) or {}
+    propias = list(fam.get(tipo) or ())
+    perfil_piezas = _PLANTILLAS_MANTENIMIENTO.get(perfil_key) or {}
+    comunes = list(perfil_piezas.get(tipo) or ())
+    if propias and (not comunes or rng.random() < 0.7):
+        opciones = propias
+    elif comunes:
+        opciones = comunes
+    else:
+        opciones = propias
+    if not opciones:
+        return ""
+    return rng.choice(opciones)
+
+
+def _componer_post_local(rng, perfil_key: str, familia: str) -> str:
+    """Ensambla un POST local (Sujeto + Accion + Comentario) segun el perfil."""
+    sujeto = _elegir_pieza(rng, perfil_key, familia, "sujetos") or "el dia de hoy"
+    accion = _elegir_pieza(rng, perfil_key, familia, "acciones") or "da para pensar"
+    comentario = (
+        _elegir_pieza(rng, perfil_key, familia, "comentarios")
+        or "asi es la vida"
+    )
+    if perfil_key == "formal":
+        titulo = sujeto[:1].upper() + sujeto[1:]
+        cierre = (
+            _elegir_pieza(rng, perfil_key, familia, "comentarios") or comentario
+        )
+        cierre = cierre[:1].upper() + cierre[1:]
+        return f"{titulo}\n\n{sujeto} {accion}, y {comentario}.\n\n{cierre}."
+    if perfil_key == "ciudadano":
+        arranque = rng.choice(("La verdad, ", "Pues ", "Mira, ", ""))
+        return f"{arranque}{sujeto} {accion}; {comentario}."
+    if perfil_key == "popular":
+        marco = rng.choice((
+            f"{sujeto} {accion} y {comentario}, pa q mas",
+            f"tons {sujeto} {accion}; {comentario}",
+            f"{sujeto} {accion} y {comentario}, xq si",
+            f"k {sujeto} {accion}; {comentario}",
+            f"{sujeto} {accion}, {comentario} jajaja",
+        ))
+        if not marco.startswith(("k ", "tons ", "xq ", "q ", "pa ")):
+            marco = marco[:1].upper() + marco[1:]
+        return marco
+    return f"{sujeto} {accion}. {comentario}."
+
+
+def _componer_comentario_local(rng, perfil_key: str, familia: str) -> str:
+    """Ensambla un COMENTARIO/RESPUESTA breve y conversacional (sin hashtags)."""
+    aperturas = list(
+        (_PLANTILLAS_COMENTARIO.get(perfil_key) or {}).get("aperturas") or ()
+    )
+    apertura = rng.choice(aperturas) if aperturas else "Buen punto"
+    fam = _PIEZAS_FAMILIA.get(familia) or {}
+    remates_familia = list(fam.get("comentarios") or ())
+    comunes = list(
+        (_PLANTILLAS_MANTENIMIENTO.get(perfil_key) or {}).get("comentarios") or ()
+    )
+    if remates_familia and (not comunes or rng.random() < 0.6):
+        remate = rng.choice(remates_familia)
+    elif comunes:
+        remate = rng.choice(comunes)
+    else:
+        remate = "vale la pena conversarlo"
+    if perfil_key == "formal":
+        cierre = rng.choice(comunes) if comunes else remate
+        return (
+            f"{apertura}\n\n{remate[:1].upper() + remate[1:]}.\n\n"
+            f"{cierre[:1].upper() + cierre[1:]}."
+        )
+    if perfil_key == "popular":
+        return f"{apertura}, {remate}, pa q mas"
+    return f"{apertura}: {remate}."
+
+
+def _generar_plantilla_local(
+    perfil: str = "",
+    tema: str = "",
+    semilla: int = 0,
+    comentario: bool = False,
+    evitar=None,
+) -> str:
+    """Texto local dinamico por PARTES (Sujeto + Accion + Comentario).
+
+    - Determinista: misma (perfil, tema, semilla, comentario, evitar) -> mismo
+      texto (``random.Random`` sembrado).
+    - Theme-aware: mapea el tema a una FAMILIA de vocabulario y prefiere sus
+      piezas; tema vacio/desconocido usa los pools genericos del perfil.
+    - Respeta el FORMATO del perfil: formal = 3 bloques con doble enter;
+      ciudadano = 1-2 frases; popular = 1 renglon casual con faltas
+      intencionales (q/pa/xq/tons/k); generico = 1-2 frases neutras.
+    - POSTS: agrega un hashtag determinista del tema (el llamador lo reubica EN
+      MEDIO y aplica el limite de 100). COMENTARIOS: sin hashtags.
+    - ``evitar`` (set de palabras clave ya usadas por la MISMA cuenta/campana):
+      reintenta la combinacion (tope de intentos) hasta no compartir ninguna.
+    - NUNCA lee ``narrativa`` (garantia anti-fuga). Nunca lanza.
+    """
+    try:
+        clave = normalizar_perfil(perfil) or "generico"
+    except Exception:
+        clave = "generico"
+    etiqueta = _PLANTILLAS_MANTENIMIENTO.get(clave)
+    if not etiqueta:
+        clave = "generico"
+    try:
+        rng = random.Random(int(semilla))
+    except Exception:
+        rng = random.Random(0)
+    try:
+        evitar_norm = {
+            str(w).strip().lower() for w in (evitar or ()) if str(w).strip()
+        }
+    except Exception:
+        evitar_norm = set()
+    familia = _familia_de_tema(tema)
+    hashtag = "" if comentario else _hashtag_de_tema(tema)
+    if hashtag and (_palabras_clave(hashtag) & evitar_norm):
+        # El hashtag del tema choca con palabras ya usadas por la cuenta:
+        # se usa un hashtag de respaldo determinista que no comparta palabras.
+        hashtag = _hashtag_alternativo(evitar_norm, semilla)
+    texto = ""
+    for _intento in range(_INTENTOS_PLANTILLA_LOCAL):
+        if comentario:
+            texto = _componer_comentario_local(rng, clave, familia)
+        else:
+            texto = _componer_post_local(rng, clave, familia)
+        if hashtag:
+            texto = f"{texto} {hashtag}"
+        claves = _palabras_clave(texto)
+        if not (claves & evitar_norm):
+            return texto.strip()
+    return (texto or "").strip()
+
+
+def _normalizar_texto_local(
+    texto: str, registro, semilla: int = 0, es_comentario: bool = False
+) -> str:
+    """Humaniza por registro y normaliza un texto local (nunca lanza).
+
+    POSTS: hashtag integrado EN MEDIO (el texto local ya trae uno estable del
+    tema) y corte DURO de 100 caracteres. COMENTARIOS: sin hashtags, links ni
+    @menciones (spam-safe para X) y sin limite de 100.
+    """
+    t = (texto or "").strip()
+    if not t:
+        return t
+    try:
+        t = _humanizar_por_registro(t, registro, semilla=semilla)
+    except Exception:
+        pass
+    try:
+        t = _quitar_signos_por_registro(t, registro)
+    except Exception:
+        pass
+    if es_comentario:
+        try:
+            t = limpiar_comentario_spam(t)
+        except Exception:
+            pass
+    else:
+        t = _con_hashtag_en_medio(t)
+        t = _acotar_limite(t)
+    return t
+
+
+def _texto_local_diverso(
+    *,
+    perfil: str = "",
+    registro: str = "",
+    tema: str = "",
+    es_comentario: bool = False,
+    nombre: str = "",
+    personalidad: str = "",
+    semilla_base: int = 0,
+    evitar=None,
+    vistos=None,
+    vistos_global=None,
+) -> str:
+    """Genera UN texto local unico y sin palabras compartidas (nunca lanza).
+
+    Reintenta con semillas distintas hasta encontrar un texto que (a) no
+    comparta palabras clave con ``evitar`` (otros textos de la MISMA cuenta),
+    (b) no este en ``vistos`` (misma cuenta) ni en ``vistos_global`` (toda la
+    campana). Si no lo logra devuelve el ultimo candidato normalizado (nunca
+    vacio en la practica: hay respaldo final). El texto NUNCA lee narrativa.
+    """
+    try:
+        evitar = set(evitar or ())
+    except Exception:
+        evitar = set()
+    vistos = vistos if isinstance(vistos, set) else set()
+    vistos_global = vistos_global if isinstance(vistos_global, set) else set()
+    pie = _pie_personal(nombre, personalidad)
+    ultimo = ""
+    for intento in range(_INTENTOS_TEXTO_LOCAL):
+        try:
+            semilla = int(semilla_base) + intento * 7919
+        except Exception:
+            semilla = intento * 7919
+        with_pie = bool(pie) and (intento % 2 == 0)
+        try:
+            bruto = _generar_plantilla_local(
+                perfil=perfil,
+                tema=tema,
+                semilla=semilla,
+                comentario=es_comentario,
+                evitar=evitar,
+            )
+        except Exception:
+            bruto = ""
+        if not bruto:
+            continue
+        if with_pie:
+            # El pie personal aporta unicidad, pero en POSTS no debe empujar
+            # el texto mas alla del limite de 100 (se omitiria a medias).
+            if es_comentario or len(bruto) + len(pie) <= 100:
+                bruto = f"{bruto}{pie}"
+        t = _normalizar_texto_local(bruto, registro, semilla, es_comentario)
+        if not t:
+            continue
+        ultimo = t
+        if t in vistos or t in vistos_global:
+            continue
+        if _palabras_clave(t) & evitar:
+            continue
+        return t
+    if ultimo:
+        return ultimo
+    try:
+        return _normalizar_texto_local(
+            "El dia de hoy da para pensar. #Comunidad",
+            registro,
+            semilla_base,
+            es_comentario,
+        ) or "Buen punto, vale la pena conversarlo."
+    except Exception:
+        return "Buen punto, vale la pena conversarlo."
 
 
 def _plantillas_por_perfil(tema: str, perfil: str = "") -> tuple:
-    """Plantillas de mantenimiento del tema para el perfil (o las genericas)."""
-    entradas = _PLANTILLAS_MANTENIMIENTO.get(tema) or _PLANTILLAS_MANTENIMIENTO["gustos"]
-    if not isinstance(entradas, dict):
-        return tuple(entradas)
-    try:
-        clave = normalizar_perfil(perfil)
-    except Exception:
-        clave = ""
-    plantillas = entradas.get(clave) if clave else None
-    if not plantillas:
-        plantillas = entradas.get("generico") or ()
-    return tuple(plantillas)
+    """Muestras locales de mantenimiento del tema/perfil (nunca lanza).
+
+    Wrapper fino de `_generar_plantilla_local`: devuelve muestras deterministas
+    (semillas 0..M-1) con el formato del perfil y hashtag en medio, en vez de
+    la lista rigida antigua. Conserva la firma publica.
+    """
+    muestras = []
+    for semilla in range(_MUESTRAS_PLANTILLAS):
+        try:
+            t = _generar_plantilla_local(perfil=perfil, tema=tema, semilla=semilla)
+            if t:
+                t = _acotar_limite(_con_hashtag_en_medio(t))
+        except Exception:
+            t = ""
+        if t and t not in muestras:
+            muestras.append(t)
+    return tuple(muestras)
 
 
 def _plantillas_comentario(perfil: str = "") -> tuple:
-    """Plantillas locales de comentario para el perfil (con generico de fallback)."""
-    try:
-        clave = normalizar_perfil(perfil)
-    except Exception:
-        clave = ""
-    return tuple(
-        _PLANTILLAS_COMENTARIO.get(clave) or _PLANTILLAS_COMENTARIO["generico"]
-    )
+    """Muestras locales de comentario para el perfil (nunca lanza).
+
+    Wrapper fino de `_generar_plantilla_local(comentario=True)`: textos
+    breves y conversacionales, sin hashtags/links/@menciones.
+    """
+    muestras = []
+    for semilla in range(_MUESTRAS_PLANTILLAS):
+        try:
+            t = _generar_plantilla_local(
+                perfil=perfil, tema="", semilla=semilla, comentario=True
+            )
+            t = limpiar_comentario_spam(t)
+        except Exception:
+            t = ""
+        if t and t not in muestras:
+            muestras.append(t)
+    return tuple(muestras)
 
 
 def _pie_personal(nombre: str = "", personalidad: str = "") -> str:
@@ -1889,6 +2746,21 @@ def _humanizar_si_ciudadano(texto: str, registro, semilla: int = 0) -> str:
     return _humanizar_por_registro(texto, registro, semilla)
 
 
+# Angulos narrativos rotativos: a cada PERFIL del lote le toca uno distinto.
+# Rompen las estructuras clonadas (dos textos con el mismo tema y el mismo
+# arranque se delatan como bot). Se rotan por POSICION en el lote.
+_ANGULOS_MANTENIMIENTO = (
+    "anecdota personal",
+    "pregunta al aire",
+    "opinion directa",
+    "recomendacion",
+    "recuerdo de infancia",
+    "humor ligero",
+    "mini-lista",
+    "comparacion",
+)
+
+
 def _prompt_lote_mantenimiento(
     lote: list,
     cuentas_info: list,
@@ -1966,10 +2838,18 @@ def _prompt_lote_mantenimiento(
         registro = str(info.get("registro") or "").strip().lower()
         perfil = str(info.get("perfil") or "").strip()
         accion = _normalizar_accion(info.get("tipo_accion"))
+        angulo = _ANGULOS_MANTENIMIENTO[
+            (idx - 1) % len(_ANGULOS_MANTENIMIENTO)
+        ]
         linea = (
             f"PERFIL {idx} | usuario: {usuario or 'cuenta'} | registro: "
             f"{registro or 'libre'} | perfil: {etiqueta_perfil(perfil)} | "
-            f"accion: {accion} | tema: {tema}"
+            f"accion: {accion} | tema: {tema} | angulo: {angulo}"
+        )
+        linea += (
+            "\nANGULO NARRATIVO OBLIGATORIO DE ESTE TEXTO: "
+            f"{angulo} (escribe el texto desde ESE angulo; no lo repitas con "
+            "el de otro PERFIL)."
         )
         linea += (
             "\nPERSONALIDAD DE LA CUENTA (respeta su tono e intereses): "
@@ -2035,6 +2915,22 @@ def _prompt_lote_mantenimiento(
         reglas_largo = "- Maximo 100 caracteres por texto.\n"
 
     partes.append(
+        "REGLA DE DIVERSIDAD (OBLIGATORIA):\n"
+        "- NINGUN texto puede parecerse a otro del lote en TEMA ni en "
+        "ESTRUCTURA: cada texto debe poder leerse como de una persona distinta.\n"
+        "- Cada PERFIL tiene asignado SU tema y SU angulo narrativo: trata SOLO "
+        "ese tema, desde ESE angulo, sin mezclar temas ni angulos de otros "
+        "textos del lote.\n"
+        "- Si un texto habla de cafe, el SIGUIENTE debe hablar de otro tema "
+        "(clima, trafico, mascotas...): PROHIBIDO repetir el tema de otro "
+        "texto del lote.\n"
+        "- PROHIBIDO repetir palabras clave, objetos, aperturas, cierres, "
+        "muletillas, estructuras o hashtags entre los textos del lote.\n"
+        "- PROHIBIDO reciclar oraciones modelo: varia largo, ritmo, "
+        "vocabulario y tipo de frase en cada texto.\n"
+    )
+
+    partes.append(
         "REGLAS DEL LOTE:\n"
         f"- Genera EXACTAMENTE {n_textos} textos DISTINTOS entre si, sin repetir "
         "frases, ideas, aperturas, muletillas ni estructuras (alterna anecdota / "
@@ -2064,11 +2960,14 @@ def _prompt_lote_mantenimiento(
 def _fallback_estructura_mantenimiento(cuentas_info, n_por_cuenta) -> list[list[str]]:
     """Ultimo recurso: estructura valida con textos no vacios (nunca lanza).
 
-    Respeta el perfil/tipo_accion/registro de cada cuenta; los POSTS llevan
-    hashtag en medio y los COMENTARIOS se limpian para no llevar hashtags,
-    links ni @menciones (spam-safe). Aplica el estilo local de cada registro
-    (ciudadana: malos signos + 4-7 errores; activista: 2-3 errores sin abrir
-    "¿"/"¡"; politica intacta).
+    Usa el fallback local DINAMICO por partes (`_generar_plantilla_local`):
+    tema rotativo por (cuenta, texto), perfil/tipo_accion/registro de cada
+    cuenta, palabras clave sin repetir dentro de la MISMA cuenta y unicidad
+    global dentro de la llamada. Los POSTS llevan hashtag en medio y <=100
+    caracteres; los COMENTARIOS salen spam-safe (sin hashtags, links ni
+    @menciones). Aplica el estilo local de cada registro (ciudadana: malos
+    signos + 4-7 errores; activista: 2-3 errores sin abrir "¿"/"¡"; politica
+    intacta). NUNCA lee la narrativa (garantia anti-fuga).
     """
     try:
         lista = list(cuentas_info or [])
@@ -2082,37 +2981,37 @@ def _fallback_estructura_mantenimiento(cuentas_info, n_por_cuenta) -> list[list[
         n = 0
 
     resultado = []
+    vistos_global: set = set()
+    total_temas = len(_TEMAS_MANTENIMIENTO) or 1
     for i, cu in enumerate(lista):
         info = cu if isinstance(cu, dict) else {}
         perfil = str(info.get("perfil") or "").strip()
         registro = str(info.get("registro") or "").strip()
         accion = _normalizar_accion(info.get("tipo_accion"))
-        if accion == "comentario":
-            plantillas = _plantillas_comentario(perfil)
-        else:
-            plantillas = _PLANTILLAS_MANTENIMIENTO["gustos"]["generico"]
         es_comentario = accion == "comentario"
+        usuario = str(info.get("usuario") or "").strip()
+        nombre = str(info.get("nombre") or info.get("usuario") or "").strip()
+        personalidad = str(info.get("personalidad") or "").strip()
         fila = []
         vistos: set = set()
+        evitar: set = set()
         for j in range(n):
-            t = plantillas[(i + j) % len(plantillas)]
-            # Estilo local por registro ANTES del hashtag (no deforma el tag).
-            t = _humanizar_por_registro(t, registro, semilla=i * 100 + j)
-            if es_comentario:
-                # Comentarios spam-safe: sin hashtags, links ni @menciones.
-                t = limpiar_comentario_spam(t)
-            else:
-                # Regla de oro: los POSTS jamas superan 100 caracteres.
-                t = _con_hashtag_en_medio(t)
-                t = _acotar_limite(t)
-            if t in vistos:
-                t = _variar_hasta_unico(t, vistos)
-                t = _humanizar_por_registro(t, registro, semilla=i * 100 + j + 997)
-                if es_comentario:
-                    t = limpiar_comentario_spam(t)
-                else:
-                    t = _acotar_limite(_con_hashtag_en_medio(t))
+            tema = _TEMAS_MANTENIMIENTO[(i * n + j) % total_temas]
+            t = _texto_local_diverso(
+                perfil=perfil,
+                registro=registro,
+                tema=tema,
+                es_comentario=es_comentario,
+                nombre=nombre,
+                personalidad=personalidad,
+                semilla_base=_semilla_plantilla(i, j, usuario),
+                evitar=evitar,
+                vistos=vistos,
+                vistos_global=vistos_global,
+            )
+            evitar |= _palabras_clave(t)
             vistos.add(t)
+            vistos_global.add(t)
             fila.append(t)
         resultado.append(fila)
     return resultado
@@ -2172,15 +3071,15 @@ def _generar_textos_mantenimiento_impl(
         except Exception as e:
             logger.error(f"Error en callback de mantenimiento: {e}")
 
-    # 1) Un slot por (cuenta, tuit) con tema rotativo; se agrupan por tema.
+    # 1) Un slot por (cuenta, tuit) con tema rotativo. Los lotes van en ORDEN
+    #    NATURAL (i, j), MEZCLANDO temas: cada lote de <=15 slots lleva temas
+    #    TODOS distintos (antes se agrupaba por tema y los lotes salian
+    #    homogeneos, con textos clonados).
     slots = []
     for i in range(total_cuentas):
         for j in range(n):
             tema = temas_limpios[(i * n + j) % len(temas_limpios)]
             slots.append((i, j, tema))
-    slots_ordenados = []
-    for tema in temas_limpios:
-        slots_ordenados.extend(s for s in slots if s[2] == tema)
 
     generador = None
     try:
@@ -2191,9 +3090,9 @@ def _generar_textos_mantenimiento_impl(
     # 2) OpenAI: lotes de <=15 perfiles, un texto por perfil separado por '---'.
     if generador is not None:
         for inicio in range(
-            0, len(slots_ordenados), _MAX_PERFILES_POR_LLAMADA_MANTENIMIENTO
+            0, len(slots), _MAX_PERFILES_POR_LLAMADA_MANTENIMIENTO
         ):
-            lote = slots_ordenados[
+            lote = slots[
                 inicio:inicio + _MAX_PERFILES_POR_LLAMADA_MANTENIMIENTO
             ]
             textos_lote = []
@@ -2221,8 +3120,11 @@ def _generar_textos_mantenimiento_impl(
             _reportar()
 
     # 3) Relleno local + normalizacion final: exactamente n textos por cuenta,
-    #    unicos en lo posible y NUNCA vacios; los POSTS con hashtag integrado
-    #    EN MEDIO y los COMENTARIOS sin hashtags/links/@menciones (spam-safe).
+    #    GLOBALMENTE unicos, sin compartir palabras clave entre los textos de
+    #    una MISMA cuenta y NUNCA vacios; los POSTS con hashtag integrado EN
+    #    MEDIO y <=100 chars; los COMENTARIOS sin hashtags/links/@menciones.
+    vistos_global: set = set()
+    total_temas = len(temas_limpios) or 1
     for i in range(total_cuentas):
         info = _info_cuenta(lista, i)
         nombre = str(info.get("nombre") or info.get("usuario") or "").strip()
@@ -2231,87 +3133,82 @@ def _generar_textos_mantenimiento_impl(
         registro = str(info.get("registro") or "").strip()
         accion = _normalizar_accion(info.get("tipo_accion"))
         es_comentario = accion == "comentario"
+        usuario = str(info.get("usuario") or "").strip()
 
         fila: list[str] = []
         vistos: set = set()
+        evitar: set = set()
 
         def _plantilla_local(j: int) -> str:
-            """Plantilla local (NO lee narrativa) del tema/perfil/accion."""
-            tema = temas_limpios[(i * n + j) % len(temas_limpios)]
-            if accion == "comentario":
-                plantillas = _plantillas_comentario(perfil)
-            else:
-                plantillas = _plantillas_por_perfil(tema, perfil)
-            base_t = (
-                plantillas[(i * n + j) % len(plantillas)]
-                .replace("{nombre}", nombre or "amig@")
-                .strip()
+            """Fallback local diverso (NO lee narrativa) del tema/perfil/accion.
+
+            Acumula `evitar`/`vistos` de la cuenta para que sus n textos no
+            compartan palabras clave ni se repitan (y `vistos_global` para no
+            repetirse entre cuentas).
+            """
+            tema = temas_limpios[(i * n + j) % total_temas]
+            return _texto_local_diverso(
+                perfil=perfil,
+                registro=registro,
+                tema=tema,
+                es_comentario=es_comentario,
+                nombre=nombre,
+                personalidad=personalidad,
+                semilla_base=_semilla_plantilla(i, j, usuario) + (i * n + j),
+                evitar=evitar,
+                vistos=vistos,
+                vistos_global=vistos_global,
             )
-            return base_t + _pie_personal(nombre, personalidad)
 
         for j in range(n):
             t = (resultado[i][j] or "").strip()
-            es_fallback = not bool(t)
             if not t:
                 t = _plantilla_local(j)
                 hechas += 1
                 _reportar()
-            elif narrativa:
-                # Red de seguridad: si el texto de la IA filtra la narrativa,
-                # se cambia por la plantilla local del mismo tema/perfil (que
-                # NO lee la narrativa) y conserva registro/perfil de la cuenta.
-                # En COMENTARIOS, las palabras del tweet ancla (tema legitimo)
-                # quedan exentas: hablar del ancla NO es filtrar la narrativa.
-                t = _reemplazo_sin_fuga(
-                    t,
-                    narrativa,
-                    lambda j=j: _plantilla_local(j),
-                    exentos=(tweet_ancla_texto if es_comentario else ""),
+            else:
+                if narrativa:
+                    # Red de seguridad: si el texto de la IA filtra la
+                    # narrativa, se cambia por el fallback local del mismo
+                    # tema/perfil (que NO lee la narrativa) y conserva
+                    # registro/perfil de la cuenta. En COMENTARIOS, las
+                    # palabras del tweet ancla (tema legitimo) quedan exentas.
+                    original_ia = t
+                    t = _reemplazo_sin_fuga(
+                        t,
+                        narrativa,
+                        lambda j=j: _plantilla_local(j),
+                        exentos=(tweet_ancla_texto if es_comentario else ""),
+                    )
+                    if not t or t != original_ia:
+                        if not t:
+                            t = _plantilla_local(j)
+                        # El reemplazo local ya viene normalizado y diverso.
+                        evitar |= _palabras_clave(t)
+                        vistos.add(t)
+                        vistos_global.add(t)
+                        fila.append(t)
+                        continue
+                # Normalizacion del texto de la IA (estilo por registro,
+                # hashtag/limite o spam-safe) con el mismo tratamiento local.
+                t = _normalizar_texto_local(
+                    t, registro, i * 100 + j, es_comentario
                 )
-                if not t:
+                # Diversidad: si el texto de la IA comparte palabras clave con
+                # otro de la MISMA cuenta, o esta repetido (cuenta o campana),
+                # se reemplaza por el fallback local del tema.
+                if (
+                    not t
+                    or (_palabras_clave(t) & evitar)
+                    or (t in vistos)
+                    or (t in vistos_global)
+                ):
                     t = _plantilla_local(j)
-            # Estilo local por registro en TODOS los textos (OpenAI y
-            # fallback): el LLM tiende a devolver texto limpio aunque el prompt
-            # pida errores, asi que se garantiza aqui. Se aplica ANTES del
-            # hashtag para no deformar el tag; con semilla por (cuenta, texto)
-            # para que cada texto varie.
-            t = _humanizar_por_registro(t, registro, semilla=i * 100 + j)
-            if es_comentario:
-                # COMENTARIOS spam-safe: estilo y signos ANTES de limpiar; X
-                # castiga las respuestas con hashtags, links o @menciones.
-                t = _quitar_signos_por_registro(t, registro)
-                t = limpiar_comentario_spam(t)
-            else:
-                t = _con_hashtag_en_medio(t)
-            if t in vistos:
-                t = _variar_hasta_unico(t, vistos)
-                t = _humanizar_por_registro(
-                    t, registro, semilla=i * 100 + j + 997
-                )
-                if es_comentario:
-                    t = _quitar_signos_por_registro(t, registro)
-                    t = limpiar_comentario_spam(t)
-                else:
-                    t = _con_hashtag_en_medio(t)
-            # Signos de apertura: activista/ciudadana NUNCA abren "¿"/"¡"
-            # (aplica tambien a los textos de la IA); politica intacta.
-            t = _quitar_signos_por_registro(t, registro)
-            if es_comentario:
-                # Garantia final: TODO comentario (IA o fallback) sale por
-                # `limpiar_comentario_spam` (NUNCA con #, links ni @) y jamas
-                # vacio: si queda muy corto, devuelve un cierre conversacional.
-                # Los COMENTARIOS quedan FUERA del limite de 100.
-                t = limpiar_comentario_spam(t)
-            else:
-                # Corte DURO (regla de oro): los POSTS (IA o fallback) jamas
-                # superan 100 caracteres. Si el recorte colisiona con otro
-                # texto, se varia SIN volver a pasarse del limite.
-                t = _acotar_limite(t)
-                if t in vistos:
-                    alterno = _acotar_limite(_variar_hasta_unico(t, vistos))
-                    if alterno and alterno not in vistos:
-                        t = alterno
+            if not t:
+                t = _plantilla_local(j)
+            evitar |= _palabras_clave(t)
             vistos.add(t)
+            vistos_global.add(t)
             fila.append(t)
         resultado[i] = fila
 
@@ -2335,11 +3232,13 @@ def generar_textos_mantenimiento(
     texto (ver `core.perfiles`); vacio/desconocido usa el comportamiento
     generico. `tipo_accion` ("post" o "comentario") permite pedir textos aptos
     para responder (breves y conversacionales).
-    temas default: ["azteca", "dia", "tendencias", "gustos"].
-    - Asigna temas rotativos por cuenta/tuit (variedad garantizada).
-    - Agrupa por tema en lotes de <=15 cuentas: pide a OpenAI UN texto por
-      personalidad (repitiendo registro, personalidad, perfil y accion de cada
-      una) separados por '---' y parsea en orden.
+    temas default: ``ia.prompts.TEMAS_MANTENIMIENTO`` (los 4 legacy + mas de
+    30 cotidianos, con rotacion que alterna familias de vocabulario).
+    - Asigna temas rotativos por cuenta/tuit (variedad garantizada). Los lotes
+      de <=15 cuentas van en orden natural MEZCLANDO temas distintos (ya no se
+      agrupan por tema): pide a OpenAI UN texto por
+      personalidad (repitiendo registro, personalidad, perfil, tema, angulo y
+      accion de cada una) separados por '---' y parsea en orden.
     - Si OpenAI falla o devuelve menos, rellena con plantillas locales
       (>=3 por perfil en cada tema, mas comentarios por perfil) + variaciones +
       el nombre/personalidad, garantizando n_por_cuenta textos NO VACIOS.

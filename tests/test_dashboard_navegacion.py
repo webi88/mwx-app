@@ -24,6 +24,12 @@ Verifica (sin Chrome y sin Streamlit runtime) que:
   - La pestana "Nombres" de Cuentas renderiza con `AppTest` y expone el flujo
     masivo con IA: tipos partido/mixto, contexto para la IA, "aplicar a
     TODAS", navegadores simultaneos y renombrar la clave interna.
+  - La proteccion de identidad de la pestana "Nombres": checkbox
+    `nom_proteger_brandeadas` (default True), el kwarg `proteger_brandeadas`
+    que `_llamar_asignar_propuestas` pasa/omite segun la firma del backend
+    (con fallback TypeError) y el banner persistente del paso 3️⃣ con las
+    cuentas omitidas (`omitidas_protegidas`/`protegidas_usuarios`/
+    `protegidas_detalle`, guardadas en `st.session_state["nom_protegidas"]`).
   - La pestana "Eliminar" de Cuentas (borrado definitivo por lista pegada) esta
     registrada en TABS/MODOS_TABS/render y renderiza con `AppTest` el
     text_area, el boton de busqueda, el multiselect autoseleccionado y el
@@ -212,6 +218,88 @@ def _tipo_mapa_nombres() -> dict:
     return {}
 
 
+def _llamada_widget_por_key(fuente: str, key: str) -> dict:
+    """Kwargs literales de la primera llamada `st.<widget>(..., key=<key>)`."""
+    arbol = ast.parse(fuente)
+    for nodo in ast.walk(arbol):
+        if not isinstance(nodo, ast.Call):
+            continue
+        coincide = False
+        salida = {}
+        for kw in nodo.keywords:
+            if isinstance(kw.value, ast.Constant):
+                salida[kw.arg] = kw.value.value
+            if (
+                kw.arg == "key"
+                and isinstance(kw.value, ast.Constant)
+                and kw.value.value == key
+            ):
+                coincide = True
+        if coincide:
+            return salida
+    return {}
+
+
+def _generar_pasa_proteger(fuente: str) -> bool:
+    """True si alguna llamada a `_llamar_asignar_propuestas` recibe
+    `proteger_brandeadas=bool(<variable>)` (retrocompatible si no)."""
+    arbol = ast.parse(fuente)
+    for nodo in ast.walk(arbol):
+        if not (
+            isinstance(nodo, ast.Call)
+            and isinstance(nodo.func, ast.Name)
+            and nodo.func.id == "_llamar_asignar_propuestas"
+        ):
+            continue
+        for kw in nodo.keywords:
+            if kw.arg != "proteger_brandeadas":
+                continue
+            valor = kw.value
+            if (
+                isinstance(valor, ast.Call)
+                and isinstance(valor.func, ast.Name)
+                and valor.func.id == "bool"
+                and valor.args
+                and isinstance(valor.args[0], ast.Name)
+                and valor.args[0].id == "proteger_brandeadas"
+            ):
+                return True
+    return False
+
+
+def _banner_en_paso3(fuente: str) -> bool:
+    """True si `_tab_nombres` llama `_banner_protegidas_pendientes()` despues
+    del titulo del paso 3️⃣ (antes de la tabla editable)."""
+    pasos = []
+    for nodo in ast.walk(ast.parse(fuente)):
+        if not (isinstance(nodo, ast.FunctionDef) and nodo.name == "_tab_nombres"):
+            continue
+        for stmt in nodo.body:
+            if not (
+                isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call)
+            ):
+                continue
+            llamada = stmt.value
+            if isinstance(llamada.func, ast.Name) and (
+                llamada.func.id == "_banner_protegidas_pendientes"
+            ):
+                pasos.append("banner")
+            if (
+                isinstance(llamada.func, ast.Attribute)
+                and llamada.func.attr == "markdown"
+                and llamada.args
+                and isinstance(llamada.args[0], ast.Constant)
+                and isinstance(llamada.args[0].value, str)
+                and "Revisa y guarda las propuestas" in llamada.args[0].value
+            ):
+                pasos.append("paso3")
+    return (
+        "paso3" in pasos
+        and "banner" in pasos
+        and pasos.index("banner") > pasos.index("paso3")
+    )
+
+
 def _fallbacks_nombres() -> dict:
     """Fallbacks de la UI cuando el backend de identidades es viejo/falta.
 
@@ -266,12 +354,118 @@ def _fallbacks_nombres() -> dict:
     }
 
 
+def _fallback_proteger_brandeadas() -> dict:
+    """`_llamar_asignar_propuestas` pasa/omite `proteger_brandeadas` por firma.
+
+    Invocacion directa con fakes (sin Streamlit): firma nueva con el kwarg al
+    final, `None` = no enviar, firma vieja sin el parametro, backend con
+    `**kwargs` y backend que acepta el parametro pero lanza `TypeError` (la UI
+    reintenta sin el y no se rompe)."""
+    from web.operaciones import cuentas
+
+    llamadas: list = []
+    sentinela = "AUSENTE"
+
+    def _nuevo(
+        usuarios,
+        tipo="auto",
+        seccion="",
+        dry_run=False,
+        contexto="",
+        proteger_brandeadas=sentinela,
+    ):
+        llamadas.append(("nuevo", proteger_brandeadas))
+        return {"firma": "nueva"}
+
+    def _viejo(usuarios, tipo="auto", seccion="", dry_run=False, contexto=""):
+        llamadas.append(("viejo", sentinela))
+        return {"firma": "vieja"}
+
+    def _terco(
+        usuarios,
+        tipo="auto",
+        seccion="",
+        dry_run=False,
+        contexto="",
+        proteger_brandeadas=sentinela,
+    ):
+        llamadas.append(("terco", proteger_brandeadas))
+        if proteger_brandeadas is not sentinela and proteger_brandeadas:
+            raise TypeError("proteger_brandeadas no soportado")
+        if contexto:
+            raise TypeError("contexto no soportado")
+        return {"firma": "terca"}
+
+    def _var_kwargs(usuarios, **kwargs):
+        llamadas.append(("kwargs", kwargs.get("proteger_brandeadas", sentinela)))
+        return {"firma": "kwargs"}
+
+    def _valores(nombre):
+        return [valor for etiqueta, valor in llamadas if etiqueta == nombre]
+
+    res_nuevo = cuentas._llamar_asignar_propuestas(
+        _nuevo, ["u"], "auto", "", "ctx", proteger_brandeadas=True
+    )
+    res_none = cuentas._llamar_asignar_propuestas(
+        _nuevo, ["u"], "auto", "", "ctx", proteger_brandeadas=None
+    )
+    res_viejo = cuentas._llamar_asignar_propuestas(
+        _viejo, ["u"], "auto", "", "ctx", proteger_brandeadas=True
+    )
+    res_terco = cuentas._llamar_asignar_propuestas(
+        _terco, ["u"], "auto", "", "ctx", proteger_brandeadas=True
+    )
+    res_var = cuentas._llamar_asignar_propuestas(
+        _var_kwargs, ["u"], "auto", "", "", proteger_brandeadas=False
+    )
+
+    return {
+        "nuevo_true": res_nuevo.get("firma") == "nueva"
+        and _valores("nuevo")[:1] == [True],
+        "none_no_enviado": res_none.get("firma") == "nueva"
+        and _valores("nuevo") == [True, sentinela],
+        "viejo_ok": res_viejo.get("firma") == "vieja"
+        and _valores("viejo") == [sentinela],
+        "terco_fallback": res_terco.get("firma") == "terca"
+        and _valores("terco")
+        and _valores("terco")[0] is True
+        and _valores("terco")[-1] is sentinela,
+        "var_kwargs_false": res_var.get("firma") == "kwargs"
+        and _valores("kwargs") == [False],
+        "soporta_nuevo": cuentas._soporta_kwargs(
+            _nuevo, ("contexto", "proteger_brandeadas")
+        ),
+        "soporta_viejo_false": not cuentas._soporta_kwargs(
+            _viejo, ("proteger_brandeadas",)
+        ),
+        "soporta_var_kwargs": cuentas._soporta_kwargs(
+            _var_kwargs, ("proteger_brandeadas",)
+        ),
+    }
+
+
 def _app_nombres():
     """Script de AppTest: pestana Nombres de Cuentas con cuentas simuladas.
 
+    Deja `nom_protegidas` en session_state para simular la recarga tras una
+    generacion con cuentas omitidas por proteccion (banner persistente).
     Solo ASCII: `AppTest.from_function` escribe el script temporal con la
     codificacion local de Windows y los acentos lo rompen en silencio."""
+    import streamlit as st
+
     from web.operaciones import cuentas
+
+    st.session_state["nom_protegidas"] = {
+        "count": 3,
+        "usuarios": ["cuenta_tres", "cuenta_cuatro", "cuenta_cinco"],
+        "detalle": [
+            {
+                "usuario": "cuenta_tres",
+                "campo": "handle_actual",
+                "valor": "ana_lopez",
+            }
+        ],
+    }
 
     class _ListarFake:
         def __call__(self, *args, **kwargs):
@@ -358,6 +552,10 @@ def _app_test_nombres() -> tuple[bool, str, dict]:
         "todas": False,
         "workers": False,
         "renombrar": False,
+        "proteger_brandeadas": False,
+        "proteger_default": False,
+        "banner_protegidas": False,
+        "banner_usuarios": False,
     }
     try:
         at = AppTest.from_function(_app_nombres, default_timeout=60)
@@ -369,6 +567,19 @@ def _app_test_nombres() -> tuple[bool, str, dict]:
         return False, str(at.exception[0].value)[:200], resultado
     resultado["sin_excepciones"] = True
 
+    claves_checkbox = {c.key for c in at.checkbox}
+    resultado["proteger_brandeadas"] = "nom_proteger_brandeadas" in claves_checkbox
+    if resultado["proteger_brandeadas"]:
+        resultado["proteger_default"] = bool(
+            at.checkbox(key="nom_proteger_brandeadas").value
+        )
+    resultado["banner_protegidas"] = any(
+        "Protecci" in str(w.value) for w in at.warning
+    )
+    resultado["banner_usuarios"] = any(
+        "cuenta_tres" in str(m.value) for m in at.markdown
+    )
+
     try:
         opciones = list(at.selectbox(key="nom_tipo_identidad").options)
     except KeyError:
@@ -379,6 +590,182 @@ def _app_test_nombres() -> tuple[bool, str, dict]:
     resultado["todas"] = any(c.key == "nom_lote_todas" for c in at.checkbox)
     resultado["workers"] = any(n.key == "nom_lote_workers" for n in at.number_input)
     resultado["renombrar"] = any(c.key == "nom_lote_renombrar" for c in at.checkbox)
+    return True, "", resultado
+
+
+def _app_nombres_generar(modo="nuevo"):
+    """Script de AppTest: pulsa "Generar propuestas" con un backend fake.
+
+    `modo="nuevo"` simula el backend con `proteger_brandeadas` al final
+    (captura el valor recibido) y devuelve `omitidas_protegidas=3` con sus
+    listas; `modo="viejo"` simula la firma vieja (sin el kwarg). Las capturas
+    quedan en `gid._captura_nombres`.
+    Solo ASCII: `AppTest.from_function` escribe el script temporal con la
+    codificacion local de Windows y los acentos lo rompen en silencio."""
+    import cuentas.generador_identidades as gid
+    from web.operaciones import cuentas
+
+    class _ListarFake:
+        def __call__(self, *args, **kwargs):
+            return [
+                {
+                    "usuario": "cuenta_uno",
+                    "email": "",
+                    "status": "active",
+                    "last_checked": "",
+                    "cookies": "si",
+                    "seccion": "",
+                    "seccion_etiqueta": "Sin asignar",
+                    "tipo_cuenta": "ciudadana",
+                    "tipo_etiqueta": "Ciudadana",
+                    "handle_actual": "cuenta_uno",
+                    "nombre_mostrado": "",
+                    "nombre_propuesto": "Naranja Uno",
+                    "handle_propuesto": "naranja_uno",
+                    "password": "",
+                    "user_agent": "",
+                    "sector": "",
+                    "grupo": "",
+                    "grupo_etiqueta": "sin grupo",
+                    "proxy": "",
+                    "activa": True,
+                    "avatar": False,
+                    "banner": False,
+                    "avatar_path": "",
+                    "banner_path": "",
+                    "perfil_personalidad": "",
+                    "personalidad": "",
+                }
+            ]
+
+        def clear(self):
+            pass
+
+    original_listar = cuentas._listar_cuentas
+    original_asignar = gid.asignar_propuestas
+    if not hasattr(gid, "_captura_nombres"):
+        gid._captura_nombres = []
+
+    if modo == "viejo":
+
+        def _asignar(usuarios, tipo="auto", seccion="", dry_run=False, contexto=""):
+            gid._captura_nombres.append("firma-vieja")
+            return {
+                "total": len(usuarios),
+                "ok": len(usuarios),
+                "errores": [],
+                "origen_ia": False,
+            }
+
+    else:
+
+        def _asignar(
+            usuarios,
+            tipo="auto",
+            seccion="",
+            dry_run=False,
+            contexto="",
+            proteger_brandeadas="AUSENTE",
+        ):
+            gid._captura_nombres.append(proteger_brandeadas)
+            return {
+                "total": len(usuarios),
+                "ok": len(usuarios),
+                "errores": [],
+                "origen_ia": False,
+                "omitidas_protegidas": 3,
+                "protegidas_usuarios": [
+                    "cuenta_tres",
+                    "cuenta_cuatro",
+                    "cuenta_cinco",
+                ],
+                "protegidas_detalle": [
+                    {
+                        "usuario": "cuenta_tres",
+                        "campo": "handle_actual",
+                        "valor": "ana_lopez",
+                    }
+                ],
+            }
+
+    cuentas._listar_cuentas = _ListarFake()
+    gid.asignar_propuestas = _asignar
+    try:
+        cuentas._tab_nombres()
+    finally:
+        cuentas._listar_cuentas = original_listar
+        gid.asignar_propuestas = original_asignar
+
+
+def _app_test_nombres_generar(modo="nuevo") -> tuple[bool, str, dict]:
+    """Genera con AppTest y verifica kwarg + banner persistente tras el rerun."""
+    from streamlit.testing.v1 import AppTest
+
+    import cuentas.generador_identidades as gid
+
+    if hasattr(gid, "_captura_nombres"):
+        delattr(gid, "_captura_nombres")
+    resultado = {
+        "sin_excepciones": False,
+        "checkbox_presente": False,
+        "checkbox_default": False,
+        "llamada": False,
+        "kwarg_true": False,
+        "session_state": False,
+        "banner": False,
+        "banner_usuarios": False,
+    }
+
+    def _capturas() -> list:
+        capturas = list(getattr(gid, "_captura_nombres", []) or [])
+        if hasattr(gid, "_captura_nombres"):
+            delattr(gid, "_captura_nombres")
+        return capturas
+
+    try:
+        at = AppTest.from_function(
+            _app_nombres_generar, default_timeout=90, kwargs={"modo": modo}
+        )
+        at.run()
+        if at.exception:
+            capturas = _capturas()
+            resultado["llamada"] = bool(capturas)
+            return False, str(at.exception[0].value)[:200], resultado
+
+        claves = {c.key for c in at.checkbox}
+        resultado["checkbox_presente"] = "nom_proteger_brandeadas" in claves
+        if resultado["checkbox_presente"]:
+            resultado["checkbox_default"] = bool(
+                at.checkbox(key="nom_proteger_brandeadas").value
+            )
+
+        at.button(key="btn_nom_generar").click().run()
+    except Exception as e:
+        _capturas()
+        return False, f"{type(e).__name__}: {e}", resultado
+
+    capturas = _capturas()
+    if at.exception:
+        return False, str(at.exception[0].value)[:200], resultado
+    resultado["sin_excepciones"] = True
+    resultado["llamada"] = bool(capturas)
+    if modo != "viejo":
+        resultado["kwarg_true"] = True in capturas
+        try:
+            resumen = at.session_state["nom_protegidas"]
+        except Exception:
+            resumen = None
+        resultado["session_state"] = (
+            isinstance(resumen, dict) and resumen.get("count") == 3
+        )
+        resultado["banner"] = any(
+            "Protecci" in str(w.value) and "omitid" in str(w.value)
+            for w in at.warning
+        )
+        resultado["banner_usuarios"] = any(
+            "cuenta_tres" in str(m.value) and "ana_lopez" in str(m.value)
+            for m in at.markdown
+        )
     return True, "", resultado
 
 
@@ -912,6 +1299,71 @@ def run(check):
         fallbacks["sin_backend_none"] and fallbacks["firma_vieja_none"],
     )
 
+    proteccion = _fallback_proteger_brandeadas()
+    check(
+        "cuentas nombres: proteger_brandeadas se pasa con firma nueva (None "
+        "no se envia)",
+        proteccion["nuevo_true"]
+        and proteccion["none_no_enviado"]
+        and proteccion["soporta_nuevo"],
+    )
+    check(
+        "cuentas nombres: firma vieja/terca no rompe (fallback TypeError)",
+        proteccion["viejo_ok"]
+        and proteccion["terco_fallback"]
+        and proteccion["soporta_viejo_false"],
+    )
+    check(
+        "cuentas nombres: backend con **kwargs recibe proteger_brandeadas",
+        proteccion["var_kwargs_false"] and proteccion["soporta_var_kwargs"],
+    )
+
+    fuente_cuentas = _fuente_cuentas()
+    checkbox_proteger = _llamada_widget_por_key(
+        fuente_cuentas, "nom_proteger_brandeadas"
+    )
+    check(
+        "cuentas nombres: checkbox de proteccion con key "
+        "nom_proteger_brandeadas y default True",
+        checkbox_proteger.get("value") is True,
+        "" if checkbox_proteger.get("value") is True else str(checkbox_proteger),
+    )
+    check(
+        "cuentas nombres: el help del checkbox explica handle_actual/"
+        "nombre_mostrado/propuesta",
+        isinstance(checkbox_proteger.get("help"), str)
+        and "handle_actual" in checkbox_proteger["help"]
+        and "nombre_mostrado" in checkbox_proteger["help"]
+        and "propuesta" in checkbox_proteger["help"],
+    )
+    check(
+        "cuentas nombres: la generacion pasa proteger_brandeadas=bool(...) al "
+        "helper",
+        _generar_pasa_proteger(fuente_cuentas),
+    )
+    check(
+        "cuentas nombres: el resumen de omitidas vive en nom_protegidas "
+        "(count/usuarios/detalle)",
+        'st.session_state["nom_protegidas"]' in fuente_cuentas
+        and '"count": omitidas' in fuente_cuentas
+        and '"usuarios": list(dict.fromkeys(protegidas_usuarios))' in fuente_cuentas
+        and '"detalle": protegidas_detalle' in fuente_cuentas,
+    )
+    check(
+        "cuentas nombres: el paso 3 llama al banner persistente de protegidas",
+        _banner_en_paso3(fuente_cuentas),
+    )
+    check(
+        "cuentas nombres: textos de omitidas (aviso + banner + detalle "
+        "campo/valor)",
+        "omitida(s) para proteger su" in fuente_cuentas
+        and "Protección de identidad:" in fuente_cuentas
+        and "porque ya parecían brandeadas." in fuente_cuentas
+        and "Cuentas omitidas para proteger su identidad" in fuente_cuentas
+        and 'fila.get("campo")' in fuente_cuentas
+        and 'fila.get("valor")' in fuente_cuentas,
+    )
+
     app_ok, app_detalle, app_widgets = _app_test_nombres()
     check(
         "cuentas nombres: la pestana Nombres renderiza sin excepciones (AppTest)",
@@ -929,6 +1381,51 @@ def run(check):
         and app_widgets["workers"]
         and app_widgets["renombrar"],
         str({k: v for k, v in app_widgets.items() if not v}) or "todos presentes",
+    )
+    check(
+        "cuentas nombres: checkbox de proteccion presente y default True "
+        "(AppTest)",
+        app_widgets["proteger_brandeadas"] and app_widgets["proteger_default"],
+        str({k: v for k, v in app_widgets.items() if not v}) or "ok",
+    )
+    check(
+        "cuentas nombres: banner persistente con usuarios/detalle en el paso 3 "
+        "tras el rerun (AppTest)",
+        app_widgets["banner_protegidas"] and app_widgets["banner_usuarios"],
+        str({k: v for k, v in app_widgets.items() if not v}) or "ok",
+    )
+
+    gen_ok, gen_detalle, gen_widgets = _app_test_nombres_generar()
+    check(
+        "cuentas nombres: generar con backend nuevo pasa "
+        "proteger_brandeadas=True (AppTest)",
+        gen_ok
+        and gen_widgets["sin_excepciones"]
+        and gen_widgets["checkbox_presente"]
+        and gen_widgets["checkbox_default"]
+        and gen_widgets["llamada"]
+        and gen_widgets["kwarg_true"],
+        gen_detalle or str({k: v for k, v in gen_widgets.items() if not v}),
+    )
+    check(
+        "cuentas nombres: con omitidas_protegidas=3 el banner y los usuarios "
+        "omitidos se renderizan tras el rerun (AppTest)",
+        gen_widgets["session_state"]
+        and gen_widgets["banner"]
+        and gen_widgets["banner_usuarios"],
+        str({k: v for k, v in gen_widgets.items() if not v}) or "ok",
+    )
+    viejo_ok, viejo_detalle, viejo_widgets = _app_test_nombres_generar(
+        modo="viejo"
+    )
+    check(
+        "cuentas nombres: backend viejo sin proteger_brandeadas no rompe la "
+        "generacion (AppTest)",
+        viejo_ok
+        and viejo_widgets["sin_excepciones"]
+        and viejo_widgets["llamada"],
+        viejo_detalle
+        or ("" if viejo_ok else f"llamada={viejo_widgets['llamada']}"),
     )
 
     # ---------------- Reparto por porcentajes `_repartir_por_porcentajes` ----

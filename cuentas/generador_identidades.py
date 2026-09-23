@@ -21,12 +21,13 @@ reparte ~50% persona / ~50% partido, barajado cuenta por cuenta.
 
 Interfaz congelada (consumida por dashboard y CLI):
 
+    es_handle_generico(handle) -> bool
     ia_disponible() -> bool
     generar_identidad(tipo="persona", seccion="", contexto="", evitar=None) -> dict
     generar_identidades(cantidad, tipo="persona", seccion="", contexto="",
-                        usuarios_existentes=None) -> list[dict]
+                        usuarios_existentes=None, registro="") -> list[dict]
     asignar_propuestas(usuarios, tipo="auto", seccion="", dry_run=False,
-                       contexto="") -> dict
+                       contexto="", proteger_brandeadas=False) -> dict
     aplicar_propuestas_en_lote(usuarios, max_workers=2, password="",
                                renombrar=False, callback=None,
                                cancelar=None) -> dict
@@ -66,6 +67,7 @@ from core.perfiles import (
 
 __all__ = [
     "HANDLE_RE",
+    "es_handle_generico",
     "ia_disponible",
     "generar_identidad",
     "generar_identidades",
@@ -455,6 +457,314 @@ def _handle_prohibido(handle: str) -> bool:
 
 
 # --------------------------------------------------------------------------- #
+# Filtro anti-sobrescritura: handles genericos de proveedores
+# --------------------------------------------------------------------------- #
+# Heuristica determinista y CONSERVADORA (ante la duda devuelve False) usada
+# por ``_cuenta_protegida``: los proveedores de cuentas "Aged" entregan
+# usuarios basura tipo "Katiaforbx7m", "GoodWinsnvn", "khawajaGjdgi",
+# "Sajtiagosal21" o "qwrtyps12x" y esas cuentas SI se pueden renombrar; las
+# que ya tienen un handle humano/brandeado NO se deben tocar.
+
+# Vocales "fuertes" (para el ratio) y letras que cortan corridas de
+# consonantes: la "y" actua como semivocal en espanol ("proyecto", "yoga").
+_VOCALES_FUERTES = frozenset("aeiou")
+_VOCALES_CORRIDA = frozenset("aeiouy")
+
+
+def _construir_pares_consonantes() -> set:
+    """Pares de consonantes tolerables en espanol (tabla fija).
+
+    Incluye los grupos clasicos con l/r (tr, br, cl, pl, gr, pr, cr, dr, fl,
+    bl, gl, str, ntr, mbr, ...), los digrafos (ch, ll, rr, qu, gu), las
+    nasales + consonante (nt, nd, mb, mp, ...), la s + consonante y la l/r +
+    consonante. Un par FUERA de la tabla delata basura de proveedor ("jt",
+    "gj", "qw", "bx", "vn", ...).
+    """
+    pares = set()
+    consonantes = "bcdfghjklmnpqrstvwxyz"
+    for c in consonantes:
+        pares.add(c + "l")
+        pares.add(c + "r")
+    pares |= {"ch", "ll", "rr", "qu", "gu"}
+    for c in consonantes:
+        pares.add("n" + c)
+        pares.add("m" + c)
+        pares.add("s" + c)
+        pares.add("l" + c)
+        pares.add("r" + c)
+    return pares
+
+
+_PARES_CONSONANTES = _construir_pares_consonantes()
+
+# Palabras legitimas (minusculas, sin acentos): nombres/apellidos mexicanos
+# ya usados por el generador, terminos politicos/organizativos y vocabulario
+# cotidiano. Si >= 70% de las letras de un handle se descomponen en estas
+# palabras, el handle se considera humano (NUNCA generico).
+_PALABRAS_LEGITIMAS = {_normalizar_texto(n) for n in _NOMBRES_MX + _APELLIDOS_MX} | {
+    # Organizacion / politica / gobierno.
+    "movimiento", "movimientos", "mov", "unidos", "unidas", "unido", "unida",
+    "voz", "voces", "libertad", "justicia", "analisis", "consultoria",
+    "datos", "ciudad", "ciudadania", "ciudadano", "ciudadana", "mexico",
+    "mexicana", "mexicano", "patria", "pueblo", "gente", "fuerza",
+    "esperanza", "futuro", "accion", "cambio", "progreso", "democracia",
+    "reforma", "revolucion", "derechos", "humanos", "territorio",
+    "colonia", "barrio", "comunidad", "vecinos", "familia", "familias",
+    "juventud", "union", "colectivo", "causa", "camino", "semilla",
+    "puente", "motor", "alianza", "manana", "horizonte", "rumbo",
+    "latido", "raices", "encuentro", "gobierno", "senado", "diputado",
+    "diputados", "legislatura", "institucion", "institucional", "privada",
+    "privado", "publico", "publica", "politica", "politico", "social",
+    "sociedad", "cultura", "deporte", "futbol", "ciencia", "tecnologia",
+    "economia", "finanzas", "empresa", "empresas", "negocios", "mercado",
+    "capital", "grupo", "fundacion", "asociacion", "organizacion",
+    "asamblea", "campesino", "campesinos", "obrero", "obreros", "maestro",
+    "maestros", "estudiante", "estudiantes", "universidad", "escuela",
+    "hospital", "seguridad", "defensa", "salud", "educacion", "trabajo",
+    "ambiente", "verde", "azul", "rojo", "guinda", "rosa", "morado",
+    "dorado", "celeste", "turquesa", "amarillo", "naranja", "luz", "marea",
+    "corriente", "ola", "sol", "faro", "estrella", "alba", "aurora",
+    "viento", "bandera", "corazon", "bolillos", "antorcha", "manantial",
+    "cauce", "eco", "amanecer", "raiz",
+    # Nombres extra y vocabulario profesional/cotidiano.
+    "katia", "santiago", "tiago", "diego", "sofia", "camila", "valeria",
+    "regina", "renata", "emilio", "bruno", "dante", "alvaro", "gael",
+    "zoe", "emma", "mia", "ana", "soledad", "concepcion", "refugio",
+    "consultor", "consultores", "analista", "analistas", "estrategia",
+    "estrategias", "proyecto", "proyectos", "soluciones", "servicios",
+    "sistemas", "digital", "digitales", "media", "medios", "noticias",
+    "periodismo", "comunicacion", "publicidad", "estudio", "estudios",
+}
+
+# Tokens cortos/con digitos que se aceptan tal cual al partir el handle
+# ("4T_puntodos" es una cuenta 4T legitima, "CDMX"/"Hdz" son siglas comunes).
+_TOKENS_CLAVE = {"4t", "cdmx", "mx", "hdz", "gzz", "mtz", "vgz", "rdz", "ip"}
+
+# Bloques minimos de contexto por seccion/registro (fallback local cuando
+# ``ia.prompts.get_prompt_identidades_contexto`` todavia no existe).
+_REGLAS_CONTEXTO_FALLBACK = (
+    "Reglas de CONTEXTO por seccion/registro (MANDAN sobre el detalle del tipo "
+    "cuando apliquen):\n"
+    "- IP + politica: identidad formal, corporativa o de analista "
+    "(ej. AnalisisIP, ConsultoriaDatos).\n"
+    "- LIB o JUS + activista: seudonimo combativo o de causas "
+    "(ej. VozLibertad, JusticiaYa).\n"
+    "- ciudadana: ignora la seccion; nombre mexicano real y coloquial "
+    "(ej. Maria Lopez, Lupita Hernandez).\n"
+)
+
+
+def _segmentar_handle(handle: str) -> list:
+    """Parte un handle en tokens por separadores y fronteras camelCase.
+
+    "UnidosMovCDMX" -> ["Unidos", "Mov", "CDMX"]; "lupita_hdz" ->
+    ["lupita", "hdz"]. Se usa para medir cuanto del handle es vocabulario
+    legitimo. Nunca lanza (cualquier valor raro devuelve []).
+    """
+    segmentos = []
+    try:
+        for bruto in re.split(r"[^A-Za-z0-9]+", str(handle or "")):
+            if not bruto:
+                continue
+            inicio = 0
+            for i in range(1, len(bruto)):
+                anterior, actual = bruto[i - 1], bruto[i]
+                corte = False
+                if anterior.islower() and actual.isupper():
+                    corte = True
+                elif (
+                    anterior.isupper()
+                    and actual.isupper()
+                    and i + 1 < len(bruto)
+                    and bruto[i + 1].islower()
+                ):
+                    corte = True
+                if corte:
+                    segmentos.append(bruto[inicio:i])
+                    inicio = i
+            segmentos.append(bruto[inicio:])
+    except Exception:
+        return []
+    return [segmento for segmento in segmentos if segmento]
+
+
+def _mejor_cobertura_palabra(token: str) -> int:
+    """Letras del token cubiertas por palabras legitimas (DP sin solaparse)."""
+    letras = re.sub(r"[^a-z]", "", str(token or "").lower())
+    n = len(letras)
+    if n < 3:
+        return 0
+    cubierto = [0] * (n + 1)
+    for i in range(1, n + 1):
+        cubierto[i] = cubierto[i - 1]
+        for largo in range(3, min(30, i) + 1):
+            if letras[i - largo:i] in _PALABRAS_LEGITIMAS:
+                cubierto[i] = max(cubierto[i], cubierto[i - largo] + largo)
+    return cubierto[n]
+
+
+def _cobertura_palabras_legitimas(handle: str) -> float:
+    """Fraccion (0-1) de letras del handle que forman palabras legitimas."""
+    letras = sum(1 for c in str(handle or "").lower() if c.isalpha())
+    if letras <= 0:
+        return 0.0
+    cubiertas = 0
+    for token in _segmentar_handle(handle):
+        cubiertas += _mejor_cobertura_palabra(token)
+    return min(1.0, cubiertas / letras)
+
+
+def _tiene_cluster_invalido(texto: str) -> bool:
+    """True si hay una corrida de consonantes imposible en espanol.
+
+    "jt", "gj", "qw", "bx", "vn" o "qwrtyps" delatan basura generada; "tr",
+    "br", "nt", "mbr" o "naranja" no. Nunca lanza.
+    """
+    try:
+        for corrida in _corridas_consonantes(texto):
+            for i in range(len(corrida) - 1):
+                if corrida[i:i + 2] not in _PARES_CONSONANTES:
+                    return True
+    except Exception:
+        return False
+    return False
+
+
+def _corridas_consonantes(texto: str) -> list:
+    """Corridas de consonantes de un texto (la "y" corta como semivocal)."""
+    corridas = []
+    actual = ""
+    for c in re.sub(r"[^a-z]", "", str(texto or "").lower()):
+        if c in _VOCALES_CORRIDA:
+            if actual:
+                corridas.append(actual)
+                actual = ""
+        else:
+            actual += c
+    if actual:
+        corridas.append(actual)
+    return corridas
+
+
+def _digitos_sospechosos(texto: str) -> bool:
+    """True si los digitos del handle tienen pinta de sufijo de proveedor.
+
+    Digitos EMBEBIDOS entre letras ("...bx7m", "12x") o numeros en un handle
+    largo ("Sajtiagosal21") son la firma tipica de los lotes Aged. Un handle
+    humano corto con algun numero ("lupita2024") queda fuera.
+    """
+    limpio = str(texto or "")
+    if not any(c.isdigit() for c in limpio):
+        return False
+    if re.search(r"[A-Za-z]\d[A-Za-z]", limpio):
+        return True
+    return len(limpio) >= 9
+
+
+def _transiciones_mayusculas(texto: str) -> int:
+    """Cambios minuscula->MAYUSCULA (y fin de acronimo) del handle."""
+    cuenta = 0
+    limpio = re.sub(r"[^A-Za-z]", "", str(texto or ""))
+    for i in range(1, len(limpio)):
+        if limpio[i - 1].islower() and limpio[i].isupper():
+            cuenta += 1
+        elif (
+            limpio[i - 1].isupper()
+            and limpio[i].isupper()
+            and i + 1 < len(limpio)
+            and limpio[i + 1].islower()
+        ):
+            cuenta += 1
+    return cuenta
+
+
+def es_handle_generico(handle) -> bool:
+    """True si ``handle`` parece un usuario generado por un proveedor.
+
+    Heuristica determinista y CONSERVADORA (ante la duda devuelve False) para
+    el filtro anti-sobrescritura de ``asignar_propuestas``: las cuentas con
+    handle humano/brandeado NO deben perder su identidad, mientras que los
+    handles basura de lotes "Aged" (``Katiaforbx7m``, ``GoodWinsnvn``,
+    ``khawajaGjdgi``, ``Sajtiagosal21``, ``qwrtyps12x``) SI se pueden renovar.
+
+    Senales combinadas (score; hace falta >= 2 para marcarlo generico):
+
+      * corridas de consonantes imposibles en espanol (se toleran tr, br, cl,
+        pl, gr, pr, cr, dr, fl, bl, gl, str, ntr, mbr, nasales+liquidas, ...);
+      * proporcion de vocales fuertes (a/e/i/o/u) menor al 34%;
+      * digitos embebidos entre letras o sufijos numericos en handles largos;
+      * cambios de mayuscula tipo camelCase aleatorio (>= 2 transiciones).
+
+    Rescates (devuelven False de inmediato): tokens clave conocidos ("4t",
+    "CDMX", "Hdz", ...) y una whitelist de nombres/apellidos mexicanos y
+    vocabulario politico/cotidiano; si >= 70% de las letras del handle se
+    descomponen en esas palabras, es humano. ``None``, vacio, numeros o un
+    display name con espacios (no es un handle) devuelven False. Nunca lanza.
+    """
+    try:
+        texto = str(handle or "").strip().lstrip("@")
+        if not texto or any(c.isspace() for c in texto):
+            return False
+        limpio = re.sub(r"[^A-Za-z0-9_]", "", texto)
+        if len(limpio) < 6:
+            return False
+        bajo = limpio.lower()
+
+        # Rescates ANTES de puntuar: tokens clave ("4T", "CDMX", "Hdz", ...) y
+        # whitelist de palabras. La segmentacion usa el camelCase ORIGINAL
+        # ("UnidosMovCDMX" -> "Unidos"/"Mov"/"CDMX"), no la copia en minusculas.
+        for token in _segmentar_handle(limpio):
+            if token.lower() in _TOKENS_CLAVE:
+                return False
+        if _cobertura_palabras_legitimas(limpio) >= 0.7:
+            return False
+
+        score = 0
+        if _tiene_cluster_invalido(bajo):
+            score += 1
+        letras = re.sub(r"[^a-z]", "", bajo)
+        if letras:
+            vocales = sum(1 for c in letras if c in _VOCALES_FUERTES)
+            if (vocales / len(letras)) < 0.34:
+                score += 1
+        if _digitos_sospechosos(limpio):
+            score += 1
+        if _transiciones_mayusculas(texto) >= 2:
+            score += 1
+        return score >= 2
+    except Exception:
+        return False
+
+
+def _cuenta_protegida(cuenta) -> tuple:
+    """Devuelve ``(protegida, campo, valor)`` para el filtro anti-sobrescritura.
+
+    Una cuenta se protege cuando ya tiene identidad humana o trabajo previo:
+
+      * ``handle_actual`` no vacio y NO generico -> ``("handle_actual", valor)``;
+      * ``nombre_mostrado`` no vacio y NO generico -> ``("nombre_mostrado", valor)``;
+      * ya tiene ``handle_propuesto`` o ``nombre_propuesto`` (fue trabajada)
+        -> ``("propuesta", valor)``.
+
+    Si no hay nada que proteger devuelve ``(False, "", "")``. Nunca lanza.
+    """
+    try:
+        handle = str(getattr(cuenta, "handle_actual", "") or "").strip()
+        if handle and not es_handle_generico(handle):
+            return True, "handle_actual", handle
+        nombre = str(getattr(cuenta, "nombre_mostrado", "") or "").strip()
+        if nombre and not es_handle_generico(nombre):
+            return True, "nombre_mostrado", nombre
+        handle_propuesto = str(getattr(cuenta, "handle_propuesto", "") or "").strip()
+        nombre_propuesto = str(getattr(cuenta, "nombre_propuesto", "") or "").strip()
+        if handle_propuesto or nombre_propuesto:
+            return True, "propuesta", handle_propuesto or nombre_propuesto
+        return False, "", ""
+    except Exception:
+        return False, "", ""
+
+
+# --------------------------------------------------------------------------- #
 # Faker / nombres de persona
 # --------------------------------------------------------------------------- #
 def _obtener_faker():
@@ -770,7 +1080,45 @@ def _openai_disponible() -> bool:
         return False
 
 
-def _construir_prompt(cantidad: int, tipo: str, seccion: str, contexto: str, evitar: set) -> str:
+def _bloque_contexto_identidades(seccion: str, registro: str, tipo: str, contexto: str) -> str:
+    """Bloque de reglas por seccion/registro para el prompt de identidades.
+
+    Llama (import perezoso) a ``ia.prompts.get_prompt_identidades_contexto``,
+    que otro modulo mantiene; si aun no existe o falla, usa el bloque local
+    minimo ``_REGLAS_CONTEXTO_FALLBACK``. Nunca lanza.
+    """
+    try:
+        from ia.prompts import get_prompt_identidades_contexto
+
+        bloque = get_prompt_identidades_contexto(
+            seccion=seccion, registro=registro, tipo=tipo, contexto=contexto
+        )
+        texto = str(bloque or "").strip()
+        if texto:
+            return texto
+    except Exception:
+        pass
+    return _REGLAS_CONTEXTO_FALLBACK
+
+
+def _construir_prompt(
+    cantidad: int,
+    tipo: str,
+    seccion: str,
+    contexto: str,
+    evitar: set,
+    registro: str = "",
+) -> str:
+    """Prompt de un lote de identidades (nombre + handle).
+
+    ``registro`` ("politica"/"activista"/"ciudadana") agrega, DESPUES del
+    detalle del tipo, el bloque de contexto por seccion/registro (MANDAN sobre
+    el detalle cuando apliquen). Regla dura: con registro "ciudadana" la
+    seccion se IGNORA (no se menciona en el prompt).
+    """
+    registro_norm = _normalizar_registro(registro)
+    if registro_norm == "ciudadana":
+        seccion = ""
     comun = (
         f"Genera exactamente {cantidad} identidades DISTINTAS para cuentas de X "
         "(Twitter) en Mexico.\n"
@@ -816,6 +1164,12 @@ def _construir_prompt(cantidad: int, tipo: str, seccion: str, contexto: str, evi
             "comun; evita nombres de politicos famosos.\n"
         )
     extra = ""
+    if registro_norm == "ciudadana":
+        # La regla dura viaja explicita en el prompt: ciudadana ignora seccion.
+        extra += (
+            "Registro ciudadana: IGNORA la seccion (cualquiera que sea); usa "
+            "nombres de personas mexicanas reales y coloquiales.\n"
+        )
     if seccion:
         extra += f"Contexto de seccion: {seccion}.\n"
     if contexto:
@@ -823,13 +1177,20 @@ def _construir_prompt(cantidad: int, tipo: str, seccion: str, contexto: str, evi
     if evitar:
         muestra = ", ".join(sorted(evitar)[:80])
         extra += f"NO uses estos handles ya ocupados: {muestra}.\n"
-    return (
-        comun
-        + detalle
-        + extra
-        + 'Responde SOLO con un JSON array, sin markdown ni explicaciones: '
+    # El bloque de contexto va DESPUES del detalle del tipo y MANDA sobre el.
+    bloque_contexto = _bloque_contexto_identidades(
+        seccion, registro_norm, tipo, contexto
+    )
+    partes = [comun, detalle]
+    if bloque_contexto:
+        partes.append(str(bloque_contexto).rstrip() + "\n")
+    if extra:
+        partes.append(extra)
+    partes.append(
+        'Responde SOLO con un JSON array, sin markdown ni explicaciones: '
         '[{"nombre": "...", "handle": "..."}, ...]'
     )
+    return "".join(partes)
 
 
 def _parsear_lote(content: str) -> list:
@@ -887,16 +1248,26 @@ def _parsear_lote(content: str) -> list:
 
 
 def _pedir_openai_lote(
-    cantidad: int, tipo: str, seccion: str, contexto: str, evitar: set, rng=random
+    cantidad: int,
+    tipo: str,
+    seccion: str,
+    contexto: str,
+    evitar: set,
+    rng=random,
+    registro: str = "",
 ) -> list:
-    """Pide un lote a OpenAI. Devuelve [] si falla o no hay key utilizable."""
+    """Pide un lote a OpenAI. Devuelve [] si falla o no hay key utilizable.
+
+    ``registro`` se pasa al prompt (bloque de contexto por seccion/registro);
+    el kwarg es opcional para no romper llamadas viejas.
+    """
     if not _openai_disponible():
         return []
     try:
         import openai
         from core.config import settings
 
-        prompt = _construir_prompt(cantidad, tipo, seccion, contexto, evitar)
+        prompt = _construir_prompt(cantidad, tipo, seccion, contexto, evitar, registro)
         api_key = settings.openai_api_key
         if hasattr(openai, "OpenAI"):  # openai >= 1.0
             client = openai.OpenAI(api_key=api_key)
@@ -918,6 +1289,30 @@ def _pedir_openai_lote(
     except Exception as e:
         logger.warning(f"OpenAI no disponible para identidades, uso generador local: {e}")
         return []
+
+
+def _pedir_openai_lote_compatible(
+    cantidad: int,
+    tipo: str,
+    seccion: str,
+    contexto: str,
+    evitar: set,
+    rng=random,
+    registro: str = "",
+) -> list:
+    """Llama a ``_pedir_openai_lote`` con ``registro`` y tolera firmas viejas.
+
+    Los consumidores/tests pueden monkeypatchear ``_pedir_openai_lote`` con la
+    firma antigua (sin el kwarg ``registro``): si el ``TypeError`` viene de la
+    firma, se reintenta sin el kwarg. Cualquier otro error se propaga igual
+    que antes (el llamador ya lo maneja).
+    """
+    try:
+        return _pedir_openai_lote(
+            cantidad, tipo, seccion, contexto, evitar, rng, registro=registro
+        )
+    except TypeError:
+        return _pedir_openai_lote(cantidad, tipo, seccion, contexto, evitar, rng)
 
 
 def _identidad_desde_item(item, tipo: str, usados: set, rng=random):
@@ -1012,6 +1407,44 @@ def _tipo_desde_cuenta(valor) -> str:
     return ""
 
 
+def _registro_desde_cuenta(cuenta) -> str:
+    """Registro de la cuenta ("politica"/"activista"/"ciudadana"; "" si no hay).
+
+    Normaliza ``Cuenta.tipo_cuenta`` con ``core.registros.normalizar_tipo_cuenta``
+    (import perezoso, con respaldo local). Nunca lanza.
+    """
+    valor = getattr(cuenta, "tipo_cuenta", "")
+    if not str(valor or "").strip():
+        return ""
+    try:
+        from core.registros import normalizar_tipo_cuenta
+
+        return normalizar_tipo_cuenta(valor) or ""
+    except Exception:
+        return _normalizar_registro(valor)
+
+
+def _seccion_efectiva_cuenta(cuenta, seccion: str, registro: str) -> str:
+    """Seccion efectiva (codigo CI/IP/LIB/JUS) para agrupar y promptear.
+
+    El parametro ``seccion`` de ``asignar_propuestas`` sobreescribe el de la
+    cuenta cuando viene; la REGLA DURA es que una cuenta de registro
+    ``"ciudadana"`` IGNORA su seccion (devuelve ""). Normaliza con
+    ``core.secciones.normalizar_seccion`` (import perezoso). Nunca lanza.
+    """
+    if registro == "ciudadana":
+        return ""
+    base = str(seccion or "").strip() or str(getattr(cuenta, "seccion", "") or "").strip()
+    if not base:
+        return ""
+    try:
+        from core.secciones import normalizar_seccion
+
+        return normalizar_seccion(base)
+    except Exception:
+        return base
+
+
 # --------------------------------------------------------------------------- #
 # API publica
 # --------------------------------------------------------------------------- #
@@ -1051,12 +1484,14 @@ def _generar_identidades_con_origen(
     seccion: str = "",
     contexto: str = "",
     usuarios_existentes: set | None = None,
+    registro: str = "",
 ) -> tuple:
     """Igual que ``generar_identidades`` pero devuelve ``(identidades, uso_ia)``.
 
     ``uso_ia`` es True solo si al menos una identidad del resultado vino de un
     lote validado de OpenAI (no del fallback local). Interno: lo usa
-    ``asignar_propuestas`` para reportar ``origen_ia``.
+    ``asignar_propuestas`` para reportar ``origen_ia``. ``registro`` viaja al
+    prompt/bloque de contexto (opcional, al final).
     """
     resultado: list[dict] = []
     uso_ia = False
@@ -1077,9 +1512,9 @@ def _generar_identidades_con_origen(
             faltan = objetivo - len(resultado)
             if usar_openai:
                 try:
-                    lote = _pedir_openai_lote(
+                    lote = _pedir_openai_lote_compatible(
                         min(_LOTE_OPENAI_MAX, faltan), tipo_norm, seccion, contexto,
-                        usados, random,
+                        usados, random, registro,
                     )
                 except Exception as e:
                     logger.warning(f"Fallo inesperado de OpenAI, sigo local: {e}")
@@ -1118,17 +1553,20 @@ def generar_identidades(
     seccion: str = "",
     contexto: str = "",
     usuarios_existentes: set | None = None,
+    registro: str = "",
 ) -> list[dict]:
     """Genera exactamente ``cantidad`` identidades unicas (nombre y handle).
 
     Usa OpenAI en lotes (max ~30 por llamada) si hay key real; completa con el
     generador local (Faker es_MX + listas). Si OpenAI falla o no hay key,
     devuelve todo local. Evita los handles de ``usuarios_existentes``.
+    ``registro`` ("politica"/"activista"/"ciudadana", opcional al final) viaja
+    al prompt para que la IA respete el estilo por seccion/registro.
     Nunca lanza excepcion; si algo revienta devuelve lo que tenga.
     """
     return _generar_identidades_con_origen(
         cantidad, tipo, seccion=seccion, contexto=contexto,
-        usuarios_existentes=usuarios_existentes,
+        usuarios_existentes=usuarios_existentes, registro=registro,
     )[0]
 
 
@@ -1201,6 +1639,7 @@ def asignar_propuestas(
     seccion: str = "",
     dry_run: bool = False,
     contexto: str = "",
+    proteger_brandeadas: bool = False,
 ) -> dict:
     """Genera y guarda ``nombre_propuesto``/``handle_propuesto`` por cuenta.
 
@@ -1213,18 +1652,36 @@ def asignar_propuestas(
       * ``"mixto"`` ("mezcla"/"mitad"): reparte ~50% persona / ~50% partido,
         barajado cuenta por cuenta.
 
-    Usa ``generar_identidades``/OpenAI en lotes (<=30 por llamada) agrupando
-    las cuentas por (tipo, seccion) y completa con el generador local; si no
-    hay key real de OpenAI sigue 100% local. Valida que nombre y handle no
-    choquen con NINGUN ocupado (``usuario``, ``handle_actual``,
-    ``handle_propuesto`` y ``nombre_mostrado``/``nombre_propuesto`` de todas
-    las Cuentas) ni con las identidades ya generadas en esta corrida; con
-    ``dry_run=True`` genera y devuelve SIN escribir en la BD.
+    Cada cuenta aporta tambien su REGISTRO (``Cuenta.tipo_cuenta`` normalizado:
+    politica/activista/ciudadana) y su SECCION (``Cuenta.seccion`` normalizada:
+    CI/IP/LIB/JUS). Los lotes se agrupan por ``(tipo, seccion, registro)`` y los
+    tres viajan al prompt. El parametro ``seccion`` sobreescribe el de la cuenta
+    cuando viene; REGLA DURA: con registro "ciudadana" la seccion se IGNORA.
+
+    ``proteger_brandeadas=True`` (opcional, al final) OMITE antes de generar a
+    las cuentas que ya tienen identidad humana o trabajo previo (ver
+    ``_cuenta_protegida``/``es_handle_generico``): ni IA ni generador local, y
+    TAMPOCO se tocan en la BD. Se reportan en ``omitidas_protegidas``,
+    ``protegidas_usuarios`` y ``protegidas_detalle``. Con ``False`` (default)
+    el comportamiento es identico al historico.
+
+    Usa ``generar_identidades``/OpenAI en lotes (<=30 por llamada) y completa
+    con el generador local; si no hay key real de OpenAI sigue 100% local.
+    Valida que nombre y handle no choquen con NINGUN ocupado (``usuario``,
+    ``handle_actual``, ``handle_propuesto`` y
+    ``nombre_mostrado``/``nombre_propuesto`` de todas las Cuentas) ni con las
+    identidades ya generadas en esta corrida; con ``dry_run=True`` genera y
+    devuelve SIN escribir en la BD.
 
     Devuelve:
         {"total", "ok", "propuestas": [{"usuario","nombre","handle","tipo"}],
          "errores": [str], "dry_run": bool, "origen_ia": bool,
-         "persona": n, "partido": n, "movimiento": n}
+         "persona": n, "partido": n, "movimiento": n,
+         "omitidas_protegidas": n, "protegidas_usuarios": [usuario, ...],
+         "protegidas_detalle": [{"usuario","campo","valor"}, ...]}
+
+    ``total`` es SIEMPRE el de la lista recibida (no el de las cuentas
+    procesadas), para que el dashboard muestre el universo real del lote.
     """
     resultado = {
         "total": 0,
@@ -1236,6 +1693,9 @@ def asignar_propuestas(
         "persona": 0,
         "partido": 0,
         "movimiento": 0,
+        "omitidas_protegidas": 0,
+        "protegidas_usuarios": [],
+        "protegidas_detalle": [],
     }
     try:
         lista_usuarios = []
@@ -1289,6 +1749,18 @@ def asignar_propuestas(
                     resultado["errores"].append(f"usuario no encontrado: {usuario}")
                     continue
 
+                # Filtro anti-sobrescritura: identidad humana ya existente o
+                # propuesta previa -> no se genera ni se toca nada.
+                if proteger_brandeadas:
+                    protegida, campo, valor = _cuenta_protegida(cuenta)
+                    if protegida:
+                        resultado["omitidas_protegidas"] += 1
+                        resultado["protegidas_usuarios"].append(usuario)
+                        resultado["protegidas_detalle"].append(
+                            {"usuario": usuario, "campo": campo, "valor": valor}
+                        )
+                        continue
+
                 if tipo_forzado == "auto":
                     tipo_identidad = _tipo_desde_cuenta(getattr(cuenta, "tipo_cuenta", ""))
                     if not tipo_identidad:
@@ -1296,12 +1768,14 @@ def asignar_propuestas(
                 else:
                     tipo_identidad = tipo_forzado  # se ajusta abajo si es "mixto"
 
-                seccion_ctx = str(seccion or getattr(cuenta, "seccion", "") or "").strip()
+                registro_cuenta = _registro_desde_cuenta(cuenta)
+                seccion_ctx = _seccion_efectiva_cuenta(cuenta, seccion, registro_cuenta)
                 asignacion.append(
                     {
                         "usuario": usuario,
                         "tipo": tipo_identidad,
                         "seccion": seccion_ctx,
+                        "registro": registro_cuenta,
                     }
                 )
     except Exception as e:
@@ -1317,12 +1791,12 @@ def asignar_propuestas(
         for item, tipo_mezcla in zip(asignacion, _tipos_mezcla(len(asignacion))):
             item["tipo"] = tipo_mezcla
 
-    # (2) Genera por lotes agrupando por (tipo, seccion). Fuera de la sesion de
-    # BD: la IA puede tardar y no hay que retener la conexion (SQLite).
+    # (2) Genera por lotes agrupando por (tipo, seccion, registro). Fuera de la
+    # sesion de BD: la IA puede tardar y no hay que retener la conexion (SQLite).
     grupos = {}
     orden = []
     for indice, item in enumerate(asignacion):
-        clave = (item["tipo"], item["seccion"])
+        clave = (item["tipo"], item["seccion"], item["registro"])
         if clave not in grupos:
             grupos[clave] = []
             orden.append(clave)
@@ -1332,7 +1806,7 @@ def asignar_propuestas(
     generados = set()  # handles de TODOS los lotes (evita choques entre grupos)
     for clave in orden:
         indices = grupos[clave]
-        tipo_grupo, seccion_grupo = clave
+        tipo_grupo, seccion_grupo, registro_grupo = clave
         try:
             lote, uso_ia = _generar_identidades_con_origen(
                 len(indices),
@@ -1340,6 +1814,7 @@ def asignar_propuestas(
                 seccion=seccion_grupo,
                 contexto=contexto,
                 usuarios_existentes=set(ocupados) | generados,
+                registro=registro_grupo,
             )
         except Exception as e:
             logger.warning(f"Lote de identidades fallo ({tipo_grupo}): {e}")
