@@ -23,6 +23,7 @@ import asyncio
 import ast
 import contextlib
 import json
+import logging
 import os
 import re
 import subprocess
@@ -91,9 +92,42 @@ def _parches(*cambios):
 
 
 class _UsuarioFake:
-    def __init__(self, uid):
+    def __init__(self, uid, username=None, first_name="Persona"):
         self.id = uid
-        self.first_name = "Persona"
+        self.username = username
+        self.first_name = first_name
+        self.full_name = first_name
+
+
+class _ChatFake:
+    def __init__(self, chat_id=1, tipo="private"):
+        self.id = chat_id
+        self.type = tipo
+
+
+class _BotFake:
+    """`context.bot` minimo (id del bot + envio directo al chat)."""
+
+    def __init__(self, bot_id=424242):
+        self.id = bot_id
+        self.enviados = []
+
+    async def send_message(self, chat_id, text):
+        self.enviados.append((chat_id, text))
+        return None
+
+
+class _MiembroFake:
+    def __init__(self, status):
+        self.status = status
+
+
+class _CambioMiembroFake:
+    """Fake de `ChatMemberUpdated` (old/new member) para my_chat_member."""
+
+    def __init__(self, viejo, nuevo):
+        self.old_chat_member = _MiembroFake(viejo)
+        self.new_chat_member = _MiembroFake(nuevo)
 
 
 class _FotoFake:
@@ -114,6 +148,7 @@ class _MensajeFake:
     def __init__(self, texto="", fotos=None):
         self.text = texto
         self.photo = list(fotos or [])
+        self.new_chat_members = []
         self.replies = []
         self.edits = []
         self.photos = []
@@ -146,8 +181,11 @@ class _QueryFake:
 
 
 class _UpdateFake:
-    def __init__(self, uid=None, texto="", fotos=None, query=None):
-        self.effective_user = _UsuarioFake(uid) if uid is not None else None
+    def __init__(self, uid=None, texto="", fotos=None, query=None, chat=None, username=None):
+        self.effective_user = (
+            _UsuarioFake(uid, username=username) if uid is not None else None
+        )
+        self.effective_chat = chat or _ChatFake(1, "private")
         self.effective_message = _MensajeFake(texto, fotos)
         self.callback_query = query
 
@@ -156,6 +194,11 @@ class _ContextoFake:
     def __init__(self, args=None):
         self.args = list(args or [])
         self.user_data = {}
+        self.bot = _BotFake()
+
+
+def _chat_grupo(chat_id=-1005538610567):
+    return _ChatFake(chat_id, "supergroup")
 
 
 def _correr(coro):
@@ -243,6 +286,11 @@ def run(check) -> None:  # noqa: C901 - seccionado por bloques tematicos
             "store: los '@' y espacios se normalizan",
             clientes_store.cuentas_de("321", ruta) == ["ConArroba", "ConEspacios"],
         )
+        clientes_store.asignar("322", "", "CuentaSuelta", ruta)
+        check(
+            "store: un string suelto se trata como UNA cuenta (no letra por letra)",
+            clientes_store.cuentas_de("322", ruta) == ["CuentaSuelta"],
+        )
         check(
             "store: usuario_permitido es case-insensitive",
             clientes_store.usuario_permitido("321", "conarroba", ruta)
@@ -260,7 +308,7 @@ def run(check) -> None:  # noqa: C901 - seccionado por bloques tematicos
         )
         check(
             "store: todos_los_clientes devuelve el registro completo",
-            set(clientes_store.todos_los_clientes(ruta)) == {"123", "321"},
+            set(clientes_store.todos_los_clientes(ruta)) == {"123", "321", "322"},
         )
         # Atomicidad: tras varias escrituras no quedan temporales y el JSON vale.
         sobrantes = [n for n in os.listdir(carpeta) if n.endswith(".tmp")]
@@ -911,6 +959,243 @@ def run(check) -> None:  # noqa: C901 - seccionado por bloques tematicos
             query.message.edits and "cli_ayuda" in _callbacks(query.message.edits[-1][1]["reply_markup"]),
         )
 
+    # -------------------------------------------------------------- GRUPOS --
+    check(
+        "grupo: helpers de mencion (grupo si, privado no)",
+        h.mencion_grupo(
+            _UpdateFake(uid=1, chat=_chat_grupo(), username="fulano")
+        )
+        == "@fulano"
+        and h.mencion_grupo(
+            _UpdateFake(uid=1, chat=_ChatFake(1, "private"), username="fulano")
+        )
+        == ""
+        and h.con_mencion("hola", "@fulano") == "👤 @fulano, hola"
+        and h.con_mencion("hola", "") == "hola",
+    )
+    check(
+        "grupo: sin @username usa el nombre visible",
+        h.mencion_grupo(_UpdateFake(uid=1, chat=_chat_grupo(), username=None))
+        == "Persona",
+    )
+
+    with _store_temporal() as ruta, _env("TELEGRAM_ADMIN_IDS", None):
+        clientes_store.asignar("800", "Cliente Grupo", ["CuentaGrupo"], ruta)
+        clientes_store.asignar("801", "Otro Cliente", ["CuentaOtra"], ruta)
+        grupo = _chat_grupo()
+
+        # Bienvenida al agregar el bot (new_chat_members) + anti-duplicado.
+        h._BIENVENIDAS.clear()
+        update = _UpdateFake(uid=500, chat=grupo)
+        update.effective_message.new_chat_members = [_UsuarioFake(424242)]
+        ctx = _ContextoFake()
+        _correr(h.bienvenida_grupo(update, ctx))
+        check(
+            "grupo: bienvenida al agregar el bot con instrucciones",
+            bool(update.effective_message.replies)
+            and "Escribe /start" in update.effective_message.replies[-1][0],
+        )
+        _correr(h.bienvenida_grupo(update, ctx))
+        check(
+            "grupo: la bienvenida NO se duplica",
+            len(update.effective_message.replies) == 1,
+        )
+        # Agregaron a otra persona (no al bot): silencio.
+        update_x = _UpdateFake(uid=500, chat=_chat_grupo(-1007777777777))
+        update_x.effective_message.new_chat_members = [_UsuarioFake(999999)]
+        _correr(h.bienvenida_grupo(update_x, _ContextoFake()))
+        check(
+            "grupo: no saluda cuando agregan a otra persona",
+            update_x.effective_message.replies == [],
+        )
+        # my_chat_member: entra al chat -> saluda; sigue admin -> silencio.
+        update2 = _UpdateFake(uid=None, chat=_chat_grupo(-1009999999999))
+        update2.effective_message = None  # un chat_member update no trae mensaje
+        update2.my_chat_member = _CambioMiembroFake("left", "member")
+        ctx2 = _ContextoFake()
+        _correr(h.bienvenida_miembro(update2, ctx2))
+        check(
+            "grupo: my_chat_member saluda cuando el bot recien entra",
+            bool(ctx2.bot.enviados)
+            and "Escribe /start" in ctx2.bot.enviados[-1][1],
+        )
+        update3 = _UpdateFake(uid=None, chat=_chat_grupo(-1008888888888))
+        update3.effective_message = None
+        update3.my_chat_member = _CambioMiembroFake("administrator", "administrator")
+        ctx3 = _ContextoFake()
+        _correr(h.bienvenida_miembro(update3, ctx3))
+        check(
+            "grupo: sin cambio de entrada no hay bienvenida",
+            not ctx3.bot.enviados,
+        )
+        h._BIENVENIDAS.clear()
+
+        # /start de cliente registrado: menu en el grupo, con mencion.
+        update = _UpdateFake(uid=800, texto="/start", chat=grupo, username="fulano")
+        _correr(h.start(update, _ContextoFake()))
+        texto = update.effective_message.replies[0][0]
+        check(
+            "grupo: /start responde EN el grupo y con mencion",
+            "👤 @fulano," in texto and "Toca un botón" in texto,
+        )
+
+        # /start de no registrado: UN mensaje claro (sin spam).
+        update = _UpdateFake(uid=999, texto="/start", chat=grupo, username="desconocido")
+        _correr(h.start(update, _ContextoFake()))
+        check(
+            "grupo: /start de no registrado recibe UN mensaje claro con mencion",
+            len(update.effective_message.replies) == 1
+            and "No tengo tu cuenta registrada"
+            in update.effective_message.replies[0][0]
+            and "👤 @desconocido," in update.effective_message.replies[0][0],
+        )
+
+        # /cancelar en grupo.
+        update = _UpdateFake(uid=800, texto="/cancelar", chat=grupo, username="fulano")
+        _correr(h.cancelar(update, _ContextoFake()))
+        check(
+            "grupo: /cancelar responde en el grupo con mencion",
+            "cancelado" in update.effective_message.replies[-1][0]
+            and "👤 @fulano," in update.effective_message.replies[-1][0],
+        )
+
+        # Texto SIN flujo de otro miembro: ignorado en silencio.
+        update = _UpdateFake(uid=801, texto="hola a todos", chat=grupo, username="otro")
+        _correr(h.texto_recibido(update, _ContextoFake()))
+        check(
+            "grupo: texto de otro miembro SIN flujo se ignora (nada de spam)",
+            update.effective_message.replies == [],
+        )
+
+        # Aislamiento: el flujo de A no lo captura B (user_data por usuario).
+        ctx_a = _ContextoFake()
+        ctx_b = _ContextoFake()
+        ctx_a.user_data["cli_espera"] = {"tipo": "nombre", "usuario": "CuentaGrupo"}
+        update_b = _UpdateFake(uid=801, texto="Nombre de B", chat=grupo, username="otro")
+        _correr(h.texto_recibido(update_b, ctx_b))
+        check(
+            "grupo: el flujo de A no lo captura B (user_data por usuario)",
+            update_b.effective_message.replies == []
+            and "cli_espera" in ctx_a.user_data,
+        )
+
+        # Texto CON flujo (mensaje suelto) -> confirmacion con mencion.
+        update = _UpdateFake(uid=800, texto="María López", chat=grupo, username="fulano")
+        _correr(h.texto_recibido(update, ctx_a))
+        texto, kwargs = update.effective_message.replies[-1]
+        check(
+            "grupo: texto CON flujo se captura y pide confirmacion con mencion",
+            "«María López»" in texto
+            and "👤 @fulano," in texto
+            and _callbacks(kwargs["reply_markup"])
+            == ["nombre_si_CuentaGrupo", "nombre_no_CuentaGrupo"],
+        )
+
+        # Texto como RESPUESTA al mensaje del bot -> tambien se captura.
+        ctx_a.user_data["cli_espera"] = {"tipo": "nombre", "usuario": "CuentaGrupo"}
+        update = _UpdateFake(uid=800, texto="Otro Nombre", chat=grupo, username="fulano")
+        update.effective_message.reply_to_message = _MensajeFake(
+            "✏️ Escríbeme el nombre nuevo para @CuentaGrupo."
+        )
+        _correr(h.texto_recibido(update, ctx_a))
+        check(
+            "grupo: la RESPUESTA al mensaje del bot tambien se captura",
+            any("Otro Nombre" in t for t, _ in update.effective_message.replies),
+        )
+
+        # Callback valido: codigo en el grupo, con mencion.
+        def _datos_totp_grupo(usuario):
+            return {
+                "usuario": usuario,
+                "handle_actual": "",
+                "nombre_mostrado": "",
+                "totp_secret": SECRETO_FAKE,
+                "email": "",
+                "email_password": "",
+            }
+
+        query = _QueryFake("cli_codigo", _MensajeFake())
+        with _parches((h, "_datos_cuenta", _datos_totp_grupo)):
+            _correr(
+                h.cli_callback(
+                    _UpdateFake(uid=800, query=query, chat=grupo, username="fulano"),
+                    _ContextoFake(),
+                )
+            )
+        ultimo = query.message.edits[-1][0]
+        check(
+            "grupo: callback valido responde con mencion y el codigo",
+            "👤 @fulano," in ultimo
+            and "Este es tu código" in ultimo
+            and re.search(r"\b\d{6}\b", ultimo) is not None,
+        )
+
+        # Botones de otra persona: la cuenta se valida contra quien pulsa.
+        query = _QueryFake("cuenta_CuentaGrupo")
+        with _parches((h, "_datos_cuenta", _datos_totp_grupo)):
+            _correr(
+                h.cuenta_callback(
+                    _UpdateFake(uid=801, query=query, chat=grupo, username="otro"),
+                    _ContextoFake(),
+                )
+            )
+        check(
+            "grupo: el boton de una cuenta ajena se rechaza (valida al que pulsa)",
+            not query.message.edits
+            and bool(query.answers)
+            and query.answers[-1][1]
+            and "no está disponible" in query.answers[-1][0],
+        )
+
+        # Otro miembro no puede confirmar el cambio de nombre ajeno.
+        query = _QueryFake("nombre_si_CuentaGrupo")
+        _correr(
+            h.nombre_callback(
+                _UpdateFake(uid=801, query=query, chat=grupo, username="otro"),
+                _ContextoFake(),
+            )
+        )
+        check(
+            "grupo: otro miembro no confirma el nombre ajeno (boton vencido)",
+            not query.message.edits
+            and bool(query.answers)
+            and query.answers[-1][1]
+            and "venció" in query.answers[-1][0],
+        )
+
+        # Botones del menu: piden la foto con mencion.
+        query = _QueryFake("cli_foto_perfil", _MensajeFake())
+        _correr(
+            h.cli_callback(
+                _UpdateFake(uid=800, query=query, chat=grupo, username="fulano"),
+                _ContextoFake(),
+            )
+        )
+        check(
+            "grupo: los botones del menu piden la foto con mencion",
+            "Envíame la foto de perfil" in query.message.edits[-1][0]
+            and "👤 @fulano," in query.message.edits[-1][0],
+        )
+
+        # Vista previa de la foto en el grupo.
+        with tempfile.TemporaryDirectory() as temporal:
+            ctx = _ContextoFake()
+            ctx.user_data["cli_espera"] = {
+                "tipo": "foto",
+                "foto_tipo": "perfil",
+                "usuario": "CuentaGrupo",
+            }
+            update = _UpdateFake(
+                uid=800, fotos=[_FotoFake()], chat=grupo, username="fulano"
+            )
+            with _parches((h, "_data_temp", lambda: temporal)):
+                _correr(h.foto_recibida(update, ctx))
+            caption = update.effective_message.photos[-1][1]
+            check(
+                "grupo: la vista previa de la foto lleva mencion",
+                "👤 @fulano," in caption and "¿Uso esta foto" in caption,
+            )
+
     # ------------------------------------------------------- ENTRYPOINT ---
     fuente = (RAIZ / "bot_clientes" / "main.py").read_text(encoding="utf-8")
     arbol = ast.parse(fuente)
@@ -932,6 +1217,38 @@ def run(check) -> None:  # noqa: C901 - seccionado por bloques tematicos
         "main: registra los 5 prefijos de callbacks del bot de clientes",
         patrones == {r"^cli_", r"^cuenta_", r"^codigo_", r"^nombre_", r"^foto_"},
     )
+    # --- Soporte de GRUPOS en el entrypoint ---
+    allowed_updates = set()
+    registros_bienvenida = set()
+    usa_new_chat_members = False
+    usa_my_chat_member = False
+    for nodo in ast.walk(arbol):
+        if isinstance(nodo, ast.Attribute):
+            if nodo.attr == "NEW_CHAT_MEMBERS":
+                usa_new_chat_members = True
+            if nodo.attr == "MY_CHAT_MEMBER":
+                usa_my_chat_member = True
+            if nodo.attr in ("bienvenida_grupo", "bienvenida_miembro"):
+                registros_bienvenida.add(nodo.attr)
+        if isinstance(nodo, ast.Call):
+            nombre_func = getattr(nodo.func, "attr", getattr(nodo.func, "id", ""))
+            if nombre_func == "run_polling":
+                for kw in nodo.keywords:
+                    if kw.arg == "allowed_updates":
+                        try:
+                            allowed_updates = set(ast.literal_eval(kw.value))
+                        except Exception:
+                            allowed_updates = set()
+    check(
+        "main: allowed_updates incluye message, callback_query y my_chat_member",
+        {"message", "callback_query", "my_chat_member"}.issubset(allowed_updates),
+    )
+    check(
+        "main: registra la bienvenida al grupo (new_chat_members + my_chat_member)",
+        {"bienvenida_grupo", "bienvenida_miembro"}.issubset(registros_bienvenida)
+        and usa_new_chat_members
+        and usa_my_chat_member,
+    )
     check(
         "main: importar no arranca nada y `construir_app` arma la app",
         "'if __name__' in fuente"
@@ -951,14 +1268,71 @@ def run(check) -> None:  # noqa: C901 - seccionado por bloques tematicos
         _import_sin_token_ok(),
     )
 
+    # ------------------------------------- TOKEN DUPLICADO (BOT INTERNO) --
+    from bot_clientes import main as mod  # noqa: E402
+
+    check(
+        "token duplicado: helper detecta el mismo token (ignora espacios)",
+        mod.es_token_del_bot_interno(" 111:AAA ", "111:AAA")
+        and not mod.es_token_del_bot_interno("111:AAA", "222:BBB"),
+    )
+    check(
+        "token duplicado: helper nunca marca tokens vacios",
+        not mod.es_token_del_bot_interno("", "111:AAA")
+        and not mod.es_token_del_bot_interno("111:AAA", "")
+        and not mod.es_token_del_bot_interno("", ""),
+    )
+    check(
+        "token duplicado: obtener_token_interno lee TELEGRAM_BOT_TOKEN del entorno",
+        _token_interno_env(),
+    )
+    check(
+        "token duplicado: obtener_token_interno cae a settings si no hay env",
+        _token_interno_settings(),
+    )
+    resultado = _main_con_token("111:AAA", " 111:AAA ")
+    check(
+        "token duplicado: main() NO construye la app y sale con SystemExit(1)",
+        resultado[0] == "exit"
+        and resultado[1] == 1
+        and not resultado[2]["construir"]
+        and not resultado[2]["polling"],
+    )
+    check(
+        "token duplicado: el error explica que Telegram rompe ambos bots",
+        any("MISMO que el del bot interno" in m for m in resultado[3])
+        and any("@BotFather" in m for m in resultado[3]),
+    )
+    resultado = _main_con_token("222:BBB", "111:AAA")
+    check(
+        "token distinto: main() arranca normal (app y polling fake)",
+        resultado[0] == "polling"
+        and resultado[2]["construir"]
+        and resultado[2]["polling"]
+        and not any("MISMO que el del bot interno" in m for m in resultado[3]),
+    )
+    resultado = _main_con_token("", "111:AAA")
+    check(
+        "token vacio: sigue el guard actual de falta de token",
+        resultado[0] == "exit"
+        and resultado[1] == 1
+        and not resultado[2]["construir"]
+        and any("falta TELEGRAM_CLIENTES_BOT_TOKEN" in m for m in resultado[3]),
+    )
+
 
 # --------------------------------------------------------------------------- #
 # Helpers de los checks de entrypoint (definidos abajo para no ensuciar)
 # --------------------------------------------------------------------------- #
 
 def _app_ok() -> bool:
-    """`construir_app` con token fake registra los 14 handlers esperados."""
-    from telegram.ext import CallbackQueryHandler, CommandHandler, MessageHandler
+    """`construir_app` con token fake registra los handlers esperados."""
+    from telegram.ext import (
+        CallbackQueryHandler,
+        ChatMemberHandler,
+        CommandHandler,
+        MessageHandler,
+    )
 
     from bot_clientes.main import construir_app
 
@@ -970,7 +1344,9 @@ def _app_ok() -> bool:
     return (
         sum(isinstance(x, CommandHandler) for x in handlers) == 7
         and sum(isinstance(x, CallbackQueryHandler) for x in handlers) == 5
-        and sum(isinstance(x, MessageHandler) for x in handlers) == 2
+        # texto + fotos + new_chat_members
+        and sum(isinstance(x, MessageHandler) for x in handlers) == 3
+        and sum(isinstance(x, ChatMemberHandler) for x in handlers) == 1
     )
 
 
@@ -979,6 +1355,85 @@ def _token_env() -> bool:
 
     with _env("TELEGRAM_CLIENTES_BOT_TOKEN", " 123:TOKEN  "):
         return mod.obtener_token() == "123:TOKEN"
+
+
+def _token_interno_env() -> bool:
+    import bot_clientes.main as mod
+
+    with _env("TELEGRAM_BOT_TOKEN", " 999:INTERNO  "):
+        return mod.obtener_token_interno() == "999:INTERNO"
+
+
+def _token_interno_settings() -> bool:
+    """Sin env, `obtener_token_interno` cae a `settings.telegram_bot_token`."""
+    import core.config as core_config
+
+    import bot_clientes.main as mod
+
+    class _SettingsFake:
+        telegram_bot_token = " 777:DESDE-SETTINGS "
+
+    with _env("TELEGRAM_BOT_TOKEN", None), _parches(
+        (core_config, "settings", _SettingsFake())
+    ):
+        return mod.obtener_token_interno() == "777:DESDE-SETTINGS"
+
+
+class _CapturaLog(logging.Handler):
+    """Handler que guarda los mensajes de log (para verificar el error)."""
+
+    def __init__(self):
+        super().__init__()
+        self.mensajes = []
+
+    def emit(self, record):
+        self.mensajes.append(record.getMessage())
+
+
+class _FinPolling(Exception):
+    """Centinela: main() llego a `run_polling` sin arrancar Telegram de verdad."""
+
+
+def _main_con_token(cliente_token, interno_env):
+    """Ejecuta `mod.main()` con `construir_app` falso (nunca toca Telegram).
+
+    Devuelve `(resultado, codigo, llamado, mensajes)`:
+      resultado: "exit" | "polling" | "retorno" | nombre de excepcion rara.
+      llamado:   {"construir": bool, "polling": bool}.
+      mensajes:  mensajes de log capturados.
+    """
+    import bot_clientes.main as mod
+
+    llamado = {"construir": False, "polling": False}
+
+    class _AppFake:
+        def run_polling(self, **kwargs):
+            llamado["polling"] = True
+            raise _FinPolling()
+
+    def _construir_fake(token):
+        llamado["construir"] = True
+        return _AppFake()
+
+    captura = _CapturaLog()
+    logger = logging.getLogger("bot_clientes.main")
+    logger.addHandler(captura)
+    try:
+        with _env("TELEGRAM_BOT_TOKEN", interno_env), _parches(
+            (mod, "obtener_token", lambda: cliente_token),
+            (mod, "construir_app", _construir_fake),
+        ):
+            try:
+                mod.main()
+                return ("retorno", 0, llamado, captura.mensajes)
+            except SystemExit as e:
+                return ("exit", int(e.code or 0), llamado, captura.mensajes)
+            except _FinPolling:
+                return ("polling", 0, llamado, captura.mensajes)
+            except Exception as e:  # nunca deberia pasar
+                return (type(e).__name__, 0, llamado, captura.mensajes)
+    finally:
+        logger.removeHandler(captura)
 
 
 def _sin_token_exit() -> bool:

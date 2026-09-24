@@ -68,6 +68,26 @@ Requisitos y registro:
 3. El archivo no guarda credenciales (solo nombre, Telegram ID y usuarios) y
    está en `.gitignore`.
 
+### Uso en GRUPO (bot @vrf2fa_bot)
+
+El bot está pensado para usarse dentro de un grupo con los clientes: cada
+miembro pulsa SUS botones y responde a los mensajes del bot. El bot contesta en
+el grupo anteponiendo `👤 @fulano, ...` para que se sepa a quién responde
+(cada usuario tiene su propio estado: los flujos nunca se mezclan) y saluda una
+sola vez al agregarlo al grupo (`new_chat_members`/`my_chat_member`).
+
+⚠️ **Group Privacy en @BotFather**: para que los clientes puedan ESCRIBIR el
+nombre nuevo o ENVIAR la foto directamente en el grupo (sin responder al
+mensaje del bot) hay que desactivar el modo privacidad del bot:
+
+1. Abre @BotFather → `/setprivacy` → elige **@vrf2fa_bot**.
+2. Pulsa **Disable**.
+
+Con la privacidad **ON** el bot igual recibe las **respuestas** a sus propios
+mensajes (name/photo como *reply*), pero con **Disable** funciona mejor: acepta
+el mensaje suelto y la respuesta. Los comandos `/start`, `/ayuda` y `/cancelar`
+funcionan en el grupo en ambos casos.
+
 ## Comandos de Telegram
 
 ### Sistema

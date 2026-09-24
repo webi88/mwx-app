@@ -26,6 +26,14 @@ bloques se extraen de forma segura (escaner balanceado + `json.loads` + patron
   (19-21) Desambiguacion: el formato clasico de cookies gana; 7º campo no plano
          -> None (con warning) y vendedor con ct0 vacio.
   (22)   Persistencia del formato vendedor en `importar_una` (sesion falsa).
+  (23-26) Heuristica por FORMA (columnas del proveedor en CUALQUIER orden):
+         email/totp intercambiados, email en la primera columna, token en medio,
+         token al final con UA posicional y con JSON de cookies + persistencia
+         de una linea desordenada en `importar_una`.
+  (27-28) Conflictos de la heuristica: prioridad de la posicion canonica (una
+         password con forma de token NO pisa al token real), token-shaped sin
+         auth real (comportamiento documentado, el parseo nunca rompe) y email
+         sin TLD valido no detectado.
 
 Uso:
     .venv/Scripts/python.exe tests/run_tests.py
@@ -537,6 +545,137 @@ def test_vendedor_persistencia(check):
     )
 
 
+# --------------------------------------------------------------------------- #
+# (23-28) Heuristica por FORMA: columnas del proveedor en cualquier orden.
+# Todos los datos son SINTETICOS (nunca credenciales reales).
+# --------------------------------------------------------------------------- #
+TOTP_B32 = "JBSWY3DPEHPK3PXP"  # 16 chars base32 mayusculas (regla 2)
+OTRO_TOKEN = "9f8e7d6c5b4a39281706f5e4d3c2b1a099887766"  # otros 40 hex (regla 1)
+
+
+def test_heuristica_desorden(check):
+    print("(23-26) heuristica: email/totp/token reasignados sin importar la columna")
+    # (23) email y totp intercambiados (cada uno en la posicion canonica del otro).
+    campos = parsear_linea(
+        f"u_des:pass_des:mail@yahoo.com:{TOTP_B32}:mails_des:{TOKEN_VENDEDOR}"
+    )
+    check("intercambiados: no devuelve None", campos is not None)
+    check("intercambiados: contrato exacto de claves", set(campos) == CLAVES_CONTRATO)
+    check(
+        "intercambiados: los 6 campos reasignados",
+        _campos_base(campos)
+        == ("u_des", "pass_des", TOTP_B32, "mail@yahoo.com", "mails_des", TOKEN_VENDEDOR),
+    )
+    check(
+        "intercambiados: cookies/UA vacios",
+        campos.get("cookies") is None and campos.get("user_agent") == "",
+    )
+
+    # (24) email en la PRIMERA columna (usuario/password corren una posicion).
+    primera = parsear_linea(
+        f"mail@example.com:usuario_des:clave_des:{TOTP_B32}:{TOKEN_VENDEDOR}:correo_pass"
+    )
+    check(
+        "email primero: los 6 campos correctos",
+        _campos_base(primera)
+        == ("usuario_des", "clave_des", TOTP_B32, "mail@example.com", "correo_pass", TOKEN_VENDEDOR),
+    )
+
+    # (25) token en medio (columna de email_pass) con "mails" en la canonica.
+    medio = parsear_linea(
+        f"u_mid:pass_mid:{TOTP_B32}:mail@example.com:{TOKEN_VENDEDOR}:mails_mid"
+    )
+    check(
+        "token en medio: los 6 campos correctos",
+        _campos_base(medio)
+        == ("u_mid", "pass_mid", TOTP_B32, "mail@example.com", "mails_mid", TOKEN_VENDEDOR),
+    )
+
+    # (26) token al final con UA posicional y con JSON de cookies.
+    con_ua = parsear_linea(
+        f"u_ua:pass_ua:{TOTP_B32}:mail@example.com:mails_ua:{TOKEN_VENDEDOR}:{UA}"
+    )
+    check(
+        "token final + UA: 6 campos + user_agent",
+        _campos_base(con_ua)
+        == ("u_ua", "pass_ua", TOTP_B32, "mail@example.com", "mails_ua", TOKEN_VENDEDOR)
+        and con_ua.get("user_agent") == UA
+        and con_ua.get("cookies") is None,
+    )
+
+    con_json = parsear_linea(
+        f"u_js:pass_js:mail@example.com:{TOTP_B32}:{TOKEN_VENDEDOR}:mails_js:{JSON_COOKIES}"
+    )
+    check(
+        "token final + JSON: 6 campos + cookies",
+        _campos_base(con_json)
+        == ("u_js", "pass_js", TOTP_B32, "mail@example.com", "mails_js", TOKEN_VENDEDOR)
+        and con_json.get("cookies") == COOKIES,
+    )
+
+    # Persistencia de una linea desordenada (sesion falsa): llega bien a la BD.
+    sesion = _FakeDB(None)
+    with mock.patch.object(importador, "get_db_session", lambda: _sesion_con(sesion)):
+        resultado = importador.importar_una(campos)
+    check("desorden persistido: resultado 'nueva'", resultado == "nueva")
+    agregada = sesion.agregadas[0]
+    check(
+        "desorden persistido: auth_token/totp/email correctos",
+        agregada.auth_token == TOKEN_VENDEDOR
+        and agregada.totp_secret == TOTP_B32
+        and agregada.email == "mail@yahoo.com",
+    )
+
+
+def test_heuristica_conflictos(check):
+    print("(27-28) heuristica: prioridad canonica y password con forma de token")
+    # (27) Varios candidatos a auth_token: gana la posicion canonica (6º campo)
+    # y la password con forma de token NO se toca (nunca se pisan valores).
+    con_auth = parsear_linea(
+        f"u_conf:{TOKEN_VENDEDOR}:{TOTP_B32}:mail@example.com:mails_conf:{OTRO_TOKEN}"
+    )
+    check("conflicto: no devuelve None", con_auth is not None)
+    check(
+        "conflicto: los 6 campos (auth canonico, password conservada)",
+        _campos_base(con_auth)
+        == ("u_conf", TOKEN_VENDEDOR, TOTP_B32, "mail@example.com", "mails_conf", OTRO_TOKEN),
+    )
+
+    # (28) Password con forma de token SIN auth real: comportamiento DOCUMENTADO
+    # (el valor con forma de token se interpreta como auth_token, la senal mas
+    # fuerte; el parseo NUNCA rompe y devuelve el contrato completo).
+    sin_auth = parsear_linea(
+        f"u_conf2:{TOKEN_VENDEDOR}:{TOTP_B32}:mail@example.com:mails_conf2"
+    )
+    check("sin auth real: no devuelve None", sin_auth is not None)
+    check("sin auth real: contrato exacto de claves", set(sin_auth) == CLAVES_CONTRATO)
+    check(
+        "sin auth real: el token-shaped se reclama como auth_token",
+        sin_auth.get("auth_token") == TOKEN_VENDEDOR,
+    )
+    check(
+        "sin auth real: no detectados conservan su orden (user/pass/mailpass)",
+        (sin_auth.get("username"), sin_auth.get("password"), sin_auth.get("email_password"))
+        == ("u_conf2", "mails_conf2", ""),
+    )
+    check(
+        "sin auth real: totp/email intactos",
+        sin_auth.get("totp_secret") == TOTP_B32
+        and sin_auth.get("email") == "mail@example.com",
+    )
+
+    # (28b) Un email SIN dominio valido no se detecta (queda posicional).
+    sin_tld = parsear_linea(
+        f"user_nt:pass_nt:correo@localhost:{TOTP_B32}:{TOKEN_VENDEDOR}:mails_nt"
+    )
+    check(
+        "email sin TLD: no se detecta pero conserva su lugar (email posicional)",
+        sin_tld is not None
+        and _campos_base(sin_tld)
+        == ("user_nt", "pass_nt", TOTP_B32, "correo@localhost", "mails_nt", TOKEN_VENDEDOR),
+    )
+
+
 def run(check):
     """Ejecuta los checks con el `check` del runner (o del marco local)."""
     test_clasicos(check)
@@ -551,6 +690,8 @@ def run(check):
     test_formato_vendedor(check)
     test_vendedor_desambiguacion(check)
     test_vendedor_persistencia(check)
+    test_heuristica_desorden(check)
+    test_heuristica_conflictos(check)
 
 
 if __name__ == "__main__":

@@ -79,7 +79,13 @@ def limpiar_usuario(usuario) -> str:
 
 
 def limpiar_usuarios(usuarios) -> list:
-    """Limpia '@'/espacios, descarta vacios y deduplica (case-insensitive)."""
+    """Limpia '@'/espacios, descarta vacios y deduplica (case-insensitive).
+
+    Acepta lista/tupla/set (o un string suelto, que se trata como una sola
+    cuenta para no iterar sus letras).
+    """
+    if isinstance(usuarios, str):
+        usuarios = [usuarios]
     vistos = set()
     limpios = []
     for usuario in usuarios or []:

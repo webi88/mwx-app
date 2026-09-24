@@ -29,6 +29,15 @@ Formato de cada línea (campos separados por `:`):
   `parsear_linea` EXTRAE ambos bloques de la línea ANTES de hacer `split(":")`:
   el JSON se localiza con un escáner balanceado y se valida con `json.loads`, y
   el UA (`Mozilla/...`) termina en `:` o fin de línea.
+* Las columnas de los 6 campos base pueden llegar en CUALQUIER orden: DESPUÉS
+  del `split(":")` una heurística por FORMA reasigna a su variable canónica los
+  campos detectados con regex — `auth_token` exactamente 40 hex en minúscula
+  (`^[a-f0-9]{40}$`), `totp_secret` exactamente 16 base32 en mayúscula
+  (`^[A-Z2-7]{16}$`) y `email` (`^[^@\s]+@[^@\s]+\.[A-Za-z]{2,}$`). Las
+  variables sin candidato toman los campos restantes en su orden original y la
+  posición canónica siempre gana (una password con forma de token no pisa al
+  token real). El formato vendedor conserva su contrato exacto: su `auth_token`
+  sale SIEMPRE del 7º campo.
 
 Este módulo reemplaza el flujo obsoleto de `cargar_cuenta.py` (login con
 contraseña para extraer la cookie): ahora las credenciales, las cookies
@@ -353,6 +362,117 @@ def _cookies_formato_vendedor(ct0: str, auth_token: str) -> list:
     return cookies
 
 
+# --------------------------------------------------------------------------- #
+# Heurística por FORMA: los proveedores entregan las columnas en cualquier
+# orden (y no siempre se pueden reacomodar a mano). Tras el `split(':')` —y
+# DESPUÉS de extraer el JSON de cookies y el User-Agent— se detectan por regex
+# los campos distintivos (email, token de 40 hex y TOTP de 16 base32) y se
+# reasignan a su variable canónica, sin importar el índice en que llegaron.
+# --------------------------------------------------------------------------- #
+_RE_AUTH_TOKEN = re.compile(r"^[a-f0-9]{40}$")
+_RE_TOTP = re.compile(r"^[A-Z2-7]{16}$")
+_RE_EMAIL = re.compile(r"^[^@\s]+@[^@\s]+\.[A-Za-z]{2,}$")
+
+# Índice canónico de cada variable dentro de los seis campos base
+# (`usuario, password, totp, email, email_pass, auth_token`).
+_INDICE_CANONICO = {
+    "username": 0,
+    "password": 1,
+    "totp_secret": 2,
+    "email": 3,
+    "email_password": 4,
+    "auth_token": 5,
+}
+
+# Orden estándar de las variables (el de la línea canónica).
+_ORDEN_CANONICO = (
+    "username",
+    "password",
+    "totp_secret",
+    "email",
+    "email_password",
+    "auth_token",
+)
+
+
+def _detectar_tipo_campo(valor: str) -> str:
+    """Devuelve la variable canónica sugerida por la FORMA del campo.
+
+    * `auth_token`: exactamente 40 caracteres hex en minúscula.
+    * `totp_secret`: exactamente 16 caracteres base32 en mayúscula (A-Z2-7).
+    * `email`: `algo@dominio.tld` (regex general, sin espacios ni `@` extra).
+
+    Devuelve `""` si el campo está vacío o no coincide con ningún patrón. Los
+    patrones son mutuamente excluyentes (longitudes distintas y el email
+    siempre trae `@`), así que el orden de evaluación es indiferente.
+    """
+    if not valor:
+        return ""
+    if _RE_EMAIL.fullmatch(valor):
+        return "email"
+    if _RE_AUTH_TOKEN.fullmatch(valor):
+        return "auth_token"
+    if _RE_TOTP.fullmatch(valor):
+        return "totp_secret"
+    return ""
+
+
+def _reasignar_campos_por_forma(partes: list, permitir_auth: bool = True) -> tuple:
+    """Reasigna email/TOTP/auth_token detectados por FORMA (columnas en desorden).
+
+    Reglas:
+    * Cada variable recibe UN candidato. Si el campo en su posición canónica
+      (`totp_secret`=3º, `email`=4º, `auth_token`=6º) ya tiene la forma de esa
+      variable, se respeta: ningún candidato externo la pisa (aunque haya una
+      password con forma de token, el token real de la posición canónica gana).
+    * Si la variable no tiene candidato en su posición canónica, reclama el
+      PRIMER campo fuera de posición con su forma (solo si la variable sigue
+      vacía: un valor ya reclamado nunca se pisa).
+    * Los campos NO detectados se asignan posicionalmente, en su orden original,
+      a las variables que quedaron libres en el orden estándar
+      (`usuario, password, totp, email, email_pass, auth_token`).
+
+    `permitir_auth=False` desactiva la reasignación de `auth_token`: la usa el
+    formato vendedor, donde el token lo define SIEMPRE el 7º campo. Devuelve los
+    seis valores en orden canónico; nunca lanza.
+    """
+    valores = (list(partes[:6]) + [""] * 6)[:6]
+
+    tipos_permitidos = {"email", "totp_secret"}
+    if permitir_auth:
+        tipos_permitidos.add("auth_token")
+
+    # 1) Detección por forma (variable -> índices candidatos, en orden).
+    candidatos = {}
+    for indice, valor in enumerate(valores):
+        tipo = _detectar_tipo_campo(valor)
+        if tipo and tipo in tipos_permitidos:
+            candidatos.setdefault(tipo, []).append(indice)
+
+    # 2) Un reclamo por variable: la posición canónica gana; si no es candidata,
+    #    el primer campo fuera de posición con la forma de esa variable.
+    reclamos = {}
+    for variable, indices in candidatos.items():
+        canonico = _INDICE_CANONICO[variable]
+        reclamos[variable] = canonico if canonico in indices else indices[0]
+
+    # 3) Los campos no reclamados llenan las variables libres en el orden
+    #    estándar (asignación posicional).
+    usados = set(reclamos.values())
+    restantes = [
+        valor for indice, valor in enumerate(valores) if indice not in usados
+    ]
+    pendientes = iter(restantes)
+
+    resultado = []
+    for variable in _ORDEN_CANONICO:
+        if variable in reclamos:
+            resultado.append(valores[reclamos[variable]])
+        else:
+            resultado.append(next(pendientes, ""))
+    return tuple(resultado)
+
+
 def _parsear_linea_impl(linea: str) -> Optional[dict]:
     """Implementación de `parsear_linea` (el wrapper solo agrega el try/except)."""
     original = linea
@@ -426,7 +546,21 @@ def _parsear_linea_impl(linea: str) -> Optional[dict]:
     if len(partes) > 7 and partes[7] and not user_agent:
         user_agent = partes[7]
 
-    username, password, totp_secret, email, email_password, auth_token = partes[:6]
+    # 5) Heurística por FORMA (columnas desordenadas del proveedor): reasigna
+    #    email, TOTP y auth_token detectados con regex, sin importar el índice
+    #    en que hayan llegado; los campos no detectados llenan las variables
+    #    libres en su orden original. En el formato vendedor el auth_token lo
+    #    define SIEMPRE el 7º campo, así que ahí no se reclama desde los 6 base.
+    (
+        username,
+        password,
+        totp_secret,
+        email,
+        email_password,
+        auth_token,
+    ) = _reasignar_campos_por_forma(
+        partes, permitir_auth=auth_token_vendedor is None
+    )
 
     # El formato vendedor define el auth_token en el 7º campo (no en el 6º).
     if auth_token_vendedor is not None:
@@ -471,6 +605,11 @@ def parsear_linea(linea: str) -> Optional[dict]:
       los valores del JSON: ambos se extraen (escáner balanceado + `json.loads`)
       ANTES de dividir por `:`, quitando también el separador adyacente. Si
       faltan campos base, se rellenan con `""`.
+    * Columnas desordenadas: los 6 campos base se reasignan por FORMA al final
+      del parseo — `auth_token` = 40 hex minúscula, `totp_secret` = 16 base32
+      mayúscula y `email` = `usuario@dominio.tld`, estén en la columna que
+      estén. La posición canónica gana ante varios candidatos del mismo tipo y
+      los campos no detectados conservan su orden relativo.
     * Los campos 7º/8º vacíos (`...:tok::`) se ignoran sin error; un valor no
       vacío después del 8º campo es línea malformada.
 

@@ -25,8 +25,20 @@ Callbacks (ver bot_clientes/keyboards.py):
   codigo_* codigo / otro codigo     -> codigo_callback
   nombre_* elegir / confirmar       -> nombre_callback
   foto_*   elegir / confirmar foto  -> foto_callback
-Mensajes: texto -> texto_recibido (solo si hay flujo pendiente);
+Mensajes: texto -> texto_recibido (solo si ESE usuario tiene flujo pendiente);
 fotos -> foto_recibida.
+
+GRUPOS (el bot vive en un grupo con los clientes):
+  - `context.user_data` de PTB v21 es POR USUARIO: los flujos de un miembro
+    nunca se mezclan con los de otro (los callbacks validan la cuenta contra
+    la lista del que pulsa el boton).
+  - En grupo, cada respuesta antepone "👤 @fulano, " para que se sepa a quien
+    le habla el bot (`mencion_grupo`/`con_mencion`).
+  - Los mensajes de otros miembros sin flujo pendiente se ignoran en silencio
+    (sin spam al grupo); el mensaje suelto y la RESPUESTA a un mensaje del bot
+    se aceptan igual.
+  - `bienvenida_grupo` (new_chat_members) y `bienvenida_miembro`
+    (my_chat_member) saludan UNA sola vez al agregar el bot (anti-duplicado).
 """
 
 from __future__ import annotations
@@ -99,7 +111,15 @@ TEXTO_AYUDA = (
     "Si algo falla:\n"
     "• Espera un momento y toca otra vez el botón (o 🔄 Intentar de nuevo).\n"
     "• Si sigue fallando, pide ayuda a la persona que te dio la cuenta.\n\n"
-    "Escribe /cancelar para detener lo que estés haciendo."
+    "Escribe /cancelar para detener lo que estés haciendo.\n\n"
+    "👥 En grupo: cada quien pulsa SUS botones y responde a MIS mensajes; "
+    "el bot contesta con el nombre de quien preguntó."
+)
+
+TEXTO_BIENVENIDA = (
+    "👋 ¡Hola! Soy el bot que te ayuda con tus cuentas de X.\n\n"
+    "Escribe /start y te muestro los botones: 🔑 código de verificación, "
+    "✏️ cambiar el nombre, 📸 foto de perfil y 🖼️ portada."
 )
 
 # Flujos y sus botones del menu.
@@ -279,6 +299,40 @@ def _limpiar(context) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Grupos: menciones y aislamiento por miembro
+# --------------------------------------------------------------------------- #
+
+def _nombre_usuario(update) -> str:
+    """'@usuario' si lo tiene; si no, su nombre visible; si no, 'amig@'."""
+    user = getattr(update, "effective_user", None) if update else None
+    username = str(getattr(user, "username", "") or "").strip().lstrip("@")
+    if username:
+        return f"@{username}"
+    nombre = str(
+        getattr(user, "full_name", "") or getattr(user, "first_name", "") or ""
+    ).strip()
+    return nombre or "amig@"
+
+
+def es_grupo(update) -> bool:
+    """True si el update viene de un grupo o supergrupo."""
+    chat = getattr(update, "effective_chat", None) if update else None
+    return str(getattr(chat, "type", "") or "").lower() in ("group", "supergroup")
+
+
+def mencion_grupo(update) -> str:
+    """'@fulano' en grupos; '' en privado (para anteponer '👤 @fulano, ')."""
+    return _nombre_usuario(update) if es_grupo(update) else ""
+
+
+def con_mencion(texto: str, mencion: str) -> str:
+    """Antepone '👤 @fulano, ' para que en el grupo se sepa a quien responde."""
+    if not mencion or not texto:
+        return texto
+    return f"👤 {mencion}, {texto}"
+
+
+# --------------------------------------------------------------------------- #
 # Acceso: guard de cliente/admin y cuentas
 # --------------------------------------------------------------------------- #
 
@@ -318,10 +372,12 @@ async def _guard(update) -> tuple | None:
     cliente = clientes_store.cliente_de(uid)
     admin = es_admin(uid)
     if cliente is None and not admin:
-        texto = TEXTO_SIN_REGISTRO
         query = getattr(update, "callback_query", None)
         if query is not None:
+            # La alerta solo la ve quien pulso el boton: sin mencion.
             texto = TEXTO_SIN_REGISTRO_CORTO
+        else:
+            texto = con_mencion(TEXTO_SIN_REGISTRO, mencion_grupo(update))
         await _avisar(update, texto)
         return None
     return uid, cliente, admin
@@ -490,7 +546,7 @@ async def codigo_desde_correo(
     }
 
 
-async def _flujo_codigo(target, context, usuario: str) -> None:
+async def _flujo_codigo(target, context, usuario: str, mencion: str = "") -> None:
     """Entrega el codigo de verificacion de `usuario` (TOTP o correo)."""
     datos = await asyncio.to_thread(_datos_cuenta, usuario)
     etiqueta = _etiqueta_cuenta(datos, usuario)
@@ -499,6 +555,7 @@ async def _flujo_codigo(target, context, usuario: str) -> None:
             target,
             f"😕 No encontré la cuenta @{etiqueta}.\n\n"
             "Pide ayuda a quien te dio la cuenta.",
+            mencion=mencion,
         )
         return
 
@@ -511,6 +568,7 @@ async def _flujo_codigo(target, context, usuario: str) -> None:
                 texto_codigo(codigo, segundos_restantes_ventana(), "totp"),
                 teclado_codigo(usuario),
                 html=True,
+                mencion=mencion,
             )
             return
         logger.warning(f"TOTP inválido para @{usuario}: {error}")
@@ -522,11 +580,14 @@ async def _flujo_codigo(target, context, usuario: str) -> None:
             target,
             f"😕 La cuenta @{etiqueta} no tiene código configurado.\n\n"
             "Pide a la persona que te dio la cuenta que lo revise.",
+            mencion=mencion,
         )
         return
 
     await _responder(
-        target, "⏳ Buscando el código en el correo, espera unos segundos..."
+        target,
+        "⏳ Buscando el código en el correo, espera unos segundos...",
+        mencion=mencion,
     )
     resultado = await codigo_desde_correo(email, password)
     if resultado.get("ok"):
@@ -535,6 +596,7 @@ async def _flujo_codigo(target, context, usuario: str) -> None:
             texto_codigo(resultado.get("codigo"), None, "correo"),
             teclado_codigo(usuario),
             html=True,
+            mencion=mencion,
         )
         return
     logger.info(f"Sin código por correo para @{usuario}: {resultado.get('error')}")
@@ -544,6 +606,7 @@ async def _flujo_codigo(target, context, usuario: str) -> None:
         "Espera unos segundos y toca «🔄 Intentar de nuevo».\n"
         "Si sigue sin llegar, pide ayuda a quien te dio la cuenta.",
         teclado_codigo_fallo(usuario),
+        mencion=mencion,
     )
 
 
@@ -616,8 +679,14 @@ async def ejecutar_cambiar_foto(usuario: str, foto_tipo: str, ruta: str) -> tupl
 # Utilidades de mensajes
 # --------------------------------------------------------------------------- #
 
-async def _responder(target, texto: str, markup=None, html: bool = False):
-    """Edita el mensaje objetivo si se puede; si no, responde uno nuevo."""
+async def _responder(target, texto: str, markup=None, html: bool = False, mencion: str = ""):
+    """Edita el mensaje objetivo si se puede; si no, responde uno nuevo.
+
+    `mencion` (solo grupos) antepone "👤 @fulano, " para que se sepa a quien
+    responde el bot dentro del grupo.
+    """
+    if mencion:
+        texto = con_mencion(texto, mencion)
     kwargs = {}
     if markup is not None:
         kwargs["reply_markup"] = markup
@@ -671,11 +740,11 @@ async def _descargar_foto(message, foto, usuario: str, foto_tipo: str) -> tuple:
 # --------------------------------------------------------------------------- #
 
 async def _iniciar_flujo(
-    target, context, tipo: str, usuario: str, editar: bool = True
+    target, context, tipo: str, usuario: str, editar: bool = True, mencion: str = ""
 ) -> None:
     """Arranca el flujo pedido con la cuenta ya elegida."""
     if tipo == "codigo":
-        await _flujo_codigo(target, context, usuario)
+        await _flujo_codigo(target, context, usuario, mencion=mencion)
         return
     if tipo == "nombre":
         context.user_data["cli_espera"] = {"tipo": "nombre", "usuario": usuario}
@@ -691,35 +760,42 @@ async def _iniciar_flujo(
         texto = texto_pedir_foto(foto_tipo, usuario)
         markup = teclado_cancelar()
     if editar:
-        await _responder(target, texto, markup)
+        await _responder(target, texto, markup, mencion=mencion)
     else:
         try:
-            await target.reply_text(texto, reply_markup=markup)
+            await target.reply_text(con_mencion(texto, mencion), reply_markup=markup)
         except Exception:
-            await _responder(target, texto, markup)
+            await _responder(target, texto, markup, mencion=mencion)
 
 
-async def _elegir_cuenta_o_iniciar(query, context, uid, cliente, admin, tipo: str) -> None:
+async def _elegir_cuenta_o_iniciar(
+    query, context, uid, cliente, admin, tipo: str, mencion: str = ""
+) -> None:
     """Con 1 cuenta va directo; con varias muestra un boton por cuenta."""
     cuentas = _cuentas_disponibles(uid, cliente, admin)
     if not cuentas:
-        await _responder(query.message, TEXTO_SIN_CUENTAS)
+        await _responder(query.message, TEXTO_SIN_CUENTAS, mencion=mencion)
         return
     if len(cuentas) == 1:
-        await _iniciar_flujo(query.message, context, tipo, cuentas[0], editar=True)
+        await _iniciar_flujo(
+            query.message, context, tipo, cuentas[0], editar=True, mencion=mencion
+        )
         return
     context.user_data["cli_flujo"] = tipo
     context.user_data.pop("cli_espera", None)
     await _responder(
-        query.message, "¿Con cuál cuenta quieres hacerlo?", teclado_cuentas(cuentas)
+        query.message,
+        "¿Con cuál cuenta quieres hacerlo?",
+        teclado_cuentas(cuentas),
+        mencion=mencion,
     )
 
 
-async def _mostrar_mis_cuentas(query, uid, cliente, admin) -> None:
+async def _mostrar_mis_cuentas(query, uid, cliente, admin, mencion: str = "") -> None:
     """Lista las cuentas con su @ real y su nombre actual (sin credenciales)."""
     cuentas = _cuentas_disponibles(uid, cliente, admin)
     if not cuentas:
-        await _responder(query.message, TEXTO_SIN_CUENTAS, menu_principal())
+        await _responder(query.message, TEXTO_SIN_CUENTAS, menu_principal(), mencion=mencion)
         return
     lineas = ["📋 Tus cuentas:", ""]
     for indice, usuario in enumerate(cuentas, 1):
@@ -732,18 +808,25 @@ async def _mostrar_mis_cuentas(query, uid, cliente, admin) -> None:
         lineas.append(linea)
     lineas += ["", "Toca una cuenta para hacer algo con ella 👇"]
     await _responder(
-        query.message, "\n".join(lineas), teclado_mis_cuentas(cuentas[:10])
+        query.message,
+        "\n".join(lineas),
+        teclado_mis_cuentas(cuentas[:10]),
+        mencion=mencion,
     )
 
 
-async def _pedir_nombre(target, context, usuario: str) -> None:
+async def _pedir_nombre(target, context, usuario: str, mencion: str = "") -> None:
     """Pide el nombre nuevo por texto."""
     context.user_data["cli_espera"] = {"tipo": "nombre", "usuario": usuario}
     context.user_data.pop("cli_nombre_pend", None)
-    await _responder(target, texto_pedir_nombre(usuario), teclado_cancelar())
+    await _responder(
+        target, texto_pedir_nombre(usuario), teclado_cancelar(), mencion=mencion
+    )
 
 
-async def _pedir_foto(target, context, usuario: str, foto_tipo: str) -> None:
+async def _pedir_foto(
+    target, context, usuario: str, foto_tipo: str, mencion: str = ""
+) -> None:
     """Pide la imagen por Telegram."""
     context.user_data["cli_espera"] = {
         "tipo": "foto",
@@ -751,7 +834,9 @@ async def _pedir_foto(target, context, usuario: str, foto_tipo: str) -> None:
         "usuario": usuario,
     }
     context.user_data.pop("cli_foto_pend", None)
-    await _responder(target, texto_pedir_foto(foto_tipo, usuario), teclado_cancelar())
+    await _responder(
+        target, texto_pedir_foto(foto_tipo, usuario), teclado_cancelar(), mencion=mencion
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -767,7 +852,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     _limpiar(context)
     cuentas = _cuentas_disponibles(uid, cliente, admin)
     await update.effective_message.reply_text(
-        texto_menu(cliente, admin, cuentas), reply_markup=menu_principal()
+        con_mencion(texto_menu(cliente, admin, cuentas), mencion_grupo(update)),
+        reply_markup=menu_principal(),
     )
 
 
@@ -778,7 +864,7 @@ async def ayuda(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     _limpiar(context)
     await update.effective_message.reply_text(
-        TEXTO_AYUDA, reply_markup=menu_principal()
+        con_mencion(TEXTO_AYUDA, mencion_grupo(update)), reply_markup=menu_principal()
     )
 
 
@@ -789,7 +875,10 @@ async def cancelar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     _limpiar(context)
     await update.effective_message.reply_text(
-        "Listo, cancelado. ✅\n\n¿Qué quieres hacer ahora? Toca un botón 👇",
+        con_mencion(
+            "Listo, cancelado. ✅\n\n¿Qué quieres hacer ahora? Toca un botón 👇",
+            mencion_grupo(update),
+        ),
         reply_markup=menu_principal(),
     )
 
@@ -806,6 +895,7 @@ async def cli_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
     uid, cliente, admin = ctx
     data = (query.data or "").strip()
+    mencion = mencion_grupo(update)
     await query.answer()
 
     if data.startswith("cli_cuenta_"):
@@ -823,6 +913,7 @@ async def cli_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             query.message,
             f"¿Qué quieres hacer con @{usuario}?",
             teclado_acciones_cuenta(usuario),
+            mencion=mencion,
         )
         return
 
@@ -832,11 +923,12 @@ async def cli_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             query.message,
             texto_menu(cliente, admin, _cuentas_disponibles(uid, cliente, admin)),
             menu_principal(),
+            mencion=mencion,
         )
         return
     if data == "cli_ayuda":
         _limpiar(context)
-        await _responder(query.message, TEXTO_AYUDA, menu_principal())
+        await _responder(query.message, TEXTO_AYUDA, menu_principal(), mencion=mencion)
         return
     if data == "cli_cancelar":
         _limpiar(context)
@@ -844,17 +936,20 @@ async def cli_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             query.message,
             "Listo, cancelado. ✅\n\n¿Qué quieres hacer ahora? Toca un botón 👇",
             menu_principal(),
+            mencion=mencion,
         )
         return
     if data == "cli_mis_cuentas":
         _limpiar(context)
-        await _mostrar_mis_cuentas(query, uid, cliente, admin)
+        await _mostrar_mis_cuentas(query, uid, cliente, admin, mencion=mencion)
         return
 
     tipo = TIPO_POR_BOTON.get(data)
     if tipo:
         _limpiar(context)
-        await _elegir_cuenta_o_iniciar(query, context, uid, cliente, admin, tipo)
+        await _elegir_cuenta_o_iniciar(
+            query, context, uid, cliente, admin, tipo, mencion=mencion
+        )
 
 
 async def cuenta_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -864,6 +959,7 @@ async def cuenta_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if ctx is None:
         return
     uid, cliente, admin = ctx
+    mencion = mencion_grupo(update)
     usuario = _resolver_cuenta(
         (query.data or "")[len("cuenta_"):],
         _cuentas_disponibles(uid, cliente, admin),
@@ -874,11 +970,18 @@ async def cuenta_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     tipo = str(context.user_data.get("cli_flujo") or "").strip()
     if tipo not in ("codigo", "nombre", "foto_perfil", "foto_portada"):
         await query.answer("Primero elige qué quieres hacer 🙂", show_alert=True)
-        await _responder(query.message, "¿Qué quieres hacer? Toca un botón 👇", menu_principal())
+        await _responder(
+            query.message,
+            "¿Qué quieres hacer? Toca un botón 👇",
+            menu_principal(),
+            mencion=mencion,
+        )
         return
     await query.answer()
     context.user_data.pop("cli_flujo", None)
-    await _iniciar_flujo(query.message, context, tipo, usuario, editar=True)
+    await _iniciar_flujo(
+        query.message, context, tipo, usuario, editar=True, mencion=mencion
+    )
 
 
 async def codigo_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -888,6 +991,7 @@ async def codigo_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if ctx is None:
         return
     uid, cliente, admin = ctx
+    mencion = mencion_grupo(update)
     usuario = _resolver_cuenta(
         (query.data or "")[len("codigo_"):],
         _cuentas_disponibles(uid, cliente, admin),
@@ -897,7 +1001,7 @@ async def codigo_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
     await query.answer()
     _limpiar(context)
-    await _flujo_codigo(query.message, context, usuario)
+    await _flujo_codigo(query.message, context, usuario, mencion=mencion)
 
 
 async def nombre_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -909,6 +1013,7 @@ async def nombre_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     uid, cliente, admin = ctx
     data = (query.data or "").strip()
     cuentas = _cuentas_disponibles(uid, cliente, admin)
+    mencion = mencion_grupo(update)
 
     for prefijo in ("nombre_si_", "nombre_no_"):
         if not data.startswith(prefijo):
@@ -928,7 +1033,10 @@ async def nombre_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         if prefijo == "nombre_no_":
             context.user_data.pop("cli_nombre_pend", None)
             await _responder(
-                query.message, "Está bien, no cambié nada. 👍", menu_principal()
+                query.message,
+                "Está bien, no cambié nada. 👍",
+                menu_principal(),
+                mencion=mencion,
             )
             return
         nombre = str(pendiente.get("nombre"))
@@ -936,18 +1044,22 @@ async def nombre_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             query.message,
             f"⏳ Cambiando el nombre de @{usuario} a «{nombre}».\n\n"
             "Esto tarda 1-2 minutos. No cierres el chat, por favor...",
+            mencion=mencion,
         )
         ok, error = await ejecutar_cambiar_nombre(usuario, nombre)
         context.user_data.pop("cli_nombre_pend", None)
         if ok:
             await query.message.reply_text(
-                f"✅ ¡Listo! Ahora el nombre de @{usuario} es «{nombre}».",
+                con_mencion(
+                    f"✅ ¡Listo! Ahora el nombre de @{usuario} es «{nombre}».",
+                    mencion,
+                ),
                 reply_markup=menu_principal(),
             )
         else:
             logger.warning(f"No se pudo cambiar el nombre de @{usuario}: {error}")
             await query.message.reply_text(
-                TEXTO_FALLO_NOMBRE,
+                con_mencion(TEXTO_FALLO_NOMBRE, mencion),
                 reply_markup=teclado_reintentar_nombre(usuario),
             )
         return
@@ -958,7 +1070,7 @@ async def nombre_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await query.answer("Esa cuenta ya no está disponible.", show_alert=True)
             return
         await query.answer()
-        await _pedir_nombre(query.message, context, usuario)
+        await _pedir_nombre(query.message, context, usuario, mencion=mencion)
         return
 
     await query.answer()
@@ -973,6 +1085,7 @@ async def foto_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     uid, cliente, admin = ctx
     data = (query.data or "").strip()
     cuentas = _cuentas_disponibles(uid, cliente, admin)
+    mencion = mencion_grupo(update)
 
     for accion in ("foto_si_", "foto_no_", "foto_otra_"):
         if not data.startswith(accion):
@@ -997,12 +1110,15 @@ async def foto_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             context.user_data.pop("cli_foto_pend", None)
             _limpiar(context)
             await _responder(
-                query.message, "Está bien, no cambié nada. 👍", menu_principal()
+                query.message,
+                "Está bien, no cambié nada. 👍",
+                menu_principal(),
+                mencion=mencion,
             )
             return
         if accion == "foto_otra_":
             context.user_data.pop("cli_foto_pend", None)
-            await _pedir_foto(query.message, context, usuario, foto_tipo)
+            await _pedir_foto(query.message, context, usuario, foto_tipo, mencion=mencion)
             return
         ruta = str(pendiente.get("ruta") or "")
         context.user_data.pop("cli_espera", None)
@@ -1010,6 +1126,7 @@ async def foto_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             query.message,
             f"⏳ Subiendo tu nueva {etiqueta} de @{usuario}.\n\n"
             "Esto tarda 1-2 minutos. No cierres el chat, por favor...",
+            mencion=mencion,
         )
         ok, error = await ejecutar_cambiar_foto(usuario, foto_tipo, ruta)
         context.user_data.pop("cli_foto_pend", None)
@@ -1020,13 +1137,13 @@ async def foto_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             except OSError:
                 pass
             await query.message.reply_text(
-                f"✅ ¡Listo! Ya cambié tu {etiqueta}.",
+                con_mencion(f"✅ ¡Listo! Ya cambié tu {etiqueta}.", mencion),
                 reply_markup=menu_principal(),
             )
         else:
             logger.warning(f"No se pudo subir {foto_tipo} de @{usuario}: {error}")
             await query.message.reply_text(
-                TEXTO_FALLO_FOTO,
+                con_mencion(TEXTO_FALLO_FOTO, mencion),
                 reply_markup=teclado_reintentar_foto(foto_tipo, usuario),
             )
         return
@@ -1039,7 +1156,7 @@ async def foto_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             await query.answer("Esa cuenta ya no está disponible.", show_alert=True)
             return
         await query.answer()
-        await _pedir_foto(query.message, context, usuario, foto_tipo)
+        await _pedir_foto(query.message, context, usuario, foto_tipo, mencion=mencion)
         return
 
     await query.answer()
@@ -1050,7 +1167,13 @@ async def foto_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 # --------------------------------------------------------------------------- #
 
 async def texto_recibido(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Texto libre: SOLO se procesa si hay un flujo pendiente (nombre nuevo)."""
+    """Texto libre: SOLO se procesa si ESE usuario tiene un flujo pendiente.
+
+    En grupos (con privacy ON alcanza con responder a un mensaje del bot; con
+    privacy OFF se reciben todos): los mensajes de otros miembros sin flujo se
+    IGNORAN en silencio (sin spam al grupo) porque `context.user_data` es por
+    usuario en PTB v21.
+    """
     espera = context.user_data.get("cli_espera") or {}
     if espera.get("tipo") != "nombre":
         return
@@ -1058,26 +1181,33 @@ async def texto_recibido(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if ctx is None:
         return
     uid, cliente, admin = ctx
+    mencion = mencion_grupo(update)
     usuario = _resolver_cuenta(
         espera.get("usuario") or "", _cuentas_disponibles(uid, cliente, admin)
     )
     if not usuario:
         _limpiar(context)
         await update.effective_message.reply_text(
-            "😕 La cuenta ya no está disponible. Vuelve a empezar con /start."
+            con_mencion(
+                "😕 La cuenta ya no está disponible. Vuelve a empezar con /start.",
+                mencion,
+            )
         )
         return
     texto = str(getattr(update.effective_message, "text", "") or "")
     ok, nombre, error = validar_nombre(texto)
     if not ok:
         await update.effective_message.reply_text(
-            f"🤔 {error}\n\nEscríbelo otra vez, por favor."
+            con_mencion(f"🤔 {error}\n\nEscríbelo otra vez, por favor.", mencion)
         )
         return
     context.user_data.pop("cli_espera", None)
     context.user_data["cli_nombre_pend"] = {"usuario": usuario, "nombre": nombre}
     await update.effective_message.reply_text(
-        f"Voy a cambiar el nombre de @{usuario} a:\n\n«{nombre}»\n\n¿Lo hago?",
+        con_mencion(
+            f"Voy a cambiar el nombre de @{usuario} a:\n\n«{nombre}»\n\n¿Lo hago?",
+            mencion,
+        ),
         reply_markup=teclado_confirmar_nombre(usuario),
     )
 
@@ -1085,13 +1215,17 @@ async def texto_recibido(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 async def foto_recibida(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Foto de Telegram: la guarda en data/temp y pide confirmacion."""
     espera = context.user_data.get("cli_espera") or {}
+    mencion = mencion_grupo(update)
     if espera.get("tipo") != "foto":
         ctx = await _guard(update)
         if ctx is None:
             return
         await update.effective_message.reply_text(
-            "📸 No esperaba ninguna foto.\n\n"
-            "Primero toca el botón 📸 o 🖼️ y después mándame la imagen. 🙂"
+            con_mencion(
+                "📸 No esperaba ninguna foto.\n\n"
+                "Primero toca el botón 📸 o 🖼️ y después mándame la imagen. 🙂",
+                mencion,
+            )
         )
         return
     ctx = await _guard(update)
@@ -1105,13 +1239,16 @@ async def foto_recibida(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if not usuario:
         _limpiar(context)
         await update.effective_message.reply_text(
-            "😕 La cuenta ya no está disponible. Vuelve a empezar con /start."
+            con_mencion(
+                "😕 La cuenta ya no está disponible. Vuelve a empezar con /start.",
+                mencion,
+            )
         )
         return
     fotos = list(getattr(update.effective_message, "photo", []) or [])
     if not fotos:
         await update.effective_message.reply_text(
-            "📸 Mándala como FOTO (no como archivo 📎), por favor."
+            con_mencion("📸 Mándala como FOTO (no como archivo 📎), por favor.", mencion)
         )
         return
     ruta, error = await _descargar_foto(
@@ -1120,7 +1257,10 @@ async def foto_recibida(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if not ruta:
         logger.warning(f"No se pudo bajar la foto de @{usuario}: {error}")
         await update.effective_message.reply_text(
-            "❌ No se pudo recibir la foto. Inténtalo otra vez, por favor."
+            con_mencion(
+                "❌ No se pudo recibir la foto. Inténtalo otra vez, por favor.",
+                mencion,
+            )
         )
         return
     context.user_data.pop("cli_espera", None)
@@ -1130,23 +1270,128 @@ async def foto_recibida(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "ruta": ruta,
     }
     etiqueta = "foto de perfil" if foto_tipo == "perfil" else "portada"
+    pregunta = con_mencion(
+        f"¿Uso esta foto como tu nueva {etiqueta} de @{usuario}?", mencion
+    )
     try:
         await update.effective_message.reply_photo(
             photo=fotos[-1].file_id,
-            caption=f"¿Uso esta foto como tu nueva {etiqueta} de @{usuario}?",
+            caption=pregunta,
             reply_markup=teclado_confirmar_foto(foto_tipo, usuario),
         )
     except Exception as e:
         logger.warning(f"No se pudo reenviar la vista previa a @{usuario}: {e}")
         await update.effective_message.reply_text(
-            f"¿Uso esta foto como tu nueva {etiqueta} de @{usuario}?",
+            pregunta,
             reply_markup=teclado_confirmar_foto(foto_tipo, usuario),
         )
 
 
 # --------------------------------------------------------------------------- #
+# Grupos: bienvenida al agregar el bot
+# --------------------------------------------------------------------------- #
+
+# Anti-duplicado: al agregar el bot, Telegram manda DOS updates (el mensaje de
+# `new_chat_members` y el `my_chat_member`); solo se saluda UNA vez por chat.
+_BIENVENIDAS: dict = {}
+BIENVENIDA_VENTANA_SEG = 60.0
+
+
+def _bienvenida_reciente(chat_id, ventana: float = BIENVENIDA_VENTANA_SEG) -> bool:
+    """True si ya se saludo a ese chat hace menos de `ventana` segundos."""
+    if chat_id is None:
+        return True
+    try:
+        ahora = time.monotonic()
+    except Exception:
+        ahora = time.time()
+    previo = _BIENVENIDAS.get(chat_id)
+    if previo is not None and (ahora - previo) < float(ventana):
+        return True
+    _BIENVENIDAS[chat_id] = ahora
+    return False
+
+
+async def _enviar_bienvenida(update, context, chat_id) -> None:
+    """Manda el saludo por el mensaje del update o, si no, directo al chat."""
+    mensaje = getattr(update, "effective_message", None)
+    if mensaje is not None:
+        try:
+            await mensaje.reply_text(TEXTO_BIENVENIDA)
+            return
+        except Exception:
+            pass
+    try:
+        await context.bot.send_message(chat_id=chat_id, text=TEXTO_BIENVENIDA)
+    except Exception as e:
+        logger.debug(f"No se pudo saludar al chat {chat_id}: {e}")
+
+
+def _bot_entre_los_nuevos(update, context) -> bool:
+    """True si el bot aparece en `new_chat_members` (o no hay bot que comparar)."""
+    mensaje = getattr(update, "effective_message", None)
+    nuevos = list(getattr(mensaje, "new_chat_members", []) or []) if mensaje else []
+    if not nuevos:
+        return True
+    bot_id = getattr(getattr(context, "bot", None), "id", None)
+    if bot_id is None:
+        return True
+    return any(getattr(usuario, "id", None) == bot_id for usuario in nuevos)
+
+
+async def bienvenida_grupo(update, context) -> None:
+    """Al AGREGAR el bot a un grupo: instrucciones cortas (una sola vez).
+
+    Se registra con `MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS)`.
+    Si agregan a otra persona (no al bot), no dice nada.
+    """
+    chat = getattr(update, "effective_chat", None)
+    chat_id = getattr(chat, "id", None)
+    if chat_id is None or not _bot_entre_los_nuevos(update, context):
+        return
+    if _bienvenida_reciente(chat_id):
+        return
+    await _enviar_bienvenida(update, context, chat_id)
+
+
+_ESTADOS_FUERA = {"left", "kicked"}
+_ESTADOS_DENTRO = {"member", "administrator", "creator", "restricted"}
+
+
+async def bienvenida_miembro(update, context) -> None:
+    """`ChatMemberHandler(MY_CHAT_MEMBER)`: saluda cuando el bot RECIEN entra.
+
+    Complementa a `bienvenida_grupo` (Telegram manda ambos updates al agregar
+    el bot); `_bienvenida_reciente` evita el saludo doble.
+    """
+    miembro = getattr(update, "my_chat_member", None)
+    if miembro is None:
+        return
+    viejo = str(getattr(getattr(miembro, "old_chat_member", None), "status", "") or "")
+    nuevo = str(getattr(getattr(miembro, "new_chat_member", None), "status", "") or "")
+    if viejo not in _ESTADOS_FUERA or nuevo not in _ESTADOS_DENTRO:
+        return
+    chat = getattr(update, "effective_chat", None)
+    chat_id = getattr(chat, "id", None)
+    if chat_id is None or _bienvenida_reciente(chat_id):
+        return
+    await _enviar_bienvenida(update, context, chat_id)
+
+
+# --------------------------------------------------------------------------- #
 # Comandos de admin (/clientes, /asignar, /quitar)
 # --------------------------------------------------------------------------- #
+
+async def _responder_admin(update, texto: str) -> None:
+    """Respuesta de un comando de admin (con mencion si llega de un grupo)."""
+    message = getattr(update, "effective_message", None) if update else None
+    if message is None:
+        return
+    try:
+        await message.reply_text(con_mencion(texto, mencion_grupo(update)))
+    except Exception:
+        pass
+
 
 def solo_admins(func):
     """Decorador: solo TELEGRAM_ADMIN_IDS puede ejecutar el comando."""
@@ -1155,14 +1400,7 @@ def solo_admins(func):
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
         uid = _telegram_id(update)
         if uid is None or not es_admin(uid):
-            message = getattr(update, "effective_message", None) if update else None
-            if message is not None:
-                try:
-                    await message.reply_text(
-                        "⛔ Este comando es solo para el equipo."
-                    )
-                except Exception:
-                    pass
+            await _responder_admin(update, "⛔ Este comando es solo para el equipo.")
             return
         return await func(update, context, *args, **kwargs)
 
@@ -1206,9 +1444,10 @@ async def comando_clientes(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     """/clientes: lista los clientes registrados y sus cuentas (solo admin)."""
     clientes = clientes_store.todos_los_clientes()
     if not clientes:
-        await update.effective_message.reply_text(
+        await _responder_admin(
+            update,
             "👥 Todavía no hay clientes registrados.\n\n"
-            "Usa: /asignar <telegram_id> [nombre] <usuario1> <usuario2> ..."
+            "Usa: /asignar <telegram_id> [nombre] <usuario1> <usuario2> ...",
         )
         return
     lineas = [f"👥 Clientes del bot ({len(clientes)}):", ""]
@@ -1220,7 +1459,7 @@ async def comando_clientes(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         lineas.append("")
     lineas.append("Para agregar cuentas: /asignar <id> [nombre] <usuario...>")
     lineas.append("Para quitar cuentas: /quitar <id> <usuario...>")
-    await update.effective_message.reply_text("\n".join(lineas))
+    await _responder_admin(update, "\n".join(lineas))
 
 
 @solo_admins
@@ -1228,7 +1467,7 @@ async def comando_asignar(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     """/asignar <telegram_id> [nombre] <usuario1> ...: da cuentas a un cliente."""
     args = [str(a) for a in (context.args or [])]
     if len(args) < 2:
-        await update.effective_message.reply_text(_texto_uso_asignar())
+        await _responder_admin(update, _texto_uso_asignar())
         return
     telegram_id = args[0].strip()
     resto = [a for a in args[1:] if a.strip()]
@@ -1251,7 +1490,7 @@ async def comando_asignar(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     }
     error = clientes_store.asignar(telegram_id, nombre, usuarios)
     if error:
-        await update.effective_message.reply_text(f"❌ {error}")
+        await _responder_admin(update, f"❌ {error}")
         return
     info = clientes_store.cliente_de(telegram_id) or {}
     agregadas = [u for u in usuarios if u.lower() not in previos]
@@ -1270,7 +1509,7 @@ async def comando_asignar(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 "⚠️ Ojo: no están en la base de datos: "
                 + ", ".join(f"@{u}" for u in faltantes)
             )
-    await update.effective_message.reply_text("\n".join(lineas))
+    await _responder_admin(update, "\n".join(lineas))
 
 
 @solo_admins
@@ -1278,15 +1517,15 @@ async def comando_quitar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     """/quitar <telegram_id> <usuario1> ...: quita cuentas a un cliente."""
     args = [str(a) for a in (context.args or [])]
     if len(args) < 2:
-        await update.effective_message.reply_text(
-            "Uso: /quitar <telegram_id> <usuario1> <usuario2> ..."
+        await _responder_admin(
+            update, "Uso: /quitar <telegram_id> <usuario1> <usuario2> ..."
         )
         return
     telegram_id = args[0].strip()
     usuarios = clientes_store.limpiar_usuarios(args[1:])
     error = clientes_store.quitar(telegram_id, usuarios)
     if error:
-        await update.effective_message.reply_text(f"❌ {error}")
+        await _responder_admin(update, f"❌ {error}")
         return
     info = clientes_store.cliente_de(telegram_id) or {}
     lineas = [f"✅ Listo. Cliente {telegram_id} — {info.get('nombre') or 'Cliente'}."]
@@ -1295,4 +1534,4 @@ async def comando_quitar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         lineas.append("Le quedan: " + ", ".join(f"@{u}" for u in restantes))
     else:
         lineas.append("Ya no tiene cuentas asignadas.")
-    await update.effective_message.reply_text("\n".join(lineas))
+    await _responder_admin(update, "\n".join(lineas))
