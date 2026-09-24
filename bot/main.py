@@ -3,7 +3,8 @@
 Registra comandos y callbacks. Sin token real no construye la app
 (verificacion de solo-imports: ast.parse).
 Comandos registrados: /start /help /ayuda /status /cuentas
-/cuentas_verificar /brandear /cambiar_perfil /cambiar_nombre /cambiar_handle.
+/cuentas_verificar /brandear /cambiar_perfil /cambiar_nombre /cambiar_handle
+/codigo.
 Callbacks: menu_*, cuentas_verificar, brandeo:*, perfil_*, foto_*.
 Fotos: MessageHandler(filters.PHOTO) -> foto_recibida.
 """
@@ -40,6 +41,7 @@ from bot.handlers.cuentas import (
     perfil_portada_callback,
     perfil_verificar_callback,
 )
+from bot.handlers.verificaciones import comando_codigo
 
 load_dotenv()
 logging.basicConfig(
@@ -79,6 +81,7 @@ def construir_app(token: str) -> Application:
     app.add_handler(CommandHandler("cambiar_perfil", cambiar_perfil))
     app.add_handler(CommandHandler("cambiar_nombre", cambiar_nombre))
     app.add_handler(CommandHandler("cambiar_handle", cambiar_handle))
+    app.add_handler(CommandHandler("codigo", comando_codigo))  # 2FA (TOTP)
 
     # Callbacks: menu (comandos.py) + cuentas/fotos (cuentas.py)
     app.add_handler(CallbackQueryHandler(menu_callback, pattern=r"^menu_"))
@@ -116,7 +119,10 @@ def main() -> None:
         log.error("Falta TELEGRAM_BOT_TOKEN real en el .env; el bot no arranca.")
         raise SystemExit(1)
     app = construir_app(token)
-    log.info("Bot iniciado (PTB v21, polling). Comandos: /start /brandear /cambiar_perfil.")
+    log.info(
+        "Bot iniciado (PTB v21, polling). "
+        "Comandos: /start /brandear /cambiar_perfil /codigo."
+    )
     app.run_polling(allowed_updates=["message", "callback_query"])
 
 
