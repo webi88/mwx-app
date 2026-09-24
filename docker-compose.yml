@@ -1,8 +1,11 @@
 version: '3.8'
 
 services:
-  # Dashboard web (Streamlit) + scheduler, igual que en Railway (supervisord).
-  # Sin bot de Telegram: la interfaz es el dashboard web.
+  # Todo en uno, igual que en Railway (supervisord): xvfb + dashboard web
+  # (Streamlit) + scheduler + bot interno de Telegram (@enigmawebi_bot,
+  # TELEGRAM_BOT_TOKEN) + bot de clientes (@vrf2fa_bot,
+  # TELEGRAM_CLIENTES_BOT_TOKEN), todos en el MISMO contenedor.
+  # Los dos tokens deben ser DISTINTOS entre sí.
   app:
     build: .
     container_name: gestor-redes-dashboard
@@ -23,24 +26,8 @@ services:
         max-size: "10m"
         max-file: "3"
 
-  # Bot de Telegram para CLIENTES no técnicos (código de verificación de X,
-  # cambiar nombre, foto de perfil y portada con botones).
-  # Token propio: TELEGRAM_CLIENTES_BOT_TOKEN en .env (crear el bot con
-  # @BotFather). Es independiente del bot interno.
-  bot-clientes:
-    build: .
-    container_name: gestor-redes-bot-clientes
-    restart: unless-stopped
-    env_file:
-      - .env
-    volumes:
-      - ./data:/app/data
-      - ./config:/app/config
-    command: python -m bot_clientes.main
-    environment:
-      - TZ=America/Mexico_City
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "3"
+# NOTA: no existe (ni debe crearse) un servicio aparte para los bots de
+# Telegram. El servicio `app` los arranca dentro de supervisord
+# ([program:bot] y [program:bot-clientes]); un segundo proceso con el mismo
+# token produciría un conflicto de polling (`Conflict: terminated by other
+# getUpdates request`) y tumbaría ambos bots.

@@ -1,9 +1,10 @@
 """Flujos del bot de clientes de X (PTB v21, async).
 
 Bot INDEPENDIENTE del bot interno (`bot/`): aqui el cliente no tecnico
-obtiene el codigo de verificacion (2FA TOTP o codigo recibido en el correo de
-la cuenta), cambia el nombre, la foto de perfil y la portada de sus cuentas de
-X. Todo con BOTONES; el cliente solo necesita escribir `/start`.
+obtiene el codigo de verificacion 2FA (TOTP) generado al momento desde la
+semilla guardada en `Cuenta.totp_secret`, cambia el nombre, la foto de perfil y
+la portada de sus cuentas de X. Todo con BOTONES; el cliente solo necesita
+escribir `/start`.
 
 Reglas de diseno:
   - Mensajes cortos y sencillos ("como si fueran tontos"): sin terminos
@@ -14,9 +15,10 @@ Reglas de diseno:
   - Selenium NUNCA en el hilo del bot: `asyncio.to_thread(...)` con import
     perezoso de `plataformas.twitter.selenium_bot` y `bot.cerrar()` SIEMPRE en
     `finally`.
-  - El lector de correo (`utils.lector_correo.obtener_codigo_verificacion`,
-    contrato congelado `(email, password, timeout=25) -> dict`) se importa
-    perezosamente y su ImportError se tolera con un mensaje simple.
+  - El codigo 2FA es SOLO TOTP (`pyotp.TOTP(semilla).now()`): el bot ya NO
+    revisa correos ni usa `utils.lector_correo` (el correo lo tienen los
+    propios clientes). Si no hay semilla, se pide ayuda al que dio la cuenta.
+  - El secreto TOTP NUNCA se muestra.
   - Nada de credenciales en mensajes ni en `data/clientes_bot.json`.
 
 Callbacks (ver bot_clientes/keyboards.py):
@@ -46,9 +48,7 @@ from __future__ import annotations
 import asyncio
 import functools
 import html
-import inspect
 import os
-import random
 import re
 import time
 
@@ -122,6 +122,13 @@ TEXTO_BIENVENIDA = (
     "✏️ cambiar el nombre, 📸 foto de perfil y 🖼️ portada."
 )
 
+# Cuenta sin semilla 2FA en la BD: mensaje claro y amable, sin correos ni
+# tecnicismos (el correo lo tienen los propios clientes).
+TEXTO_SIN_TOTP = (
+    "⚠️ Esta cuenta todavía no tiene configurado el código 2FA en el bot.\n\n"
+    "Pide ayuda a la persona que te dio la cuenta."
+)
+
 # Flujos y sus botones del menu.
 TIPO_POR_BOTON = {
     "cli_codigo": "codigo",
@@ -130,11 +137,7 @@ TIPO_POR_BOTON = {
     "cli_foto_portada": "foto_portada",
 }
 
-# Correo (contrato congelado del lector IMAP).
-TIEMPO_CORREO = 25
-INTENTOS_CORREO = 3
-ESPERA_CORREO_MIN = 5.0
-ESPERA_CORREO_MAX = 8.0
+# Codigo 2FA: SOLO TOTP desde Cuenta.totp_secret (ya no se usa el correo).
 VENTANA_TOTP = 30
 
 # Validacion del nombre visible.
@@ -208,12 +211,10 @@ def _esc(texto) -> str:
     return html.escape(str(texto or ""))
 
 
-def texto_codigo(codigo: str, segundos=None, origen: str = "totp") -> str:
-    """Mensaje (HTML) con el codigo, pensado para clientes no tecnicos."""
+def texto_codigo(codigo: str, segundos=None) -> str:
+    """Mensaje (HTML) con el codigo TOTP, pensado para clientes no tecnicos."""
     codigo = str(codigo or "").strip()
     lineas = [f"✅ Este es tu código: <b>{_esc(codigo)}</b>", ""]
-    if origen == "correo":
-        lineas.append("Lo encontré en tu correo (llegó hace un momento).")
     lineas.append(
         "Cópialo y pégalo en X. X te lo pide después de escribir tu usuario "
         "y tu contraseña."
@@ -441,8 +442,6 @@ def _datos_cuenta(usuario: str) -> dict | None:
                     getattr(cuenta, "nombre_mostrado", "") or ""
                 ).strip(),
                 "totp_secret": str(getattr(cuenta, "totp_secret", "") or ""),
-                "email": str(getattr(cuenta, "email", "") or "").strip(),
-                "email_password": str(getattr(cuenta, "email_password", "") or ""),
                 "activa": bool(getattr(cuenta, "activa", True)),
             }
     except Exception as e:
@@ -451,103 +450,16 @@ def _datos_cuenta(usuario: str) -> dict | None:
 
 
 # --------------------------------------------------------------------------- #
-# Codigo de verificacion (TOTP o correo)
+# Codigo de verificacion 2FA (SOLO TOTP; el bot ya no revisa correos)
 # --------------------------------------------------------------------------- #
 
-def _importar_lector_correo():
-    """Import perezoso del lector IMAP (lo crea otro agente en utils/)."""
-    from utils.lector_correo import obtener_codigo_verificacion
-
-    return obtener_codigo_verificacion
-
-
-def _llamar_lector(buscador, email: str, password: str, timeout: int = TIEMPO_CORREO):
-    """Llama al lector respetando su firma (timeout opcional)."""
-    try:
-        parametros = inspect.signature(buscador).parameters
-        if "timeout" in parametros:
-            return buscador(email, password, timeout=timeout)
-    except (TypeError, ValueError):
-        pass
-    return buscador(email, password)
-
-
-async def codigo_desde_correo(
-    email: str,
-    password: str,
-    intentos: int = INTENTOS_CORREO,
-    espera_min: float = ESPERA_CORREO_MIN,
-    espera_max: float = ESPERA_CORREO_MAX,
-    buscador=None,
-    dormir=None,
-    importador=None,
-) -> dict:
-    """Busca el codigo de 6 digitos en el correo (hasta `intentos` veces).
-
-    Devuelve `{"ok", "codigo", "intentos", "error"}`. Nunca lanza: si el
-    modulo `utils.lector_correo` no existe (ImportError) responde con error
-    simple. `buscador`/`dormir`/`importador` se inyectan en las pruebas.
-    """
-    email = str(email or "").strip()
-    if not email or not str(password or ""):
-        return {
-            "ok": False,
-            "codigo": "",
-            "intentos": 0,
-            "error": "La cuenta no tiene correo configurado.",
-        }
-    if buscador is None:
-        try:
-            buscador = (importador or _importar_lector_correo)()
-        except Exception as e:
-            logger.info(f"Lector de correo no disponible: {type(e).__name__}: {e}")
-            return {
-                "ok": False,
-                "codigo": "",
-                "intentos": 0,
-                "error": "No pude revisar el correo (lector no disponible).",
-            }
-        if not callable(buscador):
-            return {
-                "ok": False,
-                "codigo": "",
-                "intentos": 0,
-                "error": "No pude revisar el correo (lector inválido).",
-            }
-    dormir = dormir or asyncio.sleep
-    try:
-        intentos = max(1, int(intentos or 1))
-    except (TypeError, ValueError):
-        intentos = INTENTOS_CORREO
-    ultimo_error = ""
-    for intento in range(1, intentos + 1):
-        try:
-            resultado = await asyncio.to_thread(
-                _llamar_lector, buscador, email, password
-            )
-        except Exception as e:
-            resultado = {"ok": False, "error": f"{type(e).__name__}: {e}"}
-        if not isinstance(resultado, dict):
-            resultado = {"ok": False, "error": "respuesta inesperada del lector"}
-        codigo = str(resultado.get("codigo") or "").strip()
-        if resultado.get("ok") and codigo:
-            return {"ok": True, "codigo": codigo, "intentos": intento, "error": ""}
-        ultimo_error = str(resultado.get("error") or "").strip()
-        if intento < intentos:
-            try:
-                await dormir(random.uniform(espera_min, espera_max))
-            except Exception:
-                pass
-    return {
-        "ok": False,
-        "codigo": "",
-        "intentos": intentos,
-        "error": ultimo_error or "No llegó ningún código al correo todavía.",
-    }
-
-
 async def _flujo_codigo(target, context, usuario: str, mencion: str = "") -> None:
-    """Entrega el codigo de verificacion de `usuario` (TOTP o correo)."""
+    """Entrega el codigo TOTP de `usuario` desde `Cuenta.totp_secret`.
+
+    El codigo se genera al momento con pyotp y el SECRETO NUNCA se muestra.
+    Sin semilla: mensaje amable y boton para reintentar (por si el admin acaba
+    de importarla). Ya NO existe la via de correo (`utils.lector_correo`).
+    """
     datos = await asyncio.to_thread(_datos_cuenta, usuario)
     etiqueta = _etiqueta_cuenta(datos, usuario)
     if datos is None:
@@ -560,52 +472,23 @@ async def _flujo_codigo(target, context, usuario: str, mencion: str = "") -> Non
         return
 
     secreto = str(datos.get("totp_secret") or "")
-    if secreto.strip():
-        codigo, error = generar_codigo_totp(secreto)
-        if codigo:
-            await _responder(
-                target,
-                texto_codigo(codigo, segundos_restantes_ventana(), "totp"),
-                teclado_codigo(usuario),
-                html=True,
-                mencion=mencion,
-            )
-            return
-        logger.warning(f"TOTP inválido para @{usuario}: {error}")
-
-    email = str(datos.get("email") or "").strip()
-    password = str(datos.get("email_password") or "")
-    if not email or not password:
+    codigo, error = generar_codigo_totp(secreto)
+    if not codigo:
+        if error and error != "sin secreto TOTP":
+            logger.warning(f"Semilla TOTP inválida para @{usuario}: {error}")
         await _responder(
             target,
-            f"😕 La cuenta @{etiqueta} no tiene código configurado.\n\n"
-            "Pide a la persona que te dio la cuenta que lo revise.",
+            TEXTO_SIN_TOTP,
+            teclado_codigo_fallo(usuario),
             mencion=mencion,
         )
         return
 
     await _responder(
         target,
-        "⏳ Buscando el código en el correo, espera unos segundos...",
-        mencion=mencion,
-    )
-    resultado = await codigo_desde_correo(email, password)
-    if resultado.get("ok"):
-        await _responder(
-            target,
-            texto_codigo(resultado.get("codigo"), None, "correo"),
-            teclado_codigo(usuario),
-            html=True,
-            mencion=mencion,
-        )
-        return
-    logger.info(f"Sin código por correo para @{usuario}: {resultado.get('error')}")
-    await _responder(
-        target,
-        "😕 No encontré ningún código nuevo en el correo.\n\n"
-        "Espera unos segundos y toca «🔄 Intentar de nuevo».\n"
-        "Si sigue sin llegar, pide ayuda a quien te dio la cuenta.",
-        teclado_codigo_fallo(usuario),
+        texto_codigo(codigo, segundos_restantes_ventana()),
+        teclado_codigo(usuario),
+        html=True,
         mencion=mencion,
     )
 

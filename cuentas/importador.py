@@ -33,11 +33,15 @@ Formato de cada línea (campos separados por `:`):
   del `split(":")` una heurística por FORMA reasigna a su variable canónica los
   campos detectados con regex — `auth_token` exactamente 40 hex en minúscula
   (`^[a-f0-9]{40}$`), `totp_secret` exactamente 16 base32 en mayúscula
-  (`^[A-Z2-7]{16}$`) y `email` (`^[^@\s]+@[^@\s]+\.[A-Za-z]{2,}$`). Las
-  variables sin candidato toman los campos restantes en su orden original y la
-  posición canónica siempre gana (una password con forma de token no pisa al
-  token real). El formato vendedor conserva su contrato exacto: su `auth_token`
-  sale SIEMPRE del 7º campo.
+  (`^[A-Z2-7]{16}$`) y `email` (`^[^@\s]+@[^@\s]+\.[A-Za-z]{2,}$`). Los campos
+  NO detectados se asignan a las variables libres respetando su posición
+  RELATIVA a los detectados (segmentos del orden canónico): en una línea de 5
+  campos sin TOTP (`u:pass:email:mailpass:auth40`) el `mailpass` cae entre el
+  `email` y el `auth_token`, así que va a `email_password` y NO a
+  `totp_secret`; en los extremos/segmentos completos se conserva el relleno
+  posicional histórico. La posición canónica siempre gana (una password con
+  forma de token no pisa al token real). El formato vendedor conserva su
+  contrato exacto: su `auth_token` sale SIEMPRE del 7º campo.
 
 Este módulo reemplaza el flujo obsoleto de `cargar_cuenta.py` (login con
 contraseña para extraer la cookie): ahora las credenciales, las cookies
@@ -428,9 +432,18 @@ def _reasignar_campos_por_forma(partes: list, permitir_auth: bool = True) -> tup
     * Si la variable no tiene candidato en su posición canónica, reclama el
       PRIMER campo fuera de posición con su forma (solo si la variable sigue
       vacía: un valor ya reclamado nunca se pisa).
-    * Los campos NO detectados se asignan posicionalmente, en su orden original,
-      a las variables que quedaron libres en el orden estándar
-      (`usuario, password, totp, email, email_pass, auth_token`).
+    * Los campos NO detectados que quedan ENTRE dos campos detectados cuyas
+      variables están en orden canónico (`variable_a < variable_b`) llenan los
+      huecos del segmento del orden estándar delimitado por ambos (`usuario,
+      password, totp, email, email_pass, auth_token`): alineación exacta con
+      los mismos campos que huecos; con más campos, los FINALES toman los
+      huecos; con menos, los iniciales. Así, en una línea de 5 campos sin TOTP
+      (`u:pass:email:mailpass:auth_token`) el `mailpass` cae entre el `email`
+      (4ª variable) y el `auth_token` (6ª) y va a `email_password`, NO a
+      `totp_secret`.
+    * El resto de los campos no detectados (extremos de la línea, anclas
+      cruzadas o segmentos ya completos) llenan las variables libres en el
+      orden estándar, en su orden original (relleno posicional histórico).
 
     `permitir_auth=False` desactiva la reasignación de `auth_token`: la usa el
     formato vendedor, donde el token lo define SIEMPRE el 7º campo. Devuelve los
@@ -456,20 +469,66 @@ def _reasignar_campos_por_forma(partes: list, permitir_auth: bool = True) -> tup
         canonico = _INDICE_CANONICO[variable]
         reclamos[variable] = canonico if canonico in indices else indices[0]
 
-    # 3) Los campos no reclamados llenan las variables libres en el orden
-    #    estándar (asignación posicional).
-    usados = set(reclamos.values())
-    restantes = [
-        valor for indice, valor in enumerate(valores) if indice not in usados
-    ]
-    pendientes = iter(restantes)
+    # 3) Asignación: índice de entrada -> variable. Los campos detectados ya
+    #    están fijados (un reclamo por variable, sin colisiones).
+    posicion_a_variable = {
+        indice: variable for variable, indice in reclamos.items()
+    }
 
+    # 4) Campos no detectados ENTRE dos anclas monotónicas: se asignan a los
+    #    huecos del segmento del orden canónico delimitado por ellas (caso real
+    #    del lote de 5 campos sin TOTP: `mailpass` está entre `email` y
+    #    `auth_token` y debe ir a `email_password`, no a `totp_secret`).
+    #    Alineación: exacta cuando hay los mismos campos que huecos; si el
+    #    segmento trae MÁS campos, los FINALES toman los huecos (lo inmediato
+    #    al ancla siguiente, p.ej. `email:u:pass:mailpass:auth`); si trae
+    #    MENOS, los iniciales toman los primeros huecos. Lo que no alcance
+    #    hueco cae al relleno posicional histórico del paso 5.
+    anclas = sorted(
+        (indice, _INDICE_CANONICO[variable])
+        for variable, indice in reclamos.items()
+    )
+    for (inicio_a, variable_a), (inicio_b, variable_b) in zip(anclas, anclas[1:]):
+        if variable_a >= variable_b:
+            continue  # anclas cruzadas: no delimitan un segmento canónico
+        posiciones = [
+            indice
+            for indice in range(inicio_a + 1, inicio_b)
+            if indice not in posicion_a_variable
+        ]
+        if not posiciones:
+            continue
+        variables = [
+            variable
+            for variable in _ORDEN_CANONICO[variable_a + 1 : variable_b]
+            if variable not in posicion_a_variable.values()
+        ]
+        if not variables:
+            continue  # el segmento no tiene huecos libres
+        if len(posiciones) > len(variables):
+            posiciones = posiciones[-len(variables):]
+        for indice, variable in zip(posiciones, variables):
+            posicion_a_variable[indice] = variable
+
+    # 5) Los que quedaron sin segmento (extremos, anclas cruzadas o segmento ya
+    #    completo) llenan las variables libres en el orden estándar.
+    libres = iter(
+        variable
+        for variable in _ORDEN_CANONICO
+        if variable not in posicion_a_variable.values()
+    )
+    for indice in range(6):
+        if indice not in posicion_a_variable:
+            posicion_a_variable[indice] = next(libres, "")
+
+    # 6) Salida en orden canónico.
+    indice_por_variable = {
+        variable: indice for indice, variable in posicion_a_variable.items()
+    }
     resultado = []
     for variable in _ORDEN_CANONICO:
-        if variable in reclamos:
-            resultado.append(valores[reclamos[variable]])
-        else:
-            resultado.append(next(pendientes, ""))
+        indice = indice_por_variable.get(variable)
+        resultado.append(valores[indice] if indice is not None else "")
     return tuple(resultado)
 
 
@@ -609,7 +668,9 @@ def parsear_linea(linea: str) -> Optional[dict]:
       del parseo — `auth_token` = 40 hex minúscula, `totp_secret` = 16 base32
       mayúscula y `email` = `usuario@dominio.tld`, estén en la columna que
       estén. La posición canónica gana ante varios candidatos del mismo tipo y
-      los campos no detectados conservan su orden relativo.
+      los campos no detectados se asignan respetando su posición relativa a los
+      detectados (segmentos del orden canónico: una línea sin TOTP no mueve su
+      `email_password` a `totp_secret`).
     * Los campos 7º/8º vacíos (`...:tok::`) se ignoran sin error; un valor no
       vacío después del 8º campo es línea malformada.
 

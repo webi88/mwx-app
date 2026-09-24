@@ -114,7 +114,7 @@ def teclado_codigo(usuario: str) -> InlineKeyboardMarkup:
 
 
 def teclado_codigo_fallo(usuario: str) -> InlineKeyboardMarkup:
-    """Boton de reintento cuando el codigo del correo no llego."""
+    """Boton de reintento cuando la cuenta aun no tiene semilla 2FA (TOTP)."""
     return InlineKeyboardMarkup(
         [
             [

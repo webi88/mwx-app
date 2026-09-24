@@ -5,12 +5,14 @@ Cubre:
   - `clientes_store`: crear/leer/asignar/quitar, duplicados, '@', IDs
     invalidos, JSON corrupto y escritura atomica (siempre en archivo temporal).
   - `keyboards`: los botones/callbacks esperados del menu y confirmaciones.
-  - Validacion del nombre nuevo y formateo del codigo de verificacion (TOTP
-    con semilla fake y lector de correo mockeado en sus 3 ramas: ok, falla y
-    reintenta, sin modulo).
+  - Validacion del nombre nuevo y formateo del codigo 2FA, que es SOLO TOTP
+    (semilla fake -> 6 digitos; sin semilla -> mensaje amable) y que el flujo
+    YA NO depende de `utils.lector_correo` (ni import, ni llamada; un lector
+    falso que explota no afecta).
   - Guard de no autorizado, admin detectado y flujos completos con fakes PTB
-    (start/menu, codigo TOTP y por correo, confirmacion de nombre, foto y
-    comandos de admin `/asignar`/`/quitar` escribiendo un JSON temporal).
+    (start/menu, codigo TOTP, confirmacion de nombre, foto y comandos de admin
+    `/asignar`/`/quitar` escribiendo un JSON temporal).
+  - Grupos: bienvenida, menciones, aislamiento por usuario y callbacks.
   - `import bot_clientes.main` no arranca nada y `main()` exige token.
 
 Uso:
@@ -30,6 +32,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import types
 from pathlib import Path
 
 RAIZ = Path(__file__).resolve().parent.parent
@@ -211,13 +214,6 @@ def _callbacks(markup) -> list:
         return []
     filas = getattr(markup, "inline_keyboard", None) or []
     return [boton.callback_data for fila in filas for boton in fila]
-
-
-def _reloj_async(registro):
-    async def _dormir(segundos):
-        registro.append(segundos)
-
-    return _dormir
 
 
 # --------------------------------------------------------------------------- #
@@ -422,7 +418,7 @@ def run(check) -> None:  # noqa: C901 - seccionado por bloques tematicos
         "codigo: segundos restantes de la ventana en 1..30",
         1 <= h.segundos_restantes_ventana() <= 30,
     )
-    texto_totp = h.texto_codigo("123456", 12, "totp")
+    texto_totp = h.texto_codigo("123456", 12)
     check(
         "codigo: texto TOTP trae codigo, vencimiento y aviso de no compartir",
         "123456" in texto_totp
@@ -430,93 +426,37 @@ def run(check) -> None:  # noqa: C901 - seccionado por bloques tematicos
         and "compartas" in texto_totp
         and "usuario" in texto_totp,
     )
-    texto_correo = h.texto_codigo("654321", None, "correo")
     check(
-        "codigo: texto del correo menciona el correo y pide otro si vence",
-        "654321" in texto_correo
-        and "correo" in texto_correo
-        and "pide otro código" in texto_correo,
+        "codigo: el mensaje ya NO menciona correo (solo TOTP)",
+        "correo" not in texto_totp.lower()
+        and "correo" not in h.TEXTO_SIN_TOTP.lower(),
     )
 
-    # ---------------------------------------------------- LECTOR DE CORREO --
-    registro = []
-
-    def _buscador_ok(email, password, timeout=25):
-        registro.append((email, password, timeout))
-        return {"ok": True, "codigo": "112233", "remitente": "x@x.com", "error": ""}
-
-    resultado = _correr(
-        h.codigo_desde_correo(
-            "verif@correo.com",
-            "clave",
-            buscador=_buscador_ok,
-            dormir=_reloj_async([]),
-        )
-    )
+    # --------------------------------- CODIGO SOLO TOTP (SIN LECTOR CORREO) --
+    fuente_handlers = (RAIZ / "bot_clientes" / "handlers.py").read_text(encoding="utf-8")
+    arbol_handlers = ast.parse(fuente_handlers)
+    modulos_importados = set()
+    funciones_definidas = set()
+    for nodo in ast.walk(arbol_handlers):
+        if isinstance(nodo, ast.ImportFrom) and nodo.module:
+            modulos_importados.add(nodo.module)
+        if isinstance(nodo, ast.Import):
+            for alias in nodo.names:
+                modulos_importados.add(alias.name)
+        if isinstance(nodo, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            funciones_definidas.add(nodo.name)
     check(
-        "correo: rama OK devuelve el codigo al primer intento",
-        resultado["ok"]
-        and resultado["codigo"] == "112233"
-        and resultado["intentos"] == 1
-        and registro[0][:2] == ("verif@correo.com", "clave"),
-    )
-
-    def _buscador_falla(email, password):
-        registro.append((email, password))
-        return {"ok": False, "codigo": "", "error": "todavia no llega"}
-
-    registro.clear()
-    esperas = []
-    resultado = _correr(
-        h.codigo_desde_correo(
-            "verif@correo.com",
-            "clave",
-            buscador=_buscador_falla,
-            dormir=_reloj_async(esperas),
-        )
+        "codigo: el flujo YA NO importa ni define el lector de correo",
+        "utils.lector_correo" not in modulos_importados
+        and "codigo_desde_correo" not in funciones_definidas
+        and "_importar_lector_correo" not in funciones_definidas
+        and "_llamar_lector" not in funciones_definidas,
     )
     check(
-        "correo: rama falla reintenta 3 veces con espera",
-        not resultado["ok"]
-        and resultado["intentos"] == 3
-        and len(registro) == 3
-        and len(esperas) == 2
-        and all(5 <= s <= 8 for s in esperas),
-    )
-    resultado = _correr(
-        h.codigo_desde_correo("", "", buscador=_buscador_ok, dormir=_reloj_async([]))
-    )
-    check(
-        "correo: sin email configurado no llama al lector",
-        not resultado["ok"] and resultado["intentos"] == 0,
-    )
-    resultado = _correr(
-        h.codigo_desde_correo(
-            "verif@correo.com",
-            "clave",
-            importador=lambda: (_ for _ in ()).throw(ImportError("no existe")),
-            dormir=_reloj_async([]),
-        )
-    )
-    check(
-        "correo: ImportError del lector se tolera con error simple",
-        not resultado["ok"] and bool(resultado["error"]),
-    )
-
-    def _buscador_explota(email, password):
-        raise RuntimeError("imap caido")
-
-    resultado = _correr(
-        h.codigo_desde_correo(
-            "verif@correo.com",
-            "clave",
-            buscador=_buscador_explota,
-            dormir=_reloj_async([]),
-        )
-    )
-    check(
-        "correo: excepcion del lector no rompe (3 intentos)",
-        not resultado["ok"] and resultado["intentos"] == 3,
+        "codigo: el bot ya no lee email_password para dar codigos",
+        "email_password" not in fuente_handlers
+        and not hasattr(h, "codigo_desde_correo")
+        and not hasattr(h, "TIEMPO_CORREO"),
     )
 
     # -------------------------------------------------- GUARD / START/MENU --
@@ -574,8 +514,6 @@ def run(check) -> None:  # noqa: C901 - seccionado por bloques tematicos
                 "handle_actual": "HandleReal",
                 "nombre_mostrado": "",
                 "totp_secret": SECRETO_FAKE,
-                "email": "",
-                "email_password": "",
                 "activa": True,
             }
 
@@ -621,61 +559,73 @@ def run(check) -> None:  # noqa: C901 - seccionado por bloques tematicos
             and contexto.user_data.get("cli_flujo") is None,
         )
 
-        # Rama correo OK.
-        def _datos_correo(usuario):
-            return {
-                "usuario": usuario,
-                "handle_actual": "",
-                "nombre_mostrado": "",
-                "totp_secret": "",
-                "email": "cuenta@correo.com",
-                "email_password": "clave",
-                "activa": True,
-            }
-
-        async def _correo_ok(email, password, **kwargs):
-            return {"ok": True, "codigo": "654321", "error": ""}
-
-        query = _QueryFake("cli_codigo")
-        with _parches(
-            (h, "_datos_cuenta", _datos_correo),
-            (h, "codigo_desde_correo", _correo_ok),
-        ):
-            _correr(h.cli_callback(_UpdateFake(uid=702, query=query), _ContextoFake()))
-        textos = [texto for texto, _ in query.message.edits]
-        check(
-            "codigo: rama correo muestra 'buscando' y luego el codigo",
-            any("Buscando el código" in t for t in textos)
-            and any("654321" in t and "correo" in t for t in textos),
-        )
-
-        # Rama correo falla.
-        async def _correo_falla(email, password, **kwargs):
-            return {"ok": False, "codigo": "", "intentos": 3, "error": "nada"}
-
-        query = _QueryFake("cli_codigo")
-        with _parches(
-            (h, "_datos_cuenta", _datos_correo),
-            (h, "codigo_desde_correo", _correo_falla),
-        ):
-            _correr(h.cli_callback(_UpdateFake(uid=702, query=query), _ContextoFake()))
-        ultimo, kwargs = query.message.edits[-1]
-        check(
-            "codigo: si el correo falla ofrece reintentar con boton",
-            "No encontré ningún código" in ultimo
-            and "codigo_SoloDos" in _callbacks(kwargs["reply_markup"]),
-        )
-
-        # Sin 2FA ni correo.
+        # Sin semilla: mensaje amable + boton de reintento (sin correo).
         def _datos_vacios(usuario):
-            return {"totp_secret": "", "email": "", "email_password": ""}
+            return {"totp_secret": "", "handle_actual": "", "nombre_mostrado": ""}
 
         query = _QueryFake("cli_codigo")
         with _parches((h, "_datos_cuenta", _datos_vacios)):
             _correr(h.cli_callback(_UpdateFake(uid=702, query=query), _ContextoFake()))
+        ultimo, kwargs = query.message.edits[-1]
         check(
-            "codigo: sin 2FA ni correo explica que pida ayuda",
-            "no tiene código configurado" in query.message.edits[-1][0],
+            "codigo: sin semilla muestra el mensaje amable (sin correo)",
+            "no tiene configurado el código 2FA" in ultimo
+            and "Pide ayuda" in ultimo
+            and "correo" not in ultimo.lower()
+            and "codigo_SoloDos" in _callbacks(kwargs["reply_markup"]),
+        )
+
+        # Semilla invalida: mismo mensaje amable (el detalle va al log).
+        def _datos_malos(usuario):
+            return {"totp_secret": "no-es-base32!!"}
+
+        query = _QueryFake("cli_codigo")
+        with _parches((h, "_datos_cuenta", _datos_malos)):
+            _correr(h.cli_callback(_UpdateFake(uid=702, query=query), _ContextoFake()))
+        check(
+            "codigo: semilla invalida tambien muestra el mensaje amable",
+            "no tiene configurado el código 2FA" in query.message.edits[-1][0]
+            and "no-es-base32" not in query.message.edits[-1][0],
+        )
+
+        # La semilla NUNCA se muestra.
+        query = _QueryFake("cli_codigo")
+        with _parches((h, "_datos_cuenta", _datos_totp)):
+            _correr(h.cli_callback(_UpdateFake(uid=701, query=query), _ContextoFake()))
+        texto_seguro = query.message.edits[-1][0]
+        check(
+            "codigo: la semilla TOTP nunca se muestra (solo el codigo)",
+            SECRETO_FAKE not in texto_seguro
+            and "totp_secret" not in texto_seguro
+            and re.search(r"\b\d{6}\b", texto_seguro) is not None,
+        )
+
+        # Un lector de correo que explota NO se usa: el flujo es SOLO TOTP.
+        modulo_falso = types.ModuleType("utils.lector_correo")
+
+        def _lector_explota(*args, **kwargs):
+            raise AssertionError(
+                "el bot de clientes YA NO debe usar el lector de correo"
+            )
+
+        modulo_falso.obtener_codigo_verificacion = _lector_explota
+        previo = sys.modules.get("utils.lector_correo")
+        sys.modules["utils.lector_correo"] = modulo_falso
+        try:
+            query = _QueryFake("cli_codigo")
+            with _parches((h, "_datos_cuenta", _datos_vacios)):
+                _correr(
+                    h.cli_callback(_UpdateFake(uid=702, query=query), _ContextoFake())
+                )
+        finally:
+            if previo is None:
+                sys.modules.pop("utils.lector_correo", None)
+            else:
+                sys.modules["utils.lector_correo"] = previo
+        check(
+            "codigo: un lector de correo que explota no afecta el flujo (no se usa)",
+            bool(query.message.edits)
+            and "no tiene configurado el código 2FA" in query.message.edits[-1][0],
         )
 
     # ------------------------------------------------ FLUJO DE NOMBRE -----
@@ -848,8 +798,6 @@ def run(check) -> None:  # noqa: C901 - seccionado por bloques tematicos
                     "handle_actual": "HandleReal",
                     "nombre_mostrado": "Nombre Real",
                     "totp_secret": "",
-                    "email": "",
-                    "email_password": "",
                 },
             )
         ):
@@ -1110,8 +1058,6 @@ def run(check) -> None:  # noqa: C901 - seccionado por bloques tematicos
                 "handle_actual": "",
                 "nombre_mostrado": "",
                 "totp_secret": SECRETO_FAKE,
-                "email": "",
-                "email_password": "",
             }
 
         query = _QueryFake("cli_codigo", _MensajeFake())

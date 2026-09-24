@@ -45,8 +45,10 @@ Bot de Telegram **independiente** del bot interno, pensado para clientes no
 técnicos que reciben cuentas de X. Todo se hace con **botones** (solo
 `/start`, `/ayuda` y `/cancelar`):
 
-- 🔑 **Código de verificación**: 2FA TOTP o el código que llega al correo de
-  la cuenta (lector IMAP `utils/lector_correo.py`).
+- 🔑 **Código de verificación (TOTP)**: se genera al momento desde la semilla
+  2FA guardada en `Cuenta.totp_secret` (`pyotp`). El bot **ya no revisa
+  correos**: el correo lo tienen los propios clientes. Si una cuenta no tiene
+  semilla, el bot pide ayuda a quien le entregó la cuenta.
 - ✏️ **Cambiar el nombre** de la cuenta.
 - 📸 **Foto de perfil** y 🖼️ **portada** (el cliente envía la imagen por
   Telegram y el bot la sube con Selenium).

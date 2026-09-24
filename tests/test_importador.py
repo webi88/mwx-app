@@ -34,6 +34,9 @@ bloques se extraen de forma segura (escaner balanceado + `json.loads` + patron
          password con forma de token NO pisa al token real), token-shaped sin
          auth real (comportamiento documentado, el parseo nunca rompe) y email
          sin TLD valido no detectado.
+  (29)   Ordenes de compra: 5 campos SIN TOTP (el email_password NO cae en
+         totp_secret) y 6 campos con la semilla TOTP al final, mas la variante
+         de 5 campos con el email al frente. Todos los datos son SINTETICOS.
 
 Uso:
     .venv/Scripts/python.exe tests/run_tests.py
@@ -676,6 +679,64 @@ def test_heuristica_conflictos(check):
     )
 
 
+def test_ordenes_5_y_6_campos(check):
+    print("(29) ordenes: 5 campos SIN TOTP y 6 con TOTP al final (sinteticos)")
+    # Caso A (orden 1): 5 campos, SIN TOTP. El email_password debe quedar en su
+    # campo y JAMAS caer en totp_secret (bug corregido: la heuristica reservaba
+    # el 3er slot y metia la password del correo en totp_secret).
+    sin_totp = parsear_linea(
+        f"orden_uno:clave_uno:uno@x.com:mailpass_uno:{TOKEN_VENDEDOR}"
+    )
+    check("orden 5 campos: no devuelve None", sin_totp is not None)
+    check(
+        "orden 5 campos: los 5 campos bien y totp_secret VACIO",
+        _campos_base(sin_totp)
+        == ("orden_uno", "clave_uno", "", "uno@x.com", "mailpass_uno", TOKEN_VENDEDOR),
+    )
+    check(
+        "orden 5 campos: email_password != totp_secret (fix del bug)",
+        sin_totp.get("email_password") == "mailpass_uno"
+        and sin_totp.get("totp_secret") == "",
+    )
+
+    # Caso B (orden 2): 6 campos con la semilla TOTP al final.
+    con_totp = parsear_linea(
+        f"orden_dos:clave_dos:dos@x.com:mailpass_dos:{TOKEN_VENDEDOR}:{TOTP_B32}"
+    )
+    check("orden 6 campos: no devuelve None", con_totp is not None)
+    check(
+        "orden 6 campos: TOTP al final bien asignado",
+        _campos_base(con_totp)
+        == ("orden_dos", "clave_dos", TOTP_B32, "dos@x.com", "mailpass_dos", TOKEN_VENDEDOR),
+    )
+    check(
+        "orden 6 campos: contrato exacto de claves y sin cookies",
+        set(con_totp) == CLAVES_CONTRATO and con_totp.get("cookies") is None,
+    )
+
+    # Variante (mismo lote ambiguo): 5 campos con el email movido al frente;
+    # el campo inmediato al auth_token (mailpass) debe tomar email_password.
+    email_primero = parsear_linea(
+        f"tres@x.com:orden_tres:clave_tres:mailpass_tres:{TOKEN_VENDEDOR}"
+    )
+    check(
+        "orden 5 campos email primero: email_password en su lugar (no en totp)",
+        _campos_base(email_primero)
+        == ("orden_tres", "clave_tres", "", "tres@x.com", "mailpass_tres", TOKEN_VENDEDOR),
+    )
+
+    # Persistencia del caso A (sesion falsa): totp_secret vacio en la BD.
+    sesion = _FakeDB(None)
+    with mock.patch.object(importador, "get_db_session", lambda: _sesion_con(sesion)):
+        resultado = importador.importar_una(sin_totp)
+    check("orden 5 campos persistido: resultado 'nueva'", resultado == "nueva")
+    agregada = sesion.agregadas[0]
+    check(
+        "orden 5 campos persistido: email_password guardado y totp vacio",
+        agregada.email_password == "mailpass_uno" and agregada.totp_secret == "",
+    )
+
+
 def run(check):
     """Ejecuta los checks con el `check` del runner (o del marco local)."""
     test_clasicos(check)
@@ -692,6 +753,7 @@ def run(check):
     test_vendedor_persistencia(check)
     test_heuristica_desorden(check)
     test_heuristica_conflictos(check)
+    test_ordenes_5_y_6_campos(check)
 
 
 if __name__ == "__main__":
