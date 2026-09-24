@@ -6802,3 +6802,786 @@ class MotorActivacion:
         )
         self._anotar_pausadas(base_resumen, pausadas_omitidas)
         return self._claves_cuotas(base_resumen)
+
+    # ------------------------------------------------------------------ #
+    # MODO ACTIVIDAD (leve): 3-4 posts por cuenta con TODOS los hashtags
+    # ------------------------------------------------------------------ #
+    def ejecutar_actividad(
+        self,
+        usuarios=None,
+        hashtags=None,
+        posts_min=3,
+        posts_max=4,
+        pausa_entre_posts_seg=(60, 240),
+        texto_base="",
+        contexto="",
+        narrativa="",
+        menciones=None,
+        max_browsers=None,
+        permitir_pausadas=False,
+        duracion_max_min=120,
+        cancelar=None,
+        callback=None,
+    ) -> dict:
+        """Modo ACTIVIDAD: publicaciones suaves de 3-4 tweets por cuenta.
+
+        A diferencia de las activaciones masivas, la ACTIVIDAD es LEVE: cada
+        cuenta publica entre `posts_min` y `posts_max` tweets (N aleatorio por
+        cuenta) con pausas de `pausa_entre_posts_seg` entre los tweets de la
+        MISMA cuenta, y CADA texto lleva TODOS los hashtags pedidos (no hay
+        subconjuntos aleatorios). No usa curva de aceleracion ni cascada.
+
+        - `usuarios`: nombres/Cuentas a usar; None/[] = todas las activas.
+        - `hashtags`: lista OBLIGATORIA de 1..6 hashtags (sin ella se devuelve
+          `{"error": ...}` y NO se abre navegador).
+        - `max_browsers`: concurrencia por cuenta (default
+          `settings.max_browsers`, tope 3).
+        - `permitir_pausadas=False`: las cuentas pausadas para activacion
+          quedan fuera (con `pausadas_omitidas`/`pausadas_usuarios`); con True
+          participan (modo "mantenimiento leve" con clientes).
+        - `duracion_max_min`: tope de seguridad; los posts que no alcancen el
+          deadline se cuentan en `omitidas_por_tiempo` sin abrir navegador.
+        - `cancelar`: `threading.Event` para el PARO TOTAL; los posts no
+          intentados se cuentan en `omitidas_por_cancelacion`.
+        - Tier: el rol efectivo es "hashtags", asi que Tier 2 y Tier 3 se
+          omiten con el blindaje existente (`tier_omitidas`).
+
+        Resumen con las claves estandar de campana (`_con_claves_pestana`):
+        `exitosas`, `fallidas`, `omitidas`, `pausadas_omitidas`,
+        `pausadas_usuarios`, `tier_omitidas`, `tier_omitidas_usuarios`,
+        `sin_sesion`, `omitidas_por_cuota`, `omitidas_por_tiempo`, `urls`,
+        `cancelada`, `por_cuenta` y `total_esperado`. Nunca lanza.
+        """
+        inicio = time.monotonic()
+        try:
+            resumen = self._ejecutar_actividad_impl(
+                usuarios=usuarios,
+                hashtags=hashtags,
+                posts_min=posts_min,
+                posts_max=posts_max,
+                pausa_entre_posts_seg=pausa_entre_posts_seg,
+                texto_base=texto_base,
+                contexto=contexto,
+                narrativa=narrativa,
+                menciones=menciones,
+                max_browsers=max_browsers,
+                permitir_pausadas=permitir_pausadas,
+                duracion_max_min=duracion_max_min,
+                cancelar=cancelar,
+                callback=callback,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.error(
+                f"Actividad: error inesperado ({type(e).__name__}: {e}); "
+                f"se devuelve resumen vacio"
+            )
+            resumen = {
+                "exitosas": 0,
+                "fallidas": 0,
+                "omitidas": 0,
+                "urls": [],
+                "por_cuenta": {},
+                "total_esperado": 0,
+                "cancelada": self._cancelado(),
+                "error": f"{type(e).__name__}: {e}",
+            }
+        finally:
+            self._cerrar_pestanas()
+        self._loguear_rendimiento(inicio, resumen)
+        return self._con_claves_pestana(self._claves_cuotas(resumen))
+
+    def _ejecutar_actividad_impl(
+        self, usuarios, hashtags, posts_min, posts_max, pausa_entre_posts_seg,
+        texto_base, contexto, narrativa, menciones, max_browsers,
+        permitir_pausadas, duracion_max_min, cancelar, callback,
+    ) -> dict:
+        """Implementacion del modo ACTIVIDAD (reutiliza la maquinaria)."""
+        self._cuotas = None
+        self._reset_curva_campana()
+        self._guardar_cancelar(cancelar)
+
+        # --- Hashtags OBLIGATORIOS (1..6) ---
+        tags = self._normalizar_hashtags_actividad(hashtags)
+        if not tags:
+            logger.warning(
+                "Actividad: falta la lista de hashtags; no se abre navegador"
+            )
+            return {
+                "error": (
+                    "faltan hashtags: el modo ACTIVIDAD exige una lista de "
+                    "1 a 6 hashtags"
+                ),
+                "exitosas": 0,
+                "fallidas": 0,
+                "omitidas": 0,
+                "urls": [],
+                "por_cuenta": {},
+                "total_esperado": 0,
+                "cancelada": self._cancelado(),
+            }
+        if len(tags) > 6:
+            logger.warning(
+                f"Actividad: se pidieron {len(tags)} hashtags; se usan los "
+                f"primeros 6 (modo ACTIVIDAD usa 1..6)"
+            )
+            tags = tags[:6]
+
+        # --- N por cuenta, pausas y deadline ---
+        n_min, n_max = self._rango_n_actividad(posts_min, posts_max)
+        pausa_min, pausa_max = self._rango_pausas_actividad(
+            pausa_entre_posts_seg
+        )
+        try:
+            duracion_min = max(1, int(duracion_max_min or 0))
+        except (TypeError, ValueError):
+            duracion_min = 1
+        fin = time.monotonic() + duracion_min * 60.0
+
+        # --- Concurrencia (default settings.max_browsers, tope 3) ---
+        browsers = self._browsers_actividad(max_browsers)
+        try:
+            self.max_concurrente = browsers
+        except Exception:
+            pass
+        try:
+            self._limite_navegadores = browsers
+        except Exception:
+            pass
+
+        # --- Cuentas: pausadas -> tier -> sesion (nada abre navegador) ---
+        cuentas = self._cargar_cuentas_actividad(usuarios)
+        pausadas: list = []
+        if not permitir_pausadas:
+            cuentas, pausadas = self._separar_pausadas(cuentas)
+
+        tier_omitidas: list = []
+        tier2_omitidas: list = []
+        tier3_omitidas: list = []
+        ejecutables_tier: list = []
+        for cuenta in cuentas:
+            if _tier_permitido(cuenta, "hashtags"):
+                ejecutables_tier.append(cuenta)
+                continue
+            usuario_om = str(getattr(cuenta, "usuario", "") or "").strip()
+            if not usuario_om or usuario_om in tier_omitidas:
+                continue
+            tier_omitidas.append(usuario_om)
+            if _es_tier3(cuenta):
+                tier3_omitidas.append(usuario_om)
+                logger.warning(
+                    f"Actividad: @{usuario_om} es Tier 3 (Métricas/Soporte) y "
+                    f"el rol de la actividad es 'hashtags' (solo RT/likes): se "
+                    f"omite sin abrir navegador. {_error_tier(cuenta, 'hashtags')}"
+                )
+            else:
+                tier2_omitidas.append(usuario_om)
+                logger.warning(
+                    f"Actividad: @{usuario_om} es Tier 2 (Volumen/Aged) y tiene "
+                    f"PROHIBIDO publicar posts (hashtags): se omite sin abrir "
+                    f"navegador. {_error_tier(cuenta, 'hashtags')}"
+                )
+        cuentas = ejecutables_tier
+
+        con_sesion, sin_sesion = _partir_por_sesion(cuentas)
+        sin_sesion_usuarios = [
+            str(getattr(c, "usuario", "") or "") for c in sin_sesion
+        ]
+
+        resumen = {
+            "exitosas": 0,
+            "fallidas": 0,
+            "omitidas": 0,
+            "urls": [],
+            "por_cuenta": {},
+            "total_esperado": 0,
+            "omitidas_por_cuota": 0,
+            "omitidas_por_tiempo": 0,
+            "omitidas_por_cancelacion": 0,
+            "omitidas_por_sesion": 0,
+            "sin_sesion": len(sin_sesion),
+            "sin_sesion_usuarios": sin_sesion_usuarios,
+            "tier_omitidas": len(tier_omitidas),
+            "tier_omitidas_usuarios": tier_omitidas[:20],
+            "tier2_hashtags_omitidas": len(tier2_omitidas),
+            "tier2_hashtags_usuarios": tier2_omitidas[:20],
+            "tier3_omitidas": len(tier3_omitidas),
+            "tier3_omitidas_usuarios": tier3_omitidas[:20],
+        }
+        self._anotar_pausadas(resumen, pausadas)
+
+        if not con_sesion or self._cancelado():
+            logger.info(
+                f"Actividad: 0 cuentas ejecutables "
+                f"({len(pausadas)} pausadas, {len(tier_omitidas)} por tier, "
+                f"{len(sin_sesion)} sin sesion, "
+                f"cancelada={self._cancelado()})"
+            )
+            resumen["cancelada"] = bool(self._cancelado())
+            return resumen
+
+        # --- Objetivo (N aleatorio por cuenta) y textos (TODOS los tags) ---
+        objetivo = self._objetivos_actividad(con_sesion, n_min, n_max)
+        resumen["total_esperado"] = sum(objetivo.values())
+        for cuenta in con_sesion:
+            resumen["por_cuenta"][cuenta.usuario] = {
+                "posts_objetivo": int(objetivo.get(cuenta.usuario, 0) or 0),
+                "exitosas": 0,
+                "fallidas": 0,
+                "urls": [],
+            }
+        textos_por_cuenta = self._generar_textos_actividad(
+            con_sesion, objetivo, tags, texto_base, contexto, narrativa,
+            menciones,
+        )
+
+        self._preparar_cuotas([c.usuario for c in con_sesion])
+        with self._lock:
+            self.progreso = {
+                "hechas": 0,
+                "exitosas": 0,
+                "fallidas": 0,
+                "omitidas": 0,
+                "ronda_actual": 1,
+                "fase_actual": 1,
+                "eventos": [],
+            }
+
+        logger.info(
+            f"Actividad: {len(con_sesion)} cuentas con sesion, "
+            f"{resumen['total_esperado']} posts esperados (N {n_min}-{n_max}), "
+            f"{len(tags)} hashtags, navegadores {browsers}, "
+            f"duracion max {duracion_min} min"
+            + (f", {len(pausadas)} pausadas fuera" if pausadas else "")
+        )
+
+        def _worker_cuenta(cuenta):
+            """Publica los N posts consecutivos de UNA cuenta. Nunca lanza."""
+            usuario = str(getattr(cuenta, "usuario", "") or "")
+            textos = list(textos_por_cuenta.get(usuario) or [])
+            total_cuenta = len(textos)
+            if total_cuenta <= 0:
+                return
+            # Pausa corta entre cuentas distintas (antes de abrir nada).
+            if not self._dormir_cancelable(random.uniform(0.5, 2.0)):
+                self._contar_omitidas_actividad(
+                    resumen, usuario, 0, total_cuenta, "cancelacion"
+                )
+                return
+            for indice, texto in enumerate(textos):
+                if self._cancelado():
+                    self._contar_omitidas_actividad(
+                        resumen, usuario, indice, total_cuenta, "cancelacion"
+                    )
+                    return
+                if time.monotonic() >= fin:
+                    self._contar_omitidas_actividad(
+                        resumen, usuario, indice, total_cuenta, "tiempo"
+                    )
+                    return
+                try:
+                    resultado = self._ejecutar_accion_rol(
+                        cuenta, "hashtags", [], texto, False, 0
+                    )
+                except Exception as e:  # noqa: BLE001
+                    resultado = (
+                        usuario, "hashtags", False,
+                        f"{type(e).__name__}: {e}"[:120], "",
+                    )
+                _, rol_res, ok, detalle, url = resultado
+                if ok is None:
+                    # Omitida: PARO TOTAL o cuota agotada (nada se publico).
+                    if str(detalle or "") == MENSAJE_CANCELADO:
+                        self._contar_omitidas_actividad(
+                            resumen, usuario, indice, total_cuenta,
+                            "cancelacion",
+                        )
+                    else:
+                        self._contar_omitidas_actividad(
+                            resumen, usuario, indice, total_cuenta, "cuota"
+                        )
+                    return
+                url_limpia = str(url or "").strip() if ok else ""
+                with self._lock:
+                    self.progreso["hechas"] += 1
+                    if ok:
+                        self.progreso["exitosas"] += 1
+                    else:
+                        self.progreso["fallidas"] += 1
+                    resumen["exitosas" if ok else "fallidas"] += 1
+                    entrada = resumen["por_cuenta"].get(usuario)
+                    if isinstance(entrada, dict):
+                        entrada["exitosas" if ok else "fallidas"] += 1
+                        if url_limpia:
+                            entrada["urls"].append(url_limpia)
+                    if url_limpia:
+                        resumen["urls"].append(url_limpia)
+                    self._registrar_evento_locked(
+                        usuario, bool(ok), str(detalle or ""), 1, rol_res,
+                        url_limpia,
+                    )
+                registrar_accion(
+                    usuario,
+                    tipo_registro_rol("hashtags"),
+                    "exito" if ok else "fallido",
+                    url_limpia,
+                    str(detalle or ""),
+                )
+                if callback:
+                    try:
+                        callback(
+                            self.progreso["hechas"],
+                            resumen["total_esperado"],
+                            usuario,
+                            bool(ok),
+                        )
+                    except Exception:
+                        pass
+                if not ok and self._sesion_caida(usuario):
+                    # Sesion caida/anti-bot/rechazo: el resto de sus posts
+                    # se omiten (sin abrir navegador) y las demas cuentas
+                    # siguen con su actividad.
+                    self._contar_omitidas_actividad(
+                        resumen, usuario, indice + 1, total_cuenta, "sesion"
+                    )
+                    return
+                if indice + 1 < total_cuenta:
+                    pausa = random.uniform(pausa_min, pausa_max)
+                    if not self._dormir_cancelable(pausa):
+                        self._contar_omitidas_actividad(
+                            resumen, usuario, indice + 1, total_cuenta,
+                            "cancelacion",
+                        )
+                        return
+
+        with ThreadPoolExecutor(
+            max_workers=max(1, min(browsers, len(con_sesion)))
+        ) as pool_exec:
+            futuros = [
+                pool_exec.submit(_worker_cuenta, cuenta)
+                for cuenta in con_sesion
+            ]
+            for futuro in futuros:
+                try:
+                    futuro.result()
+                except Exception as e:  # noqa: BLE001
+                    logger.error(f"Actividad: worker termino con error: {e}")
+
+        resumen["cancelada"] = bool(self._cancelado())
+        logger.info(
+            f"Actividad finalizada: {resumen['exitosas']} exitosas, "
+            f"{resumen['fallidas']} fallidas, {resumen['omitidas']} omitidas "
+            f"de {resumen['total_esperado']} esperados"
+            + (" (CANCELADA)" if resumen["cancelada"] else "")
+        )
+        return resumen
+
+    # ---- Helpers del modo ACTIVIDAD ------------------------------------ #
+    @staticmethod
+    def _normalizar_hashtags_actividad(hashtags) -> list:
+        """Hashtags con '#' (acepta lista/tupla/texto); nunca lanza."""
+        try:
+            if hashtags is None:
+                return []
+            if isinstance(hashtags, str):
+                crudo = hashtags
+            else:
+                crudo = " ".join(
+                    str(h).strip() for h in hashtags if str(h or "").strip()
+                )
+            return _normalizar_hashtags(crudo)
+        except Exception:
+            return []
+
+    @staticmethod
+    def _rango_n_actividad(posts_min, posts_max) -> tuple:
+        """(min, max) saneados para los N por cuenta (1..50). Nunca lanza."""
+        try:
+            minimo = int(posts_min)
+        except (TypeError, ValueError):
+            minimo = 3
+        try:
+            maximo = int(posts_max)
+        except (TypeError, ValueError):
+            maximo = max(minimo, 4)
+        minimo = max(1, min(50, minimo))
+        maximo = max(1, min(50, maximo))
+        if minimo > maximo:
+            minimo, maximo = maximo, minimo
+        return minimo, maximo
+
+    @staticmethod
+    def _rango_pausas_actividad(pausa) -> tuple:
+        """(min, max) en segundos de la pausa entre posts; nunca lanza."""
+        try:
+            if isinstance(pausa, (list, tuple)) and len(pausa) >= 2:
+                minimo, maximo = pausa[0], pausa[1]
+            else:
+                minimo = maximo = pausa
+            minimo = max(0.0, float(minimo))
+            maximo = max(0.0, float(maximo))
+        except (TypeError, ValueError):
+            minimo, maximo = 60.0, 240.0
+        if minimo > maximo:
+            minimo, maximo = maximo, minimo
+        return minimo, maximo
+
+    @staticmethod
+    def _browsers_actividad(max_browsers) -> int:
+        """Concurrencia del modo ACTIVIDAD: default settings.max_browsers, tope 3."""
+        try:
+            if max_browsers is None:
+                valor = int(getattr(settings, "max_browsers", 1) or 1)
+            else:
+                valor = int(max_browsers)
+        except (TypeError, ValueError):
+            valor = 1
+        return max(1, min(3, valor))
+
+    def _cargar_cuentas_actividad(self, usuarios) -> list:
+        """Cuentas del modo ACTIVIDAD: usuarios/Cuentas o todas las activas.
+
+        Sin `usuarios` (None/[]) carga TODAS las activas de twitter con
+        `_obtener_cuentas_por_rol()`; con nombres, limita a esos usuarios; con
+        Cuentas directas, las usa tal cual. Deduplica por `.usuario`. La
+        separacion pausadas/tier/sesion la hace el llamador. Nunca lanza.
+        """
+        directas, nombres = [], []
+        try:
+            if isinstance(usuarios, str):
+                usuarios = [usuarios]
+            for entrada in (usuarios or []):
+                if isinstance(entrada, str):
+                    texto = entrada.strip().lstrip("@")
+                    if texto:
+                        nombres.append(texto)
+                elif entrada is not None:
+                    directas.append(entrada)
+        except Exception:
+            directas, nombres = [], []
+        cargadas: list = []
+        if nombres:
+            try:
+                cargadas = self._obtener_cuentas_por_rol(nombres)
+            except Exception:
+                cargadas = []
+        elif not directas:
+            try:
+                cargadas = self._obtener_cuentas_por_rol()
+            except Exception:
+                cargadas = []
+        cuentas, vistas = [], set()
+        for cuenta in list(directas) + list(cargadas or []):
+            try:
+                clave = str(
+                    getattr(cuenta, "usuario", "") or ""
+                ).strip().lower()
+            except Exception:
+                continue
+            if not clave or clave in vistas:
+                continue
+            vistas.add(clave)
+            cuentas.append(cuenta)
+        return cuentas
+
+    @staticmethod
+    def _objetivos_actividad(cuentas, n_min, n_max) -> dict:
+        """{usuario: N aleatorio en [n_min, n_max]}; nunca lanza."""
+        objetivo: dict = {}
+        for cuenta in (cuentas or []):
+            try:
+                usuario = str(getattr(cuenta, "usuario", "") or "").strip()
+                if not usuario:
+                    continue
+                objetivo[usuario] = random.randint(int(n_min), int(n_max))
+            except Exception:
+                continue
+        return objetivo
+
+    def _contar_omitidas_actividad(self, resumen, usuario, desde, total,
+                                   motivo) -> int:
+        """Cuenta los posts NO intentados de una cuenta (thread-safe).
+
+        `motivo` en {"cuota", "tiempo", "cancelacion", "sesion"}: suma a
+        `omitidas` (total), al contador especifico y a `progreso["omitidas"]`.
+        Devuelve cuantos posts se contaron. Nunca lanza.
+        """
+        try:
+            faltan = max(0, int(total or 0) - int(desde or 0))
+        except (TypeError, ValueError):
+            faltan = 0
+        if faltan <= 0:
+            return 0
+        clave = {
+            "cuota": "omitidas_por_cuota",
+            "tiempo": "omitidas_por_tiempo",
+            "cancelacion": "omitidas_por_cancelacion",
+            "sesion": "omitidas_por_sesion",
+        }.get(str(motivo or ""), "")
+        try:
+            with self._lock:
+                resumen["omitidas"] = (
+                    int(resumen.get("omitidas", 0) or 0) + faltan
+                )
+                if clave:
+                    resumen[clave] = int(resumen.get(clave, 0) or 0) + faltan
+                self.progreso["omitidas"] = (
+                    int(self.progreso.get("omitidas", 0) or 0) + faltan
+                )
+        except Exception:
+            pass
+        return faltan
+
+    def _generar_textos_actividad(self, cuentas, objetivo, tags, texto_base,
+                                  contexto, narrativa, menciones) -> dict:
+        """{usuario: [textos]} con su N exacto y TODOS los hashtags.
+
+        Cadena: `ia.generar_textos_actividad_por_cuenta` (contrato nuevo,
+        tolerante si aun no existe; aviso por log al caer) ->
+        `generar_textos_hashtags_por_cuenta` (contrato actual) -> pool local +
+        `garantizar_texto_hashtag`. Nunca lanza: siempre devuelve N textos por
+        cuenta con TODOS los hashtags pedidos.
+        """
+        textos_por_cuenta: dict = {}
+        grupos: dict = {}
+        for cuenta in (cuentas or []):
+            try:
+                n = int(objetivo.get(cuenta.usuario, 0) or 0)
+            except Exception:
+                n = 0
+            if n > 0:
+                grupos.setdefault(n, []).append(cuenta)
+        for n, grupo in grupos.items():
+            infos = [self._info_cuenta_actividad(c) for c in grupo]
+            generado: dict = {}
+            try:
+                from ia.generador_contenido import (
+                    generar_textos_actividad_por_cuenta,
+                )
+
+                crudo = generar_textos_actividad_por_cuenta(
+                    infos,
+                    tags,
+                    n,
+                    contexto=str(contexto or ""),
+                    narrativa=str(narrativa or ""),
+                    menciones=menciones,
+                )
+                generado = self._mapear_textos_actividad(crudo, grupo, n)
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    f"Actividad: generar_textos_actividad_por_cuenta no "
+                    f"disponible o fallo ({type(e).__name__}: {e}); se usa "
+                    f"generar_textos_hashtags_por_cuenta"
+                )
+                generado = {}
+            if not generado:
+                generado = self._textos_actividad_hashtags(
+                    infos, grupo, n, tags, texto_base, contexto, narrativa,
+                )
+            for cuenta in grupo:
+                lista = []
+                for texto in (generado.get(cuenta.usuario) or []):
+                    limpio = str(texto or "").strip()
+                    if limpio:
+                        lista.append(limpio)
+                textos_por_cuenta[cuenta.usuario] = (
+                    self._asegurar_textos_actividad(
+                        lista, n, tags, texto_base, contexto, menciones
+                    )
+                )
+        return textos_por_cuenta
+
+    def _textos_actividad_hashtags(self, infos, grupo, n, tags, texto_base,
+                                   contexto, narrativa) -> dict:
+        """Fallback al generador de hashtags existente (aviso por log)."""
+        base = str(texto_base or "").strip() or str(contexto or "").strip()
+        try:
+            from ia.generador_contenido import (
+                generar_textos_hashtags_por_cuenta,
+            )
+
+            crudo = generar_textos_hashtags_por_cuenta(
+                infos,
+                hashtags=" ".join(tags),
+                contexto=base,
+                n_por_cuenta=n,
+                narrativa=str(narrativa or ""),
+                entrenamiento="",
+            )
+            return self._mapear_textos_actividad(crudo, grupo, n)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                f"Actividad: el generador de hashtags tambien fallo "
+                f"({type(e).__name__}: {e}); se usa el pool local"
+            )
+            return {}
+
+    @staticmethod
+    def _info_cuenta_actividad(cuenta) -> dict:
+        """Info de la cuenta para los generadores IA (registro/perfil)."""
+        try:
+            usuario = str(getattr(cuenta, "usuario", "") or "")
+            return {
+                "usuario": usuario,
+                "registro": normalizar_tipo_cuenta(
+                    getattr(cuenta, "tipo_cuenta", "")
+                ),
+                "personalidad": str(
+                    getattr(cuenta, "personalidad", "") or ""
+                ),
+                "seccion": str(getattr(cuenta, "seccion", "") or ""),
+                "nombre": (
+                    str(getattr(cuenta, "nombre_mostrado", "") or "")
+                    or usuario
+                ),
+                "perfil": normalizar_perfil(
+                    getattr(cuenta, "perfil_personalidad", "")
+                ),
+            }
+        except Exception:
+            return {"usuario": str(getattr(cuenta, "usuario", "") or "")}
+
+    @staticmethod
+    def _lista_textos_actividad(valor, n) -> list:
+        """Normaliza el valor de UNA cuenta a lista de textos (max n)."""
+        try:
+            limite = max(1, int(n))
+        except (TypeError, ValueError):
+            limite = 1
+        salida: list = []
+
+        def _agregar(item):
+            if len(salida) >= limite:
+                return
+            if isinstance(item, str):
+                texto = item.strip()
+                if texto:
+                    salida.append(texto)
+            elif isinstance(item, (list, tuple)):
+                for sub in item:
+                    if len(salida) >= limite:
+                        break
+                    _agregar(sub)
+
+        try:
+            if valor is None:
+                return []
+            if isinstance(valor, dict):
+                for clave in ("textos", "posts", "lista", "items", "contenido"):
+                    if clave in valor:
+                        _agregar(valor[clave])
+                        break
+            else:
+                _agregar(valor)
+        except Exception:
+            return salida[:limite]
+        return salida[:limite]
+
+    @classmethod
+    def _mapear_textos_actividad(cls, crudo, cuentas, n) -> dict:
+        """{usuario: [textos]} tolerante al formato del generador.
+
+        Acepta `{usuario: textos}` (contrato principal), `{usuario: {"textos":
+        [...]}}`, lista de listas alineada con `cuentas` y listas/strings
+        simples. Nunca lanza.
+        """
+        resultado: dict = {}
+        try:
+            lista_cuentas = list(cuentas or [])
+        except Exception:
+            return {}
+        try:
+            if isinstance(crudo, dict):
+                for cuenta in lista_cuentas:
+                    lista = cls._lista_textos_actividad(
+                        crudo.get(cuenta.usuario), n
+                    )
+                    if lista:
+                        resultado[cuenta.usuario] = lista
+                if resultado:
+                    return resultado
+                valores = list(crudo.values())
+                for indice, cuenta in enumerate(lista_cuentas):
+                    if indice >= len(valores):
+                        break
+                    lista = cls._lista_textos_actividad(valores[indice], n)
+                    if lista:
+                        resultado[cuenta.usuario] = lista
+                return resultado
+            if isinstance(crudo, (list, tuple)):
+                for indice, cuenta in enumerate(lista_cuentas):
+                    if indice >= len(crudo):
+                        break
+                    lista = cls._lista_textos_actividad(crudo[indice], n)
+                    if lista:
+                        resultado[cuenta.usuario] = lista
+                return resultado
+        except Exception:
+            return resultado
+        return resultado
+
+    def _asegurar_textos_actividad(self, lista, n, tags, texto_base, contexto,
+                                   menciones) -> list:
+        """Garantiza N textos con TODOS los hashtags (pool local si faltan)."""
+        try:
+            total = max(0, int(n))
+        except (TypeError, ValueError):
+            total = 0
+        if total <= 0:
+            return []
+        salida = [
+            self._garantizar_texto_actividad(texto, tags)
+            for texto in (lista or []) if str(texto or "").strip()
+        ]
+        faltan = total - len(salida)
+        if faltan > 0:
+            base = str(texto_base or "").strip() or str(contexto or "").strip()
+            try:
+                pool = self._pool_hashtags(
+                    base,
+                    " ".join(tags),
+                    self._menciones_actividad(menciones),
+                    faltan,
+                )
+            except Exception:
+                pool = []
+            for texto in pool:
+                salida.append(self._garantizar_texto_actividad(texto, tags))
+        faltan = total - len(salida)
+        if faltan > 0:
+            relleno = self._garantizar_texto_actividad("", tags)
+            for _ in range(faltan):
+                salida.append(relleno)
+        return salida[:total]
+
+    @staticmethod
+    def _garantizar_texto_actividad(texto, tags) -> str:
+        """Devuelve el texto con TODOS los `tags` (garantia del proyecto).
+
+        Usa `ia.generador_contenido.garantizar_texto_hashtag` (import local,
+        tolerante); si no esta disponible devuelve el texto tal cual. Nunca
+        lanza.
+        """
+        try:
+            from ia.generador_contenido import garantizar_texto_hashtag
+
+            resultado = garantizar_texto_hashtag(texto, tags, limite=100)
+            if resultado:
+                return str(resultado)
+        except Exception:
+            pass
+        return str(texto or "").strip()
+
+    @staticmethod
+    def _menciones_actividad(menciones) -> str:
+        """Menciones como texto ('@a @b') desde lista o cadena; nunca lanza."""
+        if not menciones:
+            return ""
+        if isinstance(menciones, str):
+            return menciones.strip()
+        try:
+            return " ".join(
+                str(m).strip() for m in menciones if str(m or "").strip()
+            )
+        except Exception:
+            return ""

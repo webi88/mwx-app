@@ -1130,9 +1130,9 @@ def run(check):
 
     fuente_app = (RAIZ / "web" / "app.py").read_text(encoding="utf-8")
     check(
-        "navegacion: quedan 15 operaciones visibles y sin lineas comentadas "
+        "navegacion: quedan 16 operaciones visibles y sin lineas comentadas "
         "de ocultamiento",
-        len(opciones) == 15
+        len(opciones) == 16
         and "OCULTO" not in fuente_app
         and not any(
             linea.strip().startswith('# "') for linea in fuente_app.splitlines()

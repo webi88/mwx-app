@@ -1300,8 +1300,19 @@ def _mostrar_resultados_citas(resultados: dict) -> None:
 def _render_resultados(resumen, tipo: str = "citas") -> None:
     """Pinta el resumen final con el render que corresponde al tipo de campaña."""
     resumen = resumen if isinstance(resumen, dict) else {}
-    if str(tipo or "") == "roles":
+    tipo_txt = str(tipo or "")
+    if tipo_txt == "roles":
         _mostrar_resultados_roles(resumen)
+    elif tipo_txt == "actividad":
+        # Import perezoso: `actividad.py` importa este modulo al cargarse (evita
+        # el ciclo) y expone el render con las metricas/por_cuenta de la
+        # actividad leve. Si faltara, cae al render clasico de citas.
+        try:
+            from web.operaciones.actividad import mostrar_resultados_actividad
+        except Exception:
+            _mostrar_resultados_citas(resumen)
+        else:
+            mostrar_resultados_actividad(resumen)
     else:
         _mostrar_resultados_citas(resumen)
 
@@ -1517,10 +1528,17 @@ def _motor_usa_cancelar(motor, tipo: str = "citas") -> bool:
     """True si el motor acepta el kwarg `cancelar` en el flujo del `tipo`.
 
     Se comprueba la firma del metodo que la pagina va a llamar
-    (`ejecutar_por_roles` para "roles"; `ejecutar` para el resto). Con un motor
-    viejo devuelve False y el paro usa `motor.solicitar_paro()` como fallback.
+    (`ejecutar_por_roles` para "roles", `ejecutar_actividad` para "actividad";
+    `ejecutar` para el resto). Con un motor viejo devuelve False y el paro usa
+    `motor.solicitar_paro()` como fallback.
     """
-    nombre = "ejecutar_por_roles" if str(tipo or "") == "roles" else "ejecutar"
+    tipo_txt = str(tipo or "")
+    if tipo_txt == "roles":
+        nombre = "ejecutar_por_roles"
+    elif tipo_txt == "actividad":
+        nombre = "ejecutar_actividad"
+    else:
+        nombre = "ejecutar"
     func = getattr(motor, nombre, None)
     return bool(func is not None and _soporta_kwarg(func, "cancelar"))
 
@@ -2113,6 +2131,10 @@ _CLAVES_CONTEXTO_MANUAL = {
     "act": ("act_contexto",),
     # Pestana B: "Contexto de los posts con hashtag" (tema que la IA si opina).
     "act_roles": ("act_roles_contexto",),
+    # Operacion "✍️ Actividad" (web/operaciones/actividad.py): su campo
+    # "Contexto del tema" viaja como `contexto`; se limpia con el mismo
+    # checkbox de "Limpiar el contexto al terminar".
+    "actividad": ("actividad_contexto",),
 }
 
 

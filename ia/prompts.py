@@ -1266,6 +1266,7 @@ def get_prompt_hashtags(
     registro: str = "",
     personalidad: str = "",
     perfil: str = "",
+    todos: bool = False,
 ) -> str:
     """Prompt de POST ORIGINAL con hashtag(s) obligatorios.
 
@@ -1275,6 +1276,11 @@ def get_prompt_hashtags(
     ``hashtags`` pedidos se integran EN MEDIO del texto (nunca al final) y
     ``registro``/``perfil``/``personalidad`` modulan el estilo igual que en el
     resto de los prompts. Reutiliza los bloques existentes de este modulo.
+
+    ``todos`` (kwarg nuevo AL FINAL, default False): para el modo ACTIVIDAD
+    pide a la IA que incluya TODOS los hashtags de la lista en cada texto
+    cuando quepan en el maximo de 100 caracteres (si no caben, la mayor
+    cantidad posible). Default False = prompt anterior identico.
     """
     prompt = (
         _base_narrativa(narrativa, entrenamiento)
@@ -1320,6 +1326,12 @@ def get_prompt_hashtags(
             "entre un articulo y su sustantivo, nunca partiendo la frase y "
             "nunca al final del texto.\n"
         )
+        if todos:
+            prompt += (
+                "- OBLIGATORIO: incluye TODOS los hashtags de la lista en CADA "
+                "texto siempre que quepan en el máximo de 100 caracteres; si "
+                "no caben, usa la mayor cantidad posible.\n"
+            )
     if contexto:
         prompt += (
             "\nCONTEXTO (tema legítimo sobre el que SÍ debes opinar con tus "

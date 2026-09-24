@@ -4629,7 +4629,14 @@ def _personalidad_del_lote(cuentas_info, indices) -> str:
 
 
 def _texto_hashtag_local(
-    info, contexto: str, tags, indice, j, rng, inicio: int | None = None
+    info,
+    contexto: str,
+    tags,
+    indice,
+    j,
+    rng,
+    inicio: int | None = None,
+    subset_fijo=None,
 ) -> str:
     """Construye un post ORIGINAL local con el contexto y tags en medio.
 
@@ -4638,7 +4645,12 @@ def _texto_hashtag_local(
     unido por espacios) de forma natural y rota las plantillas con
     aleatoriedad para que los textos varíen entre cuentas y entre llamadas.
     ``inicio`` permite fijar el punto de rotacion por cuenta para que dos
-    textos consecutivos de la misma cuenta NO repitan plantilla. Nunca lanza.
+    textos consecutivos de la misma cuenta NO repitan plantilla.
+
+    ``subset_fijo`` (kwarg nuevo AL FINAL, opcional): fuerza el subset EXACTO
+    de hashtags a integrar (en vez del subconjunto aleatorio). Lo usa el modo
+    Actividad para garantizar la cobertura total por cuenta; default None =
+    comportamiento anterior identico. Nunca lanza.
     """
     try:
         registro = _registro_normalizado(info)
@@ -4647,10 +4659,17 @@ def _texto_hashtag_local(
             "Con esto de {contexto} uno valora lo que tiene; {tag} lo dice bien.",
         )
         ctx = " ".join(str(contexto or "").split()) or "lo que tenemos"
-        if tags:
-            subset = _subconjunto_hashtags_pedidos(tags, rng)
-            if not subset:
-                subset = [str(tags[0] or "").strip()]
+        if tags or subset_fijo:
+            if subset_fijo:
+                subset = [
+                    str(x).strip() for x in subset_fijo if str(x).strip()
+                ]
+                if not subset and tags:
+                    subset = [str(tags[0] or "").strip()]
+            else:
+                subset = _subconjunto_hashtags_pedidos(tags, rng)
+                if not subset:
+                    subset = [str(tags[0] or "").strip()]
             tag_grupo = " ".join(subset)
         else:
             try:
@@ -4950,4 +4969,722 @@ def generar_textos_hashtags_por_cuenta(
         salida[clave] = [
             str(resultado[i][j] or "").strip() for j in range(n)
         ]
+    return salida
+
+
+# ===================================================================== #
+# Modo ACTIVIDAD (producto leve de 3-4 posts por cuenta): misma logica que
+# el rol "hashtags" pero con TODOS los hashtags pedidos. Si el grupo completo
+# cabe en un tuit, TODOS los textos llevan TODOS los hashtags; si no cabe, se
+# reparten entre los N textos de ESA cuenta con cobertura total.
+# ===================================================================== #
+_MAX_CUENTAS_ACTIVIDAD_POR_LLAMADA = _MAX_CUENTAS_HASHTAGS_POR_LLAMADA
+
+# Cuerpo minimo (caracteres fuera del grupo de hashtags) que debe caber en un
+# tuit de 100 para poder afirmar que "TODOS los hashtags caben en un texto":
+# con menos, la garantia de hashtag natural EN MEDIO no puede cumplirse.
+_MIN_CUERPO_ACTIVIDAD = 26
+
+
+def _puede_llevar_grupo_hashtags(tags, limite=_MAX_LARGO_HASHTAG) -> bool:
+    """True si TODOS los ``tags`` caben en UN texto de ``limite`` caracteres.
+
+    Cuenta el grupo unido por espacios mas 2 espacios de separacion mas el
+    cuerpo minimo (``_MIN_CUERPO_ACTIVIDAD``). Sin tags devuelve True (no hay
+    nada que repartir). Nunca lanza.
+    """
+    try:
+        grupo = " ".join(
+            str(t).strip() for t in (tags or []) if str(t).strip()
+        )
+        if not grupo:
+            return True
+        return len(grupo) + 2 + _MIN_CUERPO_ACTIVIDAD <= max(1, int(limite))
+    except Exception:
+        return False
+
+
+def _repartir_hashtags_actividad(tags, n, rng=None,
+                                 limite: int = _MAX_LARGO_HASHTAG) -> list:
+    """Plan de subconjuntos de hashtags por texto con COBERTURA TOTAL.
+
+    - Si el grupo COMPLETO de ``tags`` cabe en un tuit, TODOS los ``n`` textos
+      reciben TODOS los hashtags.
+    - Si no cabe, reparte los tags entre los textos: los buckets intentan
+      caber en ``limite - cuerpo minimo`` y, si un bucket se pasa, sus tags se
+      mueven a otros buckets con hueco (los tags NUNCA se descartan: la
+      cobertura manda). Los buckets vacios (cuando hay mas textos que tags)
+      reciben uno de los tags ciclicamente.
+    - ``n <= 0`` devuelve ``[]``; sin tags devuelve ``n`` subconjuntos vacios.
+    ``rng`` (opcional) baraja el orden de asignacion para variar el reparto
+    entre cuentas. Nunca lanza: ante cualquier error devuelve el grupo
+    completo por texto (o ``[]`` sin tags).
+    """
+    try:
+        lista = [
+            str(t).strip() for t in (tags or []) if str(t).strip()
+        ]
+        n = max(0, int(n))
+    except Exception:
+        return []
+    if n <= 0:
+        return []
+    if not lista:
+        return [[] for _ in range(n)]
+    try:
+        if _puede_llevar_grupo_hashtags(lista, limite):
+            return [list(lista) for _ in range(n)]
+    except Exception:
+        return [list(lista) for _ in range(n)]
+
+    trabajo = list(lista)
+    if rng is not None:
+        try:
+            rng.shuffle(trabajo)
+        except Exception:
+            pass
+
+    capacidad = max(1, int(limite) - 2 - _MIN_CUERPO_ACTIVIDAD)
+    plan = [[] for _ in range(n)]
+    largos = [0] * n
+    for tag in trabajo:
+        idx = min(range(n), key=lambda k: (largos[k], k))
+        plan[idx].append(tag)
+        largos[idx] = len(" ".join(plan[idx]))
+
+    # Reparte el exceso de los buckets que no caben (cobertura primero: si no
+    # hay hueco en otro bucket, el tag se queda donde esta).
+    for i in range(n):
+        if largos[i] <= capacidad:
+            continue
+        while len(plan[i]) > 1 and largos[i] > capacidad:
+            tag = plan[i].pop()
+            largos[i] = len(" ".join(plan[i]))
+            destinos = [
+                k for k in range(n)
+                if k != i and largos[k] + 1 + len(tag) <= capacidad
+            ]
+            if not destinos:
+                plan[i].append(tag)
+                largos[i] = len(" ".join(plan[i]))
+                break
+            k = min(destinos, key=lambda k: (largos[k], k))
+            plan[k].append(tag)
+            largos[k] = len(" ".join(plan[k]))
+
+    # Buckets vacios: presta un tag de un bucket con varios (cobertura ya
+    # garantizada; evita textos sin ningun hashtag).
+    for i in range(n):
+        if plan[i]:
+            continue
+        for k in sorted(range(n), key=lambda k: -len(plan[k])):
+            if len(plan[k]) > 1:
+                plan[i].append(plan[k].pop())
+                break
+        if not plan[i]:
+            plan[i].append(lista[i % len(lista)])
+    return plan
+
+
+def _normalizar_menciones(menciones) -> list:
+    """Normaliza @menciones (string o lista) a handles validos y unicos.
+
+    Acepta ``"@a, @b"``, ``"a b"`` o listas; limpia arrobas repetidas,
+    descarta tokens que no sean handles validos (1-15 chars alfanumericos o
+    ``_`` y al menos una letra) y deduplica case-insensitive conservando la
+    grafia de la primera aparicion. Nunca lanza.
+    """
+    try:
+        if not menciones:
+            return []
+        if isinstance(menciones, (list, tuple, set)):
+            crudos = []
+            for item in menciones:
+                crudos.extend(re.split(r"[,\s]+", str(item or "")))
+        else:
+            crudos = re.split(r"[,\s]+", str(menciones))
+    except Exception:
+        return []
+
+    resultado: list = []
+    vistos: set = set()
+    for crudo in crudos:
+        token = "@" + str(crudo or "").strip().lstrip("@").strip()
+        # Handle valido: 1-15 chars alfanumericos/guion bajo y AL MENOS una
+        # letra (evita convertir numeros sueltos como "12" en "@12").
+        if not re.fullmatch(r"@(?=.*[A-Za-z])[A-Za-z0-9_]{1,15}", token):
+            continue
+        clave = token.lower()
+        if clave in vistos:
+            continue
+        vistos.add(clave)
+        resultado.append(token)
+    return resultado
+
+
+def _agregar_menciones_actividad(texto, menciones) -> str:
+    """Agrega las @menciones al FINAL del texto SOLO si el total cabe en 100.
+
+    Se agregan TODAS o NINGUNA: si ``texto + " " + menciones`` supera
+    ``_MAX_LARGO_HASHTAG`` no se agrega ninguna (jamas se recorta el texto ni
+    se dejan hashtags al final: las menciones van despues del cuerpo, que ya
+    trae sus hashtags en medio). Sin menciones devuelve el texto intacto.
+    Nunca lanza.
+    """
+    try:
+        t = str(texto or "").rstrip()
+        grupo = " ".join(
+            str(m).strip() for m in (menciones or []) if str(m).strip()
+        )
+        if not t or not grupo:
+            return t
+        if len(t) + 1 + len(grupo) > _MAX_LARGO_HASHTAG:
+            return t
+        return f"{t} {grupo}"
+    except Exception:
+        return str(texto or "").rstrip()
+
+
+def _texto_actividad_local(
+    info, contexto, subset, indice, j, rng, inicio=None
+) -> str:
+    """Post local del modo Actividad con el subset EXACTO de hashtags.
+
+    Reutiliza las plantillas locales por (registro, perfil) del rol hashtags
+    vía `_texto_hashtag_local(..., subset_fijo=subset)`: sustituye
+    ``{contexto}`` y ``{tag}`` (el subset COMPLETO unido por espacios) y acota
+    a 100 con `_recortar_limite_hashtag` garantizando que TODOS los tags del
+    subset queden integrados EN MEDIO. Sin subset reutiliza el comportamiento
+    clasico (hashtag global en medio). Nunca lanza.
+    """
+    tags = [str(t).strip() for t in (subset or []) if str(t).strip()]
+    try:
+        return _texto_hashtag_local(
+            info, contexto, tags, indice, j, rng,
+            inicio=inicio, subset_fijo=tags or None,
+        )
+    except Exception as e:
+        logger.error(f"Error construyendo texto local de Actividad: {e}")
+        ctx = " ".join(str(contexto or "").split()) or "lo que tenemos"
+        grupo = " ".join(tags) or "#Mexico"
+        return _recortar_limite_hashtag(
+            f"Con esto de {ctx} uno valora lo que tiene; {grupo} lo dice bien.",
+            tags or None,
+        )
+
+
+def _variar_actividad_unico(texto, registro, subset, usados, semilla: int = 0):
+    """Devuelve un texto valido que NO este en ``usados`` (best effort).
+
+    Pensado para el modo Actividad, donde ``n`` (3-4) puede superar el numero
+    de plantillas locales del par (registro, perfil): intenta variaciones
+    normales con los HASHTAGS PROTEGIDOS (``_variar_hasta_unico`` sobre una
+    copia con los tags sustituidos por marcadores), y si el texto normalizado
+    vuelve a colisionar agrega cierres naturales y, en ultimo recurso, un
+    sufijo numerado. Cada candidato se re-normaliza con
+    `_finalizar_texto_actividad` (estilo + garantia del subset de hashtags).
+    Devuelve ``""`` ante error; nunca lanza.
+    """
+    try:
+        t = str(texto or "").strip()
+        if not t:
+            return ""
+        if t not in usados:
+            return t
+        tags = _RE_TAG_TOKEN.findall(t)
+        protegido = _RE_TAG_TOKEN.sub("\x00", t)
+        usados_protegidos = {_RE_TAG_TOKEN.sub("\x00", str(x or "")) for x in usados}
+
+        def _restaurar(texto_protegido: str) -> str:
+            restaurado = str(texto_protegido or "")
+            for tag in tags:
+                restaurado = restaurado.replace("\x00", tag, 1)
+            return restaurado.replace("\x00", "").strip()
+
+        for intento in range(4):
+            try:
+                variado = _variar_hasta_unico(protegido, usados_protegidos)
+            except Exception:
+                variado = ""
+            candidato = _finalizar_texto_actividad(
+                _restaurar(variado or protegido), registro, subset,
+                semilla + intento,
+            )
+            if candidato and candidato not in usados:
+                return candidato
+            cierre = (
+                "\n\nSaludos.",
+                " ¡Así es!",
+                "\n\nAsí las cosas.",
+                " (sigue)",
+            )[intento % 4]
+            candidato = _finalizar_texto_actividad(
+                f"{t}{cierre}", registro, subset, semilla + 50 + intento
+            )
+            if candidato and candidato not in usados:
+                return candidato
+
+        sufijo = 2
+        while sufijo < 50:
+            candidato = _finalizar_texto_actividad(
+                f"{t} ({sufijo})", registro, subset, semilla + 900 + sufijo
+            )
+            if (
+                candidato
+                and candidato not in usados
+                and len(candidato) <= _MAX_LARGO_HASHTAG
+            ):
+                return candidato
+            sufijo += 1
+        return ""
+    except Exception as e:
+        logger.error(f"Error variando texto de Actividad: {e}")
+        return ""
+
+
+def _finalizar_texto_actividad(texto, registro, subset, semilla: int = 0) -> str:
+    """Aplica estilo del registro y garantiza el subset EXACTO de hashtags.
+
+    - Humaniza segun registro (activista/ciudadana) y quita los signos de
+      apertura "¿"/"¡" cuando corresponde (politica los conserva).
+    - Con ``subset`` no vacio delega en `garantizar_texto_hashtag`: TODOS los
+      hashtags del subset quedan presentes EN MEDIO, sin ajenos, con <= 100
+      caracteres y sin terminar en hashtag.
+    - Sin subset conserva el comportamiento de posts (un hashtag en medio).
+    Nunca lanza: ante cualquier error devuelve el texto recibido (limpio).
+    """
+    try:
+        t = str(texto or "").strip()
+    except Exception:
+        return ""
+    if not t:
+        return t
+    try:
+        semilla = int(semilla)
+    except (TypeError, ValueError):
+        semilla = 0
+    try:
+        t = _humanizar_por_registro(t, registro, semilla=semilla)
+        t = _quitar_signos_por_registro(t, registro)
+        tags = [str(x).strip() for x in (subset or []) if str(x).strip()]
+        if tags:
+            t = garantizar_texto_hashtag(
+                t, tags, limite=_MAX_LARGO_HASHTAG, semilla=semilla
+            )
+        else:
+            t = _garantizar_hashtag_pedido(t, [], semilla)
+        return t
+    except Exception as e:
+        logger.error(f"Error finalizando texto de Actividad: {e}")
+        return str(texto or "").strip()
+
+
+def _cubrir_hashtags_actividad(fila, subsets, tags,
+                               limite: int = _MAX_LARGO_HASHTAG) -> None:
+    """Garantiza IN PLACE que TODOS los ``tags`` aparezcan en ``fila``.
+
+    Defensa final del contrato de cobertura: si tras la generacion falta
+    algun hashtag en la cuenta, se re-garantiza el tag faltante en el texto
+    que menos hashtags lleva (via `garantizar_texto_hashtag`, que lo inserta
+    EN MEDIO sin ajenos ni pasar de ``limite``) y se actualiza el subset.
+    Nunca lanza.
+    """
+    try:
+        if not fila or not tags:
+            return
+    except Exception:
+        return
+    for intento in range(len(tags) + 1):
+        try:
+            claves = {
+                str(t).strip().lower() for t in tags if str(t).strip()
+            }
+            presentes: set = set()
+            for x in fila:
+                presentes |= {
+                    m.group(0).lower()
+                    for m in _RE_TAG_TOKEN.finditer(str(x or ""))
+                }
+            faltan = [t for t in claves if t not in presentes]
+            if not faltan:
+                return
+            tag = faltan[0]
+            idx = min(
+                range(len(fila)),
+                key=lambda k: (
+                    len(subsets[k]) if k < len(subsets) else 0, k
+                ),
+            )
+            nuevo = [str(x).strip() for x in (subsets[idx] or []) if str(x).strip()]
+            if tag not in {x.lower() for x in nuevo}:
+                nuevo.append(tag)
+            candidato = garantizar_texto_hashtag(
+                fila[idx], nuevo, limite=limite, semilla=7919 + intento
+            )
+            if (
+                candidato
+                and tag in candidato.lower()
+                and len(candidato) <= limite
+            ):
+                fila[idx] = candidato
+                subsets[idx] = nuevo
+        except Exception as e:
+            logger.error(f"Error cubriendo hashtags de Actividad: {e}")
+            return
+    try:
+        claves = {str(t).strip().lower() for t in tags if str(t).strip()}
+        presentes: set = set()
+        for x in fila:
+            presentes |= {
+                m.group(0).lower()
+                for m in _RE_TAG_TOKEN.finditer(str(x or ""))
+            }
+        if claves - presentes:
+            logger.warning(
+                "Actividad: no se logro la cobertura total de hashtags "
+                f"({sorted(claves - presentes)})"
+            )
+    except Exception:
+        pass
+
+
+def verificar_cobertura_actividad(textos, hashtags) -> bool:
+    """True si ``textos`` usa TODOS los ``hashtags`` pedidos y NINGUNO ajeno.
+
+    - ``textos``: lista de strings (tolerante: acepta un string, un dict
+      ``{usuario: [textos]}``, cualquier iterable o entradas raras; nunca
+      lanza).
+    - ``hashtags``: lista/string con o sin '#' (se normaliza con
+      `_normalizar_hashtags_pedidos`).
+    - Sin hashtags pedidos devuelve True SOLO si los textos no traen ningun
+      hashtag (cualquier hashtag seria ajeno).
+    - Ante entradas invalidas devuelve False (excepto sin pedidos y sin
+      textos: True), sin lanzar jamas.
+    """
+    try:
+        pedidos = _normalizar_hashtags_pedidos(hashtags)
+        if textos is None:
+            lista: list = []
+        elif isinstance(textos, str):
+            lista = [textos]
+        elif isinstance(textos, dict):
+            lista = []
+            for valor in textos.values():
+                if isinstance(valor, (list, tuple, set)):
+                    lista.extend(str(x or "") for x in valor)
+                elif valor is not None:
+                    lista.append(str(valor))
+        else:
+            try:
+                lista = [str(x or "") for x in textos]
+            except TypeError:
+                lista = [str(textos)]
+        encontrados: set = set()
+        for t in lista:
+            encontrados |= {
+                m.group(0).lower()
+                for m in _RE_TAG_TOKEN.finditer(str(t or ""))
+            }
+        claves = {p.lower() for p in pedidos}
+        if not claves:
+            return not encontrados
+        return claves <= encontrados and encontrados <= claves
+    except Exception:
+        return False
+
+
+def _n_actividad_por_cuenta(lista, n_por_cuenta, default: int = 3) -> list:
+    """Cantidad de textos por cuenta a partir de int o dict ``{usuario: n}``.
+
+    - int/numerico -> el mismo ``n`` para todas las cuentas (n<0 => 0).
+    - dict -> valor por ``usuario`` (case-insensitive, tolera '@' y espacios);
+      las cuentas ausentes usan ``default`` (3, el minimo del producto 3-4).
+    - Entradas invalidas -> ``default``; nunca lanza.
+    """
+    try:
+        default = max(0, int(default))
+    except (TypeError, ValueError):
+        default = 3
+    mapa = None
+    base = default
+    if isinstance(n_por_cuenta, dict):
+        mapa = {}
+        for clave, valor in n_por_cuenta.items():
+            try:
+                n = max(0, int(valor))
+            except (TypeError, ValueError):
+                continue
+            usuario = str(clave or "").strip().lstrip("@").lower()
+            if usuario:
+                mapa[usuario] = n
+    else:
+        try:
+            base = max(0, int(n_por_cuenta))
+        except (TypeError, ValueError):
+            base = default
+    salida: list = []
+    for i in range(len(lista or [])):
+        n = None
+        if mapa is not None:
+            info = _info_cuenta(lista, i)
+            usuario = (
+                str(info.get("usuario") or "").strip().lstrip("@").lower()
+            )
+            n = mapa.get(usuario)
+        if n is None:
+            n = base if mapa is None else default
+        salida.append(n)
+    return salida
+
+
+def generar_textos_actividad_por_cuenta(
+    cuentas_info: list,
+    hashtags: list,
+    n_por_cuenta,
+    contexto: str = "",
+    narrativa: str = "",
+    menciones=None,
+) -> dict:
+    """Genera posts del modo ACTIVIDAD (producto leve) con TODOS los hashtags.
+
+    ``cuentas_info``: lista de dicts con "usuario" y opcionalmente "registro"
+    ("politica"/"activista"/"ciudadana"), "perfil" ("formal"/"ciudadano"/
+    "popular"), "personalidad", "seccion" y "nombre" (mismo formato que
+    `generar_textos_hashtags_por_cuenta`); tolerante a claves faltantes o
+    valores invalidos.
+
+    ``n_por_cuenta``: int (mismo numero de textos por cuenta) o dict
+    ``{usuario: n}`` (el motor pide 3-4 por cuenta). Las cuentas ausentes del
+    dict usan 3.
+
+    REGLA DE HASHTAGS (pedido del dueño: "se usen TODOS"):
+    * Si el grupo COMPLETO de ``hashtags`` cabe en un tuit de 100 caracteres
+      (con cuerpo minimo), **TODOS los textos de TODAS las cuentas llevan
+      TODOS los hashtags**.
+    * Si la lista completa NO cabe en un tuit (hashtags largos o demasiados),
+      los hashtags se reparten entre los ``n`` textos de ESA cuenta
+      garantizando que **cada hashtag aparezca al menos una vez** (cobertura
+      total por cuenta) y que ningun hashtag pedido se descarte.
+    * Nunca aparecen hashtags ajenos, el texto no supera los 100 caracteres,
+      los hashtags van integrados EN MEDIO (nunca al final ni pegados a un
+      articulo/demostrativo) y el texto queda completo (sin cortar palabras).
+
+    ``menciones``: @menciones opcionales (string o lista). Se agregan TODAS al
+    FINAL de cada texto SOLO si el total sigue cabiendo en 100; si no caben,
+    se omiten (el texto nunca queda terminando en hashtag).
+
+    ``narrativa`` es SOLO TRASFONDO INVISIBLE: se usa como referencia para la
+    IA y, si un texto la filtra (`_fuga_narrativa`), se reemplaza por el
+    fallback local (que no la lee). ``contexto`` es el tema manual legitimo
+    sobre el que se opina.
+
+    Respeta el registro (politica/activista/ciudadana), el perfil (formal/
+    ciudadano/popular) y la personalidad de cada cuenta; si la IA falla o
+    devuelve menos textos, rellena con el fallback local con las mismas
+    garantias. Devuelve ``{usuario: [textos]}`` con EXACTAMENTE ``n`` textos
+    por cuenta (claves tolerantes a usuarios faltantes/duplicados, igual que
+    `generar_textos_hashtags_por_cuenta`). Firma congelada para el motor de
+    Activaciones. Nunca lanza.
+    """
+    try:
+        lista = list(cuentas_info or [])
+    except Exception:
+        lista = []
+
+    tags = _normalizar_hashtags_pedidos(hashtags)
+    mencion_norm = _normalizar_menciones(menciones)
+    contexto = " ".join(str(contexto or "").split())
+    total = len(lista)
+    ns = _n_actividad_por_cuenta(lista, n_por_cuenta)
+    rng = random.Random()
+
+    resultado: list = [[None] * ns[i] for i in range(total)]
+    planes: list = [
+        _repartir_hashtags_actividad(tags, ns[i], rng) for i in range(total)
+    ]
+    todos_caben = _puede_llevar_grupo_hashtags(tags)
+
+    # 1) IA: lotes de <=15 cuentas agrupadas por (registro, perfil). La
+    #    cantidad pedida es la suma de textos del lote (n distinto por cuenta).
+    if total and any(n > 0 for n in ns):
+        generador = None
+        try:
+            generador = GeneradorContenido()
+        except Exception as e:
+            logger.error(
+                f"No se pudo crear GeneradorContenido para Actividad: {e}"
+            )
+
+        if generador is not None:
+            reglas = []
+            for i in range(total):
+                info = _info_cuenta(lista, i)
+                reglas.append(
+                    (_registro_normalizado(info), _perfil_normalizado(info))
+                )
+            grupos: dict = {}
+            for i, clave in enumerate(reglas):
+                grupos.setdefault(clave, []).append(i)
+
+            for (registro, perfil), indices in grupos.items():
+                for inicio in range(
+                    0, len(indices), _MAX_CUENTAS_ACTIVIDAD_POR_LLAMADA
+                ):
+                    lote = indices[
+                        inicio:inicio + _MAX_CUENTAS_ACTIVIDAD_POR_LLAMADA
+                    ]
+                    cantidad = sum(ns[i] for i in lote)
+                    if cantidad <= 0:
+                        continue
+                    try:
+                        prompt = get_prompt_hashtags(
+                            hashtags=" ".join(tags),
+                            contexto=contexto,
+                            narrativa=narrativa,
+                            cantidad=cantidad,
+                            registro=registro,
+                            personalidad=_personalidad_del_lote(lista, lote),
+                            perfil=perfil,
+                            todos=todos_caben,
+                        )
+                        content = generador._chat(prompt, temperature=0.9)
+                        textos_lote = generador._parsear_textos(
+                            content, cantidad
+                        )
+                    except Exception as e:
+                        logger.error(
+                            f"Error OpenAI en lote de Actividad: {e}"
+                        )
+                        textos_lote = []
+
+                    limpios: list[str] = []
+                    vistos_lote: set = set()
+                    for t in textos_lote or []:
+                        t = generador._limpiar_texto(t)
+                        if t and t not in vistos_lote:
+                            vistos_lote.add(t)
+                            limpios.append(t)
+
+                    pos = 0
+                    for idx_cuenta in lote:
+                        for j in range(ns[idx_cuenta]):
+                            if pos >= len(limpios):
+                                break
+                            if resultado[idx_cuenta][j] is None:
+                                resultado[idx_cuenta][j] = limpios[pos]
+                                pos += 1
+
+    # 2) Normalizacion final por cuenta: relleno local, narrativa como
+    #    trasfondo, estilo del registro, subset EXACTO del plan EN MEDIO,
+    #    cobertura total, menciones y unicidad.
+    vistos: set = set()
+    for i in range(total):
+        n = ns[i]
+        if n <= 0:
+            continue
+        info = _info_cuenta(lista, i)
+        registro = _registro_normalizado(info)
+        subsets = planes[i] if i < len(planes) else []
+        fila = [""] * n
+        usados_cuenta: set = set()
+        try:
+            inicio_cuenta = rng.randrange(10 ** 6)
+        except Exception:
+            inicio_cuenta = i * 97
+
+        for j in range(n):
+            subset = (
+                list(subsets[j])
+                if j < len(subsets) and subsets[j]
+                else list(tags)
+            )
+
+            def _local(sub=subset, k=j, giro=0):
+                return _texto_actividad_local(
+                    info, contexto, sub,
+                    i + 7919 + giro, k, rng,
+                    inicio=inicio_cuenta + giro,
+                )
+
+            t = str(resultado[i][j] or "").strip()
+            if not t:
+                t = _local()
+            elif narrativa:
+                # Red de seguridad: si el texto de la IA filtra la narrativa,
+                # se cambia por el texto local (que no lee la narrativa).
+                t = _reemplazo_sin_fuga(t, narrativa, _local)
+                if not t:
+                    t = _local()
+            t = _finalizar_texto_actividad(
+                t, registro, subset, i * 1000 + j
+            )
+            # Prohibido: contexto pelado o simple concatenacion contexto+tag.
+            if _es_copia_contexto(t, contexto):
+                t = _finalizar_texto_actividad(
+                    _local(giro=1), registro, subset, i * 1000 + j + 17
+                )
+            # Unicidad por cuenta y entre cuentas (best effort).
+            if not t or t in usados_cuenta or t in vistos:
+                for k in range(6):
+                    alt = _finalizar_texto_actividad(
+                        _local(giro=k + 1), registro, subset,
+                        i * 1000 + j + 31 * (k + 1),
+                    )
+                    if (
+                        alt
+                        and alt not in usados_cuenta
+                        and alt not in vistos
+                    ):
+                        t = alt
+                        break
+                else:
+                    variado = _variar_actividad_unico(
+                        t, registro, subset, usados_cuenta | vistos,
+                        i * 1000 + j + 977,
+                    )
+                    if variado:
+                        t = variado
+            if not t:
+                t = _finalizar_texto_actividad(
+                    _local(giro=2), registro, subset, i * 1000 + j + 53
+                )
+            fila[j] = t
+            usados_cuenta.add(t)
+            vistos.add(t)
+
+        # 3) Cobertura total por cuenta (defensiva: el plan ya la garantiza)
+        #    y menciones al final (todas o ninguna), antes de cerrar la fila.
+        _cubrir_hashtags_actividad(fila, subsets, tags)
+        if mencion_norm:
+            for j in range(n):
+                fila[j] = _agregar_menciones_actividad(fila[j], mencion_norm)
+        resultado[i] = fila
+
+    # 4) Salida {usuario: [n textos]} (tolerante a usuario faltante/duplicado).
+    salida: dict = {}
+    usados_keys: set = set()
+    for i, cu in enumerate(lista):
+        info = cu if isinstance(cu, dict) else {}
+        usuario = str(info.get("usuario") or "").strip()
+        clave = usuario or f"cuenta_{i + 1}"
+        if clave in usados_keys:
+            sufijo = 2
+            while f"{clave}_{sufijo}" in usados_keys:
+                sufijo += 1
+            clave = f"{clave}_{sufijo}"
+        usados_keys.add(clave)
+        salida[clave] = [
+            str(resultado[i][j] or "").strip() for j in range(ns[i])
+        ]
+
+    if tags:
+        try:
+            todos_textos = [t for fila in salida.values() for t in fila]
+            if not verificar_cobertura_actividad(todos_textos, tags):
+                logger.warning(
+                    "Actividad: no se logro la cobertura total de hashtags "
+                    f"({tags})"
+                )
+        except Exception:
+            pass
     return salida

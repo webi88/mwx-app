@@ -44,6 +44,7 @@ OPCIONES = [
     "🖼️ Multimedia",
     "⚡ RTS / Activaciones",
     "🎯 Activación Masiva",
+    "✍️ Actividad",
     "❤️ Influencia: Likes",
     "🚩 Reportar Posts",
     "🚨 Alertas",
@@ -78,6 +79,7 @@ CATEGORIAS = [
         [
             "⚡ RTS / Activaciones",
             "🎯 Activación Masiva",
+            "✍️ Actividad",
             "❤️ Influencia: Likes",
             "🚩 Reportar Posts",
         ],
@@ -344,6 +346,11 @@ def main():
         render(usuario)
     elif seleccion.startswith("📋"):
         from web.operaciones.resumenes import render
+        render(usuario)
+    elif seleccion.startswith("✍️ Actividad"):
+        # Prefijo mas especifico que Change.org ("✍️"): debe ir ANTES para que
+        # la actividad no caiga en la rama generica de Change.org.
+        from web.operaciones.actividad import render
         render(usuario)
     elif seleccion.startswith("✍️"):
         from web.operaciones.change import render
