@@ -1,31 +1,61 @@
-"""Registro de clientes del bot externo (`data/clientes_bot.json`).
+"""Registro GLOBAL del bot de clientes (`data/clientes_bot.json`).
 
-Estructura del archivo::
+Estructura NUEVA (cuentas globales del grupo de clientes)::
 
-    {"clientes": {"<telegram_id>": {"nombre": "Cliente A",
-                                    "cuentas": ["usuario1", "usuario2"]}}}
+    {"chat_id": -1005538610567,
+     "cuentas": ["usuario1", "usuario2", ...]}
+
+El bot funciona SOLO en ese grupo: cualquier miembro puede elegir cualquiera de
+las cuentas. El archivo YA NO guarda Telegram IDs ni nombres de clientes.
+
+Migracion automatica: si encuentra el formato viejo
+`{"clientes": {"<telegram_id>": {"nombre": ..., "cuentas": [...]}}}` une las
+cuentas UNICAS de todos los clientes, descarta los IDs/nombres y reescribe el
+archivo en el formato nuevo.
 
 Reglas:
-  - El archivo NUNCA guarda credenciales: solo el nombre del cliente, su
-    Telegram ID y los usuarios internos de sus cuentas de X.
-  - `guardar()` es atomico (archivo temporal + `os.replace`): un corte a
-    mitad de escritura no corrompe el registro.
-  - NINGUNA funcion lanza excepcion: los errores se devuelven como string
+  - NUNCA guarda credenciales: solo el chat permitido y los usuarios de X.
+  - `guardar()` es atomico (archivo temporal + `os.replace`).
+  - Ninguna funcion lanza excepcion: los errores se devuelven como string
     ("" = todo bien). `cargar()` siempre devuelve un dict valido y crea el
-    archivo vacio si no existe.
-  - Las mutaciones (`asignar`, `quitar`) devuelven "" si todo salio bien o el
-    mensaje de error listo para mostrar en Telegram.
+    archivo con las cuentas por defecto si no existe.
 """
 
 from __future__ import annotations
 
 import json
 import os
-import re
 import tempfile
 from pathlib import Path
 
-CLAVE_CLIENTES = "clientes"
+# Chat de Telegram del grupo de clientes (fuente: TELEGRAM_CLIENTES_CHAT_ID).
+CHAT_CLIENTES_DEFAULT = -1005538610567
+
+# Cuentas por defecto (fuente historica: data/clientes/a_importar.txt). Se usan
+# para sembrar el archivo cuando no existe (p. ej. deploy nuevo en Railway) y
+# no contienen credenciales.
+CUENTAS_DEFAULT = [
+    "3ranuii97",
+    "SoLikeShady",
+    "Samia_lovesyou",
+    "LuxuryMachine",
+    "PinkLipStick16",
+    "BAMsugar96",
+    "HardisonRichard",
+    "yungbillyz",
+    "sir_portugal",
+    "kristy63411720",
+    "gadams_gene",
+    "estybaby8",
+    "_Campos_7",
+    "BuchholzLacey",
+    "Kaitlyn26014743",
+]
+
+CLAVE_CHAT = "chat_id"
+CLAVE_CUENTAS = "cuentas"
+CLAVE_VIEJA = "clientes"  # formato anterior (registro por Telegram ID)
+VARIABLE_CHAT = "TELEGRAM_CLIENTES_CHAT_ID"
 
 # Ruta alternativa (pruebas / embedding). Cadena vacia = ruta real del proyecto.
 _RUTA_OVERRIDE = ""
@@ -57,22 +87,6 @@ def usar_ruta(ruta: str) -> None:
     _RUTA_OVERRIDE = str(ruta or "").strip()
 
 
-def _normalizar_id(telegram_id) -> str:
-    """Telegram ID como string de digitos, sin signos ni espacios ("" si malo)."""
-    if telegram_id is None:
-        return ""
-    texto = str(telegram_id).strip()
-    if not texto:
-        return ""
-    try:
-        numero = int(texto)
-    except (TypeError, ValueError):
-        return ""
-    if numero <= 0:
-        return ""
-    return str(numero)
-
-
 def limpiar_usuario(usuario) -> str:
     """Quita espacios y '@' de un usuario de X."""
     return str(usuario or "").strip().lstrip("@").strip()
@@ -100,30 +114,72 @@ def limpiar_usuarios(usuarios) -> list:
     return limpios
 
 
+def _normalizar_chat_id(valor):
+    """Chat ID como int (acepta negativos). None si no es valido."""
+    if valor is None or isinstance(valor, bool):
+        return None
+    if isinstance(valor, int):
+        return valor
+    texto = str(valor).strip()
+    if not texto:
+        return None
+    try:
+        return int(texto)
+    except (TypeError, ValueError):
+        return None
+
+
+def _chat_de_entorno():
+    """Chat ID configurado por env `TELEGRAM_CLIENTES_CHAT_ID` (o None)."""
+    return _normalizar_chat_id(os.getenv(VARIABLE_CHAT, ""))
+
+
+# --------------------------------------------------------------------------- #
+# Estructura / migracion
+# --------------------------------------------------------------------------- #
+
 def _estructura_vacia() -> dict:
-    return {CLAVE_CLIENTES: {}}
+    return {
+        CLAVE_CHAT: CHAT_CLIENTES_DEFAULT,
+        CLAVE_CUENTAS: list(CUENTAS_DEFAULT),
+    }
 
 
 def _normalizar_datos(datos) -> dict:
-    """Deja `datos` con la estructura esperada y valores limpios."""
+    """Deja `datos` en el formato nuevo `{"chat_id", "cuentas"}`."""
     if not isinstance(datos, dict):
         return _estructura_vacia()
-    clientes = datos.get(CLAVE_CLIENTES)
-    if not isinstance(clientes, dict):
-        return _estructura_vacia()
-    limpios = {}
-    for telegram_id, info in clientes.items():
-        tid = _normalizar_id(telegram_id)
-        if not tid:
-            continue
-        if not isinstance(info, dict):
-            info = {}
-        nombre = re.sub(r"\s+", " ", str(info.get("nombre") or "")).strip()
-        limpios[tid] = {
-            "nombre": nombre or f"Cliente {tid}",
-            "cuentas": limpiar_usuarios(info.get("cuentas") or []),
-        }
-    return {CLAVE_CLIENTES: limpios}
+    chat = _normalizar_chat_id(datos.get(CLAVE_CHAT))
+    if chat is None:
+        chat = CHAT_CLIENTES_DEFAULT
+    cuentas = limpiar_usuarios(datos.get(CLAVE_CUENTAS) or [])
+    return {CLAVE_CHAT: chat, CLAVE_CUENTAS: cuentas}
+
+
+def _migrar_formato_viejo(datos) -> tuple:
+    """Convierte `{"clientes": {...}}` al formato nuevo.
+
+    Devuelve `(datos_nuevos, hubo_migracion)`: une las cuentas UNICAS de todos
+    los clientes (case-insensitive, conservando el primer nombre) y descarta
+    los Telegram IDs/nombres de cliente.
+    """
+    if not isinstance(datos, dict) or CLAVE_VIEJA not in datos:
+        return _normalizar_datos(datos), False
+    clientes = datos.get(CLAVE_VIEJA)
+    unidas = []
+    if isinstance(clientes, dict):
+        for info in clientes.values():
+            if isinstance(info, dict):
+                unidas.extend(info.get(CLAVE_CUENTAS) or [])
+            elif isinstance(info, list):
+                unidas.extend(info)
+    chat = _normalizar_chat_id(datos.get(CLAVE_CHAT))
+    if chat is None:
+        chat = CHAT_CLIENTES_DEFAULT
+    return {
+        CLAVE_CHAT: chat,
+        CLAVE_CUENTAS: limpiar_usuarios(unidas) or list(CUENTAS_DEFAULT),
+    }, True
 
 
 # --------------------------------------------------------------------------- #
@@ -131,7 +187,12 @@ def _normalizar_datos(datos) -> dict:
 # --------------------------------------------------------------------------- #
 
 def cargar(ruta: str = "") -> dict:
-    """Lee el registro; crea el archivo vacio si no existe. Nunca lanza."""
+    """Lee el registro (migrando el formato viejo). Nunca lanza.
+
+    Si el archivo no existe lo crea con el chat permitido y las cuentas por
+    defecto. Si detecta el formato viejo (`{"clientes": ...}`) lo migra y lo
+    reescribe en el formato nuevo.
+    """
     destino = ruta or ruta_actual()
     try:
         if not os.path.exists(destino):
@@ -140,7 +201,11 @@ def cargar(ruta: str = "") -> dict:
             return datos
         with open(destino, "r", encoding="utf-8") as fh:
             datos = json.load(fh)
-        return _normalizar_datos(datos)
+        nuevos, migrado = _migrar_formato_viejo(datos)
+        nuevos = _normalizar_datos(nuevos)
+        if migrado:
+            guardar(nuevos, destino)
+        return nuevos
     except Exception:
         return _estructura_vacia()
 
@@ -177,100 +242,22 @@ def guardar(datos: dict, ruta: str = "") -> str:
 # Consultas
 # --------------------------------------------------------------------------- #
 
-def cliente_de(telegram_id, ruta: str = "") -> dict | None:
-    """Datos del cliente (`{"nombre", "cuentas"}`) o None si no esta."""
-    tid = _normalizar_id(telegram_id)
-    if not tid:
-        return None
-    info = cargar(ruta).get(CLAVE_CLIENTES, {}).get(tid)
-    if not isinstance(info, dict):
-        return None
-    return {
-        "nombre": str(info.get("nombre") or "").strip() or f"Cliente {tid}",
-        "cuentas": limpiar_usuarios(info.get("cuentas") or []),
-    }
+def chat_id(ruta: str = "") -> int:
+    """Chat permitido: env -> JSON -> default (-1005538610567)."""
+    de_entorno = _chat_de_entorno()
+    if de_entorno is not None:
+        return de_entorno
+    return int(cargar(ruta).get(CLAVE_CHAT, CHAT_CLIENTES_DEFAULT))
 
 
-def cuentas_de(telegram_id, ruta: str = "") -> list:
-    """Usuarios asignados al cliente ([] si no esta registrado)."""
-    info = cliente_de(telegram_id, ruta)
-    return list(info.get("cuentas") or []) if info else []
+def cuentas(ruta: str = "") -> list:
+    """Cuentas GLOBALES del grupo (lista limpia y sin duplicados)."""
+    return limpiar_usuarios(cargar(ruta).get(CLAVE_CUENTAS) or [])
 
 
-def todos_los_clientes(ruta: str = "") -> dict:
-    """Copia `{telegram_id: {"nombre", "cuentas"}}` de todo el registro."""
-    return {tid: dict(info) for tid, info in cargar(ruta).get(CLAVE_CLIENTES, {}).items()}
-
-
-def es_cliente(telegram_id, ruta: str = "") -> bool:
-    """True si el Telegram ID esta registrado."""
-    return cliente_de(telegram_id, ruta) is not None
-
-
-def usuario_permitido(telegram_id, usuario, ruta: str = "") -> bool:
-    """True si `usuario` pertenece a las cuentas del cliente (case-insensitive)."""
-    buscado = limpiar_usuario(usuario).lower()
-    if not buscado:
+def es_chat_permitido(chat, ruta: str = "") -> bool:
+    """True si `chat` es el grupo de clientes configurado."""
+    valor = _normalizar_chat_id(chat)
+    if valor is None:
         return False
-    return buscado in {u.lower() for u in cuentas_de(telegram_id, ruta)}
-
-
-# --------------------------------------------------------------------------- #
-# Mutaciones
-# --------------------------------------------------------------------------- #
-
-def asignar(
-    telegram_id, nombre: str = "", usuarios=None, ruta: str = ""
-) -> str:
-    """Registra/actualiza un cliente y AGREGA cuentas (no borra las previas).
-
-    Devuelve "" si todo salio bien o el mensaje de error. El nombre solo se
-    actualiza si viene no vacio; si no, conserva el anterior (o "Cliente <id>").
-    """
-    tid = _normalizar_id(telegram_id)
-    if not tid:
-        return "Telegram ID inválido: usa solo números (el ID de la persona)."
-    usuarios_limpios = limpiar_usuarios(usuarios)
-    nombre_limpio = re.sub(r"\s+", " ", str(nombre or "")).strip()
-    if not usuarios_limpios and not nombre_limpio:
-        return "No hay usuarios válidos para asignar ni nombre para actualizar."
-
-    datos = cargar(ruta)
-    clientes = datos.setdefault(CLAVE_CLIENTES, {})
-    info = clientes.get(tid)
-    if not isinstance(info, dict):
-        info = {}
-    cuentas = limpiar_usuarios(list(info.get("cuentas") or []) + usuarios_limpios)
-    nombre_final = (
-        nombre_limpio
-        or str(info.get("nombre") or "").strip()
-        or f"Cliente {tid}"
-    )
-    clientes[tid] = {"nombre": nombre_final, "cuentas": cuentas}
-    return guardar(datos, ruta)
-
-
-def quitar(telegram_id, usuarios=None, ruta: str = "") -> str:
-    """Quita usuarios de un cliente. Devuelve "" o el mensaje de error."""
-    tid = _normalizar_id(telegram_id)
-    if not tid:
-        return "Telegram ID inválido: usa solo números (el ID de la persona)."
-    a_quitar = {u.lower() for u in limpiar_usuarios(usuarios)}
-    if not a_quitar:
-        return "No hay usuarios válidos para quitar."
-
-    datos = cargar(ruta)
-    clientes = datos.get(CLAVE_CLIENTES, {})
-    info = clientes.get(tid)
-    if not isinstance(info, dict):
-        return f"El cliente {tid} no está registrado."
-    restantes = [
-        usuario
-        for usuario in (info.get("cuentas") or [])
-        if str(usuario).lower() not in a_quitar
-    ]
-    clientes[tid] = {
-        "nombre": str(info.get("nombre") or "").strip() or f"Cliente {tid}",
-        "cuentas": restantes,
-    }
-    return guardar(datos, ruta)
+    return valor == chat_id(ruta)

@@ -9,9 +9,12 @@ escribir `/start`.
 Reglas de diseno:
   - Mensajes cortos y sencillos ("como si fueran tontos"): sin terminos
     tecnicos, sin comandos, con ejemplos.
-  - Autenticacion: el Telegram ID debe estar en `data/clientes_bot.json`
-    (o ser admin de `TELEGRAM_ADMIN_IDS`); los flujos usan las cuentas del
-    cliente registrado.
+  - El bot funciona SOLO en el grupo de clientes (`clientes_store.chat_id()`,
+    por defecto -1005538610567): en privado responde un aviso corto y en
+    OTROS grupos se queda en silencio absoluto. Ya NO hay registro por
+    Telegram ID ni `/asignar`/`/quitar`/`/clientes`.
+  - Las cuentas son GLOBALES del grupo (`clientes_store.cuentas()`): cualquier
+    miembro puede elegirlas y usar sus funciones.
   - Selenium NUNCA en el hilo del bot: `asyncio.to_thread(...)` con import
     perezoso de `plataformas.twitter.selenium_bot` y `bot.cerrar()` SIEMPRE en
     `finally`.
@@ -20,6 +23,9 @@ Reglas de diseno:
     propios clientes). Si no hay semilla, se pide ayuda al que dio la cuenta.
   - El secreto TOTP NUNCA se muestra.
   - Nada de credenciales en mensajes ni en `data/clientes_bot.json`.
+  - Admin: `/nombre <usuario> <Nuevo Nombre>` actualiza SOLO el nombre
+    registrado en la BD (sin Chrome); el nombre EN X lo cambia el cliente con
+    el boton ✏️.
 
 Callbacks (ver bot_clientes/keyboards.py):
   cli_*    menu/acciones            -> cli_callback
@@ -67,7 +73,7 @@ from bot_clientes.keyboards import (
     teclado_confirmar_foto,
     teclado_confirmar_nombre,
     teclado_cuentas,
-    teclado_mis_cuentas,
+    teclado_lista_cuentas,
     teclado_reintentar_foto,
     teclado_reintentar_nombre,
 )
@@ -76,20 +82,12 @@ from bot_clientes.keyboards import (
 # Textos (sencillos, en segunda persona, con emojis)
 # --------------------------------------------------------------------------- #
 
-TEXTO_SIN_REGISTRO = (
-    "🔒 No tengo tu cuenta registrada.\n\n"
-    "Pide a la persona que te dio la cuenta que te agregue con tu Telegram "
-    "y después escribe /start."
-)
-
-TEXTO_SIN_REGISTRO_CORTO = (
-    "🔒 No tengo tu cuenta registrada. Pide a quien te dio la cuenta que te agregue."
-)
+# Mensaje en privado: el bot es exclusivo del grupo de clientes.
+TEXTO_SOLO_GRUPO = "ℹ️ Este bot funciona únicamente en el grupo de clientes."
 
 TEXTO_SIN_CUENTAS = (
-    "😕 Todavía no tienes cuentas asignadas.\n\n"
-    "Pide a la persona que te dio la cuenta que te agregue con tu Telegram "
-    "y después escribe /start."
+    "😕 Todavía no hay cuentas configuradas en el bot.\n\n"
+    "Pide ayuda a la persona que te dio la cuenta."
 )
 
 TEXTO_FALLO_NOMBRE = (
@@ -102,24 +100,29 @@ TEXTO_FALLO_FOTO = (
 
 TEXTO_AYUDA = (
     "❓ Cómo usar este bot\n\n"
+    "Este bot funciona únicamente en este grupo y todas las cuentas son del "
+    "grupo: cualquier miembro puede elegir la cuenta y usar sus funciones.\n\n"
     "1️⃣ Toca un botón de abajo para decirme qué quieres hacer.\n"
-    "2️⃣ Si tienes varias cuentas, te pregunto con cuál.\n"
+    "2️⃣ Elige la cuenta (si hay varias, te muestro la lista).\n"
     "3️⃣ Sigue lo que dice el mensaje (escribir un nombre o enviar una foto).\n\n"
-    "🔑 Quiero mi código: te doy el código de 6 números que X te pide al entrar.\n"
-    "✏️ Cambiar el nombre: escribes el nombre nuevo y yo lo cambio.\n"
-    "📸 Foto de perfil y 🖼️ Portada: me envías la imagen y yo la pongo.\n\n"
+    "🔑 Quiero mi código: te doy el código de 6 números (2FA) que X te pide al entrar.\n"
+    "✏️ Cambiar el nombre: escribes el nombre nuevo y yo lo cambio EN X.\n"
+    "📸 Foto de perfil y 🖼️ Portada: me envías la imagen y yo la pongo.\n"
+    "📋 Cuentas: te muestro las cuentas y su nombre registrado en el bot.\n\n"
     "Si algo falla:\n"
     "• Espera un momento y toca otra vez el botón (o 🔄 Intentar de nuevo).\n"
     "• Si sigue fallando, pide ayuda a la persona que te dio la cuenta.\n\n"
     "Escribe /cancelar para detener lo que estés haciendo.\n\n"
     "👥 En grupo: cada quien pulsa SUS botones y responde a MIS mensajes; "
-    "el bot contesta con el nombre de quien preguntó."
+    "el bot contesta con el nombre de quien preguntó.\n"
+    "🔧 Equipo: /nombre <usuario> <Nuevo Nombre> actualiza el nombre REGISTRADO "
+    "en el bot (sin abrir X); para cambiarlo EN X usa el botón ✏️."
 )
 
 TEXTO_BIENVENIDA = (
-    "👋 ¡Hola! Soy el bot que te ayuda con tus cuentas de X.\n\n"
+    "👋 ¡Hola! Soy el bot que te ayuda con las cuentas de X del grupo.\n\n"
     "Escribe /start y te muestro los botones: 🔑 código de verificación, "
-    "✏️ cambiar el nombre, 📸 foto de perfil y 🖼️ portada."
+    "✏️ cambiar el nombre, 📸 foto de perfil, 🖼️ portada y 📋 cuentas."
 )
 
 # Cuenta sin semilla 2FA en la BD: mensaje claro y amable, sin correos ni
@@ -233,23 +236,18 @@ def texto_codigo(codigo: str, segundos=None) -> str:
     return "\n".join(lineas)
 
 
-def texto_menu(cliente, admin: bool, cuentas) -> str:
-    """Saludo + menu, MUY simple."""
-    nombre = str((cliente or {}).get("nombre") or "").strip()
-    if nombre:
-        saludo = f"👋 ¡Hola, {nombre}!"
-    elif admin:
-        saludo = "👋 ¡Hola, equipo!"
-    else:
-        saludo = "👋 ¡Hola!"
+def texto_menu(admin: bool, cuentas) -> str:
+    """Saludo + menu, MUY simple (cuentas GLOBALES del grupo)."""
     cuentas = list(cuentas or [])
-    lineas = [saludo, ""]
+    lineas = ["👋 ¡Hola! Soy el bot de las cuentas de X del grupo.", ""]
     if not cuentas:
-        lineas.append("Todavía no tienes cuentas asignadas.")
-    elif len(cuentas) == 1:
-        lineas.append(f"Tu cuenta es: @{str(cuentas[0]).strip().lstrip('@')}")
+        lineas.append("Todavía no hay cuentas configuradas. Pide ayuda al equipo.")
     else:
-        lineas.append(f"Tienes {len(cuentas)} cuentas.")
+        lineas.append(
+            f"Hay {len(cuentas)} cuentas disponibles; elige la que quieras."
+        )
+    if admin:
+        lineas.append("🔧 Equipo: /nombre <usuario> <Nuevo Nombre> actualiza el nombre registrado.")
     lineas += ["", "¿Qué quieres hacer? Toca un botón 👇"]
     return "\n".join(lineas)
 
@@ -334,7 +332,7 @@ def con_mencion(texto: str, mencion: str) -> str:
 
 
 # --------------------------------------------------------------------------- #
-# Acceso: guard de cliente/admin y cuentas
+# Acceso: guard por CHAT (solo el grupo de clientes)
 # --------------------------------------------------------------------------- #
 
 def _telegram_id(update) -> int | None:
@@ -365,58 +363,47 @@ async def _avisar(update, texto: str) -> None:
             pass
 
 
-async def _guard(update) -> tuple | None:
-    """(uid, cliente, admin) o None (avisando) si no esta autorizado."""
+async def _guard_chat(update) -> bool:
+    """True SOLO si el update viene del grupo de clientes permitido.
+
+    - Privado: responde UNA vez "ℹ️ Este bot funciona únicamente en el grupo
+      de clientes." (alerta si es callback).
+    - Otro grupo/canal: silencio absoluto (en callbacks solo se quita el
+      spinner, sin texto).
+    - Grupo permitido: True.
+
+    El modo deja de depender del Telegram ID: las cuentas son globales del
+    grupo (`clientes_store.cuentas()`).
+    """
+    chat = getattr(update, "effective_chat", None) if update else None
+    chat_id = getattr(chat, "id", None)
+    if clientes_store.es_chat_permitido(chat_id):
+        return True
+    es_privado = str(getattr(chat, "type", "") or "").lower() == "private"
+    query = getattr(update, "callback_query", None)
+    if query is not None:
+        try:
+            if es_privado:
+                await query.answer(TEXTO_SOLO_GRUPO, show_alert=True)
+            else:
+                await query.answer()  # quita el spinner sin responder al grupo
+        except Exception:
+            pass
+        return False
+    if es_privado:
+        await _avisar(update, TEXTO_SOLO_GRUPO)
+    return False
+
+
+def _cuentas() -> list:
+    """Cuentas GLOBALES del grupo (lista limpia del registro del bot)."""
+    return clientes_store.cuentas()
+
+
+def _es_admin_update(update) -> bool:
+    """True si quien interactua esta en TELEGRAM_ADMIN_IDS."""
     uid = _telegram_id(update)
-    if uid is None:
-        return None
-    cliente = clientes_store.cliente_de(uid)
-    admin = es_admin(uid)
-    if cliente is None and not admin:
-        query = getattr(update, "callback_query", None)
-        if query is not None:
-            # La alerta solo la ve quien pulso el boton: sin mencion.
-            texto = TEXTO_SIN_REGISTRO_CORTO
-        else:
-            texto = con_mencion(TEXTO_SIN_REGISTRO, mencion_grupo(update))
-        await _avisar(update, texto)
-        return None
-    return uid, cliente, admin
-
-
-def _cuentas_bd(limite: int = 20) -> list:
-    """Ultimo recurso para admins sin cuentas asignadas: cuentas de la BD."""
-    try:
-        from core.database import get_db_session
-        from core.models import Cuenta
-
-        with get_db_session() as db:
-            filas = (
-                db.query(Cuenta.usuario)
-                .order_by(Cuenta.usuario)
-                .limit(max(1, int(limite)))
-                .all()
-            )
-        return [str(fila[0]) for fila in filas if fila and fila[0]]
-    except Exception as e:
-        logger.warning(f"No se pudieron listar cuentas de la BD: {e}")
-        return []
-
-
-def _cuentas_disponibles(uid, cliente, admin: bool) -> list:
-    """Cuentas del cliente; el admin ve todas (JSON, y si no hay, la BD)."""
-    if cliente is not None:
-        return list(cliente.get("cuentas") or [])
-    if not admin:
-        return []
-    vistas = []
-    for info in clientes_store.todos_los_clientes().values():
-        for usuario in info.get("cuentas") or []:
-            if usuario.lower() not in {str(v).lower() for v in vistas}:
-                vistas.append(usuario)
-    if vistas:
-        return vistas
-    return _cuentas_bd()
+    return uid is not None and es_admin(uid)
 
 
 def _datos_cuenta(usuario: str) -> dict | None:
@@ -651,11 +638,9 @@ async def _iniciar_flujo(
             await _responder(target, texto, markup, mencion=mencion)
 
 
-async def _elegir_cuenta_o_iniciar(
-    query, context, uid, cliente, admin, tipo: str, mencion: str = ""
-) -> None:
+async def _elegir_cuenta_o_iniciar(query, context, tipo: str, mencion: str = "") -> None:
     """Con 1 cuenta va directo; con varias muestra un boton por cuenta."""
-    cuentas = _cuentas_disponibles(uid, cliente, admin)
+    cuentas = _cuentas()
     if not cuentas:
         await _responder(query.message, TEXTO_SIN_CUENTAS, mencion=mencion)
         return
@@ -674,13 +659,13 @@ async def _elegir_cuenta_o_iniciar(
     )
 
 
-async def _mostrar_mis_cuentas(query, uid, cliente, admin, mencion: str = "") -> None:
-    """Lista las cuentas con su @ real y su nombre actual (sin credenciales)."""
-    cuentas = _cuentas_disponibles(uid, cliente, admin)
+async def _mostrar_cuentas(query, mencion: str = "") -> None:
+    """Lista las cuentas del grupo con su @ real y su nombre REGISTRADO en la BD."""
+    cuentas = _cuentas()
     if not cuentas:
         await _responder(query.message, TEXTO_SIN_CUENTAS, menu_principal(), mencion=mencion)
         return
-    lineas = ["📋 Tus cuentas:", ""]
+    lineas = ["📋 Cuentas del grupo:", ""]
     for indice, usuario in enumerate(cuentas, 1):
         datos = await asyncio.to_thread(_datos_cuenta, usuario)
         etiqueta = _etiqueta_cuenta(datos, usuario)
@@ -693,7 +678,7 @@ async def _mostrar_mis_cuentas(query, uid, cliente, admin, mencion: str = "") ->
     await _responder(
         query.message,
         "\n".join(lineas),
-        teclado_mis_cuentas(cuentas[:10]),
+        teclado_lista_cuentas(cuentas[:10]),
         mencion=mencion,
     )
 
@@ -728,22 +713,18 @@ async def _pedir_foto(
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/start: saludo + menu de botones (lo unico que el cliente necesita)."""
-    ctx = await _guard(update)
-    if ctx is None:
+    if not await _guard_chat(update):
         return
-    uid, cliente, admin = ctx
     _limpiar(context)
-    cuentas = _cuentas_disponibles(uid, cliente, admin)
     await update.effective_message.reply_text(
-        con_mencion(texto_menu(cliente, admin, cuentas), mencion_grupo(update)),
+        con_mencion(texto_menu(_es_admin_update(update), _cuentas()), mencion_grupo(update)),
         reply_markup=menu_principal(),
     )
 
 
 async def ayuda(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Guia sencilla de cada boton y que hacer si algo falla."""
-    ctx = await _guard(update)
-    if ctx is None:
+    if not await _guard_chat(update):
         return
     _limpiar(context)
     await update.effective_message.reply_text(
@@ -753,8 +734,7 @@ async def ayuda(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def cancelar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/cancelar: detiene cualquier flujo en curso y vuelve al menu."""
-    ctx = await _guard(update)
-    if ctx is None:
+    if not await _guard_chat(update):
         return
     _limpiar(context)
     await update.effective_message.reply_text(
@@ -773,18 +753,14 @@ async def cancelar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def cli_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Menu principal y acciones: cli_menu, cli_codigo, cli_nombre, ..."""
     query = update.callback_query
-    ctx = await _guard(update)
-    if ctx is None:
+    if not await _guard_chat(update):
         return
-    uid, cliente, admin = ctx
     data = (query.data or "").strip()
     mencion = mencion_grupo(update)
     await query.answer()
 
     if data.startswith("cli_cuenta_"):
-        usuario = _resolver_cuenta(
-            data[len("cli_cuenta_"):], _cuentas_disponibles(uid, cliente, admin)
-        )
+        usuario = _resolver_cuenta(data[len("cli_cuenta_"):], _cuentas())
         if not usuario:
             try:
                 await query.answer("Esa cuenta ya no está disponible.", show_alert=True)
@@ -804,7 +780,7 @@ async def cli_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         _limpiar(context)
         await _responder(
             query.message,
-            texto_menu(cliente, admin, _cuentas_disponibles(uid, cliente, admin)),
+            texto_menu(_es_admin_update(update), _cuentas()),
             menu_principal(),
             mencion=mencion,
         )
@@ -822,31 +798,24 @@ async def cli_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             mencion=mencion,
         )
         return
-    if data == "cli_mis_cuentas":
+    if data == "cli_cuentas":
         _limpiar(context)
-        await _mostrar_mis_cuentas(query, uid, cliente, admin, mencion=mencion)
+        await _mostrar_cuentas(query, mencion=mencion)
         return
 
     tipo = TIPO_POR_BOTON.get(data)
     if tipo:
         _limpiar(context)
-        await _elegir_cuenta_o_iniciar(
-            query, context, uid, cliente, admin, tipo, mencion=mencion
-        )
+        await _elegir_cuenta_o_iniciar(query, context, tipo, mencion=mencion)
 
 
 async def cuenta_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Selector de cuenta (`cuenta_<usuario>`) segun el flujo pendiente."""
     query = update.callback_query
-    ctx = await _guard(update)
-    if ctx is None:
+    if not await _guard_chat(update):
         return
-    uid, cliente, admin = ctx
     mencion = mencion_grupo(update)
-    usuario = _resolver_cuenta(
-        (query.data or "")[len("cuenta_"):],
-        _cuentas_disponibles(uid, cliente, admin),
-    )
+    usuario = _resolver_cuenta((query.data or "")[len("cuenta_"):], _cuentas())
     if not usuario:
         await query.answer("Esa cuenta ya no está disponible.", show_alert=True)
         return
@@ -870,15 +839,10 @@ async def cuenta_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 async def codigo_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Codigo de verificacion y reintentos (`codigo_<usuario>`)."""
     query = update.callback_query
-    ctx = await _guard(update)
-    if ctx is None:
+    if not await _guard_chat(update):
         return
-    uid, cliente, admin = ctx
     mencion = mencion_grupo(update)
-    usuario = _resolver_cuenta(
-        (query.data or "")[len("codigo_"):],
-        _cuentas_disponibles(uid, cliente, admin),
-    )
+    usuario = _resolver_cuenta((query.data or "")[len("codigo_"):], _cuentas())
     if not usuario:
         await query.answer("Esa cuenta ya no está disponible.", show_alert=True)
         return
@@ -890,12 +854,10 @@ async def codigo_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 async def nombre_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Nombre: elegir cuenta (`nombre_<u>`) o confirmar (`nombre_si/no_<u>`)."""
     query = update.callback_query
-    ctx = await _guard(update)
-    if ctx is None:
+    if not await _guard_chat(update):
         return
-    uid, cliente, admin = ctx
     data = (query.data or "").strip()
-    cuentas = _cuentas_disponibles(uid, cliente, admin)
+    cuentas = _cuentas()
     mencion = mencion_grupo(update)
 
     for prefijo in ("nombre_si_", "nombre_no_"):
@@ -962,12 +924,10 @@ async def nombre_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 async def foto_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Fotos: elegir cuenta/confirmar (`foto_perfil_`, `foto_si_`, ...)."""
     query = update.callback_query
-    ctx = await _guard(update)
-    if ctx is None:
+    if not await _guard_chat(update):
         return
-    uid, cliente, admin = ctx
     data = (query.data or "").strip()
-    cuentas = _cuentas_disponibles(uid, cliente, admin)
+    cuentas = _cuentas()
     mencion = mencion_grupo(update)
 
     for accion in ("foto_si_", "foto_no_", "foto_otra_"):
@@ -1060,14 +1020,10 @@ async def texto_recibido(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     espera = context.user_data.get("cli_espera") or {}
     if espera.get("tipo") != "nombre":
         return
-    ctx = await _guard(update)
-    if ctx is None:
+    if not await _guard_chat(update):
         return
-    uid, cliente, admin = ctx
     mencion = mencion_grupo(update)
-    usuario = _resolver_cuenta(
-        espera.get("usuario") or "", _cuentas_disponibles(uid, cliente, admin)
-    )
+    usuario = _resolver_cuenta(espera.get("usuario") or "", _cuentas())
     if not usuario:
         _limpiar(context)
         await update.effective_message.reply_text(
@@ -1100,8 +1056,7 @@ async def foto_recibida(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     espera = context.user_data.get("cli_espera") or {}
     mencion = mencion_grupo(update)
     if espera.get("tipo") != "foto":
-        ctx = await _guard(update)
-        if ctx is None:
+        if not await _guard_chat(update):
             return
         await update.effective_message.reply_text(
             con_mencion(
@@ -1111,13 +1066,9 @@ async def foto_recibida(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             )
         )
         return
-    ctx = await _guard(update)
-    if ctx is None:
+    if not await _guard_chat(update):
         return
-    uid, cliente, admin = ctx
-    usuario = _resolver_cuenta(
-        espera.get("usuario") or "", _cuentas_disponibles(uid, cliente, admin)
-    )
+    usuario = _resolver_cuenta(espera.get("usuario") or "", _cuentas())
     foto_tipo = "portada" if espera.get("foto_tipo") == "portada" else "perfil"
     if not usuario:
         _limpiar(context)
@@ -1226,11 +1177,14 @@ async def bienvenida_grupo(update, context) -> None:
     """Al AGREGAR el bot a un grupo: instrucciones cortas (una sola vez).
 
     Se registra con `MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS)`.
-    Si agregan a otra persona (no al bot), no dice nada.
+    Si agregan a otra persona (no al bot), no dice nada. En un grupo que NO
+    sea el de clientes se queda en silencio.
     """
     chat = getattr(update, "effective_chat", None)
     chat_id = getattr(chat, "id", None)
-    if chat_id is None or not _bot_entre_los_nuevos(update, context):
+    if chat_id is None or not clientes_store.es_chat_permitido(chat_id):
+        return
+    if not _bot_entre_los_nuevos(update, context):
         return
     if _bienvenida_reciente(chat_id):
         return
@@ -1245,24 +1199,27 @@ async def bienvenida_miembro(update, context) -> None:
     """`ChatMemberHandler(MY_CHAT_MEMBER)`: saluda cuando el bot RECIEN entra.
 
     Complementa a `bienvenida_grupo` (Telegram manda ambos updates al agregar
-    el bot); `_bienvenida_reciente` evita el saludo doble.
+    el bot); `_bienvenida_reciente` evita el saludo doble. En otros grupos,
+    silencio.
     """
     miembro = getattr(update, "my_chat_member", None)
     if miembro is None:
+        return
+    chat = getattr(update, "effective_chat", None)
+    chat_id = getattr(chat, "id", None)
+    if chat_id is None or not clientes_store.es_chat_permitido(chat_id):
         return
     viejo = str(getattr(getattr(miembro, "old_chat_member", None), "status", "") or "")
     nuevo = str(getattr(getattr(miembro, "new_chat_member", None), "status", "") or "")
     if viejo not in _ESTADOS_FUERA or nuevo not in _ESTADOS_DENTRO:
         return
-    chat = getattr(update, "effective_chat", None)
-    chat_id = getattr(chat, "id", None)
-    if chat_id is None or _bienvenida_reciente(chat_id):
+    if _bienvenida_reciente(chat_id):
         return
     await _enviar_bienvenida(update, context, chat_id)
 
 
 # --------------------------------------------------------------------------- #
-# Comandos de admin (/clientes, /asignar, /quitar)
+# Comandos de admin (/nombre)
 # --------------------------------------------------------------------------- #
 
 async def _responder_admin(update, texto: str) -> None:
@@ -1277,12 +1234,13 @@ async def _responder_admin(update, texto: str) -> None:
 
 
 def solo_admins(func):
-    """Decorador: solo TELEGRAM_ADMIN_IDS puede ejecutar el comando."""
+    """Decorador: SOLO el grupo de clientes y TELEGRAM_ADMIN_IDS."""
 
     @functools.wraps(func)
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
-        uid = _telegram_id(update)
-        if uid is None or not es_admin(uid):
+        if not await _guard_chat(update):
+            return
+        if not _es_admin_update(update):
             await _responder_admin(update, "⛔ Este comando es solo para el equipo.")
             return
         return await func(update, context, *args, **kwargs)
@@ -1290,11 +1248,23 @@ def solo_admins(func):
     return wrapper
 
 
-def _usuarios_en_bd(usuarios) -> set | None:
-    """Set en minusculas de los usuarios que EXISTEN en la BD; None si falla."""
-    nombres = [str(u).strip() for u in (usuarios or []) if str(u).strip()]
-    if not nombres:
-        return set()
+def _texto_uso_nombre() -> str:
+    return (
+        "Uso: /nombre <usuario> <Nuevo Nombre>\n\n"
+        "Ejemplo: /nombre MiCuenta María López\n\n"
+        "Actualiza el nombre REGISTRADO en el bot (sin abrir X). Para cambiarlo "
+        "EN X usa el botón ✏️ Cambiar nombre."
+    )
+
+
+def _actualizar_nombre_registrado(usuario: str, nombre: str) -> tuple:
+    """Actualiza `Cuenta.nombre_mostrado` en la BD. Devuelve (ok, error)."""
+    usuario = clientes_store.limpiar_usuario(usuario)
+    nombre = re.sub(r"\s+", " ", str(nombre or "")).strip()
+    if not usuario:
+        return False, "Falta el usuario de la cuenta (ej. /nombre MiCuenta María López)."
+    if not nombre:
+        return False, "Falta el nombre nuevo (ej. /nombre MiCuenta María López)."
     try:
         from sqlalchemy import func
 
@@ -1302,119 +1272,43 @@ def _usuarios_en_bd(usuarios) -> set | None:
         from core.models import Cuenta
 
         with get_db_session() as db:
-            filas = (
-                db.query(func.lower(Cuenta.usuario))
-                .filter(func.lower(Cuenta.usuario).in_([n.lower() for n in nombres]))
-                .all()
+            cuenta = (
+                db.query(Cuenta)
+                .filter(func.lower(Cuenta.usuario) == usuario.lower())
+                .first()
             )
-        return {str(fila[0]).lower() for fila in filas if fila and fila[0]}
+            if cuenta is None:
+                return (
+                    False,
+                    f"No encontré la cuenta @{usuario} en la base de datos. "
+                    "Revisa el usuario.",
+                )
+            cuenta.nombre_mostrado = nombre
+        return True, ""
     except Exception as e:
-        logger.warning(f"No se pudo consultar la BD para /asignar: {e}")
-        return None
+        logger.warning(f"No se pudo actualizar nombre_mostrado de {usuario}: {e}")
+        return False, f"No se pudo actualizar el registro: {type(e).__name__}: {e}"
 
 
-def _texto_uso_asignar() -> str:
-    return (
-        "Uso: /asignar <telegram_id> [nombre] <usuario1> <usuario2> ...\n\n"
-        "Ejemplo: /asignar 123456789 Juan MiCuenta OtraCuenta\n"
-        "Si el primer dato no es una cuenta de la BD, se toma como nombre del "
-        "cliente (o usa nombre=Juan sin espacios)."
+@solo_admins
+async def comando_nombre(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/nombre <usuario> <Nuevo Nombre> (admin): actualiza el nombre REGISTRADO.
+
+    Escribe `Cuenta.nombre_mostrado` en la BD (sin Chrome). El nombre EN X lo
+    cambia el cliente con el botón ✏️.
+    """
+    args = [str(a) for a in (context.args or [])]
+    if len(args) < 2:
+        await _responder_admin(update, _texto_uso_nombre())
+        return
+    usuario = clientes_store.limpiar_usuario(args[0])
+    nombre = re.sub(r"\s+", " ", " ".join(args[1:])).strip()
+    ok, error = await asyncio.to_thread(_actualizar_nombre_registrado, usuario, nombre)
+    if not ok:
+        await _responder_admin(update, f"❌ {error}")
+        return
+    await _responder_admin(
+        update,
+        f"✅ Listo. El nombre registrado de @{usuario} ahora es «{nombre}».\n\n"
+        "(Esto actualiza el registro del bot; para cambiarlo EN X usa el boton ✏️.)",
     )
-
-
-@solo_admins
-async def comando_clientes(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/clientes: lista los clientes registrados y sus cuentas (solo admin)."""
-    clientes = clientes_store.todos_los_clientes()
-    if not clientes:
-        await _responder_admin(
-            update,
-            "👥 Todavía no hay clientes registrados.\n\n"
-            "Usa: /asignar <telegram_id> [nombre] <usuario1> <usuario2> ...",
-        )
-        return
-    lineas = [f"👥 Clientes del bot ({len(clientes)}):", ""]
-    for telegram_id in sorted(clientes, key=lambda x: int(x) if str(x).isdigit() else 0):
-        info = clientes[telegram_id]
-        lineas.append(f"• {telegram_id} — {info.get('nombre') or 'Cliente'}")
-        for usuario in info.get("cuentas") or []:
-            lineas.append(f"   - @{usuario}")
-        lineas.append("")
-    lineas.append("Para agregar cuentas: /asignar <id> [nombre] <usuario...>")
-    lineas.append("Para quitar cuentas: /quitar <id> <usuario...>")
-    await _responder_admin(update, "\n".join(lineas))
-
-
-@solo_admins
-async def comando_asignar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/asignar <telegram_id> [nombre] <usuario1> ...: da cuentas a un cliente."""
-    args = [str(a) for a in (context.args or [])]
-    if len(args) < 2:
-        await _responder_admin(update, _texto_uso_asignar())
-        return
-    telegram_id = args[0].strip()
-    resto = [a for a in args[1:] if a.strip()]
-    nombre = ""
-    tokens_usuarios = resto
-
-    if resto and resto[0].lower().startswith("nombre="):
-        nombre = resto[0].split("=", 1)[1].replace("_", " ").strip()
-        tokens_usuarios = resto[1:]
-    elif resto:
-        conocidos = _usuarios_en_bd(resto[:2])
-        primero = resto[0].lower()
-        segundo = resto[1].lower() if len(resto) >= 2 else ""
-        if conocidos and primero not in conocidos and segundo in conocidos:
-            nombre, tokens_usuarios = resto[0], resto[1:]
-
-    usuarios = clientes_store.limpiar_usuarios(tokens_usuarios)
-    previos = {
-        str(u).lower() for u in clientes_store.cuentas_de(telegram_id)
-    }
-    error = clientes_store.asignar(telegram_id, nombre, usuarios)
-    if error:
-        await _responder_admin(update, f"❌ {error}")
-        return
-    info = clientes_store.cliente_de(telegram_id) or {}
-    agregadas = [u for u in usuarios if u.lower() not in previos]
-    lineas = [f"✅ Listo. Cliente {telegram_id} — {info.get('nombre') or 'Cliente'}."]
-    if agregadas:
-        lineas.append("Cuentas agregadas: " + ", ".join(f"@{u}" for u in agregadas))
-    todas = info.get("cuentas") or []
-    if todas:
-        lineas.append("Ahora tiene: " + ", ".join(f"@{u}" for u in todas))
-    lineas.append("\nDile a esa persona que abra el bot y escriba /start.")
-    conocidos = _usuarios_en_bd(usuarios)
-    if conocidos is not None:
-        faltantes = [u for u in usuarios if u.lower() not in conocidos]
-        if faltantes:
-            lineas.append(
-                "⚠️ Ojo: no están en la base de datos: "
-                + ", ".join(f"@{u}" for u in faltantes)
-            )
-    await _responder_admin(update, "\n".join(lineas))
-
-
-@solo_admins
-async def comando_quitar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/quitar <telegram_id> <usuario1> ...: quita cuentas a un cliente."""
-    args = [str(a) for a in (context.args or [])]
-    if len(args) < 2:
-        await _responder_admin(
-            update, "Uso: /quitar <telegram_id> <usuario1> <usuario2> ..."
-        )
-        return
-    telegram_id = args[0].strip()
-    usuarios = clientes_store.limpiar_usuarios(args[1:])
-    error = clientes_store.quitar(telegram_id, usuarios)
-    if error:
-        await _responder_admin(update, f"❌ {error}")
-        return
-    info = clientes_store.cliente_de(telegram_id) or {}
-    lineas = [f"✅ Listo. Cliente {telegram_id} — {info.get('nombre') or 'Cliente'}."]
-    restantes = info.get("cuentas") or []
-    if restantes:
-        lineas.append("Le quedan: " + ", ".join(f"@{u}" for u in restantes))
-    else:
-        lineas.append("Ya no tiene cuentas asignadas.")
-    await _responder_admin(update, "\n".join(lineas))

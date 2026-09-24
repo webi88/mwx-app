@@ -1,18 +1,23 @@
 # -*- coding: utf-8 -*-
 """Tests del bot de clientes (`bot_clientes/`) sin Telegram real ni Chrome.
 
+Modelo actual: el bot funciona SOLO en el grupo de clientes
+(`TELEGRAM_CLIENTES_CHAT_ID`, por defecto -1005538610567) y las cuentas son
+GLOBALES del grupo (`data/clientes_bot.json`).
+
 Cubre:
-  - `clientes_store`: crear/leer/asignar/quitar, duplicados, '@', IDs
-    invalidos, JSON corrupto y escritura atomica (siempre en archivo temporal).
-  - `keyboards`: los botones/callbacks esperados del menu y confirmaciones.
-  - Validacion del nombre nuevo y formateo del codigo 2FA, que es SOLO TOTP
-    (semilla fake -> 6 digitos; sin semilla -> mensaje amable) y que el flujo
-    YA NO depende de `utils.lector_correo` (ni import, ni llamada; un lector
-    falso que explota no afecta).
-  - Guard de no autorizado, admin detectado y flujos completos con fakes PTB
-    (start/menu, codigo TOTP, confirmacion de nombre, foto y comandos de admin
-    `/asignar`/`/quitar` escribiendo un JSON temporal).
-  - Grupos: bienvenida, menciones, aislamiento por usuario y callbacks.
+  - `clientes_store`: estructura nueva `{"chat_id", "cuentas"}`, migracion del
+    formato viejo `{"clientes": {...}}` (cuentas unicas + IDs descartados),
+    chat_id por JSON/env/default, `es_chat_permitido`, normalizacion y
+    escritura atomica (siempre en archivo temporal).
+  - `keyboards`: botones/callbacks esperados del menu (`cli_cuentas`) y
+    confirmaciones.
+  - Validacion del nombre nuevo y formateo del codigo 2FA (SOLO TOTP: semilla
+    fake -> 6 digitos; sin semilla -> mensaje amable) y que el flujo YA NO
+    depende de `utils.lector_correo`.
+  - Guard por CHAT: privado -> mensaje corto; otro grupo -> silencio; grupo
+    correcto -> sigue. Flujos con fakes PTB (codigo, nombre, foto, grupo,
+    aislamiento por usuario) y admin `/nombre` (BD fake).
   - `import bot_clientes.main` no arranca nada y `main()` exige token.
 
 Uso:
@@ -43,7 +48,26 @@ from bot_clientes import clientes_store  # noqa: E402
 from bot_clientes import handlers as h  # noqa: E402
 from bot_clientes import keyboards as k  # noqa: E402
 
+CHAT_GRUPO = -1005538610567
+CHAT_OTRO = -1009999999999
 SECRETO_FAKE = "JBSWY3DPEHPK3PXP"
+CUENTAS_15 = [
+    "3ranuii97",
+    "SoLikeShady",
+    "Samia_lovesyou",
+    "LuxuryMachine",
+    "PinkLipStick16",
+    "BAMsugar96",
+    "HardisonRichard",
+    "yungbillyz",
+    "sir_portugal",
+    "kristy63411720",
+    "gadams_gene",
+    "estybaby8",
+    "_Campos_7",
+    "BuchholzLacey",
+    "Kaitlyn26014743",
+]
 
 
 # --------------------------------------------------------------------------- #
@@ -106,6 +130,10 @@ class _ChatFake:
     def __init__(self, chat_id=1, tipo="private"):
         self.id = chat_id
         self.type = tipo
+
+
+def _chat_grupo(chat_id=CHAT_GRUPO):
+    return _ChatFake(chat_id, "supergroup")
 
 
 class _BotFake:
@@ -200,10 +228,6 @@ class _ContextoFake:
         self.bot = _BotFake()
 
 
-def _chat_grupo(chat_id=-1005538610567):
-    return _ChatFake(chat_id, "supergroup")
-
-
 def _correr(coro):
     return asyncio.run(coro)
 
@@ -216,130 +240,161 @@ def _callbacks(markup) -> list:
     return [boton.callback_data for fila in filas for boton in fila]
 
 
+class _CuentaBDFake:
+    """Fila minima de `Cuenta` para la sesion fake de /nombre."""
+
+    def __init__(self, usuario="MiCuenta", nombre_mostrado=""):
+        self.usuario = usuario
+        self.nombre_mostrado = nombre_mostrado
+
+
+class _QueryBDFake:
+    def __init__(self, cuenta):
+        self._cuenta = cuenta
+
+    def filter(self, *args, **kwargs):
+        return self
+
+    def first(self):
+        return self._cuenta
+
+
+class _SesionBDFake:
+    def __init__(self, cuenta):
+        self._cuenta = cuenta
+
+    def query(self, modelo):
+        return _QueryBDFake(self._cuenta)
+
+
+@contextlib.contextmanager
+def _db_fake(cuenta):
+    """Sustituye `get_db_session()` por una sesion fake con `cuenta`."""
+    import core.database as core_database
+
+    with _parches((core_database, "get_db_session", lambda: _db_fake_ctx(cuenta))):
+        yield
+
+
+@contextlib.contextmanager
+def _db_fake_ctx(cuenta):
+    yield _SesionBDFake(cuenta)
+
+
 # --------------------------------------------------------------------------- #
 # Tests
 # --------------------------------------------------------------------------- #
 
 def run(check) -> None:  # noqa: C901 - seccionado por bloques tematicos
     # ---------------------------------------------------------------- STORE --
-    with _store_temporal() as ruta:
+    with _store_temporal() as ruta, _env("TELEGRAM_CLIENTES_CHAT_ID", None):
         carpeta = os.path.dirname(ruta)
         datos = clientes_store.cargar(ruta)
         check(
-            "store: cargar crea el archivo vacio si no existe",
-            os.path.isfile(ruta) and datos == {"clientes": {}},
+            "store: cargar crea el archivo con chat + 15 cuentas por defecto",
+            os.path.isfile(ruta)
+            and datos["chat_id"] == CHAT_GRUPO
+            and datos["cuentas"] == CUENTAS_15,
         )
         check(
-            "store: asignar devuelve ok y registra nombre + cuentas",
-            clientes_store.asignar("123", "Cliente A", ["uno", "dos"], ruta) == ""
-            and clientes_store.cliente_de("123", ruta) == {
-                "nombre": "Cliente A",
-                "cuentas": ["uno", "dos"],
-            },
+            "store: cuentas() devuelve las 15 globales",
+            clientes_store.cuentas(ruta) == CUENTAS_15,
         )
         check(
-            "store: cuentas_de devuelve la lista del cliente",
-            clientes_store.cuentas_de("123", ruta) == ["uno", "dos"],
-        )
-        clientes_store.asignar("123", "", ["DOS", "tres"], ruta)
-        check(
-            "store: asignar AGREGA y deduplica case-insensitive",
-            clientes_store.cuentas_de("123", ruta) == ["uno", "dos", "tres"],
-        )
-        clientes_store.asignar("123", "Cliente A2", [], ruta)
-        check(
-            "store: asignar sin cuentas solo actualiza el nombre",
-            clientes_store.cliente_de("123", ruta)
-            == {"nombre": "Cliente A2", "cuentas": ["uno", "dos", "tres"]},
-        )
-        clientes_store.quitar("123", ["uno"], ruta)
-        check(
-            "store: quitar elimina la cuenta pedida",
-            clientes_store.cuentas_de("123", ruta) == ["dos", "tres"],
-        )
-        clientes_store.quitar("123", ["no-existe"], ruta)
-        check(
-            "store: quitar una cuenta inexistente no rompe",
-            clientes_store.cuentas_de("123", ruta) == ["dos", "tres"],
-        )
-        error = clientes_store.quitar("999", ["x"], ruta)
-        check(
-            "store: quitar de un cliente inexistente devuelve error string",
-            isinstance(error, str) and "no está registrado" in error,
-        )
-        for malo in ("abc", "12x", None, "", "0", "-5"):
-            check(
-                f"store: ID invalido {malo!r} no se registra",
-                bool(clientes_store.asignar(malo, "", ["u"], ruta))
-                and clientes_store.cliente_de(malo, ruta) is None,
-            )
-        check(
-            "store: asignar sin usuarios ni nombre devuelve error",
-            "No hay usuarios válidos" in clientes_store.asignar("77", "", [], ruta),
-        )
-        clientes_store.asignar("321", "", ["@ConArroba", " ConEspacios "], ruta)
-        check(
-            "store: los '@' y espacios se normalizan",
-            clientes_store.cuentas_de("321", ruta) == ["ConArroba", "ConEspacios"],
-        )
-        clientes_store.asignar("322", "", "CuentaSuelta", ruta)
-        check(
-            "store: un string suelto se trata como UNA cuenta (no letra por letra)",
-            clientes_store.cuentas_de("322", ruta) == ["CuentaSuelta"],
+            "store: chat_id() usa el JSON (default del grupo)",
+            clientes_store.chat_id(ruta) == CHAT_GRUPO,
         )
         check(
-            "store: usuario_permitido es case-insensitive",
-            clientes_store.usuario_permitido("321", "conarroba", ruta)
-            and not clientes_store.usuario_permitido("321", "otra", ruta),
+            "store: es_chat_permitido solo con el grupo configurado",
+            clientes_store.es_chat_permitido(CHAT_GRUPO, ruta)
+            and clientes_store.es_chat_permitido(str(CHAT_GRUPO), ruta)
+            and not clientes_store.es_chat_permitido(CHAT_OTRO, ruta)
+            and not clientes_store.es_chat_permitido(123, ruta)
+            and not clientes_store.es_chat_permitido(None, ruta),
+        )
+        error = clientes_store.guardar(
+            {"chat_id": CHAT_OTRO, "cuentas": ["@Uno", " dos ", "DOS", ""]}, ruta
         )
         check(
-            "store: es_cliente distingue registrados",
-            clientes_store.es_cliente("321", ruta)
-            and not clientes_store.es_cliente("999", ruta),
+            "store: guardar normaliza chat y cuentas (sin '@', sin duplicados)",
+            error == ""
+            and clientes_store.chat_id(ruta) == CHAT_OTRO
+            and clientes_store.cuentas(ruta) == ["Uno", "dos"],
         )
-        clientes_store.asignar("000321", "", ["OtraMas"], ruta)
+        clientes_store.guardar(
+            {"chat_id": CHAT_GRUPO, "cuentas": "CuentaSuelta"}, ruta
+        )
         check(
-            "store: los IDs se normalizan (000321 == 321)",
-            clientes_store.cuentas_de("321", ruta) == ["ConArroba", "ConEspacios", "OtraMas"],
+            "store: un string suelto se trata como UNA cuenta",
+            clientes_store.cuentas(ruta) == ["CuentaSuelta"],
+        )
+
+        # Migracion del formato viejo (registro por Telegram ID).
+        viejo = {
+            "clientes": {
+                "111": {"nombre": "Cliente A", "cuentas": ["uno", "dos"]},
+                "222": {"nombre": "Cliente B", "cuentas": ["DOS", "tres"]},
+                "333": {"nombre": "Cliente C", "cuentas": ["@cuatro"]},
+            }
+        }
+        with open(ruta, "w", encoding="utf-8") as fh:
+            json.dump(viejo, fh)
+        migrado = clientes_store.cargar(ruta)
+        check(
+            "store: migra el formato viejo a cuentas unicas + chat",
+            migrado["chat_id"] == CHAT_GRUPO
+            and migrado["cuentas"] == ["uno", "dos", "tres", "cuatro"],
+        )
+        with open(ruta, "r", encoding="utf-8") as fh:
+            en_disco = json.load(fh)
+        check(
+            "store: la migracion se reescribe en disco (sin 'clientes' ni IDs)",
+            "clientes" not in en_disco
+            and en_disco["chat_id"] == CHAT_GRUPO
+            and en_disco["cuentas"] == ["uno", "dos", "tres", "cuatro"],
+        )
+
+        # JSON corrupto: nunca lanza, devuelve estructura valida.
+        with open(ruta, "w", encoding="utf-8") as fh:
+            fh.write("{esto no es json!!")
+        recuperado = clientes_store.cargar(ruta)
+        check(
+            "store: JSON corrupto no lanza y devuelve estructura valida",
+            recuperado["chat_id"] == CHAT_GRUPO
+            and recuperado["cuentas"] == CUENTAS_15,
         )
         check(
-            "store: todos_los_clientes devuelve el registro completo",
-            set(clientes_store.todos_los_clientes(ruta)) == {"123", "321", "322"},
+            "store: guardar con datos invalidos normaliza (nunca lanza)",
+            clientes_store.guardar("no-dict", ruta) == ""
+            and clientes_store.cargar(ruta)["chat_id"] == CHAT_GRUPO,
         )
-        # Atomicidad: tras varias escrituras no quedan temporales y el JSON vale.
         sobrantes = [n for n in os.listdir(carpeta) if n.endswith(".tmp")]
         with open(ruta, encoding="utf-8") as fh:
             contenido = json.load(fh)
         check(
             "store: guardar es atomico (sin .tmp y JSON valido)",
-            not sobrantes and "clientes" in contenido,
+            not sobrantes and "cuentas" in contenido,
         )
-        # JSON corrupto: no lanza y devuelve estructura vacia.
-        with open(ruta, "w", encoding="utf-8") as fh:
-            fh.write("{esto no es json!!")
-        recuperado = clientes_store.cargar(ruta)
-        check(
-            "store: JSON corrupto no lanza y devuelve estructura vacia",
-            recuperado == {"clientes": {}},
-        )
-        check(
-            "store: guardar con datos invalidos normaliza (nunca lanza)",
-            clientes_store.guardar("no-dict", ruta) == ""
-            and clientes_store.cargar(ruta) == {"clientes": {}},
-        )
+        with _env("TELEGRAM_CLIENTES_CHAT_ID", "-1005555555555"):
+            check(
+                "store: el env TELEGRAM_CLIENTES_CHAT_ID manda sobre el JSON",
+                clientes_store.chat_id(ruta) == -1005555555555
+                and clientes_store.es_chat_permitido(-1005555555555, ruta)
+                and not clientes_store.es_chat_permitido(CHAT_GRUPO, ruta),
+            )
 
     # ------------------------------------------------------------ KEYBOARDS --
     menu = k.menu_principal()
     callbacks_menu = _callbacks(menu)
     check(
-        "teclados: el menu tiene los 6 botones del cliente",
+        "teclados: el menu tiene los 6 botones del cliente (Cuentas global)",
         callbacks_menu
         == [
             "cli_codigo",
             "cli_nombre",
             "cli_foto_perfil",
             "cli_foto_portada",
-            "cli_mis_cuentas",
+            "cli_cuentas",
             "cli_ayuda",
         ],
     )
@@ -353,6 +408,11 @@ def run(check) -> None:  # noqa: C901 - seccionado por bloques tematicos
         set(
             ["codigo_X", "nombre_X", "foto_perfil_X", "foto_portada_X"]
         ).issubset(set(_callbacks(k.teclado_acciones_cuenta("X")))),
+    )
+    check(
+        "teclados: la lista de cuentas usa cli_cuenta_<usuario>",
+        _callbacks(k.teclado_lista_cuentas(["Uno"]))
+        == ["cli_cuenta_Uno", "cli_menu"],
     )
     check(
         "teclados: confirmacion de nombre con si/no",
@@ -459,79 +519,100 @@ def run(check) -> None:  # noqa: C901 - seccionado por bloques tematicos
         and not hasattr(h, "TIEMPO_CORREO"),
     )
 
-    # -------------------------------------------------- GUARD / START/MENU --
-    with _store_temporal() as ruta, _env("TELEGRAM_ADMIN_IDS", None):
-        update = _UpdateFake(uid=999, texto="/start")
+    # ------------------------------------------------ GUARD POR CHAT / START --
+    with _store_temporal() as ruta, _env("TELEGRAM_CLIENTES_CHAT_ID", None), _env(
+        "TELEGRAM_ADMIN_IDS", None
+    ):
+        # Privado: mensaje corto y nada mas.
+        update = _UpdateFake(uid=500, texto="/start")
         _correr(h.start(update, _ContextoFake()))
         check(
-            "guard: no registrado recibe UN mensaje claro y sin menu",
+            "guard: privado recibe el aviso corto (sin menu)",
             update.effective_message.replies
-            and "No tengo tu cuenta registrada" in update.effective_message.replies[0][0]
+            and h.TEXTO_SOLO_GRUPO in update.effective_message.replies[0][0]
             and not update.effective_message.replies[0][1],
         )
+        # Callback privado: alerta corta, sin editar nada.
         query = _QueryFake("cli_menu")
-        update = _UpdateFake(uid=999, query=query)
-        _correr(h.cli_callback(update, _ContextoFake()))
+        _correr(h.cli_callback(_UpdateFake(uid=500, query=query), _ContextoFake()))
         check(
-            "guard: callback de no registrado responde alerta",
-            query.answers and query.answers[-1][1] and not query.message.edits,
+            "guard: callback privado responde alerta corta",
+            query.answers
+            and query.answers[-1][1]
+            and h.TEXTO_SOLO_GRUPO in query.answers[-1][0]
+            and not query.message.edits,
         )
-
-    with _store_temporal() as ruta, _env("TELEGRAM_ADMIN_IDS", "555"):
-        check(
-            "admin detectado solo con su ID en TELEGRAM_ADMIN_IDS",
-            h.es_admin(555) and not h.es_admin(556) and not h.es_admin("x"),
-        )
-        update = _UpdateFake(uid=555, texto="/start")
+        # Otro grupo: silencio absoluto (mensaje y callback).
+        update = _UpdateFake(uid=500, texto="/start", chat=_chat_grupo(CHAT_OTRO))
         _correr(h.start(update, _ContextoFake()))
         check(
-            "admin no registrado igual entra al menu",
-            update.effective_message.replies
-            and "Hola" in update.effective_message.replies[0][0]
-            and "cli_codigo" in _callbacks(update.effective_message.replies[0][1]["reply_markup"]),
+            "guard: otro grupo se ignora en silencio (nada de nada)",
+            update.effective_message.replies == [],
         )
-        error = clientes_store.asignar("700", "Cliente A", ["Uno", "Dos"], ruta)
-        update = _UpdateFake(uid=700, texto="/start")
+        query = _QueryFake("cli_menu")
+        _correr(
+            h.cli_callback(
+                _UpdateFake(uid=500, query=query, chat=_chat_grupo(CHAT_OTRO)),
+                _ContextoFake(),
+            )
+        )
+        check(
+            "guard: callback de otro grupo solo quita el spinner",
+            not query.message.edits
+            and query.answers
+            and query.answers[-1] == ("", False),
+        )
+        # Grupo correcto: menu con las 15 cuentas.
+        update = _UpdateFake(uid=500, texto="/start", chat=_chat_grupo(), username="fulano")
         _correr(h.start(update, _ContextoFake()))
         texto, kwargs = update.effective_message.replies[0]
         check(
-            "start cliente: saluda con su nombre y avisa cuantas cuentas tiene",
-            error == ""
-            and "Cliente A" in texto
-            and "2 cuentas" in texto
+            "guard: el grupo correcto recibe el menu con las 15 cuentas",
+            "15 cuentas disponibles" in texto
+            and "👤 @fulano," in texto
             and "cli_codigo" in _callbacks(kwargs["reply_markup"]),
         )
 
     # ------------------------------------------------- FLUJO DE CODIGO ----
-    with _store_temporal() as ruta, _env("TELEGRAM_ADMIN_IDS", None):
-        clientes_store.asignar("701", "Cliente Uno", ["SoloUno"], ruta)
-        clientes_store.asignar("702", "Cliente Dos", ["SoloDos"], ruta)
-        clientes_store.asignar("703", "Cliente Tres", ["Multi1", "Multi2"], ruta)
-
+    with _store_temporal() as ruta, _env("TELEGRAM_CLIENTES_CHAT_ID", None), _env(
+        "TELEGRAM_ADMIN_IDS", None
+    ):
         def _datos_totp(usuario):
             return {
                 "usuario": usuario,
                 "handle_actual": "HandleReal",
                 "nombre_mostrado": "",
                 "totp_secret": SECRETO_FAKE,
-                "activa": True,
             }
 
-        # Multiples cuentas: pregunta con cual.
-        query = _QueryFake("cli_codigo")
+        # Con varias cuentas pregunta con cual (default: 15).
+        query = _QueryFake("cli_codigo", _MensajeFake())
         with _parches((h, "_datos_cuenta", _datos_totp)):
-            _correr(h.cli_callback(_UpdateFake(uid=703, query=query), _ContextoFake()))
+            _correr(
+                h.cli_callback(
+                    _UpdateFake(uid=700, query=query, chat=_chat_grupo(), username="fulano"),
+                    _ContextoFake(),
+                )
+            )
         ultimo, kwargs = query.message.edits[-1]
         check(
-            "codigo: con varias cuentas pregunta con cual",
+            "codigo: con varias cuentas pregunta con cual (15 botones)",
             "¿Con cuál cuenta" in ultimo
-            and {"cuenta_Multi1", "cuenta_Multi2"}.issubset(set(_callbacks(kwargs["reply_markup"]))),
+            and "cuenta_3ranuii97" in _callbacks(kwargs["reply_markup"])
+            and "cuenta_Kaitlyn26014743" in _callbacks(kwargs["reply_markup"]),
         )
-        # Una sola cuenta: va directo al codigo TOTP.
-        query = _QueryFake("cli_codigo")
+
+        # Una sola cuenta: va directo al TOTP.
+        clientes_store.guardar({"chat_id": CHAT_GRUPO, "cuentas": ["SoloUno"]}, ruta)
+        query = _QueryFake("cli_codigo", _MensajeFake())
         contexto = _ContextoFake()
         with _parches((h, "_datos_cuenta", _datos_totp)):
-            _correr(h.cli_callback(_UpdateFake(uid=701, query=query), contexto))
+            _correr(
+                h.cli_callback(
+                    _UpdateFake(uid=700, query=query, chat=_chat_grupo(), username="fulano"),
+                    contexto,
+                )
+            )
         ultimo, kwargs = query.message.edits[-1]
         seis = re.search(r"\b\d{6}\b", ultimo)
         check(
@@ -541,66 +622,83 @@ def run(check) -> None:  # noqa: C901 - seccionado por bloques tematicos
             and kwargs.get("parse_mode") == "HTML"
             and "codigo_SoloUno" in _callbacks(kwargs["reply_markup"]),
         )
-
-        # Flujo multi: elegir cuenta por callback.
-        query = _QueryFake("cli_codigo")
-        contexto = _ContextoFake()
-        with _parches((h, "_datos_cuenta", _datos_totp)):
-            _correr(h.cli_callback(_UpdateFake(uid=703, query=query), contexto))
-            check(
-                "codigo: el flujo pendiente queda guardado",
-                contexto.user_data.get("cli_flujo") == "codigo",
-            )
-            query2 = _QueryFake("cuenta_Multi2", _MensajeFake())
-            _correr(h.cuenta_callback(_UpdateFake(uid=703, query=query2), contexto))
         check(
-            "codigo: al elegir cuenta se entrega su TOTP",
-            any("Este es tu código" in texto for texto, _ in query2.message.edits)
-            and contexto.user_data.get("cli_flujo") is None,
+            "codigo: la semilla TOTP nunca se muestra (solo el codigo)",
+            SECRETO_FAKE not in ultimo and "totp_secret" not in ultimo,
         )
 
         # Sin semilla: mensaje amable + boton de reintento (sin correo).
         def _datos_vacios(usuario):
             return {"totp_secret": "", "handle_actual": "", "nombre_mostrado": ""}
 
-        query = _QueryFake("cli_codigo")
+        query = _QueryFake("cli_codigo", _MensajeFake())
         with _parches((h, "_datos_cuenta", _datos_vacios)):
-            _correr(h.cli_callback(_UpdateFake(uid=702, query=query), _ContextoFake()))
+            _correr(
+                h.cli_callback(
+                    _UpdateFake(uid=700, query=query, chat=_chat_grupo(), username="fulano"),
+                    _ContextoFake(),
+                )
+            )
         ultimo, kwargs = query.message.edits[-1]
         check(
             "codigo: sin semilla muestra el mensaje amable (sin correo)",
             "no tiene configurado el código 2FA" in ultimo
             and "Pide ayuda" in ultimo
             and "correo" not in ultimo.lower()
-            and "codigo_SoloDos" in _callbacks(kwargs["reply_markup"]),
+            and "codigo_SoloUno" in _callbacks(kwargs["reply_markup"]),
         )
 
-        # Semilla invalida: mismo mensaje amable (el detalle va al log).
         def _datos_malos(usuario):
             return {"totp_secret": "no-es-base32!!"}
 
-        query = _QueryFake("cli_codigo")
+        query = _QueryFake("cli_codigo", _MensajeFake())
         with _parches((h, "_datos_cuenta", _datos_malos)):
-            _correr(h.cli_callback(_UpdateFake(uid=702, query=query), _ContextoFake()))
+            _correr(
+                h.cli_callback(
+                    _UpdateFake(uid=700, query=query, chat=_chat_grupo(), username="fulano"),
+                    _ContextoFake(),
+                )
+            )
         check(
             "codigo: semilla invalida tambien muestra el mensaje amable",
             "no tiene configurado el código 2FA" in query.message.edits[-1][0]
             and "no-es-base32" not in query.message.edits[-1][0],
         )
 
-        # La semilla NUNCA se muestra.
-        query = _QueryFake("cli_codigo")
+        # Flujo multi: elegir por callback y regenerar con "otro codigo".
+        clientes_store.guardar(
+            {"chat_id": CHAT_GRUPO, "cuentas": ["Multi1", "Multi2"]}, ruta
+        )
+        query = _QueryFake("cli_codigo", _MensajeFake())
+        contexto = _ContextoFake()
         with _parches((h, "_datos_cuenta", _datos_totp)):
-            _correr(h.cli_callback(_UpdateFake(uid=701, query=query), _ContextoFake()))
-        texto_seguro = query.message.edits[-1][0]
+            _correr(
+                h.cli_callback(
+                    _UpdateFake(uid=700, query=query, chat=_chat_grupo(), username="fulano"),
+                    contexto,
+                )
+            )
+            check(
+                "codigo: el flujo pendiente queda guardado",
+                contexto.user_data.get("cli_flujo") == "codigo",
+            )
+            query2 = _QueryFake("cuenta_Multi2", _MensajeFake())
+            _correr(
+                h.cuenta_callback(
+                    _UpdateFake(uid=700, query=query2, chat=_chat_grupo(), username="fulano"),
+                    contexto,
+                )
+            )
         check(
-            "codigo: la semilla TOTP nunca se muestra (solo el codigo)",
-            SECRETO_FAKE not in texto_seguro
-            and "totp_secret" not in texto_seguro
-            and re.search(r"\b\d{6}\b", texto_seguro) is not None,
+            "codigo: al elegir cuenta se entrega su TOTP",
+            any("Este es tu código" in texto for texto, _ in query2.message.edits)
+            and contexto.user_data.get("cli_flujo") is None,
         )
 
         # Un lector de correo que explota NO se usa: el flujo es SOLO TOTP.
+        clientes_store.guardar(
+            {"chat_id": CHAT_GRUPO, "cuentas": ["SoloTres"]}, ruta
+        )
         modulo_falso = types.ModuleType("utils.lector_correo")
 
         def _lector_explota(*args, **kwargs):
@@ -612,10 +710,13 @@ def run(check) -> None:  # noqa: C901 - seccionado por bloques tematicos
         previo = sys.modules.get("utils.lector_correo")
         sys.modules["utils.lector_correo"] = modulo_falso
         try:
-            query = _QueryFake("cli_codigo")
+            query = _QueryFake("cli_codigo", _MensajeFake())
             with _parches((h, "_datos_cuenta", _datos_vacios)):
                 _correr(
-                    h.cli_callback(_UpdateFake(uid=702, query=query), _ContextoFake())
+                    h.cli_callback(
+                        _UpdateFake(uid=700, query=query, chat=_chat_grupo(), username="fulano"),
+                        _ContextoFake(),
+                    )
                 )
         finally:
             if previo is None:
@@ -629,43 +730,63 @@ def run(check) -> None:  # noqa: C901 - seccionado por bloques tematicos
         )
 
     # ------------------------------------------------ FLUJO DE NOMBRE -----
-    with _store_temporal() as ruta, _env("TELEGRAM_ADMIN_IDS", None):
-        clientes_store.asignar("704", "Cliente Nombre", ["CuentaNombre"], ruta)
-        query = _QueryFake("cli_nombre")
+    with _store_temporal() as ruta, _env("TELEGRAM_CLIENTES_CHAT_ID", None), _env(
+        "TELEGRAM_ADMIN_IDS", None
+    ):
+        clientes_store.guardar({"chat_id": CHAT_GRUPO, "cuentas": ["CuentaNombre"]}, ruta)
+        query = _QueryFake("cli_nombre", _MensajeFake())
         contexto = _ContextoFake()
-        _correr(h.cli_callback(_UpdateFake(uid=704, query=query), contexto))
+        _correr(
+            h.cli_callback(
+                _UpdateFake(uid=704, query=query, chat=_chat_grupo(), username="fulano"),
+                contexto,
+            )
+        )
         check(
             "nombre: pide el nombre por texto y deja flujo pendiente",
             "Escríbeme el nombre" in query.message.edits[-1][0]
             and contexto.user_data.get("cli_espera", {}).get("tipo") == "nombre",
         )
-        update = _UpdateFake(uid=704, texto="http://spam.com")
+        update = _UpdateFake(
+            uid=704, texto="http://spam.com", chat=_chat_grupo(), username="fulano"
+        )
         _correr(h.texto_recibido(update, contexto))
         check(
             "nombre: texto invalido pide escribirlo otra vez",
             "No uses links" in update.effective_message.replies[-1][0]
             and contexto.user_data.get("cli_espera", {}).get("tipo") == "nombre",
         )
-        update = _UpdateFake(uid=704, texto="María López")
+        update = _UpdateFake(
+            uid=704, texto="María López", chat=_chat_grupo(), username="fulano"
+        )
         _correr(h.texto_recibido(update, contexto))
         texto, kwargs = update.effective_message.replies[-1]
         check(
             "nombre: pide confirmacion con el nombre y botones si/no",
             "«María López»" in texto
             and "¿Lo hago?" in texto
-            and _callbacks(kwargs["reply_markup"]) == ["nombre_si_CuentaNombre", "nombre_no_CuentaNombre"]
+            and "👤 @fulano," in texto
+            and _callbacks(kwargs["reply_markup"])
+            == ["nombre_si_CuentaNombre", "nombre_no_CuentaNombre"]
             and contexto.user_data["cli_nombre_pend"]["nombre"] == "María López",
         )
         # ❌ No.
         query = _QueryFake("nombre_no_CuentaNombre")
-        _correr(h.nombre_callback(_UpdateFake(uid=704, query=query), contexto))
+        _correr(
+            h.nombre_callback(
+                _UpdateFake(uid=704, query=query, chat=_chat_grupo(), username="fulano"),
+                contexto,
+            )
+        )
         check(
             "nombre: el boton No no cambia nada y limpia el pendiente",
             "no cambié nada" in query.message.edits[-1][0]
             and "cli_nombre_pend" not in contexto.user_data,
         )
         # ✅ Sí (con Selenium mockeado).
-        update = _UpdateFake(uid=704, texto="Nuevo Nombre")
+        update = _UpdateFake(
+            uid=704, texto="Nuevo Nombre", chat=_chat_grupo(), username="fulano"
+        )
         contexto.user_data["cli_espera"] = {"tipo": "nombre", "usuario": "CuentaNombre"}
         _correr(h.texto_recibido(update, contexto))
         llamado = {}
@@ -677,7 +798,12 @@ def run(check) -> None:  # noqa: C901 - seccionado por bloques tematicos
 
         query = _QueryFake("nombre_si_CuentaNombre")
         with _parches((h, "ejecutar_cambiar_nombre", _cambiar_ok)):
-            _correr(h.nombre_callback(_UpdateFake(uid=704, query=query), contexto))
+            _correr(
+                h.nombre_callback(
+                    _UpdateFake(uid=704, query=query, chat=_chat_grupo(), username="fulano"),
+                    contexto,
+                )
+            )
         check(
             "nombre: el boton Si ejecuta el cambio y avisa Listo",
             llamado == {"usuario": "CuentaNombre", "nombre": "Nuevo Nombre"}
@@ -692,7 +818,12 @@ def run(check) -> None:  # noqa: C901 - seccionado por bloques tematicos
             return False, "sin sesion"
 
         with _parches((h, "ejecutar_cambiar_nombre", _cambiar_falla)):
-            _correr(h.nombre_callback(_UpdateFake(uid=704, query=query), contexto))
+            _correr(
+                h.nombre_callback(
+                    _UpdateFake(uid=704, query=query, chat=_chat_grupo(), username="fulano"),
+                    contexto,
+                )
+            )
         check(
             "nombre: fallo muestra mensaje simple y reintento",
             any("No se pudo cambiar" in t for t, _ in query.message.replies)
@@ -700,25 +831,39 @@ def run(check) -> None:  # noqa: C901 - seccionado por bloques tematicos
         )
         # Boton vencido.
         query = _QueryFake("nombre_si_CuentaNombre")
-        _correr(h.nombre_callback(_UpdateFake(uid=704, query=query), contexto))
+        _correr(
+            h.nombre_callback(
+                _UpdateFake(uid=704, query=query, chat=_chat_grupo(), username="fulano"),
+                contexto,
+            )
+        )
         check(
             "nombre: confirmacion vencida avisa sin ejecutar",
             query.answers and query.answers[-1][1],
         )
 
     # -------------------------------------------------- FLUJO DE FOTO -----
-    with _store_temporal() as ruta, _env("TELEGRAM_ADMIN_IDS", None):
-        clientes_store.asignar("705", "Cliente Foto", ["CuentaFoto"], ruta)
+    with _store_temporal() as ruta, _env("TELEGRAM_CLIENTES_CHAT_ID", None), _env(
+        "TELEGRAM_ADMIN_IDS", None
+    ):
+        clientes_store.guardar({"chat_id": CHAT_GRUPO, "cuentas": ["CuentaFoto"]}, ruta)
         with tempfile.TemporaryDirectory() as temporal:
-            query = _QueryFake("cli_foto_perfil")
+            query = _QueryFake("cli_foto_perfil", _MensajeFake())
             contexto = _ContextoFake()
-            _correr(h.cli_callback(_UpdateFake(uid=705, query=query), contexto))
+            _correr(
+                h.cli_callback(
+                    _UpdateFake(uid=705, query=query, chat=_chat_grupo(), username="fulano"),
+                    contexto,
+                )
+            )
             check(
                 "foto: pide la imagen por Telegram",
                 "Envíame la foto de perfil" in query.message.edits[-1][0]
                 and contexto.user_data.get("cli_espera", {}).get("tipo") == "foto",
             )
-            update = _UpdateFake(uid=705, fotos=[_FotoFake()])
+            update = _UpdateFake(
+                uid=705, fotos=[_FotoFake()], chat=_chat_grupo(), username="fulano"
+            )
             with _parches((h, "_data_temp", lambda: temporal)):
                 _correr(h.foto_recibida(update, contexto))
             caption = update.effective_message.photos[-1][1]
@@ -733,20 +878,37 @@ def run(check) -> None:  # noqa: C901 - seccionado por bloques tematicos
             )
             # ❌ No.
             query = _QueryFake("foto_no_perfil_CuentaFoto")
-            _correr(h.foto_callback(_UpdateFake(uid=705, query=query), contexto))
+            _correr(
+                h.foto_callback(
+                    _UpdateFake(uid=705, query=query, chat=_chat_grupo(), username="fulano"),
+                    contexto,
+                )
+            )
             check(
                 "foto: el boton No limpia la pendiente",
                 "no cambié nada" in query.message.edits[-1][0]
                 and "cli_foto_pend" not in contexto.user_data,
             )
             # 🔁 Otra foto.
-            query = _QueryFake("cli_foto_perfil")
-            _correr(h.cli_callback(_UpdateFake(uid=705, query=query), contexto))
-            update = _UpdateFake(uid=705, fotos=[_FotoFake()])
+            query = _QueryFake("cli_foto_perfil", _MensajeFake())
+            _correr(
+                h.cli_callback(
+                    _UpdateFake(uid=705, query=query, chat=_chat_grupo(), username="fulano"),
+                    contexto,
+                )
+            )
+            update = _UpdateFake(
+                uid=705, fotos=[_FotoFake()], chat=_chat_grupo(), username="fulano"
+            )
             with _parches((h, "_data_temp", lambda: temporal)):
                 _correr(h.foto_recibida(update, contexto))
             query = _QueryFake("foto_otra_perfil_CuentaFoto")
-            _correr(h.foto_callback(_UpdateFake(uid=705, query=query), contexto))
+            _correr(
+                h.foto_callback(
+                    _UpdateFake(uid=705, query=query, chat=_chat_grupo(), username="fulano"),
+                    contexto,
+                )
+            )
             check(
                 "foto: el boton Otra foto vuelve a pedirla",
                 "Envíame la foto de perfil" in query.message.edits[-1][0]
@@ -769,7 +931,12 @@ def run(check) -> None:  # noqa: C901 - seccionado por bloques tematicos
 
             query = _QueryFake("foto_si_perfil_CuentaFoto")
             with _parches((h, "ejecutar_cambiar_foto", _foto_ok)):
-                _correr(h.foto_callback(_UpdateFake(uid=705, query=query), contexto))
+                _correr(
+                    h.foto_callback(
+                        _UpdateFake(uid=705, query=query, chat=_chat_grupo(), username="fulano"),
+                        contexto,
+                    )
+                )
             check(
                 "foto: el boton Si sube la foto y limpia la pendiente",
                 llamado["usuario"] == "CuentaFoto"
@@ -779,7 +946,9 @@ def run(check) -> None:  # noqa: C901 - seccionado por bloques tematicos
             )
             # Foto sin flujo pendiente.
             contexto.user_data.pop("cli_espera", None)
-            update = _UpdateFake(uid=705, fotos=[_FotoFake()])
+            update = _UpdateFake(
+                uid=705, fotos=[_FotoFake()], chat=_chat_grupo(), username="fulano"
+            )
             _correr(h.foto_recibida(update, contexto))
             check(
                 "foto: sin flujo pendiente avisa que no la esperaba",
@@ -787,25 +956,28 @@ def run(check) -> None:  # noqa: C901 - seccionado por bloques tematicos
                 in update.effective_message.replies[-1][0],
             )
 
-        # 📋 Mis cuentas muestra el @ real y el nombre actual.
-        query = _QueryFake("cli_mis_cuentas")
-        with _parches(
-            (
-                h,
-                "_datos_cuenta",
-                lambda u: {
-                    "usuario": u,
-                    "handle_actual": "HandleReal",
-                    "nombre_mostrado": "Nombre Real",
-                    "totp_secret": "",
-                },
+        # 📋 Cuentas muestra el @ y el nombre REGISTRADO (BD fake).
+        def _datos_registrado(u):
+            return {
+                "usuario": u,
+                "handle_actual": "HandleReal",
+                "nombre_mostrado": "Nombre Registrado",
+                "totp_secret": "",
+            }
+
+        query = _QueryFake("cli_cuentas", _MensajeFake())
+        with _parches((h, "_datos_cuenta", _datos_registrado)):
+            _correr(
+                h.cli_callback(
+                    _UpdateFake(uid=705, query=query, chat=_chat_grupo(), username="fulano"),
+                    _ContextoFake(),
+                )
             )
-        ):
-            _correr(h.cli_callback(_UpdateFake(uid=705, query=query), _ContextoFake()))
         check(
-            "mis cuentas: lista @handle y nombre sin credenciales",
+            "cuentas: lista las cuentas del grupo con su nombre registrado",
             "@HandleReal" in query.message.edits[-1][0]
-            and "«Nombre Real»" in query.message.edits[-1][0],
+            and "«Nombre Registrado»" in query.message.edits[-1][0]
+            and "cli_cuenta_CuentaFoto" in _callbacks(query.message.edits[-1][1]["reply_markup"]),
         )
 
         # /cancelar limpia cualquier flujo.
@@ -818,7 +990,9 @@ def run(check) -> None:  # noqa: C901 - seccionado por bloques tematicos
                 "cli_foto_pend": {"usuario": "x"},
             }
         )
-        update = _UpdateFake(uid=705, texto="/cancelar")
+        update = _UpdateFake(
+            uid=705, texto="/cancelar", chat=_chat_grupo(), username="fulano"
+        )
         _correr(h.cancelar(update, contexto))
         check(
             "/cancelar: limpia flujos y vuelve al menu",
@@ -831,88 +1005,10 @@ def run(check) -> None:  # noqa: C901 - seccionado por bloques tematicos
             )),
         )
 
-    # ---------------------------------------------------- COMANDOS ADMIN --
-    with _store_temporal() as ruta, _env("TELEGRAM_ADMIN_IDS", "555"):
-        update = _UpdateFake(uid=666, texto="/asignar 1 u")
-        contexto = _ContextoFake(args=["1", "u"])
-        _correr(h.comando_asignar(update, contexto))
-        check(
-            "admin: /asignar bloqueado para quien no es admin",
-            "solo para el equipo" in update.effective_message.replies[-1][0],
-        )
-
-        update = _UpdateFake(uid=555, texto="/asignar")
-        _correr(h.comando_asignar(update, _ContextoFake(args=[])))
-        check(
-            "admin: /asignar sin datos muestra el uso",
-            "Uso: /asignar" in update.effective_message.replies[-1][0],
-        )
-
-        contexto = _ContextoFake(args=["999", "Juan", "CuentaUno", "CuentaDos"])
-        update = _UpdateFake(uid=555, texto="/asignar")
-        with _parches((h, "_usuarios_en_bd", lambda usuarios: {"cuentauno", "cuentados"})):
-            _correr(h.comando_asignar(update, contexto))
-        info = clientes_store.cliente_de(999, ruta)
-        check(
-            "admin: /asignar <id> <nombre> <usuario...> escribe el JSON",
-            info == {"nombre": "Juan", "cuentas": ["CuentaUno", "CuentaDos"]},
-        )
-        check(
-            "admin: /asignar confirma con las cuentas agregadas",
-            "@CuentaUno" in update.effective_message.replies[-1][0]
-            and "Cuentas agregadas" in update.effective_message.replies[-1][0],
-        )
-
-        contexto = _ContextoFake(args=["1000", "nombre=Cliente_Piloto", "OtraCuenta"])
-        with _parches((h, "_usuarios_en_bd", lambda usuarios: None)):
-            _correr(h.comando_asignar(_UpdateFake(uid=555, texto="/asignar"), contexto))
-        check(
-            "admin: /asignar nombre=Cliente_Piloto (con '_' -> espacio)",
-            clientes_store.cliente_de(1000, ruta) == {
-                "nombre": "Cliente Piloto",
-                "cuentas": ["OtraCuenta"],
-            },
-        )
-
-        update = _UpdateFake(uid=555, texto="/clientes")
-        with _parches((h, "_usuarios_en_bd", lambda usuarios: None)):
-            _correr(h.comando_clientes(update, _ContextoFake()))
-        check(
-            "admin: /clientes lista clientes y sus cuentas",
-            "999" in update.effective_message.replies[-1][0]
-            and "@CuentaUno" in update.effective_message.replies[-1][0]
-            and "1000" in update.effective_message.replies[-1][0],
-        )
-
-        contexto = _ContextoFake(args=["999", "CuentaUno"])
-        _correr(h.comando_quitar(_UpdateFake(uid=555, texto="/quitar"), contexto))
-        check(
-            "admin: /quitar quita solo la cuenta pedida",
-            clientes_store.cuentas_de(999, ruta) == ["CuentaDos"],
-        )
-
-        contexto = _ContextoFake(args=["999", "CuentaDos"])
-        update = _UpdateFake(uid=555, texto="/quitar")
-        _correr(h.comando_quitar(update, contexto))
-        check(
-            "admin: /quitar avisa cuando ya no le quedan cuentas",
-            "Ya no tiene cuentas" in update.effective_message.replies[-1][0],
-        )
-
-        query = _QueryFake("cli_menu")
-        update = _UpdateFake(uid=999, query=query)
-        _correr(h.cli_callback(update, _ContextoFake()))
-        check(
-            "admin: cliente sin cuentas sigue pudiendo usar el menu",
-            query.message.edits and "cli_ayuda" in _callbacks(query.message.edits[-1][1]["reply_markup"]),
-        )
-
     # -------------------------------------------------------------- GRUPOS --
     check(
         "grupo: helpers de mencion (grupo si, privado no)",
-        h.mencion_grupo(
-            _UpdateFake(uid=1, chat=_chat_grupo(), username="fulano")
-        )
+        h.mencion_grupo(_UpdateFake(uid=1, chat=_chat_grupo(), username="fulano"))
         == "@fulano"
         and h.mencion_grupo(
             _UpdateFake(uid=1, chat=_ChatFake(1, "private"), username="fulano")
@@ -927,11 +1023,10 @@ def run(check) -> None:  # noqa: C901 - seccionado por bloques tematicos
         == "Persona",
     )
 
-    with _store_temporal() as ruta, _env("TELEGRAM_ADMIN_IDS", None):
-        clientes_store.asignar("800", "Cliente Grupo", ["CuentaGrupo"], ruta)
-        clientes_store.asignar("801", "Otro Cliente", ["CuentaOtra"], ruta)
+    with _store_temporal() as ruta, _env("TELEGRAM_CLIENTES_CHAT_ID", None), _env(
+        "TELEGRAM_ADMIN_IDS", None
+    ):
         grupo = _chat_grupo()
-
         # Bienvenida al agregar el bot (new_chat_members) + anti-duplicado.
         h._BIENVENIDAS.clear()
         update = _UpdateFake(uid=500, chat=grupo)
@@ -948,67 +1043,67 @@ def run(check) -> None:  # noqa: C901 - seccionado por bloques tematicos
             "grupo: la bienvenida NO se duplica",
             len(update.effective_message.replies) == 1,
         )
-        # Agregaron a otra persona (no al bot): silencio.
-        update_x = _UpdateFake(uid=500, chat=_chat_grupo(-1007777777777))
-        update_x.effective_message.new_chat_members = [_UsuarioFake(999999)]
-        _correr(h.bienvenida_grupo(update_x, _ContextoFake()))
+        # En OTRO grupo: silencio (no saluda).
+        update_otro = _UpdateFake(uid=500, chat=_chat_grupo(CHAT_OTRO))
+        update_otro.effective_message.new_chat_members = [_UsuarioFake(424242)]
+        _correr(h.bienvenida_grupo(update_otro, _ContextoFake()))
         check(
-            "grupo: no saluda cuando agregan a otra persona",
-            update_x.effective_message.replies == [],
+            "grupo: la bienvenida NO se manda en otros grupos",
+            update_otro.effective_message.replies == [],
         )
-        # my_chat_member: entra al chat -> saluda; sigue admin -> silencio.
-        update2 = _UpdateFake(uid=None, chat=_chat_grupo(-1009999999999))
+        # my_chat_member: entra al chat permitido -> saluda; otro -> silencio.
+        update2 = _UpdateFake(uid=None, chat=_chat_grupo(-1009999999998))
         update2.effective_message = None  # un chat_member update no trae mensaje
         update2.my_chat_member = _CambioMiembroFake("left", "member")
         ctx2 = _ContextoFake()
         _correr(h.bienvenida_miembro(update2, ctx2))
         check(
-            "grupo: my_chat_member saluda cuando el bot recien entra",
-            bool(ctx2.bot.enviados)
-            and "Escribe /start" in ctx2.bot.enviados[-1][1],
+            "grupo: my_chat_member no saluda si el chat NO es el permitido",
+            not ctx2.bot.enviados,
         )
-        update3 = _UpdateFake(uid=None, chat=_chat_grupo(-1008888888888))
+        update3 = _UpdateFake(uid=None, chat=grupo)
         update3.effective_message = None
-        update3.my_chat_member = _CambioMiembroFake("administrator", "administrator")
+        update3.my_chat_member = _CambioMiembroFake("left", "member")
         ctx3 = _ContextoFake()
+        h._BIENVENIDAS.clear()  # el grupo ya se marco con new_chat_members
         _correr(h.bienvenida_miembro(update3, ctx3))
         check(
+            "grupo: my_chat_member saluda al entrar al grupo permitido",
+            bool(ctx3.bot.enviados) and "Escribe /start" in ctx3.bot.enviados[-1][1],
+        )
+        update4 = _UpdateFake(uid=None, chat=_chat_grupo(-1008888888888))
+        update4.effective_message = None
+        update4.my_chat_member = _CambioMiembroFake("administrator", "administrator")
+        ctx4 = _ContextoFake()
+        _correr(h.bienvenida_miembro(update4, ctx4))
+        check(
             "grupo: sin cambio de entrada no hay bienvenida",
-            not ctx3.bot.enviados,
+            not ctx4.bot.enviados,
         )
         h._BIENVENIDAS.clear()
 
-        # /start de cliente registrado: menu en el grupo, con mencion.
-        update = _UpdateFake(uid=800, texto="/start", chat=grupo, username="fulano")
-        _correr(h.start(update, _ContextoFake()))
-        texto = update.effective_message.replies[0][0]
-        check(
-            "grupo: /start responde EN el grupo y con mencion",
-            "👤 @fulano," in texto and "Toca un botón" in texto,
-        )
+        # Un miembro CUALQUIERA obtiene el TOTP de una cuenta global.
+        def _datos_totp(usuario):
+            return {"totp_secret": SECRETO_FAKE, "handle_actual": "", "nombre_mostrado": ""}
 
-        # /start de no registrado: UN mensaje claro (sin spam).
-        update = _UpdateFake(uid=999, texto="/start", chat=grupo, username="desconocido")
-        _correr(h.start(update, _ContextoFake()))
+        query = _QueryFake("codigo_3ranuii97", _MensajeFake())
+        with _parches((h, "_datos_cuenta", _datos_totp)):
+            _correr(
+                h.codigo_callback(
+                    _UpdateFake(uid=999, query=query, chat=grupo, username="nuevo"),
+                    _ContextoFake(),
+                )
+            )
         check(
-            "grupo: /start de no registrado recibe UN mensaje claro con mencion",
-            len(update.effective_message.replies) == 1
-            and "No tengo tu cuenta registrada"
-            in update.effective_message.replies[0][0]
-            and "👤 @desconocido," in update.effective_message.replies[0][0],
-        )
-
-        # /cancelar en grupo.
-        update = _UpdateFake(uid=800, texto="/cancelar", chat=grupo, username="fulano")
-        _correr(h.cancelar(update, _ContextoFake()))
-        check(
-            "grupo: /cancelar responde en el grupo con mencion",
-            "cancelado" in update.effective_message.replies[-1][0]
-            and "👤 @fulano," in update.effective_message.replies[-1][0],
+            "grupo: cualquier miembro obtiene el TOTP (cuentas globales)",
+            any("Este es tu código" in t for t, _ in query.message.edits)
+            and re.search(r"\b\d{6}\b", query.message.edits[-1][0]) is not None,
         )
 
         # Texto SIN flujo de otro miembro: ignorado en silencio.
-        update = _UpdateFake(uid=801, texto="hola a todos", chat=grupo, username="otro")
+        update = _UpdateFake(
+            uid=801, texto="hola a todos", chat=grupo, username="otro"
+        )
         _correr(h.texto_recibido(update, _ContextoFake()))
         check(
             "grupo: texto de otro miembro SIN flujo se ignora (nada de spam)",
@@ -1018,7 +1113,7 @@ def run(check) -> None:  # noqa: C901 - seccionado por bloques tematicos
         # Aislamiento: el flujo de A no lo captura B (user_data por usuario).
         ctx_a = _ContextoFake()
         ctx_b = _ContextoFake()
-        ctx_a.user_data["cli_espera"] = {"tipo": "nombre", "usuario": "CuentaGrupo"}
+        ctx_a.user_data["cli_espera"] = {"tipo": "nombre", "usuario": "CuentaFoto"}
         update_b = _UpdateFake(uid=801, texto="Nombre de B", chat=grupo, username="otro")
         _correr(h.texto_recibido(update_b, ctx_b))
         check(
@@ -1027,23 +1122,14 @@ def run(check) -> None:  # noqa: C901 - seccionado por bloques tematicos
             and "cli_espera" in ctx_a.user_data,
         )
 
-        # Texto CON flujo (mensaje suelto) -> confirmacion con mencion.
-        update = _UpdateFake(uid=800, texto="María López", chat=grupo, username="fulano")
-        _correr(h.texto_recibido(update, ctx_a))
-        texto, kwargs = update.effective_message.replies[-1]
-        check(
-            "grupo: texto CON flujo se captura y pide confirmacion con mencion",
-            "«María López»" in texto
-            and "👤 @fulano," in texto
-            and _callbacks(kwargs["reply_markup"])
-            == ["nombre_si_CuentaGrupo", "nombre_no_CuentaGrupo"],
-        )
-
         # Texto como RESPUESTA al mensaje del bot -> tambien se captura.
-        ctx_a.user_data["cli_espera"] = {"tipo": "nombre", "usuario": "CuentaGrupo"}
+        clientes_store.guardar(
+            {"chat_id": CHAT_GRUPO, "cuentas": ["CuentaFoto"]}, ruta
+        )
+        ctx_a.user_data["cli_espera"] = {"tipo": "nombre", "usuario": "CuentaFoto"}
         update = _UpdateFake(uid=800, texto="Otro Nombre", chat=grupo, username="fulano")
         update.effective_message.reply_to_message = _MensajeFake(
-            "✏️ Escríbeme el nombre nuevo para @CuentaGrupo."
+            "✏️ Escríbeme el nombre nuevo para @CuentaFoto."
         )
         _correr(h.texto_recibido(update, ctx_a))
         check(
@@ -1051,50 +1137,8 @@ def run(check) -> None:  # noqa: C901 - seccionado por bloques tematicos
             any("Otro Nombre" in t for t, _ in update.effective_message.replies),
         )
 
-        # Callback valido: codigo en el grupo, con mencion.
-        def _datos_totp_grupo(usuario):
-            return {
-                "usuario": usuario,
-                "handle_actual": "",
-                "nombre_mostrado": "",
-                "totp_secret": SECRETO_FAKE,
-            }
-
-        query = _QueryFake("cli_codigo", _MensajeFake())
-        with _parches((h, "_datos_cuenta", _datos_totp_grupo)):
-            _correr(
-                h.cli_callback(
-                    _UpdateFake(uid=800, query=query, chat=grupo, username="fulano"),
-                    _ContextoFake(),
-                )
-            )
-        ultimo = query.message.edits[-1][0]
-        check(
-            "grupo: callback valido responde con mencion y el codigo",
-            "👤 @fulano," in ultimo
-            and "Este es tu código" in ultimo
-            and re.search(r"\b\d{6}\b", ultimo) is not None,
-        )
-
-        # Botones de otra persona: la cuenta se valida contra quien pulsa.
-        query = _QueryFake("cuenta_CuentaGrupo")
-        with _parches((h, "_datos_cuenta", _datos_totp_grupo)):
-            _correr(
-                h.cuenta_callback(
-                    _UpdateFake(uid=801, query=query, chat=grupo, username="otro"),
-                    _ContextoFake(),
-                )
-            )
-        check(
-            "grupo: el boton de una cuenta ajena se rechaza (valida al que pulsa)",
-            not query.message.edits
-            and bool(query.answers)
-            and query.answers[-1][1]
-            and "no está disponible" in query.answers[-1][0],
-        )
-
-        # Otro miembro no puede confirmar el cambio de nombre ajeno.
-        query = _QueryFake("nombre_si_CuentaGrupo")
+        # Boton de confirmacion ajeno: no puede confirmar el pendiente de otro.
+        query = _QueryFake("nombre_si_CuentaFoto")
         _correr(
             h.nombre_callback(
                 _UpdateFake(uid=801, query=query, chat=grupo, username="otro"),
@@ -1109,38 +1153,69 @@ def run(check) -> None:  # noqa: C901 - seccionado por bloques tematicos
             and "venció" in query.answers[-1][0],
         )
 
-        # Botones del menu: piden la foto con mencion.
-        query = _QueryFake("cli_foto_perfil", _MensajeFake())
-        _correr(
-            h.cli_callback(
-                _UpdateFake(uid=800, query=query, chat=grupo, username="fulano"),
-                _ContextoFake(),
-            )
-        )
+    # ---------------------------------------------------- ADMIN /nombre ----
+    with _store_temporal() as ruta, _env("TELEGRAM_CLIENTES_CHAT_ID", None), _env(
+        "TELEGRAM_ADMIN_IDS", "555"
+    ):
+        grupo = _chat_grupo()
+        # BD fake: la cuenta existe y se actualiza nombre_mostrado.
+        cuenta_fake = _CuentaBDFake("MiCuenta", "")
+        with _db_fake(cuenta_fake):
+            ok, error = h._actualizar_nombre_registrado("MiCuenta", "María  López")
         check(
-            "grupo: los botones del menu piden la foto con mencion",
-            "Envíame la foto de perfil" in query.message.edits[-1][0]
-            and "👤 @fulano," in query.message.edits[-1][0],
+            "admin /nombre: actualiza nombre_mostrado en la BD (sesion fake)",
+            ok and error == "" and cuenta_fake.nombre_mostrado == "María López",
         )
-
-        # Vista previa de la foto en el grupo.
-        with tempfile.TemporaryDirectory() as temporal:
-            ctx = _ContextoFake()
-            ctx.user_data["cli_espera"] = {
-                "tipo": "foto",
-                "foto_tipo": "perfil",
-                "usuario": "CuentaGrupo",
-            }
-            update = _UpdateFake(
-                uid=800, fotos=[_FotoFake()], chat=grupo, username="fulano"
-            )
-            with _parches((h, "_data_temp", lambda: temporal)):
-                _correr(h.foto_recibida(update, ctx))
-            caption = update.effective_message.photos[-1][1]
-            check(
-                "grupo: la vista previa de la foto lleva mencion",
-                "👤 @fulano," in caption and "¿Uso esta foto" in caption,
-            )
+        with _db_fake(None):
+            ok, error = h._actualizar_nombre_registrado("NoExiste", "X")
+        check(
+            "admin /nombre: cuenta no encontrada devuelve error claro",
+            not ok and "No encontré la cuenta" in error,
+        )
+        # Handler completo con la BD fake.
+        update = _UpdateFake(uid=555, texto="/nombre", chat=grupo, username="jefe")
+        with _db_fake(cuenta_fake):
+            _correr(h.comando_nombre(update, _ContextoFake(args=["MiCuenta", "Nuevo"])))
+        check(
+            "admin /nombre: confirma el cambio con el nombre completo",
+            "Nuevo" in cuenta_fake.nombre_mostrado
+            and "ahora es «Nuevo»" in update.effective_message.replies[-1][0],
+        )
+        # Sin args -> uso.
+        update = _UpdateFake(uid=555, texto="/nombre", chat=grupo, username="jefe")
+        _correr(h.comando_nombre(update, _ContextoFake(args=[])))
+        check(
+            "admin /nombre: sin args muestra el uso",
+            "Uso: /nombre" in update.effective_message.replies[-1][0],
+        )
+        # No-admin -> rechazado.
+        update = _UpdateFake(uid=666, texto="/nombre", chat=grupo, username="curioso")
+        _correr(h.comando_nombre(update, _ContextoFake(args=["MiCuenta", "Nuevo"])))
+        check(
+            "admin /nombre: no-admin recibe 'solo para el equipo'",
+            "solo para el equipo" in update.effective_message.replies[-1][0],
+        )
+        # Privado -> aviso corto (guard por chat antes del admin).
+        update = _UpdateFake(uid=555, texto="/nombre")
+        _correr(h.comando_nombre(update, _ContextoFake(args=["MiCuenta", "Nuevo"])))
+        check(
+            "admin /nombre: en privado responde el aviso corto",
+            h.TEXTO_SOLO_GRUPO in update.effective_message.replies[-1][0],
+        )
+        # Otro grupo -> silencio.
+        update = _UpdateFake(uid=555, texto="/nombre", chat=_chat_grupo(CHAT_OTRO))
+        _correr(h.comando_nombre(update, _ContextoFake(args=["MiCuenta", "Nuevo"])))
+        check(
+            "admin /nombre: en otro grupo se ignora en silencio",
+            update.effective_message.replies == [],
+        )
+        # Los comandos viejos por cliente YA NO existen.
+        check(
+            "admin: /asignar, /quitar y /clientes se eliminaron",
+            not hasattr(h, "comando_asignar")
+            and not hasattr(h, "comando_quitar")
+            and not hasattr(h, "comando_clientes"),
+        )
 
     # ------------------------------------------------------- ENTRYPOINT ---
     fuente = (RAIZ / "bot_clientes" / "main.py").read_text(encoding="utf-8")
@@ -1156,8 +1231,9 @@ def run(check) -> None:  # noqa: C901 - seccionado por bloques tematicos
                     if kw.arg == "pattern":
                         patrones.add(ast.literal_eval(kw.value))
     check(
-        "main: registra los comandos del cliente y de admin",
-        {"start", "ayuda", "cancelar", "clientes", "asignar", "quitar"}.issubset(comandos),
+        "main: registra los comandos del cliente y el /nombre de admin",
+        {"start", "ayuda", "cancelar", "nombre"}.issubset(comandos)
+        and not ({"asignar", "quitar", "clientes"} & comandos),
     )
     check(
         "main: registra los 5 prefijos de callbacks del bot de clientes",
@@ -1197,9 +1273,11 @@ def run(check) -> None:  # noqa: C901 - seccionado por bloques tematicos
     )
     check(
         "main: importar no arranca nada y `construir_app` arma la app",
-        "'if __name__' in fuente"
-        and fuente.count("main()") >= 1
-        and _app_ok(),
+        (
+            "'if __name__' in fuente"
+            " and fuente.count('main()') >= 1"
+            " and _app_ok()"
+        ),
     )
     check(
         "main: obtener_token lee TELEGRAM_CLIENTES_BOT_TOKEN del entorno",
@@ -1288,7 +1366,7 @@ def _app_ok() -> bool:
         return False
     handlers = [handler for grupo in app.handlers.values() for handler in grupo]
     return (
-        sum(isinstance(x, CommandHandler) for x in handlers) == 7
+        sum(isinstance(x, CommandHandler) for x in handlers) == 5
         and sum(isinstance(x, CallbackQueryHandler) for x in handlers) == 5
         # texto + fotos + new_chat_members
         and sum(isinstance(x, MessageHandler) for x in handlers) == 3

@@ -1,15 +1,17 @@
 """Entry point del bot de CLIENTES (PTB v21, async).
 
 Bot INDEPENDIENTE del bot interno (`bot/`): token propio
-(`TELEGRAM_CLIENTES_BOT_TOKEN`, creado con @BotFather) y su propio registro de
-clientes (`data/clientes_bot.json`).
+(`TELEGRAM_CLIENTES_BOT_TOKEN`, creado con @BotFather). Funciona SOLO en el
+grupo de clientes (`TELEGRAM_CLIENTES_CHAT_ID`, por defecto -1005538610567) y
+las cuentas son GLOBALES del grupo (`data/clientes_bot.json`).
 
 Comandos registrados:
   Cliente: /start /ayuda /help /cancelar
-  Admin:   /clientes /asignar /quitar   (solo TELEGRAM_ADMIN_IDS)
+  Admin:   /nombre <usuario> <Nuevo Nombre>   (solo TELEGRAM_ADMIN_IDS)
 Callbacks: cli_* (menu), cuenta_* (selector), codigo_*, nombre_*, foto_*.
 Mensajes: texto (solo con flujo pendiente) y fotos (filters.PHOTO).
-Grupos: bienvenida al agregar el bot (new_chat_members + my_chat_member).
+Grupos: bienvenida al agregar el bot (new_chat_members + my_chat_member);
+en privado solo un aviso corto y en otros grupos, silencio.
 
 Arranque:
     python -m bot_clientes.main
@@ -112,10 +114,8 @@ def construir_app(token: str) -> Application:
     app.add_handler(CommandHandler("help", handlers.ayuda))
     app.add_handler(CommandHandler("cancelar", handlers.cancelar))
 
-    # Comandos de admin.
-    app.add_handler(CommandHandler("clientes", handlers.comando_clientes))
-    app.add_handler(CommandHandler("asignar", handlers.comando_asignar))
-    app.add_handler(CommandHandler("quitar", handlers.comando_quitar))
+    # Comando de admin (nombre REGISTRADO en el bot, sin Chrome).
+    app.add_handler(CommandHandler("nombre", handlers.comando_nombre))
 
     # Callbacks con prefijos propios (ver docstring de bot_clientes/handlers.py).
     app.add_handler(CallbackQueryHandler(handlers.cli_callback, pattern=r"^cli_"))
@@ -168,7 +168,7 @@ def main() -> None:
     app = construir_app(token)
     log.info(
         "Bot de clientes iniciado (PTB v21, polling). "
-        "Cliente: /start /ayuda /cancelar | Admin: /clientes /asignar /quitar"
+        "Cliente: /start /ayuda /cancelar | Admin: /nombre"
     )
     app.run_polling(
         allowed_updates=["message", "callback_query", "my_chat_member"]

@@ -41,42 +41,49 @@ docker-compose up -d
 
 ## Bot para clientes (`bot_clientes/`)
 
-Bot de Telegram **independiente** del bot interno, pensado para clientes no
-técnicos que reciben cuentas de X. Todo se hace con **botones** (solo
-`/start`, `/ayuda` y `/cancelar`):
+Bot de Telegram **independiente** del bot interno. Funciona **solo en el grupo
+de clientes** (`TELEGRAM_CLIENTES_CHAT_ID`, por defecto `-1005538610567`): en
+privado responde un aviso corto y en otros grupos no responde nada. Las
+**cuentas son globales del grupo** (cualquier miembro puede elegirlas) y todo
+se hace con **botones** (solo `/start`, `/ayuda` y `/cancelar`):
 
 - 🔑 **Código de verificación (TOTP)**: se genera al momento desde la semilla
   2FA guardada en `Cuenta.totp_secret` (`pyotp`). El bot **ya no revisa
   correos**: el correo lo tienen los propios clientes. Si una cuenta no tiene
   semilla, el bot pide ayuda a quien le entregó la cuenta.
-- ✏️ **Cambiar el nombre** de la cuenta.
+- ✏️ **Cambiar el nombre** de la cuenta EN X (con Selenium).
 - 📸 **Foto de perfil** y 🖼️ **portada** (el cliente envía la imagen por
   Telegram y el bot la sube con Selenium).
+- 📋 **Cuentas**: lista las cuentas del grupo y su nombre **registrado** en el
+  bot (desde la BD; sin credenciales).
 
 ```bash
 python -m bot_clientes.main
 ```
 
-Requisitos y registro:
+Requisitos y configuración:
 
 1. `TELEGRAM_CLIENTES_BOT_TOKEN` en `.env` (crear un bot nuevo con @BotFather,
    distinto al bot interno).
-2. Los clientes se registran en `data/clientes_bot.json` **con estos comandos
-   de admin** (los IDs admin salen de `TELEGRAM_ADMIN_IDS`):
-   - `/clientes` — lista los clientes y sus cuentas.
-   - `/asignar <telegram_id> [nombre] <usuario1> <usuario2> ...` — agrega
-     cuentas a un cliente (el archivo se crea solo si no existe).
-   - `/quitar <telegram_id> <usuario1> ...` — quita cuentas a un cliente.
-3. El archivo no guarda credenciales (solo nombre, Telegram ID y usuarios) y
-   está en `.gitignore`.
+2. `TELEGRAM_CLIENTES_CHAT_ID` con el chat_id del grupo (por defecto
+   `-1005538610567`; también se puede fijar en el `chat_id` de
+   `data/clientes_bot.json`).
+3. `data/clientes_bot.json` guarda las cuentas globales del grupo:
+   `{"chat_id": -1005538610567, "cuentas": ["usuario1", ...]}`. Se siembra solo
+   con las 15 cuentas si no existe y migra automáticamente el formato viejo
+   (`{"clientes": {...}}`). No guarda credenciales y está en `.gitignore`.
+4. **Admin** (`TELEGRAM_ADMIN_IDS`): `/nombre <usuario> <Nuevo Nombre>`
+   actualiza el **nombre registrado en el bot** (escribe `Cuenta.nombre_mostrado`
+   en la BD, sin Chrome). Para cambiar el nombre **EN X** se usa el botón
+   ✏️ Cambiar nombre de los clientes.
 
 ### Uso en GRUPO (bot @vrf2fa_bot)
 
-El bot está pensado para usarse dentro de un grupo con los clientes: cada
-miembro pulsa SUS botones y responde a los mensajes del bot. El bot contesta en
-el grupo anteponiendo `👤 @fulano, ...` para que se sepa a quién responde
-(cada usuario tiene su propio estado: los flujos nunca se mezclan) y saluda una
-sola vez al agregarlo al grupo (`new_chat_members`/`my_chat_member`).
+El bot está pensado para usarse dentro del grupo de clientes: cada miembro
+pulsa SUS botones y responde a los mensajes del bot. El bot contesta en el
+grupo anteponiendo `👤 @fulano, ...` para que se sepa a quién responde (cada
+usuario tiene su propio estado: los flujos nunca se mezclan) y saluda una sola
+vez al agregarlo al grupo (`new_chat_members`/`my_chat_member`).
 
 ⚠️ **Group Privacy en @BotFather**: para que los clientes puedan ESCRIBIR el
 nombre nuevo o ENVIAR la foto directamente en el grupo (sin responder al

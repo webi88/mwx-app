@@ -3,7 +3,7 @@
 CONVENCION DE CALLBACKS (cada prefijo tiene su manejador en handlers.py):
   cli_*          Menu y acciones -> cli_callback
     - cli_menu | cli_codigo | cli_nombre | cli_foto_perfil | cli_foto_portada
-    - cli_mis_cuentas | cli_ayuda | cli_cancelar | cli_cuenta_<usuario>
+    - cli_cuentas | cli_ayuda | cli_cancelar | cli_cuenta_<usuario>
   cuenta_*       Selector de cuenta -> cuenta_callback
   codigo_*       Pedir otro codigo -> codigo_callback
   nombre_*       Elegir cuenta / confirmar -> nombre_callback
@@ -33,7 +33,7 @@ def menu_principal() -> InlineKeyboardMarkup:
                     "🖼️ Cambiar la portada", callback_data="cli_foto_portada"
                 )
             ],
-            [InlineKeyboardButton("📋 Mis cuentas", callback_data="cli_mis_cuentas")],
+            [InlineKeyboardButton("📋 Cuentas", callback_data="cli_cuentas")],
             [InlineKeyboardButton("❓ Ayuda", callback_data="cli_ayuda")],
         ]
     )
@@ -55,7 +55,7 @@ def teclado_cuentas(usuarios) -> InlineKeyboardMarkup:
 
 
 def teclado_acciones_cuenta(usuario: str) -> InlineKeyboardMarkup:
-    """Acciones disponibles para UNA cuenta (desde 📋 Mis cuentas)."""
+    """Acciones disponibles para UNA cuenta (desde 📋 Cuentas)."""
     usuario = str(usuario or "").strip()
     return InlineKeyboardMarkup(
         [
@@ -84,8 +84,8 @@ def teclado_acciones_cuenta(usuario: str) -> InlineKeyboardMarkup:
     )
 
 
-def teclado_mis_cuentas(usuarios) -> InlineKeyboardMarkup:
-    """Lista de cuentas tocables (desde 📋 Mis cuentas)."""
+def teclado_lista_cuentas(usuarios) -> InlineKeyboardMarkup:
+    """Lista de cuentas tocables (desde 📋 Cuentas)."""
     filas = [
         [
             InlineKeyboardButton(
