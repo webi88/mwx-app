@@ -1365,6 +1365,12 @@ class MotorActivacion:
         # Cuentas Tier 3 DISTINTAS con al menos una accion EXITOSA en la fase 2
         # de la curva (`tier3_liberadas` del resumen).
         self._tier3_liberadas_usr: set = set()
+        # Fase 1 ANTICIPADA: True si la curva salto a la fase 2 antes del
+        # reloj porque NINGUN Tier 1 era utilizable (sin cupo horario/diario o
+        # con la sesion caida/omitida). `_curva_fase2_motivo` explica el porque
+        # (se agrega al resumen como `curva_fase2_anticipada`/`motivo`).
+        self._curva_fase2_anticipada = False
+        self._curva_fase2_motivo = ""
         # PARO TOTAL: evento de cancelacion de la campana en curso. Lo asigna
         # cada campana con el kwarg `cancelar` (solo si parece un Event real)
         # o `solicitar_paro()` (fallback interno ya seteado). `None` = sin
@@ -1979,6 +1985,17 @@ class MotorActivacion:
         resumen.setdefault("reserva_disponible", 0)
         resumen.setdefault("curva_aceleracion", False)
         resumen.setdefault("curva_fase1_min", 0)
+        # Fase 1 anticipada: la curva salto a la fase 2 antes del reloj porque
+        # NINGUN Tier 1 era utilizable (sin cupo o con sesion caida); el motivo
+        # explica la razon en Reportes/logs.
+        resumen.setdefault(
+            "curva_fase2_anticipada", bool(self._curva_fase2_anticipada)
+        )
+        resumen.setdefault("curva_fase2_motivo", str(self._curva_fase2_motivo or ""))
+        # PAUSA para activacion: cuentas excluidas de TODOS los flujos (siguen
+        # en mantenimiento). Claves SIEMPRE presentes aunque no haya pausadas.
+        resumen.setdefault("pausadas_omitidas", 0)
+        resumen.setdefault("pausadas_usuarios", [])
         resumen.setdefault("omitidas_por_cancelacion", 0)
         resumen.setdefault("fase_actual", int(self.progreso.get("fase_actual", 1) or 1))
         try:
@@ -2063,6 +2080,8 @@ class MotorActivacion:
             self._curva_activa = False
             self._curva_fase1_seg = 0.0
             self._curva_fase2_t0 = None
+            self._curva_fase2_anticipada = False
+            self._curva_fase2_motivo = ""
             with self._lock:
                 self._urls_fase1 = []
                 self._cascada_usadas = set()
@@ -2083,6 +2102,134 @@ class MotorActivacion:
                     self._tier_de[usuario] = _tier_cuenta(cuenta)
             except Exception:
                 pass
+
+    @staticmethod
+    def _separar_pausadas(cuentas) -> tuple:
+        """(elegibles, usuarios_pausados) para activacion masiva.
+
+        Import LOCAL de `core.pausas` (evita ciclos). Las cuentas con
+        `pausada_activacion` quedan FUERA de TODO flujo de activacion; el
+        calentamiento/mantenimiento NO pasa por aqui (siguen vivas). Nunca
+        lanza: ante el minimo fallo devuelve la lista original sin pausadas
+        reportadas.
+        """
+        try:
+            from core.pausas import filtrar_para_activacion, pausadas_usuarios
+
+            lista = list(cuentas or [])
+            return filtrar_para_activacion(lista), pausadas_usuarios(lista)
+        except Exception:
+            try:
+                return list(cuentas or []), []
+            except Exception:
+                return [], []
+
+    @staticmethod
+    def _anotar_pausadas(resumen, pausadas) -> None:
+        """Vuelca `pausadas_omitidas`/`pausadas_usuarios` y loguea UNA vez.
+
+        `pausadas_usuarios` sale recortado a 20 (el contrato de los resumenes
+        del motor no crece sin limite); `pausadas_omitidas` lleva el total
+        real. El INFO (una vez por campana) deja claro que siguen en
+        mantenimiento. Nunca lanza.
+        """
+        usuarios: list = []
+        try:
+            for usuario in (pausadas or []):
+                texto = str(usuario or "").strip()
+                if texto and texto not in usuarios:
+                    usuarios.append(texto)
+        except Exception:
+            usuarios = []
+        if isinstance(resumen, dict):
+            try:
+                resumen["pausadas_omitidas"] = len(usuarios)
+                resumen["pausadas_usuarios"] = usuarios[:20]
+            except Exception:
+                pass
+        if usuarios:
+            listado = ", ".join(f"@{u}" for u in usuarios[:5])
+            if len(usuarios) > 5:
+                listado += f", +{len(usuarios) - 5} mas"
+            logger.info(
+                f"Activacion: {len(usuarios)} cuenta(s) pausada(s) para "
+                f"activación quedaron fuera (siguen en mantenimiento): "
+                f"{listado}"
+            )
+
+    def _tier_registrado(self, usuario) -> str:
+        """Tier de una cuenta en `_tier_de`, tolerante a espacios/mayusculas.
+
+        `_registrar_tiers` guarda las claves sin espacios, pero el resto del
+        motor consulta con el usuario tal cual viene de la BD/UI. Si la clave
+        exacta no existe se prueban la version recortada y una comparacion
+        case-insensitive SIN espacios; sin coincidencia devuelve "" (sin tier).
+        Nunca lanza.
+        """
+        try:
+            clave = str(usuario or "")
+            if clave in self._tier_de:
+                return str(self._tier_de.get(clave) or "")
+            recorte = clave.strip()
+            if recorte in self._tier_de:
+                return str(self._tier_de.get(recorte) or "")
+            if not recorte:
+                return ""
+            objetivo = recorte.casefold()
+            for registrado, tier in self._tier_de.items():
+                try:
+                    if str(registrado).strip().casefold() == objetivo:
+                        return str(tier or "")
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        return ""
+
+    def _activar_fase2_anticipada(self, motivo="", sin_cupo=None,
+                                  sin_sesion=None) -> bool:
+        """Termina la fase 1 de la curva ANTES de tiempo (nunca lanza).
+
+        La llama el GATE cuando su fase 1 se quedo SIN ningun Tier 1
+        utilizable (todos sin cupo horario/diario o con la sesion caida): en
+        vez de dejar la campana detenida hasta agotar `curva_fase1_min`, se
+        libera la fase 2 (Tier 2/Tier 3 y sin tier) de inmediato. Marca
+        `_curva_fase2_anticipada`/`_curva_fase2_motivo` (van al resumen) y
+        loguea un WARNING con el detalle para que la razon sea visible.
+
+        Devuelve True solo si la transicion ocurrio en ESTA llamada.
+        """
+        try:
+            if not self._curva_activa or self._en_fase2():
+                return False
+            self._curva_fase2_t0 = time.monotonic() - 1.0
+            self._curva_fase2_anticipada = True
+            self._curva_fase2_motivo = str(motivo or "")
+            try:
+                with self._lock:
+                    self.progreso["fase_actual"] = 2
+            except Exception:
+                pass
+            detalle = ""
+            try:
+                usuarios = list(sin_cupo or []) + list(sin_sesion or [])
+                if usuarios:
+                    detalle = " (" + ", ".join(
+                        f"@{u}" for u in usuarios[:5]
+                    )
+                    if len(usuarios) > 5:
+                        detalle += f", +{len(usuarios) - 5} mas"
+                    detalle += ")"
+            except Exception:
+                detalle = ""
+            logger.warning(
+                "Activacion (curva): fase 1 sin cuentas Tier 1 utilizables "
+                f"[{self._curva_fase2_motivo or 'sin Tier 1'}]; se ANTICIPA "
+                f"la fase 2 para no detener la campana{detalle}"
+            )
+            return True
+        except Exception:
+            return False
 
     def _configurar_curva(self, cuentas, curva_aceleracion, curva_fase1_min,
                           duracion_min, resumen) -> tuple:
@@ -2156,7 +2303,7 @@ class MotorActivacion:
         )
         return True, fase1
 
-    def _elegibilidad_curva(self, activa: bool):
+    def _elegibilidad_curva(self, activa: bool, viable=None, procesables=None):
         """Callable `usuario -> bool` del GATE de fase (None si no hay curva).
 
         Se evalua al INICIAR CADA RONDA: en fase 1 solo cuentas Tier 1; al
@@ -2167,9 +2314,90 @@ class MotorActivacion:
         (no entran al subconjunto de la ronda: no se les generan textos ni
         abren navegador). En fase 2 se liberan, pero el blindaje de roles sigue
         vigente: una cuenta Tier 3 solo podra ejecutar "rt"/"like" en cascada.
+
+        `viable(usuario) -> bool` (opcional, lo pasan las campanas): dice si
+        la cuenta TIENE CUPO para actuar (cuotas horarias/diarias). En fase 1
+        las cuentas sin cupo NO son elegibles: antes se tomaban en cada ronda y
+        devolvian "cuota agotada" una y otra vez (rondas basura) mientras el
+        usuario solo veia que los Tier 1 "se detenian". Ademas, si NINGUN Tier 1
+        DE LA CAMPANA es utilizable (todos sin cupo o con la sesion caida), el
+        callable expone `avanzar_si_bloqueada()`: en vez de dejar la campana
+        detenida hasta agotar `curva_fase1_min`, se ANTICIPA la fase 2 (Tier 2/
+        Tier 3 y sin tier) y se registra el motivo en el resumen/log.
+
+        `procesables` (opcional): lista MUTABLE de Cuentas de la campana (la
+        misma que consume `_bucle_rondas` y que `_rotar_agotadas_dia` actualiza
+        al sustituir cuentas). El diagnostico de Tier 1 utilizables SOLO mira
+        esa lista: una reserva registrada en `_tier_de` pero todavia FUERA de
+        la campana no cuenta como Tier 1 disponible.
         """
         if not activa:
             return None
+
+        def _tier1_estado() -> tuple:
+            """(hay_utilizable, sin_cupo, sin_sesion) de los Tier 1. Nunca lanza."""
+            sin_cupo, sin_sesion = [], []
+            hay = False
+            try:
+                if procesables is not None:
+                    usuarios = []
+                    for cuenta in list(procesables):
+                        try:
+                            usuario = str(
+                                getattr(cuenta, "usuario", "") or ""
+                            )
+                        except Exception:
+                            usuario = ""
+                        if usuario:
+                            usuarios.append(usuario)
+                    if not usuarios:
+                        return False, [], []
+                else:
+                    with self._lock:
+                        usuarios = list(self._tier_de.keys())
+            except Exception:
+                return True, [], []
+            for usuario in usuarios:
+                try:
+                    if self._tier_registrado(usuario) != "tier1":
+                        continue
+                    if self._sesion_caida(usuario):
+                        sin_sesion.append(usuario)
+                        continue
+                    if viable is not None:
+                        try:
+                            con_cupo = bool(viable(usuario))
+                        except Exception:
+                            con_cupo = True
+                        if not con_cupo:
+                            sin_cupo.append(usuario)
+                            continue
+                    hay = True
+                except Exception:
+                    hay = True
+            return hay, sin_cupo, sin_sesion
+
+        def _avanzar_si_bloqueada() -> bool:
+            """Anticipa la fase 2 si la fase 1 se quedo sin Tier 1 utilizables."""
+            try:
+                if self._en_fase2():
+                    return False
+                hay, sin_cupo, sin_sesion = _tier1_estado()
+                if hay:
+                    return False
+                motivos = []
+                if sin_cupo:
+                    motivos.append(f"{len(sin_cupo)} Tier 1 sin cupo")
+                if sin_sesion:
+                    motivos.append(
+                        f"{len(sin_sesion)} Tier 1 con sesion caida u omitida"
+                    )
+                motivo = "; ".join(motivos) or "sin Tier 1 en la campana"
+                return self._activar_fase2_anticipada(
+                    motivo, sin_cupo, sin_sesion
+                )
+            except Exception:
+                return False
 
         def _elegible(usuario) -> bool:
             try:
@@ -2188,11 +2416,36 @@ class MotorActivacion:
             if fase == 1:
                 # Tier 2 y Tier 3 no son elegibles en fase 1 (ni textos ni
                 # navegador): el gate de `_bucle_rondas` los descarta antes de
-                # llamar a `generar_textos`.
-                return self._tier_de.get(str(usuario)) == "tier1"
+                # llamar a `generar_textos`. Los Tier 1 SOLO son elegibles si
+                # tienen cupo: los que "descansan" no se despachan en balde y
+                # se avisa (throttle 1/min/cuenta) para que la razon se vea.
+                if self._tier_registrado(usuario) != "tier1":
+                    return False
+                if viable is not None and not self._curva_con_cupo(
+                    viable, usuario
+                ):
+                    try:
+                        self._avisar_cuota_agotada(usuario)
+                    except Exception:
+                        pass
+                    return False
+                return True
             return True
 
+        try:
+            _elegible.avanzar_si_bloqueada = _avanzar_si_bloqueada
+        except Exception:
+            pass
         return _elegible
+
+    @staticmethod
+    def _curva_con_cupo(viable, usuario) -> bool:
+        """`viable(usuario)` tolerante: ante cualquier fallo, True (nunca lanza)."""
+        try:
+            return bool(viable(usuario))
+        except Exception:
+            return True
+
 
     def _en_fase2(self) -> bool:
         """True si la curva esta activa y ya empezo la fase 2. Nunca lanza."""
@@ -2234,7 +2487,7 @@ class MotorActivacion:
             rol_norm = "hashtags" if str(rol or "") == "post" else str(rol or "")
             if rol_norm != "hashtags":
                 return
-            if self._tier_de.get(str(usuario or "")) != "tier1":
+            if self._tier_registrado(usuario) != "tier1":
                 return
             url = str(url or "").strip()
             if not url:
@@ -2265,14 +2518,18 @@ class MotorActivacion:
             pass
 
     def _preparar_reservas(self, reserva_usuarios, principales, secciones=None,
-                           solo_con_registro: bool = False) -> list:
+                           solo_con_registro: bool = False,
+                           pausadas_out=None) -> list:
         """Carga las cuentas de RESPALDO de la campana (sin abrir navegador).
 
         Acepta usuarios (str, con o sin '@') o Cuentas ya construidas. Filtra
-        activas y con sesion (helpers existentes), quita duplicadas y las que
-        ya estan en la campana, respeta `solo_con_registro` y el tope
-        `RESERVA_MAX_CUENTAS` (env, default 50). `None`/vacio = comportamiento
-        actual exacto (sin reservas). Nunca lanza.
+        activas, con sesion (helpers existentes) y NO pausadas para activacion
+        (una reserva pausada jamas entra a la campana); quita duplicadas y las
+        que ya estan en la campana, respeta `solo_con_registro` y el tope
+        `RESERVA_MAX_CUENTAS` (env, default 50). `pausadas_out` (lista
+        mutable opcional) recibe los usuarios de las reservas pausadas para
+        reportarlos en el resumen. `None`/vacio = comportamiento actual
+        exacto (sin reservas). Nunca lanza.
         """
         try:
             if not reserva_usuarios:
@@ -2326,6 +2583,14 @@ class MotorActivacion:
                 continue
             vistas.add(clave)
             reservas.append(cuenta)
+        # PAUSA: una cuenta pausada para activacion JAMAS es reserva (sigue
+        # disponible para mantenimiento); se reporta por `pausadas_out`.
+        reservas, pausadas = self._separar_pausadas(reservas)
+        if pausadas and pausadas_out is not None:
+            try:
+                pausadas_out.extend(pausadas)
+            except Exception:
+                pass
         con_sesion, _sin = _partir_por_sesion(reservas)
         if solo_con_registro:
             con_sesion, _sin_reg = _partir_por_registro(con_sesion)
@@ -3547,6 +3812,36 @@ class MotorActivacion:
                     if permitida:
                         filtrados.append(candidata)
                 elegibles = filtrados
+                if not elegibles:
+                    # El gate puede LIBERAR una fase cuando no deja elegibles
+                    # (curva de aceleracion: fase 1 sin Tier 1 utilizables ->
+                    # fase 2 anticipada). Se le da UNA oportunidad y, si la
+                    # fase cambio, se recalcula el subconjunto bajo la nueva
+                    # fase en vez de dejar la campana detenida.
+                    avanzar = getattr(
+                        elegibilidad, "avanzar_si_bloqueada", None
+                    )
+                    if callable(avanzar):
+                        try:
+                            liberada = bool(avanzar())
+                        except Exception:
+                            liberada = False
+                        if liberada:
+                            elegibles = [
+                                c for c in procesables
+                                if not self._sesion_caida(c.usuario)
+                            ]
+                            filtrados = []
+                            for candidata in elegibles:
+                                try:
+                                    permitida = bool(
+                                        elegibilidad(candidata.usuario)
+                                    )
+                                except Exception:
+                                    permitida = True
+                                if permitida:
+                                    filtrados.append(candidata)
+                            elegibles = filtrados
             if not elegibles:
                 return False
             # Paro total: cortar ANTES de incrementar la ronda y de generar
@@ -4660,6 +4955,10 @@ class MotorActivacion:
         cuentas = self._obtener_cuentas(
             cantidad_cuentas, tags, grupo, secciones
         )
+        # PAUSA para activacion: las cuentas pausadas se excluyen ANTES de
+        # cualquier particion (no son fallidas, no abren navegador y no
+        # aparecen en sin_sesion/sin_rol); siguen en mantenimiento.
+        cuentas, pausadas_omitidas = self._separar_pausadas(cuentas)
 
         sin_registro = []
         if solo_con_registro:
@@ -4676,7 +4975,7 @@ class MotorActivacion:
 
         if not cuentas:
             logger.warning("No hay cuentas activas de twitter para la activacion")
-            return self._claves_cuotas({
+            resumen_vacio = {
                 "exitosas": 0, "fallidas": 0, "detalles": [], "total": 0,
                 "sin_sesion": 0, "sin_sesion_usuarios": [],
                 "sugerencia_sesion": "",
@@ -4685,7 +4984,9 @@ class MotorActivacion:
                 "sugerencia_registro": sugerencia_registro,
                 "rondas": 0 if repetir else 1,
                 "omitidas_por_cuota": 0,
-            })
+            }
+            self._anotar_pausadas(resumen_vacio, pausadas_omitidas)
+            return self._claves_cuotas(resumen_vacio)
 
         con_sesion, sin_sesion = _partir_por_sesion(cuentas)
         # TIER: Cita masiva hace quote-RT (rol "cita") para TODAS las cuentas
@@ -4769,6 +5070,7 @@ class MotorActivacion:
         reservas = self._preparar_reservas(
             reserva_usuarios, con_sesion, secciones=secciones,
             solo_con_registro=solo_con_registro,
+            pausadas_out=pausadas_omitidas,
         )
         # Una reserva Tier 3 JAMAS entra a Cita masiva (rol "cita" prohibido:
         # solo RT/likes): se filtra antes de registrar tiers/cuotas/curva.
@@ -4830,6 +5132,20 @@ class MotorActivacion:
             }
 
             usados: dict = {}
+
+            def _viable_curva(usuario):
+                """True si la cuenta Tier 1 tiene cupo de CITA (rol unico de esta
+                campana). Lo consume el GATE de la curva: en fase 1 las cuentas
+                sin cupo no se despachan y, si NINGUN Tier 1 tiene cupo, la
+                fase 2 se anticipa. Sin cuotas siempre True. Nunca lanza.
+                """
+                try:
+                    cuotas = self._cuotas
+                    if cuotas is None:
+                        return True
+                    return bool(cuotas.rol_permitido(usuario, "cita"))
+                except Exception:
+                    return True
 
             def _generar_textos_ronda(_ronda, usuarios=None):
                 if usuarios is None:
@@ -4925,7 +5241,9 @@ class MotorActivacion:
                 _reportar_ronda,
                 porcentaje_min_ronda=porcentaje_min_ronda,
                 porcentaje_max_ronda=porcentaje_max_ronda,
-                elegibilidad=self._elegibilidad_curva(curva_activa),
+                elegibilidad=self._elegibilidad_curva(
+                    curva_activa, _viable_curva, con_sesion
+                ),
                 sustituir=(
                     lambda: self._rotar_agotadas_dia(
                         con_sesion, reservas, {}, True, resumen
@@ -4945,6 +5263,7 @@ class MotorActivacion:
                 f"({resumen['sin_sesion']} sin sesión, "
                 f"{resumen['sin_registro']} sin registro)"
             )
+            self._anotar_pausadas(resumen, pausadas_omitidas)
             return self._claves_cuotas(resumen)
 
         # --- Una sola pasada (con curva: DOS etapas secuenciales) ---------- #
@@ -5125,6 +5444,7 @@ class MotorActivacion:
             f"({resumen['sin_sesion']} sin sesión, "
             f"{resumen['sin_registro']} sin registro)"
         )
+        self._anotar_pausadas(resumen, pausadas_omitidas)
         return self._claves_cuotas(resumen)
 
     def ejecutar_por_roles(
@@ -5369,6 +5689,9 @@ class MotorActivacion:
         cuentas = self._obtener_cuentas_por_rol(
             usuarios, None if roles_aleatorios else solo_roles, secciones
         )
+        # PAUSA para activacion: se excluyen ANTES de agrupar por rol/sesion
+        # (ni sin_rol, ni sin_sesion, ni fallidas; siguen en mantenimiento).
+        cuentas, pausadas_omitidas = self._separar_pausadas(cuentas)
 
         sin_registro = []
         if solo_con_registro:
@@ -5529,6 +5852,7 @@ class MotorActivacion:
                 "Activacion por roles: no hay cuentas con rol para ejecutar "
                 f"({len(sin_rol_usuarios)} sin rol)"
             )
+            self._anotar_pausadas(resumen, pausadas_omitidas)
             return self._claves_cuotas(resumen)
 
         if sin_sesion:
@@ -5544,6 +5868,7 @@ class MotorActivacion:
                 f"{resumen['fallidas']} fallidas de {resumen['total']} "
                 f"({resumen['sin_rol']} sin rol, {resumen['sin_sesion']} sin sesión)"
             )
+            self._anotar_pausadas(resumen, pausadas_omitidas)
             return self._claves_cuotas(resumen)
 
         rol_por_usuario = {
@@ -5551,11 +5876,33 @@ class MotorActivacion:
             for cuenta in ejecutables
         }
 
+        def _viable_curva(usuario):
+            """True si la cuenta Tier 1 tiene cupo para ALGUN rol de la campana.
+
+            Lo consume el GATE de la curva: en fase 1 las cuentas sin cupo NO
+            se despachan (antes se tomaban y devolvian "cuota agotada" ronda
+            tras ronda) y, si NINGUN Tier 1 tiene cupo, la fase 2 se anticipa.
+            Sin cuotas (`self._cuotas is None`) siempre True. Nunca lanza.
+            """
+            try:
+                cuotas = self._cuotas
+                if cuotas is None:
+                    return True
+                if roles_aleatorios:
+                    return bool(cuotas.viables(usuario, roles_sortear))
+                rol = rol_por_usuario.get(usuario, "")
+                if not rol:
+                    return True
+                return bool(cuotas.rol_permitido(usuario, rol))
+            except Exception:
+                return True
+
         # Con cuentas ejecutables: reservas de respaldo, tiers, cuotas
         # horarias+diarias (base desde la BD) y curva de aceleracion.
         reservas = self._preparar_reservas(
             reserva_usuarios, ejecutables, secciones=secciones,
             solo_con_registro=solo_con_registro,
+            pausadas_out=pausadas_omitidas,
         )
         self._registrar_tiers(list(ejecutables) + list(reservas))
         self._preparar_cuotas(
@@ -5820,7 +6167,9 @@ class MotorActivacion:
                 cooldown_min=cooldown_val,
                 porcentaje_min_ronda=porcentaje_min_ronda,
                 porcentaje_max_ronda=porcentaje_max_ronda,
-                elegibilidad=self._elegibilidad_curva(curva_activa),
+                elegibilidad=self._elegibilidad_curva(
+                    curva_activa, _viable_curva, ejecutables
+                ),
                 sustituir=(
                     lambda: self._rotar_agotadas_dia(
                         ejecutables, reservas, rol_por_usuario,
@@ -5843,6 +6192,7 @@ class MotorActivacion:
                 f"({resumen['sin_rol']} sin rol, {resumen['sin_sesion']} sin sesión, "
                 f"{resumen['sin_registro']} sin registro)"
             )
+            self._anotar_pausadas(resumen, pausadas_omitidas)
             return self._claves_cuotas(resumen)
 
         # --- Una sola pasada (con curva: DOS etapas secuenciales) ---------- #
@@ -6066,6 +6416,7 @@ class MotorActivacion:
             f"{resumen['fallidas']} fallidas de {resumen['total']} "
             f"({resumen['sin_rol']} sin rol, {resumen['sin_sesion']} sin sesión)"
         )
+        self._anotar_pausadas(resumen, pausadas_omitidas)
         return self._claves_cuotas(resumen)
 
     def _ejecutar_campana_una_cuenta(self, cuenta: Cuenta, acciones: list,
@@ -6229,6 +6580,10 @@ class MotorActivacion:
                 c for c in cuentas
                 if (c.usuario or "").strip().lstrip("@").lower() in deseados
             ]
+        # PAUSA para activacion: excluidas ANTES de sesion/cuotas (no son
+        # fallidas, no abren navegador; siguen en mantenimiento). La seleccion
+        # manual tambien se filtra.
+        cuentas, pausadas_omitidas = self._separar_pausadas(cuentas)
 
         base_resumen = {
             "modo": "campana_3_3_3",
@@ -6250,6 +6605,7 @@ class MotorActivacion:
         }
         if not cuentas:
             logger.warning("Campana 3+3+3: no hay cuentas activas de twitter")
+            self._anotar_pausadas(base_resumen, pausadas_omitidas)
             return self._claves_cuotas(base_resumen)
 
         con_sesion, sin_sesion = _partir_por_sesion(cuentas)
@@ -6321,6 +6677,7 @@ class MotorActivacion:
                 f"{base_resumen['fallidas']} fallidas de "
                 f"{base_resumen['total_acciones']} ({base_resumen['sin_sesion']} sin sesión)"
             )
+            self._anotar_pausadas(base_resumen, pausadas_omitidas)
             return self._claves_cuotas(base_resumen)
 
         # Con cuentas ejecutables: preparar el contador de cuotas horarias
@@ -6443,4 +6800,5 @@ class MotorActivacion:
             f"{base_resumen['fallidas']} fallidas de {base_resumen['total_acciones']} "
             f"({base_resumen['sin_sesion']} sin sesión)"
         )
+        self._anotar_pausadas(base_resumen, pausadas_omitidas)
         return self._claves_cuotas(base_resumen)

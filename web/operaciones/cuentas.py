@@ -180,6 +180,11 @@ def _normalizar_rol_cuota_seguro(valor) -> str:
         return str(valor or "").strip().lower()
 
 
+def _etiqueta_pausa(fila: dict) -> str:
+    """Badge de pausa para activación: "⏸️ Pausada" / "▶️ Activa"."""
+    return "⏸️ Pausada" if (fila or {}).get("pausada_activacion") else "▶️ Activa"
+
+
 def _fila_como_cuenta(fila: dict):
     """Vista mínima (por atributos) de una fila del inventario para core.tiers."""
     from types import SimpleNamespace
@@ -562,6 +567,11 @@ def _listar_cuentas(status_filtro: str = OPCION_TODAS, seccion_filtro=None) -> l
                         "rol_activacion": _normalizar_rol_cuota_seguro(
                             getattr(c, "rol_activacion", "")
                         ),
+                        # Pausa para activacion (solo clientes), tolerante si el
+                        # campo no existe en una BD vieja.
+                        "pausada_activacion": bool(
+                            getattr(c, "pausada_activacion", False)
+                        ),
                     }
                 )
     except Exception as e:
@@ -940,6 +950,29 @@ def _cambiar_estado(usuarios, activa: bool) -> int:
             db.query(Cuenta)
             .filter(Cuenta.plataforma == "twitter", Cuenta.usuario.in_(usuarios))
             .update({Cuenta.activa: bool(activa)}, synchronize_session=False)
+        )
+    _listar_cuentas.clear()
+    return cambiadas
+
+
+def _cambiar_pausa(usuarios, pausada: bool) -> int:
+    """UPDATE masivo de `Cuenta.pausada_activacion`; devuelve cuántas cambió.
+
+    Pausada = EXCLUIDA de la activación masiva (campañas, RT/likes masivos y
+    reparto por hora) pero SIGUE disponible para mantenimiento y calentamiento
+    (`core.pausas`). Limpia la caché de `_listar_cuentas` para que el cambio se
+    vea de inmediato."""
+    usuarios = [u for u in (usuarios or []) if u]
+    if not usuarios:
+        return 0
+    with get_db_session() as db:
+        cambiadas = (
+            db.query(Cuenta)
+            .filter(Cuenta.plataforma == "twitter", Cuenta.usuario.in_(usuarios))
+            .update(
+                {Cuenta.pausada_activacion: bool(pausada)},
+                synchronize_session=False,
+            )
         )
     _listar_cuentas.clear()
     return cambiadas
@@ -2617,11 +2650,72 @@ def _tab_estado():
             _aplicar_estado(True, "activadas", "activar")
 
     st.markdown("---")
+    st.markdown("#### ⏸️ Pausa para activación masiva (solo clientes)")
+    st.caption(
+        "Las cuentas pausadas quedan EXCLUIDAS de la activación masiva "
+        "(campañas, RT/likes masivos y reparto por hora), pero SIGUEN "
+        "funcionando en mantenimiento programado, publicar texto/IA y "
+        "calentamiento. Es reversible: «▶️ Quitar pausa» las reincorpora."
+    )
+    pausadas_sel = [f for f in seleccion if f.get("pausada_activacion")]
+    sin_pausa_sel = [f for f in seleccion if not f.get("pausada_activacion")]
+    p1, p2, p3 = st.columns(3)
+    p1.metric("En la selección", len(seleccion))
+    p2.metric("⏸️ Pausadas", len(pausadas_sel))
+    p3.metric("▶️ Sin pausa", len(sin_pausa_sel))
+
+    confirmar_pausa = st.checkbox(
+        "Confirmo aplicar el cambio de pausa a las cuentas seleccionadas",
+        key="est_pausa_confirmar",
+    )
+
+    def _aplicar_pausa(nueva_pausa: bool, etiqueta: str, accion: str):
+        if not seleccion:
+            st.warning("Selecciona al menos una cuenta.")
+            return
+        if not confirmar_pausa:
+            st.warning("Marca la confirmación para cambiar la pausa.")
+            return
+        usuarios = [f["usuario"] for f in seleccion]
+        try:
+            cambiadas = _cambiar_pausa(usuarios, nueva_pausa)
+        except Exception as e:
+            st.error(f"No se pudieron {accion} las cuentas: {e}")
+            return
+        st.success(f"{etiqueta}: {cambiadas} cuenta(s). {descripcion_sel}")
+
+    col_pausar, col_quitar_pausa = st.columns(2)
+    with col_pausar:
+        if st.button(
+            "⏸️ Pausar para activación",
+            type="primary",
+            use_container_width=True,
+            key="btn_est_pausar",
+        ):
+            _aplicar_pausa(
+                True,
+                "⏸️ Cuentas pausadas para activación (siguen en mantenimiento)",
+                "pausar",
+            )
+    with col_quitar_pausa:
+        if st.button(
+            "▶️ Quitar pausa",
+            use_container_width=True,
+            key="btn_est_quitar_pausa",
+        ):
+            _aplicar_pausa(
+                False,
+                "▶️ Cuentas sin pausa (vuelven a la activación masiva)",
+                "quitar la pausa de",
+            )
+
+    st.markdown("---")
     st.markdown("#### 📋 Estado actual")
     tabla = [
         {
             "usuario": f["usuario"],
             "activa": "Sí" if f.get("activa") else "No",
+            "pausa": _etiqueta_pausa(f),
             "status": f["status"],
             "sección": f["seccion_etiqueta"],
             "tipo": f["tipo_etiqueta"],
@@ -4763,7 +4857,7 @@ def _tab_inventario():
         "registro de lenguaje con sus conteos."
     )
 
-    col_status, col_seccion, col_tipo, col_estado = st.columns(4)
+    col_status, col_seccion, col_tipo, col_estado, col_pausa = st.columns(5)
     with col_status:
         filtro_status = st.selectbox(
             "Filtrar por status",
@@ -4788,12 +4882,22 @@ def _tab_inventario():
             [OPCION_TODAS, "Activas", "Inactivas"],
             key="inv_estado",
         )
+    with col_pausa:
+        filtro_pausa = st.selectbox(
+            "Filtrar por pausa",
+            [OPCION_TODAS, "⏸️ Pausadas", "▶️ Sin pausa"],
+            key="inv_pausa",
+        )
 
     filas_base = _listar_cuentas(filtro_status, _seccion_desde_filtro(filtro_seccion))
     if filtro_estado == "Activas":
         filas_base = [f for f in filas_base if f.get("activa")]
     elif filtro_estado == "Inactivas":
         filas_base = [f for f in filas_base if not f.get("activa")]
+    if filtro_pausa == "⏸️ Pausadas":
+        filas_base = [f for f in filas_base if f.get("pausada_activacion")]
+    elif filtro_pausa == "▶️ Sin pausa":
+        filas_base = [f for f in filas_base if not f.get("pausada_activacion")]
 
     # Conteos por registro sobre el conjunto ya filtrado por status/sección/
     # estado (sin aplicar aún el filtro de registro, para ver el reparto).
@@ -4853,6 +4957,7 @@ def _tab_inventario():
                 "nombre_propuesto": f["nombre_propuesto"],
                 "handle_propuesto": f["handle_propuesto"],
                 "activa": "Sí" if f.get("activa") else "No",
+                "pausa": _etiqueta_pausa(f),
                 "avatar": "Sí" if f.get("avatar") else "No",
                 "portada": "Sí" if f.get("banner") else "No",
                 "status": f["status"],

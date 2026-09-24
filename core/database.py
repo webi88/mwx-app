@@ -120,7 +120,9 @@ def _resincronizar_secuencias():
 
 # Columnas que se agregan a tablas 'cuentas' ya existentes.
 # Formato: nombre -> tipo SQL (compatible con SQLite; en PostgreSQL se omiten
-# los tipos DATETIME, que no existen en ese motor).
+# los tipos DATETIME, que no existen en ese motor). Los booleanos usan
+# "BOOLEAN DEFAULT FALSE": valido en SQLite >= 3.23 (literales TRUE/FALSE) y
+# en PostgreSQL; "BOOLEAN DEFAULT 0" NO es valido en PostgreSQL.
 NUEVAS_COLUMNAS_CUENTAS = {
     "proxy": "VARCHAR(300) DEFAULT ''",
     "pais": "VARCHAR(50) DEFAULT ''",
@@ -137,6 +139,7 @@ NUEVAS_COLUMNAS_CUENTAS = {
     "rol_activacion": "VARCHAR(20) DEFAULT ''",
     "perfil_personalidad": "VARCHAR(20) DEFAULT ''",
     "tier_calidad": "VARCHAR(20) DEFAULT ''",
+    "pausada_activacion": "BOOLEAN DEFAULT FALSE",
     "totp_secret": "VARCHAR(100) DEFAULT ''",
     "email_password": "VARCHAR(200) DEFAULT ''",
     "auth_token": "VARCHAR(200) DEFAULT ''",

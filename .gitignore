@@ -19,5 +19,9 @@ data/avatars/
 data/portadas/
 data/backups/
 data/campanas/
+data/clientes/
+data/clientes_bot.json
+*.db-shm
+*.db-wal
 .DS_Store
 Thumbs.db

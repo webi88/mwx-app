@@ -1,6 +1,12 @@
 import streamlit as st
 from web.ui import cabecera
-from web.operaciones._helpers import cuentas_por_plataforma, ejecutar_en_cuentas, mostrar_resultados
+from web.operaciones._helpers import (
+    aviso_pausadas,
+    cuentas_por_plataforma,
+    ejecutar_en_cuentas,
+    mostrar_resultados,
+    separar_pausadas,
+)
 
 
 def render(usuario: dict):
@@ -19,6 +25,17 @@ def render(usuario: dict):
     cuentas = cuentas_por_plataforma(plataforma)
     if not cuentas:
         st.warning(f"No hay cuentas activas de {plataforma}.")
+        return
+
+    # Pausadas para activación: fuera de los likes masivos (siguen en
+    # mantenimiento). Además `ejecutar_en_cuentas` las omite por defecto.
+    cuentas, pausadas = separar_pausadas(cuentas)
+    aviso_pausadas(pausadas)
+    if not cuentas:
+        st.warning(
+            f"Todas las cuentas activas de {plataforma} están pausadas para "
+            "activación (siguen en mantenimiento)."
+        )
         return
     
     cuenta_opts = {f"@{c.usuario} (Grupo {c.grupo})": c for c in cuentas}

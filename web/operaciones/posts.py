@@ -125,7 +125,14 @@ def _publicar_texto():
             else:
                 acciones = [(lambda b, t=texto: b.publicar(t, imagen_path)) for texto in pool]
             resultados = ejecutar_en_cuentas(
-                cuentas, acciones, plataforma, progreso, estado, tipo="mantenimiento"
+                cuentas,
+                acciones,
+                plataforma,
+                progreso,
+                estado,
+                tipo="mantenimiento",
+                # Mantenimiento: las pausadas para activación SÍ publican.
+                incluir_pausadas=True,
             )
         else:
             if plataforma == "twitter":
@@ -133,7 +140,14 @@ def _publicar_texto():
             else:
                 accion = lambda bot: bot.publicar(contenido, imagen_path)
             resultados = ejecutar_en_cuentas(
-                cuentas, accion, plataforma, progreso, estado, tipo="mantenimiento"
+                cuentas,
+                accion,
+                plataforma,
+                progreso,
+                estado,
+                tipo="mantenimiento",
+                # Mantenimiento: las pausadas para activación SÍ publican.
+                incluir_pausadas=True,
             )
         
         st.markdown("---")
@@ -550,6 +564,8 @@ def _publicar_mismo_texto(texto: str, cuentas: list):
         progreso,
         estado,
         tipo="mantenimiento",
+        # Mantenimiento: las pausadas para activación SÍ publican.
+        incluir_pausadas=True,
     )
     mostrar_resultados(resultados)
 

@@ -234,6 +234,9 @@ def _es_elegible(cuenta, recientes: set, excluidos: set) -> bool:
     TIER: las cuentas Tier 3 (Métricas/Soporte) quedan FUERA porque el
     calentamiento publica un post (rol hashtags) y el Tier 3 solo puede
     RT/likes. Tier 2 NO se excluye (mantiene el comportamiento actual).
+
+    PAUSA: las cuentas pausadas para activacion masiva SI son elegibles aqui
+    (el calentamiento es mantenimiento): la pausa solo excluye activacion.
     """
     try:
         if getattr(cuenta, "id", None) is None:

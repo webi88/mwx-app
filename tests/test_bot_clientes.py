@@ -1,0 +1,1028 @@
+# -*- coding: utf-8 -*-
+"""Tests del bot de clientes (`bot_clientes/`) sin Telegram real ni Chrome.
+
+Cubre:
+  - `clientes_store`: crear/leer/asignar/quitar, duplicados, '@', IDs
+    invalidos, JSON corrupto y escritura atomica (siempre en archivo temporal).
+  - `keyboards`: los botones/callbacks esperados del menu y confirmaciones.
+  - Validacion del nombre nuevo y formateo del codigo de verificacion (TOTP
+    con semilla fake y lector de correo mockeado en sus 3 ramas: ok, falla y
+    reintenta, sin modulo).
+  - Guard de no autorizado, admin detectado y flujos completos con fakes PTB
+    (start/menu, codigo TOTP y por correo, confirmacion de nombre, foto y
+    comandos de admin `/asignar`/`/quitar` escribiendo un JSON temporal).
+  - `import bot_clientes.main` no arranca nada y `main()` exige token.
+
+Uso:
+    .venv/Scripts/python.exe tests/run_tests.py
+    .venv/Scripts/python.exe tests/test_bot_clientes.py
+"""
+from __future__ import annotations
+
+import asyncio
+import ast
+import contextlib
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+RAIZ = Path(__file__).resolve().parent.parent
+if str(RAIZ) not in sys.path:
+    sys.path.insert(0, str(RAIZ))
+
+from bot_clientes import clientes_store  # noqa: E402
+from bot_clientes import handlers as h  # noqa: E402
+from bot_clientes import keyboards as k  # noqa: E402
+
+SECRETO_FAKE = "JBSWY3DPEHPK3PXP"
+
+
+# --------------------------------------------------------------------------- #
+# Helpers de entorno y fakes PTB
+# --------------------------------------------------------------------------- #
+
+@contextlib.contextmanager
+def _store_temporal():
+    """store -> archivo JSON temporal; restaura la ruta real al salir."""
+    with tempfile.TemporaryDirectory() as carpeta:
+        ruta = os.path.join(carpeta, "clientes_bot.json")
+        anterior = getattr(clientes_store, "_RUTA_OVERRIDE", "")
+        clientes_store.usar_ruta(ruta)
+        try:
+            yield ruta
+        finally:
+            clientes_store.usar_ruta(anterior)
+
+
+@contextlib.contextmanager
+def _env(nombre, valor):
+    """Fija/quita una variable de entorno y la restaura al salir."""
+    previo = os.environ.get(nombre)
+    if valor is None:
+        os.environ.pop(nombre, None)
+    else:
+        os.environ[nombre] = str(valor)
+    try:
+        yield
+    finally:
+        if previo is None:
+            os.environ.pop(nombre, None)
+        else:
+            os.environ[nombre] = previo
+
+
+@contextlib.contextmanager
+def _parches(*cambios):
+    """Aplica `(objeto, nombre, valor)` y restaura SIEMPRE al salir."""
+    originales = []
+    try:
+        for objeto, nombre, valor in cambios:
+            originales.append((objeto, nombre, getattr(objeto, nombre)))
+            setattr(objeto, nombre, valor)
+        yield
+    finally:
+        for objeto, nombre, valor in reversed(originales):
+            setattr(objeto, nombre, valor)
+
+
+class _UsuarioFake:
+    def __init__(self, uid):
+        self.id = uid
+        self.first_name = "Persona"
+
+
+class _FotoFake:
+    def __init__(self, file_id="file_id_foto"):
+        self.file_id = file_id
+
+    async def get_file(self):
+        return _ArchivoFake()
+
+
+class _ArchivoFake:
+    async def download_to_drive(self, ruta):
+        with open(ruta, "wb") as fh:
+            fh.write(b"jpeg-fake")
+
+
+class _MensajeFake:
+    def __init__(self, texto="", fotos=None):
+        self.text = texto
+        self.photo = list(fotos or [])
+        self.replies = []
+        self.edits = []
+        self.photos = []
+
+    async def reply_text(self, texto, **kwargs):
+        self.replies.append((texto, kwargs))
+        return self
+
+    async def edit_text(self, texto, **kwargs):
+        self.edits.append((texto, kwargs))
+        return self
+
+    async def reply_photo(self, photo, caption="", **kwargs):
+        self.photos.append((photo, caption, kwargs))
+        return self
+
+
+class _QueryFake:
+    def __init__(self, data, message=None):
+        self.data = data
+        self.message = message or _MensajeFake()
+        self.answers = []
+
+    async def answer(self, text="", show_alert=False):
+        self.answers.append((text, bool(show_alert)))
+
+    async def edit_message_text(self, texto, **kwargs):
+        self.message.edits.append((texto, kwargs))
+        return self.message
+
+
+class _UpdateFake:
+    def __init__(self, uid=None, texto="", fotos=None, query=None):
+        self.effective_user = _UsuarioFake(uid) if uid is not None else None
+        self.effective_message = _MensajeFake(texto, fotos)
+        self.callback_query = query
+
+
+class _ContextoFake:
+    def __init__(self, args=None):
+        self.args = list(args or [])
+        self.user_data = {}
+
+
+def _correr(coro):
+    return asyncio.run(coro)
+
+
+def _callbacks(markup) -> list:
+    """Lista plana de callback_data de un InlineKeyboardMarkup."""
+    if markup is None:
+        return []
+    filas = getattr(markup, "inline_keyboard", None) or []
+    return [boton.callback_data for fila in filas for boton in fila]
+
+
+def _reloj_async(registro):
+    async def _dormir(segundos):
+        registro.append(segundos)
+
+    return _dormir
+
+
+# --------------------------------------------------------------------------- #
+# Tests
+# --------------------------------------------------------------------------- #
+
+def run(check) -> None:  # noqa: C901 - seccionado por bloques tematicos
+    # ---------------------------------------------------------------- STORE --
+    with _store_temporal() as ruta:
+        carpeta = os.path.dirname(ruta)
+        datos = clientes_store.cargar(ruta)
+        check(
+            "store: cargar crea el archivo vacio si no existe",
+            os.path.isfile(ruta) and datos == {"clientes": {}},
+        )
+        check(
+            "store: asignar devuelve ok y registra nombre + cuentas",
+            clientes_store.asignar("123", "Cliente A", ["uno", "dos"], ruta) == ""
+            and clientes_store.cliente_de("123", ruta) == {
+                "nombre": "Cliente A",
+                "cuentas": ["uno", "dos"],
+            },
+        )
+        check(
+            "store: cuentas_de devuelve la lista del cliente",
+            clientes_store.cuentas_de("123", ruta) == ["uno", "dos"],
+        )
+        clientes_store.asignar("123", "", ["DOS", "tres"], ruta)
+        check(
+            "store: asignar AGREGA y deduplica case-insensitive",
+            clientes_store.cuentas_de("123", ruta) == ["uno", "dos", "tres"],
+        )
+        clientes_store.asignar("123", "Cliente A2", [], ruta)
+        check(
+            "store: asignar sin cuentas solo actualiza el nombre",
+            clientes_store.cliente_de("123", ruta)
+            == {"nombre": "Cliente A2", "cuentas": ["uno", "dos", "tres"]},
+        )
+        clientes_store.quitar("123", ["uno"], ruta)
+        check(
+            "store: quitar elimina la cuenta pedida",
+            clientes_store.cuentas_de("123", ruta) == ["dos", "tres"],
+        )
+        clientes_store.quitar("123", ["no-existe"], ruta)
+        check(
+            "store: quitar una cuenta inexistente no rompe",
+            clientes_store.cuentas_de("123", ruta) == ["dos", "tres"],
+        )
+        error = clientes_store.quitar("999", ["x"], ruta)
+        check(
+            "store: quitar de un cliente inexistente devuelve error string",
+            isinstance(error, str) and "no está registrado" in error,
+        )
+        for malo in ("abc", "12x", None, "", "0", "-5"):
+            check(
+                f"store: ID invalido {malo!r} no se registra",
+                bool(clientes_store.asignar(malo, "", ["u"], ruta))
+                and clientes_store.cliente_de(malo, ruta) is None,
+            )
+        check(
+            "store: asignar sin usuarios ni nombre devuelve error",
+            "No hay usuarios válidos" in clientes_store.asignar("77", "", [], ruta),
+        )
+        clientes_store.asignar("321", "", ["@ConArroba", " ConEspacios "], ruta)
+        check(
+            "store: los '@' y espacios se normalizan",
+            clientes_store.cuentas_de("321", ruta) == ["ConArroba", "ConEspacios"],
+        )
+        check(
+            "store: usuario_permitido es case-insensitive",
+            clientes_store.usuario_permitido("321", "conarroba", ruta)
+            and not clientes_store.usuario_permitido("321", "otra", ruta),
+        )
+        check(
+            "store: es_cliente distingue registrados",
+            clientes_store.es_cliente("321", ruta)
+            and not clientes_store.es_cliente("999", ruta),
+        )
+        clientes_store.asignar("000321", "", ["OtraMas"], ruta)
+        check(
+            "store: los IDs se normalizan (000321 == 321)",
+            clientes_store.cuentas_de("321", ruta) == ["ConArroba", "ConEspacios", "OtraMas"],
+        )
+        check(
+            "store: todos_los_clientes devuelve el registro completo",
+            set(clientes_store.todos_los_clientes(ruta)) == {"123", "321"},
+        )
+        # Atomicidad: tras varias escrituras no quedan temporales y el JSON vale.
+        sobrantes = [n for n in os.listdir(carpeta) if n.endswith(".tmp")]
+        with open(ruta, encoding="utf-8") as fh:
+            contenido = json.load(fh)
+        check(
+            "store: guardar es atomico (sin .tmp y JSON valido)",
+            not sobrantes and "clientes" in contenido,
+        )
+        # JSON corrupto: no lanza y devuelve estructura vacia.
+        with open(ruta, "w", encoding="utf-8") as fh:
+            fh.write("{esto no es json!!")
+        recuperado = clientes_store.cargar(ruta)
+        check(
+            "store: JSON corrupto no lanza y devuelve estructura vacia",
+            recuperado == {"clientes": {}},
+        )
+        check(
+            "store: guardar con datos invalidos normaliza (nunca lanza)",
+            clientes_store.guardar("no-dict", ruta) == ""
+            and clientes_store.cargar(ruta) == {"clientes": {}},
+        )
+
+    # ------------------------------------------------------------ KEYBOARDS --
+    menu = k.menu_principal()
+    callbacks_menu = _callbacks(menu)
+    check(
+        "teclados: el menu tiene los 6 botones del cliente",
+        callbacks_menu
+        == [
+            "cli_codigo",
+            "cli_nombre",
+            "cli_foto_perfil",
+            "cli_foto_portada",
+            "cli_mis_cuentas",
+            "cli_ayuda",
+        ],
+    )
+    check(
+        "teclados: selector de cuenta tiene un boton por cuenta",
+        _callbacks(k.teclado_cuentas(["Uno", "Dos"]))
+        == ["cuenta_Uno", "cuenta_Dos", "cli_menu"],
+    )
+    check(
+        "teclados: acciones por cuenta incluye los 4 flujos",
+        set(
+            ["codigo_X", "nombre_X", "foto_perfil_X", "foto_portada_X"]
+        ).issubset(set(_callbacks(k.teclado_acciones_cuenta("X")))),
+    )
+    check(
+        "teclados: confirmacion de nombre con si/no",
+        _callbacks(k.teclado_confirmar_nombre("X")) == ["nombre_si_X", "nombre_no_X"],
+    )
+    check(
+        "teclados: confirmacion de foto con si/otra/no",
+        _callbacks(k.teclado_confirmar_foto("portada", "X"))
+        == ["foto_si_portada_X", "foto_otra_portada_X", "foto_no_portada_X"],
+    )
+    check(
+        "teclados: codigo ofrece 'otro codigo' y menu",
+        _callbacks(k.teclado_codigo("X")) == ["codigo_X", "cli_menu"],
+    )
+    check(
+        "teclados: cancelar usa cli_cancelar",
+        _callbacks(k.teclado_cancelar()) == ["cli_cancelar"],
+    )
+
+    # ------------------------------------------------------ VALIDAR NOMBRE --
+    ok, nombre, error = h.validar_nombre("  María   López ")
+    check(
+        "nombre: acepta nombre normal y normaliza espacios",
+        ok and nombre == "María López" and error == "",
+    )
+    ok, nombre, _ = h.validar_nombre("José Luis Pérez-Hernández")
+    check("nombre: acepta acentos y guiones", ok and nombre == "José Luis Pérez-Hernández")
+    for malo, motivo in (
+        ("", "vacio"),
+        ("A", "1 letra"),
+        ("x" * 51, "51 chars"),
+        ("Visita http://spam.com", "URL"),
+        ("@mari", "@"),
+        ("María 😀", "emoji"),
+        ("12345", "solo digitos"),
+    ):
+        ok, _, mensaje = h.validar_nombre(malo)
+        check(f"nombre: rechaza {motivo}", not ok and bool(mensaje))
+
+    # ----------------------------------------------------------------- TOTP --
+    codigo, error = h.generar_codigo_totp(SECRETO_FAKE)
+    try:
+        import pyotp
+
+        verifica = pyotp.TOTP(SECRETO_FAKE).verify(codigo, valid_window=1)
+    except Exception:
+        verifica = False
+    check(
+        "codigo: TOTP de 6 digitos con semilla fake",
+        len(codigo) == 6 and codigo.isdigit() and error == "" and verifica,
+    )
+    codigo_espacios, _ = h.generar_codigo_totp("  JBSW Y3DP EHPK 3PXP ")
+    check(
+        "codigo: TOTP limpia espacios de la semilla",
+        len(codigo_espacios) == 6 and codigo_espacios.isdigit(),
+    )
+    codigo_malo, error_malo = h.generar_codigo_totp("no-es-base32!!")
+    check(
+        "codigo: semilla invalida devuelve error (nunca lanza)",
+        codigo_malo == "" and bool(error_malo),
+    )
+    check(
+        "codigo: segundos restantes de la ventana en 1..30",
+        1 <= h.segundos_restantes_ventana() <= 30,
+    )
+    texto_totp = h.texto_codigo("123456", 12, "totp")
+    check(
+        "codigo: texto TOTP trae codigo, vencimiento y aviso de no compartir",
+        "123456" in texto_totp
+        and "Vence en ~12" in texto_totp
+        and "compartas" in texto_totp
+        and "usuario" in texto_totp,
+    )
+    texto_correo = h.texto_codigo("654321", None, "correo")
+    check(
+        "codigo: texto del correo menciona el correo y pide otro si vence",
+        "654321" in texto_correo
+        and "correo" in texto_correo
+        and "pide otro código" in texto_correo,
+    )
+
+    # ---------------------------------------------------- LECTOR DE CORREO --
+    registro = []
+
+    def _buscador_ok(email, password, timeout=25):
+        registro.append((email, password, timeout))
+        return {"ok": True, "codigo": "112233", "remitente": "x@x.com", "error": ""}
+
+    resultado = _correr(
+        h.codigo_desde_correo(
+            "verif@correo.com",
+            "clave",
+            buscador=_buscador_ok,
+            dormir=_reloj_async([]),
+        )
+    )
+    check(
+        "correo: rama OK devuelve el codigo al primer intento",
+        resultado["ok"]
+        and resultado["codigo"] == "112233"
+        and resultado["intentos"] == 1
+        and registro[0][:2] == ("verif@correo.com", "clave"),
+    )
+
+    def _buscador_falla(email, password):
+        registro.append((email, password))
+        return {"ok": False, "codigo": "", "error": "todavia no llega"}
+
+    registro.clear()
+    esperas = []
+    resultado = _correr(
+        h.codigo_desde_correo(
+            "verif@correo.com",
+            "clave",
+            buscador=_buscador_falla,
+            dormir=_reloj_async(esperas),
+        )
+    )
+    check(
+        "correo: rama falla reintenta 3 veces con espera",
+        not resultado["ok"]
+        and resultado["intentos"] == 3
+        and len(registro) == 3
+        and len(esperas) == 2
+        and all(5 <= s <= 8 for s in esperas),
+    )
+    resultado = _correr(
+        h.codigo_desde_correo("", "", buscador=_buscador_ok, dormir=_reloj_async([]))
+    )
+    check(
+        "correo: sin email configurado no llama al lector",
+        not resultado["ok"] and resultado["intentos"] == 0,
+    )
+    resultado = _correr(
+        h.codigo_desde_correo(
+            "verif@correo.com",
+            "clave",
+            importador=lambda: (_ for _ in ()).throw(ImportError("no existe")),
+            dormir=_reloj_async([]),
+        )
+    )
+    check(
+        "correo: ImportError del lector se tolera con error simple",
+        not resultado["ok"] and bool(resultado["error"]),
+    )
+
+    def _buscador_explota(email, password):
+        raise RuntimeError("imap caido")
+
+    resultado = _correr(
+        h.codigo_desde_correo(
+            "verif@correo.com",
+            "clave",
+            buscador=_buscador_explota,
+            dormir=_reloj_async([]),
+        )
+    )
+    check(
+        "correo: excepcion del lector no rompe (3 intentos)",
+        not resultado["ok"] and resultado["intentos"] == 3,
+    )
+
+    # -------------------------------------------------- GUARD / START/MENU --
+    with _store_temporal() as ruta, _env("TELEGRAM_ADMIN_IDS", None):
+        update = _UpdateFake(uid=999, texto="/start")
+        _correr(h.start(update, _ContextoFake()))
+        check(
+            "guard: no registrado recibe UN mensaje claro y sin menu",
+            update.effective_message.replies
+            and "No tengo tu cuenta registrada" in update.effective_message.replies[0][0]
+            and not update.effective_message.replies[0][1],
+        )
+        query = _QueryFake("cli_menu")
+        update = _UpdateFake(uid=999, query=query)
+        _correr(h.cli_callback(update, _ContextoFake()))
+        check(
+            "guard: callback de no registrado responde alerta",
+            query.answers and query.answers[-1][1] and not query.message.edits,
+        )
+
+    with _store_temporal() as ruta, _env("TELEGRAM_ADMIN_IDS", "555"):
+        check(
+            "admin detectado solo con su ID en TELEGRAM_ADMIN_IDS",
+            h.es_admin(555) and not h.es_admin(556) and not h.es_admin("x"),
+        )
+        update = _UpdateFake(uid=555, texto="/start")
+        _correr(h.start(update, _ContextoFake()))
+        check(
+            "admin no registrado igual entra al menu",
+            update.effective_message.replies
+            and "Hola" in update.effective_message.replies[0][0]
+            and "cli_codigo" in _callbacks(update.effective_message.replies[0][1]["reply_markup"]),
+        )
+        error = clientes_store.asignar("700", "Cliente A", ["Uno", "Dos"], ruta)
+        update = _UpdateFake(uid=700, texto="/start")
+        _correr(h.start(update, _ContextoFake()))
+        texto, kwargs = update.effective_message.replies[0]
+        check(
+            "start cliente: saluda con su nombre y avisa cuantas cuentas tiene",
+            error == ""
+            and "Cliente A" in texto
+            and "2 cuentas" in texto
+            and "cli_codigo" in _callbacks(kwargs["reply_markup"]),
+        )
+
+    # ------------------------------------------------- FLUJO DE CODIGO ----
+    with _store_temporal() as ruta, _env("TELEGRAM_ADMIN_IDS", None):
+        clientes_store.asignar("701", "Cliente Uno", ["SoloUno"], ruta)
+        clientes_store.asignar("702", "Cliente Dos", ["SoloDos"], ruta)
+        clientes_store.asignar("703", "Cliente Tres", ["Multi1", "Multi2"], ruta)
+
+        def _datos_totp(usuario):
+            return {
+                "usuario": usuario,
+                "handle_actual": "HandleReal",
+                "nombre_mostrado": "",
+                "totp_secret": SECRETO_FAKE,
+                "email": "",
+                "email_password": "",
+                "activa": True,
+            }
+
+        # Multiples cuentas: pregunta con cual.
+        query = _QueryFake("cli_codigo")
+        with _parches((h, "_datos_cuenta", _datos_totp)):
+            _correr(h.cli_callback(_UpdateFake(uid=703, query=query), _ContextoFake()))
+        ultimo, kwargs = query.message.edits[-1]
+        check(
+            "codigo: con varias cuentas pregunta con cual",
+            "¿Con cuál cuenta" in ultimo
+            and {"cuenta_Multi1", "cuenta_Multi2"}.issubset(set(_callbacks(kwargs["reply_markup"]))),
+        )
+        # Una sola cuenta: va directo al codigo TOTP.
+        query = _QueryFake("cli_codigo")
+        contexto = _ContextoFake()
+        with _parches((h, "_datos_cuenta", _datos_totp)):
+            _correr(h.cli_callback(_UpdateFake(uid=701, query=query), contexto))
+        ultimo, kwargs = query.message.edits[-1]
+        seis = re.search(r"\b\d{6}\b", ultimo)
+        check(
+            "codigo: una sola cuenta entrega el TOTP directo (con HTML y boton)",
+            seis is not None
+            and "Este es tu código" in ultimo
+            and kwargs.get("parse_mode") == "HTML"
+            and "codigo_SoloUno" in _callbacks(kwargs["reply_markup"]),
+        )
+
+        # Flujo multi: elegir cuenta por callback.
+        query = _QueryFake("cli_codigo")
+        contexto = _ContextoFake()
+        with _parches((h, "_datos_cuenta", _datos_totp)):
+            _correr(h.cli_callback(_UpdateFake(uid=703, query=query), contexto))
+            check(
+                "codigo: el flujo pendiente queda guardado",
+                contexto.user_data.get("cli_flujo") == "codigo",
+            )
+            query2 = _QueryFake("cuenta_Multi2", _MensajeFake())
+            _correr(h.cuenta_callback(_UpdateFake(uid=703, query=query2), contexto))
+        check(
+            "codigo: al elegir cuenta se entrega su TOTP",
+            any("Este es tu código" in texto for texto, _ in query2.message.edits)
+            and contexto.user_data.get("cli_flujo") is None,
+        )
+
+        # Rama correo OK.
+        def _datos_correo(usuario):
+            return {
+                "usuario": usuario,
+                "handle_actual": "",
+                "nombre_mostrado": "",
+                "totp_secret": "",
+                "email": "cuenta@correo.com",
+                "email_password": "clave",
+                "activa": True,
+            }
+
+        async def _correo_ok(email, password, **kwargs):
+            return {"ok": True, "codigo": "654321", "error": ""}
+
+        query = _QueryFake("cli_codigo")
+        with _parches(
+            (h, "_datos_cuenta", _datos_correo),
+            (h, "codigo_desde_correo", _correo_ok),
+        ):
+            _correr(h.cli_callback(_UpdateFake(uid=702, query=query), _ContextoFake()))
+        textos = [texto for texto, _ in query.message.edits]
+        check(
+            "codigo: rama correo muestra 'buscando' y luego el codigo",
+            any("Buscando el código" in t for t in textos)
+            and any("654321" in t and "correo" in t for t in textos),
+        )
+
+        # Rama correo falla.
+        async def _correo_falla(email, password, **kwargs):
+            return {"ok": False, "codigo": "", "intentos": 3, "error": "nada"}
+
+        query = _QueryFake("cli_codigo")
+        with _parches(
+            (h, "_datos_cuenta", _datos_correo),
+            (h, "codigo_desde_correo", _correo_falla),
+        ):
+            _correr(h.cli_callback(_UpdateFake(uid=702, query=query), _ContextoFake()))
+        ultimo, kwargs = query.message.edits[-1]
+        check(
+            "codigo: si el correo falla ofrece reintentar con boton",
+            "No encontré ningún código" in ultimo
+            and "codigo_SoloDos" in _callbacks(kwargs["reply_markup"]),
+        )
+
+        # Sin 2FA ni correo.
+        def _datos_vacios(usuario):
+            return {"totp_secret": "", "email": "", "email_password": ""}
+
+        query = _QueryFake("cli_codigo")
+        with _parches((h, "_datos_cuenta", _datos_vacios)):
+            _correr(h.cli_callback(_UpdateFake(uid=702, query=query), _ContextoFake()))
+        check(
+            "codigo: sin 2FA ni correo explica que pida ayuda",
+            "no tiene código configurado" in query.message.edits[-1][0],
+        )
+
+    # ------------------------------------------------ FLUJO DE NOMBRE -----
+    with _store_temporal() as ruta, _env("TELEGRAM_ADMIN_IDS", None):
+        clientes_store.asignar("704", "Cliente Nombre", ["CuentaNombre"], ruta)
+        query = _QueryFake("cli_nombre")
+        contexto = _ContextoFake()
+        _correr(h.cli_callback(_UpdateFake(uid=704, query=query), contexto))
+        check(
+            "nombre: pide el nombre por texto y deja flujo pendiente",
+            "Escríbeme el nombre" in query.message.edits[-1][0]
+            and contexto.user_data.get("cli_espera", {}).get("tipo") == "nombre",
+        )
+        update = _UpdateFake(uid=704, texto="http://spam.com")
+        _correr(h.texto_recibido(update, contexto))
+        check(
+            "nombre: texto invalido pide escribirlo otra vez",
+            "No uses links" in update.effective_message.replies[-1][0]
+            and contexto.user_data.get("cli_espera", {}).get("tipo") == "nombre",
+        )
+        update = _UpdateFake(uid=704, texto="María López")
+        _correr(h.texto_recibido(update, contexto))
+        texto, kwargs = update.effective_message.replies[-1]
+        check(
+            "nombre: pide confirmacion con el nombre y botones si/no",
+            "«María López»" in texto
+            and "¿Lo hago?" in texto
+            and _callbacks(kwargs["reply_markup"]) == ["nombre_si_CuentaNombre", "nombre_no_CuentaNombre"]
+            and contexto.user_data["cli_nombre_pend"]["nombre"] == "María López",
+        )
+        # ❌ No.
+        query = _QueryFake("nombre_no_CuentaNombre")
+        _correr(h.nombre_callback(_UpdateFake(uid=704, query=query), contexto))
+        check(
+            "nombre: el boton No no cambia nada y limpia el pendiente",
+            "no cambié nada" in query.message.edits[-1][0]
+            and "cli_nombre_pend" not in contexto.user_data,
+        )
+        # ✅ Sí (con Selenium mockeado).
+        update = _UpdateFake(uid=704, texto="Nuevo Nombre")
+        contexto.user_data["cli_espera"] = {"tipo": "nombre", "usuario": "CuentaNombre"}
+        _correr(h.texto_recibido(update, contexto))
+        llamado = {}
+
+        async def _cambiar_ok(usuario, nombre):
+            llamado["usuario"] = usuario
+            llamado["nombre"] = nombre
+            return True, ""
+
+        query = _QueryFake("nombre_si_CuentaNombre")
+        with _parches((h, "ejecutar_cambiar_nombre", _cambiar_ok)):
+            _correr(h.nombre_callback(_UpdateFake(uid=704, query=query), contexto))
+        check(
+            "nombre: el boton Si ejecuta el cambio y avisa Listo",
+            llamado == {"usuario": "CuentaNombre", "nombre": "Nuevo Nombre"}
+            and "Cambiando el nombre" in query.message.edits[-1][0]
+            and any("¡Listo!" in t for t, _ in query.message.replies),
+        )
+        # ✅ Sí pero falla.
+        contexto.user_data["cli_nombre_pend"] = {"usuario": "CuentaNombre", "nombre": "Otro"}
+        query = _QueryFake("nombre_si_CuentaNombre")
+
+        async def _cambiar_falla(usuario, nombre):
+            return False, "sin sesion"
+
+        with _parches((h, "ejecutar_cambiar_nombre", _cambiar_falla)):
+            _correr(h.nombre_callback(_UpdateFake(uid=704, query=query), contexto))
+        check(
+            "nombre: fallo muestra mensaje simple y reintento",
+            any("No se pudo cambiar" in t for t, _ in query.message.replies)
+            and "nombre_CuentaNombre" in _callbacks(query.message.replies[-1][1]["reply_markup"]),
+        )
+        # Boton vencido.
+        query = _QueryFake("nombre_si_CuentaNombre")
+        _correr(h.nombre_callback(_UpdateFake(uid=704, query=query), contexto))
+        check(
+            "nombre: confirmacion vencida avisa sin ejecutar",
+            query.answers and query.answers[-1][1],
+        )
+
+    # -------------------------------------------------- FLUJO DE FOTO -----
+    with _store_temporal() as ruta, _env("TELEGRAM_ADMIN_IDS", None):
+        clientes_store.asignar("705", "Cliente Foto", ["CuentaFoto"], ruta)
+        with tempfile.TemporaryDirectory() as temporal:
+            query = _QueryFake("cli_foto_perfil")
+            contexto = _ContextoFake()
+            _correr(h.cli_callback(_UpdateFake(uid=705, query=query), contexto))
+            check(
+                "foto: pide la imagen por Telegram",
+                "Envíame la foto de perfil" in query.message.edits[-1][0]
+                and contexto.user_data.get("cli_espera", {}).get("tipo") == "foto",
+            )
+            update = _UpdateFake(uid=705, fotos=[_FotoFake()])
+            with _parches((h, "_data_temp", lambda: temporal)):
+                _correr(h.foto_recibida(update, contexto))
+            caption = update.effective_message.photos[-1][1]
+            kwargs = update.effective_message.photos[-1][2]
+            pendiente = contexto.user_data.get("cli_foto_pend") or {}
+            check(
+                "foto: vista previa pide confirmacion con botones",
+                "¿Uso esta foto como tu nueva foto de perfil de @CuentaFoto?"
+                in caption
+                and "foto_si_perfil_CuentaFoto" in _callbacks(kwargs["reply_markup"])
+                and os.path.isfile(pendiente.get("ruta", "")),
+            )
+            # ❌ No.
+            query = _QueryFake("foto_no_perfil_CuentaFoto")
+            _correr(h.foto_callback(_UpdateFake(uid=705, query=query), contexto))
+            check(
+                "foto: el boton No limpia la pendiente",
+                "no cambié nada" in query.message.edits[-1][0]
+                and "cli_foto_pend" not in contexto.user_data,
+            )
+            # 🔁 Otra foto.
+            query = _QueryFake("cli_foto_perfil")
+            _correr(h.cli_callback(_UpdateFake(uid=705, query=query), contexto))
+            update = _UpdateFake(uid=705, fotos=[_FotoFake()])
+            with _parches((h, "_data_temp", lambda: temporal)):
+                _correr(h.foto_recibida(update, contexto))
+            query = _QueryFake("foto_otra_perfil_CuentaFoto")
+            _correr(h.foto_callback(_UpdateFake(uid=705, query=query), contexto))
+            check(
+                "foto: el boton Otra foto vuelve a pedirla",
+                "Envíame la foto de perfil" in query.message.edits[-1][0]
+                and contexto.user_data.get("cli_espera", {}).get("tipo") == "foto",
+            )
+            # ✅ Sí (Selenium mockeado + limpieza del archivo temporal).
+            ruta_temporal = os.path.join(temporal, "prueba.jpg")
+            with open(ruta_temporal, "wb") as fh:
+                fh.write(b"foto")
+            contexto.user_data["cli_foto_pend"] = {
+                "usuario": "CuentaFoto",
+                "tipo": "perfil",
+                "ruta": ruta_temporal,
+            }
+            llamado = {}
+
+            async def _foto_ok(usuario, tipo, ruta):
+                llamado.update({"usuario": usuario, "tipo": tipo, "ruta": ruta})
+                return True, ""
+
+            query = _QueryFake("foto_si_perfil_CuentaFoto")
+            with _parches((h, "ejecutar_cambiar_foto", _foto_ok)):
+                _correr(h.foto_callback(_UpdateFake(uid=705, query=query), contexto))
+            check(
+                "foto: el boton Si sube la foto y limpia la pendiente",
+                llamado["usuario"] == "CuentaFoto"
+                and llamado["tipo"] == "perfil"
+                and "Subiendo" in query.message.edits[-1][0]
+                and any("¡Listo!" in t for t, _ in query.message.replies),
+            )
+            # Foto sin flujo pendiente.
+            contexto.user_data.pop("cli_espera", None)
+            update = _UpdateFake(uid=705, fotos=[_FotoFake()])
+            _correr(h.foto_recibida(update, contexto))
+            check(
+                "foto: sin flujo pendiente avisa que no la esperaba",
+                "No esperaba ninguna foto"
+                in update.effective_message.replies[-1][0],
+            )
+
+        # 📋 Mis cuentas muestra el @ real y el nombre actual.
+        query = _QueryFake("cli_mis_cuentas")
+        with _parches(
+            (
+                h,
+                "_datos_cuenta",
+                lambda u: {
+                    "usuario": u,
+                    "handle_actual": "HandleReal",
+                    "nombre_mostrado": "Nombre Real",
+                    "totp_secret": "",
+                    "email": "",
+                    "email_password": "",
+                },
+            )
+        ):
+            _correr(h.cli_callback(_UpdateFake(uid=705, query=query), _ContextoFake()))
+        check(
+            "mis cuentas: lista @handle y nombre sin credenciales",
+            "@HandleReal" in query.message.edits[-1][0]
+            and "«Nombre Real»" in query.message.edits[-1][0],
+        )
+
+        # /cancelar limpia cualquier flujo.
+        contexto = _ContextoFake()
+        contexto.user_data.update(
+            {
+                "cli_flujo": "codigo",
+                "cli_espera": {"tipo": "foto"},
+                "cli_nombre_pend": {"usuario": "x"},
+                "cli_foto_pend": {"usuario": "x"},
+            }
+        )
+        update = _UpdateFake(uid=705, texto="/cancelar")
+        _correr(h.cancelar(update, contexto))
+        check(
+            "/cancelar: limpia flujos y vuelve al menu",
+            "cancelado" in update.effective_message.replies[-1][0]
+            and not any(clave in contexto.user_data for clave in (
+                "cli_flujo",
+                "cli_espera",
+                "cli_nombre_pend",
+                "cli_foto_pend",
+            )),
+        )
+
+    # ---------------------------------------------------- COMANDOS ADMIN --
+    with _store_temporal() as ruta, _env("TELEGRAM_ADMIN_IDS", "555"):
+        update = _UpdateFake(uid=666, texto="/asignar 1 u")
+        contexto = _ContextoFake(args=["1", "u"])
+        _correr(h.comando_asignar(update, contexto))
+        check(
+            "admin: /asignar bloqueado para quien no es admin",
+            "solo para el equipo" in update.effective_message.replies[-1][0],
+        )
+
+        update = _UpdateFake(uid=555, texto="/asignar")
+        _correr(h.comando_asignar(update, _ContextoFake(args=[])))
+        check(
+            "admin: /asignar sin datos muestra el uso",
+            "Uso: /asignar" in update.effective_message.replies[-1][0],
+        )
+
+        contexto = _ContextoFake(args=["999", "Juan", "CuentaUno", "CuentaDos"])
+        update = _UpdateFake(uid=555, texto="/asignar")
+        with _parches((h, "_usuarios_en_bd", lambda usuarios: {"cuentauno", "cuentados"})):
+            _correr(h.comando_asignar(update, contexto))
+        info = clientes_store.cliente_de(999, ruta)
+        check(
+            "admin: /asignar <id> <nombre> <usuario...> escribe el JSON",
+            info == {"nombre": "Juan", "cuentas": ["CuentaUno", "CuentaDos"]},
+        )
+        check(
+            "admin: /asignar confirma con las cuentas agregadas",
+            "@CuentaUno" in update.effective_message.replies[-1][0]
+            and "Cuentas agregadas" in update.effective_message.replies[-1][0],
+        )
+
+        contexto = _ContextoFake(args=["1000", "nombre=Cliente_Piloto", "OtraCuenta"])
+        with _parches((h, "_usuarios_en_bd", lambda usuarios: None)):
+            _correr(h.comando_asignar(_UpdateFake(uid=555, texto="/asignar"), contexto))
+        check(
+            "admin: /asignar nombre=Cliente_Piloto (con '_' -> espacio)",
+            clientes_store.cliente_de(1000, ruta) == {
+                "nombre": "Cliente Piloto",
+                "cuentas": ["OtraCuenta"],
+            },
+        )
+
+        update = _UpdateFake(uid=555, texto="/clientes")
+        with _parches((h, "_usuarios_en_bd", lambda usuarios: None)):
+            _correr(h.comando_clientes(update, _ContextoFake()))
+        check(
+            "admin: /clientes lista clientes y sus cuentas",
+            "999" in update.effective_message.replies[-1][0]
+            and "@CuentaUno" in update.effective_message.replies[-1][0]
+            and "1000" in update.effective_message.replies[-1][0],
+        )
+
+        contexto = _ContextoFake(args=["999", "CuentaUno"])
+        _correr(h.comando_quitar(_UpdateFake(uid=555, texto="/quitar"), contexto))
+        check(
+            "admin: /quitar quita solo la cuenta pedida",
+            clientes_store.cuentas_de(999, ruta) == ["CuentaDos"],
+        )
+
+        contexto = _ContextoFake(args=["999", "CuentaDos"])
+        update = _UpdateFake(uid=555, texto="/quitar")
+        _correr(h.comando_quitar(update, contexto))
+        check(
+            "admin: /quitar avisa cuando ya no le quedan cuentas",
+            "Ya no tiene cuentas" in update.effective_message.replies[-1][0],
+        )
+
+        query = _QueryFake("cli_menu")
+        update = _UpdateFake(uid=999, query=query)
+        _correr(h.cli_callback(update, _ContextoFake()))
+        check(
+            "admin: cliente sin cuentas sigue pudiendo usar el menu",
+            query.message.edits and "cli_ayuda" in _callbacks(query.message.edits[-1][1]["reply_markup"]),
+        )
+
+    # ------------------------------------------------------- ENTRYPOINT ---
+    fuente = (RAIZ / "bot_clientes" / "main.py").read_text(encoding="utf-8")
+    arbol = ast.parse(fuente)
+    comandos = set()
+    patrones = set()
+    for nodo in ast.walk(arbol):
+        if isinstance(nodo, ast.Call) and isinstance(nodo.func, ast.Name):
+            if nodo.func.id == "CommandHandler" and nodo.args:
+                comandos.add(ast.literal_eval(nodo.args[0]))
+            if nodo.func.id == "CallbackQueryHandler":
+                for kw in nodo.keywords:
+                    if kw.arg == "pattern":
+                        patrones.add(ast.literal_eval(kw.value))
+    check(
+        "main: registra los comandos del cliente y de admin",
+        {"start", "ayuda", "cancelar", "clientes", "asignar", "quitar"}.issubset(comandos),
+    )
+    check(
+        "main: registra los 5 prefijos de callbacks del bot de clientes",
+        patrones == {r"^cli_", r"^cuenta_", r"^codigo_", r"^nombre_", r"^foto_"},
+    )
+    check(
+        "main: importar no arranca nada y `construir_app` arma la app",
+        "'if __name__' in fuente"
+        and fuente.count("main()") >= 1
+        and _app_ok(),
+    )
+    check(
+        "main: obtener_token lee TELEGRAM_CLIENTES_BOT_TOKEN del entorno",
+        _token_env(),
+    )
+    check(
+        "main: sin token no arranca (SystemExit 1)",
+        _sin_token_exit(),
+    )
+    check(
+        "main: `import bot_clientes.main` sin token no imprime el arranque",
+        _import_sin_token_ok(),
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Helpers de los checks de entrypoint (definidos abajo para no ensuciar)
+# --------------------------------------------------------------------------- #
+
+def _app_ok() -> bool:
+    """`construir_app` con token fake registra los 14 handlers esperados."""
+    from telegram.ext import CallbackQueryHandler, CommandHandler, MessageHandler
+
+    from bot_clientes.main import construir_app
+
+    try:
+        app = construir_app("123456:FAKE-TOKEN")
+    except Exception:
+        return False
+    handlers = [handler for grupo in app.handlers.values() for handler in grupo]
+    return (
+        sum(isinstance(x, CommandHandler) for x in handlers) == 7
+        and sum(isinstance(x, CallbackQueryHandler) for x in handlers) == 5
+        and sum(isinstance(x, MessageHandler) for x in handlers) == 2
+    )
+
+
+def _token_env() -> bool:
+    import bot_clientes.main as mod
+
+    with _env("TELEGRAM_CLIENTES_BOT_TOKEN", " 123:TOKEN  "):
+        return mod.obtener_token() == "123:TOKEN"
+
+
+def _sin_token_exit() -> bool:
+    import bot_clientes.main as mod
+
+    with _parches((mod, "obtener_token", lambda: "")):
+        try:
+            mod.main()
+        except SystemExit as e:
+            return int(e.code or 0) == 1
+        except Exception:
+            return False
+    return False
+
+
+def _import_sin_token_ok() -> bool:
+    """Subproceso: importar no arranca polling y termina con 0."""
+    entorno = os.environ.copy()
+    entorno.pop("TELEGRAM_CLIENTES_BOT_TOKEN", None)
+    try:
+        salida = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "import bot_clientes.main; print('IMPORT-OK')",
+            ],
+            cwd=str(RAIZ),
+            env=entorno,
+            capture_output=True,
+            text=True,
+            timeout=90,
+        )
+    except Exception:
+        return False
+    return (
+        salida.returncode == 0
+        and "IMPORT-OK" in (salida.stdout or "")
+        and "Bot de clientes iniciado" not in (salida.stdout or "")
+    )
+
+
+if __name__ == "__main__":
+    # Ejecucion suelta: `python tests/test_bot_clientes.py`.
+    from run_tests import check, resumen  # noqa: E402
+
+    run(check)
+    sys.exit(resumen())

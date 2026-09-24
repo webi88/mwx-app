@@ -22,3 +22,25 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+
+  # Bot de Telegram para CLIENTES no técnicos (código de verificación de X,
+  # cambiar nombre, foto de perfil y portada con botones).
+  # Token propio: TELEGRAM_CLIENTES_BOT_TOKEN en .env (crear el bot con
+  # @BotFather). Es independiente del bot interno.
+  bot-clientes:
+    build: .
+    container_name: gestor-redes-bot-clientes
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+      - ./config:/app/config
+    command: python -m bot_clientes.main
+    environment:
+      - TZ=America/Mexico_City
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"

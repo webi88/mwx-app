@@ -106,6 +106,11 @@ import uuid
 import streamlit as st
 
 from web.ui import cabecera
+from web.operaciones._helpers import (
+    aviso_pausadas,
+    es_pausada_activacion,
+    separar_pausadas,
+)
 from core.config import settings
 from core.secciones import SECCIONES, etiqueta_seccion, normalizar_seccion
 
@@ -999,8 +1004,10 @@ def _cargar_reserva_usuarios(excluidos=None, seccion=None, maximo: int = 50) -> 
     """Cuentas twitter activas CON sesion que NO estan en la seleccion principal.
 
     Mismo filtro de seccion si `seccion` viene ("" / None = sin filtro),
-    barajadas y limitadas a `maximo`. Se usan como respaldo cuando una cuenta
-    agota su cuota diaria. Nunca lanza: ante cualquier error devuelve []."""
+    barajadas y limitadas a `maximo`. Las cuentas PAUSADAS para activacion
+    (`core.pausas`) quedan fuera tambien de la reserva. Se usan como respaldo
+    cuando una cuenta agota su cuota diaria. Nunca lanza: ante cualquier error
+    devuelve []."""
     try:
         from core.database import get_db_session
         from core.models import Cuenta
@@ -1015,6 +1022,8 @@ def _cargar_reserva_usuarios(excluidos=None, seccion=None, maximo: int = 50) -> 
             )
         candidatos = []
         for c in cuentas:
+            if es_pausada_activacion(c):
+                continue
             if seccion and normalizar_seccion(getattr(c, "seccion", "")) != seccion:
                 continue
             if not _tiene_sesion_cuenta(c):
@@ -1959,6 +1968,11 @@ def _cargar_cuentas_con_roles() -> list:
                     "tier_calidad": normalizar_tier(
                         getattr(c, "tier_calidad", "")
                     ),
+                    # Pausa para activacion (solo clientes): las paginas la
+                    # excluyen de campanas y reservas con `_helpers`.
+                    "pausada_activacion": bool(
+                        getattr(c, "pausada_activacion", False)
+                    ),
                 }
                 for c in cuentas
             ]
@@ -2417,6 +2431,10 @@ def _cita_masiva():
         else [normalizar_seccion(seccion_opcion)]
     )
     cuentas_activas = _cargar_cuentas_con_roles()
+    # Pausadas para activacion (clientes): FUERA de la campana (siguen en
+    # mantenimiento). El aviso muestra el conteo excluido.
+    cuentas_activas, pausadas_activas = separar_pausadas(cuentas_activas)
+    aviso_pausadas(pausadas_activas)
     if secciones_param:
         n_seccion = sum(
             1 for f in cuentas_activas if f.get("seccion") == secciones_param[0]
@@ -2792,6 +2810,10 @@ def _por_roles():
         return
 
     cuentas = _cargar_cuentas_con_roles()
+    # Pausadas para activacion (clientes): FUERA de la campana (siguen en
+    # mantenimiento). El aviso muestra el conteo excluido.
+    cuentas, pausadas = separar_pausadas(cuentas)
+    aviso_pausadas(pausadas)
     st.caption(f"Cuentas twitter activas: **{len(cuentas)}**")
 
     if not cuentas:

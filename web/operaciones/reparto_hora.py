@@ -24,7 +24,12 @@ import streamlit as st
 from loguru import logger
 
 from web.ui import cabecera, empty_state
-from web.operaciones._helpers import cuentas_por_plataforma
+from web.operaciones._helpers import (
+    aviso_pausadas,
+    cuentas_por_plataforma,
+    separar_pausadas,
+    texto_pausadas,
+)
 
 
 def render(usuario: dict):
@@ -33,6 +38,17 @@ def render(usuario: dict):
     cuentas = cuentas_por_plataforma("twitter")
     if not cuentas:
         empty_state("No hay cuentas de Twitter activas.")
+        return
+
+    # Pausadas para activacion (clientes): FUERA del plan 3+3+3 (siguen en
+    # mantenimiento). El aviso muestra el conteo excluido.
+    cuentas, pausadas = separar_pausadas(cuentas)
+    aviso_pausadas(pausadas)
+    if not cuentas:
+        empty_state(
+            "Todas las cuentas de Twitter están pausadas para activación "
+            "(siguen en mantenimiento)."
+        )
         return
 
     st.caption(
@@ -189,6 +205,9 @@ def render(usuario: dict):
             f"{resumen_previo.get('comentarios', 0)} comentarios · "
             f"{resumen_previo.get('retweets', 0)} retweets."
         )
+        texto_pausas = texto_pausadas(resumen_previo.get("pausadas_excluidas"))
+        if texto_pausas:
+            st.caption(texto_pausas)
         tier3_previas = int(resumen_previo.get("tier3_limitadas") or 0)
         if tier3_previas:
             st.caption(
@@ -335,6 +354,10 @@ def _preparar(
         construir_plan_completo,
         plan_hora_cuenta,
     )
+
+    # Defensa adicional (el selector ya las excluye): ninguna cuenta pausada
+    # para activacion entra al plan 3+3+3; su conteo queda en el resumen.
+    seleccion, pausadas = separar_pausadas(seleccion)
 
     usuarios = [c.usuario for c in seleccion]
     perfil_por_usuario = _perfiles_normalizados(seleccion)
@@ -499,6 +522,7 @@ def _preparar(
         "comentarios": sum(1 for p in plan if p["tipo"] == "comentario"),
         "retweets": sum(1 for p in plan if p["tipo"] == "retweet"),
         "tier3_limitadas": len(tier3),
+        "pausadas_excluidas": len(pausadas),
         "faltantes": faltantes,
     }
     st.rerun()

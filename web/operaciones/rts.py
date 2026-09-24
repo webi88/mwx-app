@@ -1,6 +1,13 @@
 import streamlit as st
 from web.ui import cabecera
-from web.operaciones._helpers import cuentas_por_tags, ejecutar_en_cuentas, mostrar_resultados, guardar_imagen_subida
+from web.operaciones._helpers import (
+    aviso_pausadas,
+    cuentas_por_tags,
+    ejecutar_en_cuentas,
+    mostrar_resultados,
+    guardar_imagen_subida,
+    separar_pausadas,
+)
 
 
 def render(usuario: dict):
@@ -54,6 +61,10 @@ def _seleccionar_cuentas(key: str):
                 getattr(c, "rol_activacion", "")
             ) in deseados
         ]
+    # Pausadas para activación: fuera de RT masivo/likes/calentamiento (siguen
+    # en mantenimiento). Además `ejecutar_en_cuentas` las omite por defecto.
+    cuentas, pausadas = separar_pausadas(cuentas)
+    aviso_pausadas(pausadas)
     st.caption(f"Cuentas disponibles: **{len(cuentas)}**")
     
     opciones = {

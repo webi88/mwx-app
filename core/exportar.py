@@ -30,7 +30,19 @@ COLUMNAS_CUENTAS = (
     ("rol_activacion", "Rol_Activacion"),
     ("tier_calidad", "Tier_Calidad"),
     ("banner_path", "Banner_Portada"),
+    ("pausada_activacion", "Pausada_Activacion"),
 )
+
+
+def _formatear_valor_cuenta(atributo: str, valor):
+    """Da formato al valor de UNA columna de cuenta para Excel/CSV.
+
+    Caso especial: `pausada_activacion` se exporta como "Sí"/"No" (mismo
+    patron que los booleanos de la interfaz). El resto de columnas se exportan
+    tal cual y `None` sigue siendo celda vacia, igual que antes."""
+    if atributo == "pausada_activacion":
+        return "Sí" if valor else "No"
+    return "" if valor is None else valor
 
 INSTRUCCIONES_LOGIN = [
     "GUIA DE ACCESO MANUAL A X (LOGIN EXTERNO)",
@@ -94,7 +106,7 @@ def exportar_cuentas_excel(ruta: str = None, solo_activas: bool = False) -> dict
             fila = []
             for atributo, _ in COLUMNAS_CUENTAS:
                 valor = getattr(cuenta, atributo, "")
-                fila.append("" if valor is None else valor)
+                fila.append(_formatear_valor_cuenta(atributo, valor))
             ws.append(fila)
 
         # Ancho de columnas para que se lea bien.
@@ -154,7 +166,7 @@ def exportar_cuentas_csv(ruta: str = None, solo_activas: bool = False) -> dict:
                 fila = []
                 for atributo, _ in COLUMNAS_CUENTAS:
                     valor = getattr(cuenta, atributo, "")
-                    fila.append("" if valor is None else valor)
+                    fila.append(_formatear_valor_cuenta(atributo, valor))
                 writer.writerow(fila)
 
         logger.info(f"CSV de cuentas generado: {ruta} ({len(cuentas)} cuentas)")

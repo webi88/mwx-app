@@ -1,0 +1,1298 @@
+"""Flujos del bot de clientes de X (PTB v21, async).
+
+Bot INDEPENDIENTE del bot interno (`bot/`): aqui el cliente no tecnico
+obtiene el codigo de verificacion (2FA TOTP o codigo recibido en el correo de
+la cuenta), cambia el nombre, la foto de perfil y la portada de sus cuentas de
+X. Todo con BOTONES; el cliente solo necesita escribir `/start`.
+
+Reglas de diseno:
+  - Mensajes cortos y sencillos ("como si fueran tontos"): sin terminos
+    tecnicos, sin comandos, con ejemplos.
+  - Autenticacion: el Telegram ID debe estar en `data/clientes_bot.json`
+    (o ser admin de `TELEGRAM_ADMIN_IDS`); los flujos usan las cuentas del
+    cliente registrado.
+  - Selenium NUNCA en el hilo del bot: `asyncio.to_thread(...)` con import
+    perezoso de `plataformas.twitter.selenium_bot` y `bot.cerrar()` SIEMPRE en
+    `finally`.
+  - El lector de correo (`utils.lector_correo.obtener_codigo_verificacion`,
+    contrato congelado `(email, password, timeout=25) -> dict`) se importa
+    perezosamente y su ImportError se tolera con un mensaje simple.
+  - Nada de credenciales en mensajes ni en `data/clientes_bot.json`.
+
+Callbacks (ver bot_clientes/keyboards.py):
+  cli_*    menu/acciones            -> cli_callback
+  cuenta_* selector de cuenta       -> cuenta_callback
+  codigo_* codigo / otro codigo     -> codigo_callback
+  nombre_* elegir / confirmar       -> nombre_callback
+  foto_*   elegir / confirmar foto  -> foto_callback
+Mensajes: texto -> texto_recibido (solo si hay flujo pendiente);
+fotos -> foto_recibida.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import functools
+import html
+import inspect
+import os
+import random
+import re
+import time
+
+from loguru import logger
+from telegram import Update
+from telegram.ext import ContextTypes
+
+from bot.middlewares import obtener_admin_ids
+from bot_clientes import clientes_store
+from bot_clientes.keyboards import (
+    menu_principal,
+    teclado_acciones_cuenta,
+    teclado_cancelar,
+    teclado_codigo,
+    teclado_codigo_fallo,
+    teclado_confirmar_foto,
+    teclado_confirmar_nombre,
+    teclado_cuentas,
+    teclado_mis_cuentas,
+    teclado_reintentar_foto,
+    teclado_reintentar_nombre,
+)
+
+# --------------------------------------------------------------------------- #
+# Textos (sencillos, en segunda persona, con emojis)
+# --------------------------------------------------------------------------- #
+
+TEXTO_SIN_REGISTRO = (
+    "🔒 No tengo tu cuenta registrada.\n\n"
+    "Pide a la persona que te dio la cuenta que te agregue con tu Telegram "
+    "y después escribe /start."
+)
+
+TEXTO_SIN_REGISTRO_CORTO = (
+    "🔒 No tengo tu cuenta registrada. Pide a quien te dio la cuenta que te agregue."
+)
+
+TEXTO_SIN_CUENTAS = (
+    "😕 Todavía no tienes cuentas asignadas.\n\n"
+    "Pide a la persona que te dio la cuenta que te agregue con tu Telegram "
+    "y después escribe /start."
+)
+
+TEXTO_FALLO_NOMBRE = (
+    "❌ No se pudo cambiar. Inténtalo otra vez o pide ayuda a quien te dio la cuenta."
+)
+
+TEXTO_FALLO_FOTO = (
+    "❌ No se pudo subir la foto. Inténtalo otra vez o pide ayuda a quien te dio la cuenta."
+)
+
+TEXTO_AYUDA = (
+    "❓ Cómo usar este bot\n\n"
+    "1️⃣ Toca un botón de abajo para decirme qué quieres hacer.\n"
+    "2️⃣ Si tienes varias cuentas, te pregunto con cuál.\n"
+    "3️⃣ Sigue lo que dice el mensaje (escribir un nombre o enviar una foto).\n\n"
+    "🔑 Quiero mi código: te doy el código de 6 números que X te pide al entrar.\n"
+    "✏️ Cambiar el nombre: escribes el nombre nuevo y yo lo cambio.\n"
+    "📸 Foto de perfil y 🖼️ Portada: me envías la imagen y yo la pongo.\n\n"
+    "Si algo falla:\n"
+    "• Espera un momento y toca otra vez el botón (o 🔄 Intentar de nuevo).\n"
+    "• Si sigue fallando, pide ayuda a la persona que te dio la cuenta.\n\n"
+    "Escribe /cancelar para detener lo que estés haciendo."
+)
+
+# Flujos y sus botones del menu.
+TIPO_POR_BOTON = {
+    "cli_codigo": "codigo",
+    "cli_nombre": "nombre",
+    "cli_foto_perfil": "foto_perfil",
+    "cli_foto_portada": "foto_portada",
+}
+
+# Correo (contrato congelado del lector IMAP).
+TIEMPO_CORREO = 25
+INTENTOS_CORREO = 3
+ESPERA_CORREO_MIN = 5.0
+ESPERA_CORREO_MAX = 8.0
+VENTANA_TOTP = 30
+
+# Validacion del nombre visible.
+NOMBRE_MIN = 2
+NOMBRE_MAX = 50
+_PATRON_NOMBRE = re.compile(r"^[\w .,'\-&()]+$", re.UNICODE)
+_PATRON_LETRA = re.compile(r"[^\W\d_]", re.UNICODE)
+_FRAGMENTOS_URL = ("http://", "https://", "www.", "t.me/", ".com/", ".net/")
+
+
+# --------------------------------------------------------------------------- #
+# Helpers puros
+# --------------------------------------------------------------------------- #
+
+def es_admin(telegram_id) -> bool:
+    """True si el Telegram ID esta en TELEGRAM_ADMIN_IDS (helper del bot interno)."""
+    try:
+        uid = int(telegram_id)
+    except (TypeError, ValueError):
+        return False
+    try:
+        return uid in obtener_admin_ids()
+    except Exception:
+        return False
+
+
+def validar_nombre(texto: str) -> tuple:
+    """Valida el nombre nuevo. Devuelve (ok, nombre_limpio, mensaje_error)."""
+    nombre = re.sub(r"\s+", " ", str(texto or "")).strip()
+    if not nombre:
+        return False, "", "Escribe el nombre nuevo, por favor."
+    if len(nombre) < NOMBRE_MIN:
+        return False, "", "El nombre es muy corto: escribe al menos 2 letras."
+    if len(nombre) > NOMBRE_MAX:
+        return False, "", "El nombre es muy largo: máximo 50 letras."
+    minusculas = nombre.lower()
+    if any(fragmento in minusculas for fragmento in _FRAGMENTOS_URL):
+        return False, "", "No uses links: solo el nombre, por ejemplo: María López."
+    if "@" in nombre:
+        return False, "", "No uses @: solo el nombre, por ejemplo: María López."
+    if not _PATRON_NOMBRE.match(nombre):
+        return False, "", "Usa solo letras y números, sin emojis ni símbolos raros."
+    if not _PATRON_LETRA.search(nombre):
+        return False, "", "El nombre debe tener al menos una letra."
+    return True, nombre, ""
+
+
+def generar_codigo_totp(secreto: str) -> tuple:
+    """Codigo TOTP de 6 digitos desde la semilla. Devuelve (codigo, error)."""
+    limpio = "".join(str(secreto or "").split())
+    if not limpio:
+        return "", "sin secreto TOTP"
+    try:
+        import pyotp
+
+        return str(pyotp.TOTP(limpio).now()), ""
+    except Exception as e:
+        return "", f"{type(e).__name__}: {e}"
+
+
+def segundos_restantes_ventana(ventana: int = VENTANA_TOTP) -> int:
+    """Segundos que le quedan a la ventana TOTP actual (1..ventana)."""
+    try:
+        return int(ventana) - int(time.time()) % int(ventana)
+    except Exception:
+        return int(ventana)
+
+
+def _esc(texto) -> str:
+    """Escapa HTML (solo se usa en mensajes con parse_mode HTML)."""
+    return html.escape(str(texto or ""))
+
+
+def texto_codigo(codigo: str, segundos=None, origen: str = "totp") -> str:
+    """Mensaje (HTML) con el codigo, pensado para clientes no tecnicos."""
+    codigo = str(codigo or "").strip()
+    lineas = [f"✅ Este es tu código: <b>{_esc(codigo)}</b>", ""]
+    if origen == "correo":
+        lineas.append("Lo encontré en tu correo (llegó hace un momento).")
+    lineas.append(
+        "Cópialo y pégalo en X. X te lo pide después de escribir tu usuario "
+        "y tu contraseña."
+    )
+    try:
+        segundos = int(segundos) if segundos else 0
+    except (TypeError, ValueError):
+        segundos = 0
+    if segundos > 0:
+        lineas.append(
+            f"⏳ Vence en ~{segundos} segundos: si se vence, pide otro código."
+        )
+    else:
+        lineas.append("⏳ Úsalo cuanto antes: si se vence, pide otro código.")
+    lineas.append("🤫 No lo compartas con nadie.")
+    return "\n".join(lineas)
+
+
+def texto_menu(cliente, admin: bool, cuentas) -> str:
+    """Saludo + menu, MUY simple."""
+    nombre = str((cliente or {}).get("nombre") or "").strip()
+    if nombre:
+        saludo = f"👋 ¡Hola, {nombre}!"
+    elif admin:
+        saludo = "👋 ¡Hola, equipo!"
+    else:
+        saludo = "👋 ¡Hola!"
+    cuentas = list(cuentas or [])
+    lineas = [saludo, ""]
+    if not cuentas:
+        lineas.append("Todavía no tienes cuentas asignadas.")
+    elif len(cuentas) == 1:
+        lineas.append(f"Tu cuenta es: @{str(cuentas[0]).strip().lstrip('@')}")
+    else:
+        lineas.append(f"Tienes {len(cuentas)} cuentas.")
+    lineas += ["", "¿Qué quieres hacer? Toca un botón 👇"]
+    return "\n".join(lineas)
+
+
+def texto_pedir_nombre(usuario: str) -> str:
+    return (
+        f"✏️ Escríbeme el nombre nuevo para @{usuario}.\n\n"
+        "Ejemplo: María López\n\n"
+        "Solo el nombre: sin @ y sin links."
+    )
+
+
+def texto_pedir_foto(foto_tipo: str, usuario: str) -> str:
+    etiqueta = "foto de perfil" if foto_tipo == "perfil" else "portada"
+    return (
+        f"📸 Envíame la {etiqueta} de @{usuario} como imagen.\n\n"
+        "Mándala aquí como FOTO (no como archivo 📎).\n"
+        "Después te pregunto si la uso."
+    )
+
+
+def _etiqueta_cuenta(datos, usuario: str) -> str:
+    handle = str((datos or {}).get("handle_actual") or "").strip().lstrip("@")
+    return handle or str(usuario or "").strip().lstrip("@")
+
+
+def _resolver_cuenta(usuario, cuentas) -> str:
+    """Devuelve el usuario EXACTO de la lista (case-insensitive) o ""."""
+    buscado = str(usuario or "").strip().lstrip("@").strip().lower()
+    if not buscado:
+        return ""
+    for cuenta in cuentas or []:
+        if str(cuenta).strip().lstrip("@").strip().lower() == buscado:
+            return str(cuenta).strip()
+    return ""
+
+
+def _limpiar(context) -> None:
+    """Borra el estado de cualquier flujo en curso."""
+    user_data = getattr(context, "user_data", None)
+    if user_data is None:
+        return
+    for clave in ("cli_flujo", "cli_espera", "cli_nombre_pend", "cli_foto_pend"):
+        try:
+            user_data.pop(clave, None)
+        except Exception:
+            pass
+
+
+# --------------------------------------------------------------------------- #
+# Acceso: guard de cliente/admin y cuentas
+# --------------------------------------------------------------------------- #
+
+def _telegram_id(update) -> int | None:
+    user = getattr(update, "effective_user", None) if update else None
+    uid = getattr(user, "id", None)
+    if uid is None:
+        return None
+    try:
+        return int(uid)
+    except (TypeError, ValueError):
+        return None
+
+
+async def _avisar(update, texto: str) -> None:
+    """Responde al update (alerta en callbacks, mensaje en texto). Nunca lanza."""
+    query = getattr(update, "callback_query", None)
+    if query is not None:
+        try:
+            await query.answer(str(texto)[:190], show_alert=True)
+        except Exception:
+            pass
+        return
+    message = getattr(update, "effective_message", None)
+    if message is not None:
+        try:
+            await message.reply_text(texto)
+        except Exception:
+            pass
+
+
+async def _guard(update) -> tuple | None:
+    """(uid, cliente, admin) o None (avisando) si no esta autorizado."""
+    uid = _telegram_id(update)
+    if uid is None:
+        return None
+    cliente = clientes_store.cliente_de(uid)
+    admin = es_admin(uid)
+    if cliente is None and not admin:
+        texto = TEXTO_SIN_REGISTRO
+        query = getattr(update, "callback_query", None)
+        if query is not None:
+            texto = TEXTO_SIN_REGISTRO_CORTO
+        await _avisar(update, texto)
+        return None
+    return uid, cliente, admin
+
+
+def _cuentas_bd(limite: int = 20) -> list:
+    """Ultimo recurso para admins sin cuentas asignadas: cuentas de la BD."""
+    try:
+        from core.database import get_db_session
+        from core.models import Cuenta
+
+        with get_db_session() as db:
+            filas = (
+                db.query(Cuenta.usuario)
+                .order_by(Cuenta.usuario)
+                .limit(max(1, int(limite)))
+                .all()
+            )
+        return [str(fila[0]) for fila in filas if fila and fila[0]]
+    except Exception as e:
+        logger.warning(f"No se pudieron listar cuentas de la BD: {e}")
+        return []
+
+
+def _cuentas_disponibles(uid, cliente, admin: bool) -> list:
+    """Cuentas del cliente; el admin ve todas (JSON, y si no hay, la BD)."""
+    if cliente is not None:
+        return list(cliente.get("cuentas") or [])
+    if not admin:
+        return []
+    vistas = []
+    for info in clientes_store.todos_los_clientes().values():
+        for usuario in info.get("cuentas") or []:
+            if usuario.lower() not in {str(v).lower() for v in vistas}:
+                vistas.append(usuario)
+    if vistas:
+        return vistas
+    return _cuentas_bd()
+
+
+def _datos_cuenta(usuario: str) -> dict | None:
+    """Datos de la cuenta en SQLite (sin credenciales sensibles) o None."""
+    try:
+        from sqlalchemy import func
+
+        from core.database import get_db_session
+        from core.models import Cuenta
+
+        with get_db_session() as db:
+            cuenta = (
+                db.query(Cuenta)
+                .filter(func.lower(Cuenta.usuario) == str(usuario).lower())
+                .first()
+            )
+            if cuenta is None:
+                return None
+            return {
+                "usuario": str(getattr(cuenta, "usuario", "") or "").strip(),
+                "handle_actual": str(getattr(cuenta, "handle_actual", "") or "").strip(),
+                "nombre_mostrado": str(
+                    getattr(cuenta, "nombre_mostrado", "") or ""
+                ).strip(),
+                "totp_secret": str(getattr(cuenta, "totp_secret", "") or ""),
+                "email": str(getattr(cuenta, "email", "") or "").strip(),
+                "email_password": str(getattr(cuenta, "email_password", "") or ""),
+                "activa": bool(getattr(cuenta, "activa", True)),
+            }
+    except Exception as e:
+        logger.warning(f"No se pudo leer la cuenta {usuario} en la BD: {e}")
+        return None
+
+
+# --------------------------------------------------------------------------- #
+# Codigo de verificacion (TOTP o correo)
+# --------------------------------------------------------------------------- #
+
+def _importar_lector_correo():
+    """Import perezoso del lector IMAP (lo crea otro agente en utils/)."""
+    from utils.lector_correo import obtener_codigo_verificacion
+
+    return obtener_codigo_verificacion
+
+
+def _llamar_lector(buscador, email: str, password: str, timeout: int = TIEMPO_CORREO):
+    """Llama al lector respetando su firma (timeout opcional)."""
+    try:
+        parametros = inspect.signature(buscador).parameters
+        if "timeout" in parametros:
+            return buscador(email, password, timeout=timeout)
+    except (TypeError, ValueError):
+        pass
+    return buscador(email, password)
+
+
+async def codigo_desde_correo(
+    email: str,
+    password: str,
+    intentos: int = INTENTOS_CORREO,
+    espera_min: float = ESPERA_CORREO_MIN,
+    espera_max: float = ESPERA_CORREO_MAX,
+    buscador=None,
+    dormir=None,
+    importador=None,
+) -> dict:
+    """Busca el codigo de 6 digitos en el correo (hasta `intentos` veces).
+
+    Devuelve `{"ok", "codigo", "intentos", "error"}`. Nunca lanza: si el
+    modulo `utils.lector_correo` no existe (ImportError) responde con error
+    simple. `buscador`/`dormir`/`importador` se inyectan en las pruebas.
+    """
+    email = str(email or "").strip()
+    if not email or not str(password or ""):
+        return {
+            "ok": False,
+            "codigo": "",
+            "intentos": 0,
+            "error": "La cuenta no tiene correo configurado.",
+        }
+    if buscador is None:
+        try:
+            buscador = (importador or _importar_lector_correo)()
+        except Exception as e:
+            logger.info(f"Lector de correo no disponible: {type(e).__name__}: {e}")
+            return {
+                "ok": False,
+                "codigo": "",
+                "intentos": 0,
+                "error": "No pude revisar el correo (lector no disponible).",
+            }
+        if not callable(buscador):
+            return {
+                "ok": False,
+                "codigo": "",
+                "intentos": 0,
+                "error": "No pude revisar el correo (lector inválido).",
+            }
+    dormir = dormir or asyncio.sleep
+    try:
+        intentos = max(1, int(intentos or 1))
+    except (TypeError, ValueError):
+        intentos = INTENTOS_CORREO
+    ultimo_error = ""
+    for intento in range(1, intentos + 1):
+        try:
+            resultado = await asyncio.to_thread(
+                _llamar_lector, buscador, email, password
+            )
+        except Exception as e:
+            resultado = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+        if not isinstance(resultado, dict):
+            resultado = {"ok": False, "error": "respuesta inesperada del lector"}
+        codigo = str(resultado.get("codigo") or "").strip()
+        if resultado.get("ok") and codigo:
+            return {"ok": True, "codigo": codigo, "intentos": intento, "error": ""}
+        ultimo_error = str(resultado.get("error") or "").strip()
+        if intento < intentos:
+            try:
+                await dormir(random.uniform(espera_min, espera_max))
+            except Exception:
+                pass
+    return {
+        "ok": False,
+        "codigo": "",
+        "intentos": intentos,
+        "error": ultimo_error or "No llegó ningún código al correo todavía.",
+    }
+
+
+async def _flujo_codigo(target, context, usuario: str) -> None:
+    """Entrega el codigo de verificacion de `usuario` (TOTP o correo)."""
+    datos = await asyncio.to_thread(_datos_cuenta, usuario)
+    etiqueta = _etiqueta_cuenta(datos, usuario)
+    if datos is None:
+        await _responder(
+            target,
+            f"😕 No encontré la cuenta @{etiqueta}.\n\n"
+            "Pide ayuda a quien te dio la cuenta.",
+        )
+        return
+
+    secreto = str(datos.get("totp_secret") or "")
+    if secreto.strip():
+        codigo, error = generar_codigo_totp(secreto)
+        if codigo:
+            await _responder(
+                target,
+                texto_codigo(codigo, segundos_restantes_ventana(), "totp"),
+                teclado_codigo(usuario),
+                html=True,
+            )
+            return
+        logger.warning(f"TOTP inválido para @{usuario}: {error}")
+
+    email = str(datos.get("email") or "").strip()
+    password = str(datos.get("email_password") or "")
+    if not email or not password:
+        await _responder(
+            target,
+            f"😕 La cuenta @{etiqueta} no tiene código configurado.\n\n"
+            "Pide a la persona que te dio la cuenta que lo revise.",
+        )
+        return
+
+    await _responder(
+        target, "⏳ Buscando el código en el correo, espera unos segundos..."
+    )
+    resultado = await codigo_desde_correo(email, password)
+    if resultado.get("ok"):
+        await _responder(
+            target,
+            texto_codigo(resultado.get("codigo"), None, "correo"),
+            teclado_codigo(usuario),
+            html=True,
+        )
+        return
+    logger.info(f"Sin código por correo para @{usuario}: {resultado.get('error')}")
+    await _responder(
+        target,
+        "😕 No encontré ningún código nuevo en el correo.\n\n"
+        "Espera unos segundos y toca «🔄 Intentar de nuevo».\n"
+        "Si sigue sin llegar, pide ayuda a quien te dio la cuenta.",
+        teclado_codigo_fallo(usuario),
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Ejecucion en X (Selenium; hilo aparte + cierre garantizado)
+# --------------------------------------------------------------------------- #
+
+def _guardar_nombre_mostrado(usuario: str, nombre: str) -> None:
+    """Persiste el nombre en la BD (para 📋 Mis cuentas). Nunca lanza."""
+    try:
+        from core.database import get_db_session
+        from core.models import Cuenta
+
+        with get_db_session() as db:
+            cuenta = db.query(Cuenta).filter(Cuenta.usuario == usuario).first()
+            if cuenta is not None:
+                cuenta.nombre_mostrado = nombre
+    except Exception as e:
+        logger.debug(f"No se pudo guardar nombre_mostrado de {usuario}: {e}")
+
+
+async def ejecutar_cambiar_nombre(usuario: str, nombre: str) -> tuple:
+    """Cambia el nombre en X con TwitterBot. Devuelve (ok, error_real)."""
+    try:
+        from plataformas.twitter.selenium_bot import TwitterBot
+    except Exception as e:
+        return False, f"modulo no disponible: {type(e).__name__}: {e}"
+    bot = TwitterBot(usuario)
+    try:
+        ok = await asyncio.to_thread(bot.cambiar_nombre, nombre)
+        error = (getattr(bot, "ultimo_error", "") or "").strip()
+        if ok:
+            _guardar_nombre_mostrado(usuario, nombre)
+        return bool(ok), error
+    except Exception as e:
+        logger.exception(f"Error cambiando el nombre de @{usuario}: {e}")
+        return False, f"{type(e).__name__}: {e}"
+    finally:
+        try:
+            bot.cerrar()
+        except Exception:
+            pass
+
+
+async def ejecutar_cambiar_foto(usuario: str, foto_tipo: str, ruta: str) -> tuple:
+    """Sube la foto de perfil/portada en X. Devuelve (ok, error_real)."""
+    try:
+        from plataformas.twitter.selenium_bot import TwitterBot
+    except Exception as e:
+        return False, f"modulo no disponible: {type(e).__name__}: {e}"
+    bot = TwitterBot(usuario)
+    try:
+        if str(foto_tipo).strip().lower() == "portada":
+            ok = await asyncio.to_thread(bot.cambiar_foto_portada, ruta)
+        else:
+            ok = await asyncio.to_thread(bot.cambiar_foto_perfil, ruta)
+        error = (getattr(bot, "ultimo_error", "") or "").strip()
+        return bool(ok), error
+    except Exception as e:
+        logger.exception(f"Error subiendo {foto_tipo} de @{usuario}: {e}")
+        return False, f"{type(e).__name__}: {e}"
+    finally:
+        try:
+            bot.cerrar()
+        except Exception:
+            pass
+
+
+# --------------------------------------------------------------------------- #
+# Utilidades de mensajes
+# --------------------------------------------------------------------------- #
+
+async def _responder(target, texto: str, markup=None, html: bool = False):
+    """Edita el mensaje objetivo si se puede; si no, responde uno nuevo."""
+    kwargs = {}
+    if markup is not None:
+        kwargs["reply_markup"] = markup
+    if html:
+        kwargs["parse_mode"] = "HTML"
+    for metodo in ("edit_text", "reply_text"):
+        funcion = getattr(target, metodo, None)
+        if funcion is None:
+            continue
+        try:
+            return await funcion(texto, **kwargs)
+        except Exception:
+            continue
+    return None
+
+
+def _data_temp() -> str:
+    """Carpeta `data/temp/` (para las imagenes que manda el cliente)."""
+    try:
+        from core.config import resolver_ruta
+
+        destino = resolver_ruta("data/temp")
+    except Exception:
+        raiz = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        destino = os.path.join(raiz, "data", "temp")
+    os.makedirs(destino, exist_ok=True)
+    return destino
+
+
+async def _descargar_foto(message, foto, usuario: str, foto_tipo: str) -> tuple:
+    """Descarga la imagen de Telegram a data/temp/. Devuelve (ruta, error)."""
+    try:
+        destino_dir = _data_temp()
+    except Exception as e:
+        return "", f"no hay carpeta temporal: {type(e).__name__}: {e}"
+    seguro = re.sub(r"[^A-Za-z0-9_-]+", "_", str(usuario))[:40] or "cuenta"
+    ruta = os.path.join(
+        destino_dir, f"cli_{seguro}_{foto_tipo}_{int(time.time() * 1000)}.jpg"
+    )
+    try:
+        archivo = await foto.get_file()
+        await archivo.download_to_drive(ruta)
+        return ruta, ""
+    except Exception as e:
+        logger.warning(f"No se pudo descargar la foto de Telegram: {e}")
+        return "", f"{type(e).__name__}: {e}"
+
+
+# --------------------------------------------------------------------------- #
+# Seleccion de cuenta / inicio de flujos
+# --------------------------------------------------------------------------- #
+
+async def _iniciar_flujo(
+    target, context, tipo: str, usuario: str, editar: bool = True
+) -> None:
+    """Arranca el flujo pedido con la cuenta ya elegida."""
+    if tipo == "codigo":
+        await _flujo_codigo(target, context, usuario)
+        return
+    if tipo == "nombre":
+        context.user_data["cli_espera"] = {"tipo": "nombre", "usuario": usuario}
+        texto = texto_pedir_nombre(usuario)
+        markup = teclado_cancelar()
+    else:
+        foto_tipo = "perfil" if tipo == "foto_perfil" else "portada"
+        context.user_data["cli_espera"] = {
+            "tipo": "foto",
+            "foto_tipo": foto_tipo,
+            "usuario": usuario,
+        }
+        texto = texto_pedir_foto(foto_tipo, usuario)
+        markup = teclado_cancelar()
+    if editar:
+        await _responder(target, texto, markup)
+    else:
+        try:
+            await target.reply_text(texto, reply_markup=markup)
+        except Exception:
+            await _responder(target, texto, markup)
+
+
+async def _elegir_cuenta_o_iniciar(query, context, uid, cliente, admin, tipo: str) -> None:
+    """Con 1 cuenta va directo; con varias muestra un boton por cuenta."""
+    cuentas = _cuentas_disponibles(uid, cliente, admin)
+    if not cuentas:
+        await _responder(query.message, TEXTO_SIN_CUENTAS)
+        return
+    if len(cuentas) == 1:
+        await _iniciar_flujo(query.message, context, tipo, cuentas[0], editar=True)
+        return
+    context.user_data["cli_flujo"] = tipo
+    context.user_data.pop("cli_espera", None)
+    await _responder(
+        query.message, "¿Con cuál cuenta quieres hacerlo?", teclado_cuentas(cuentas)
+    )
+
+
+async def _mostrar_mis_cuentas(query, uid, cliente, admin) -> None:
+    """Lista las cuentas con su @ real y su nombre actual (sin credenciales)."""
+    cuentas = _cuentas_disponibles(uid, cliente, admin)
+    if not cuentas:
+        await _responder(query.message, TEXTO_SIN_CUENTAS, menu_principal())
+        return
+    lineas = ["📋 Tus cuentas:", ""]
+    for indice, usuario in enumerate(cuentas, 1):
+        datos = await asyncio.to_thread(_datos_cuenta, usuario)
+        etiqueta = _etiqueta_cuenta(datos, usuario)
+        nombre = str((datos or {}).get("nombre_mostrado") or "").strip()
+        linea = f"{indice}. @{etiqueta}"
+        if nombre:
+            linea += f" — «{nombre}»"
+        lineas.append(linea)
+    lineas += ["", "Toca una cuenta para hacer algo con ella 👇"]
+    await _responder(
+        query.message, "\n".join(lineas), teclado_mis_cuentas(cuentas[:10])
+    )
+
+
+async def _pedir_nombre(target, context, usuario: str) -> None:
+    """Pide el nombre nuevo por texto."""
+    context.user_data["cli_espera"] = {"tipo": "nombre", "usuario": usuario}
+    context.user_data.pop("cli_nombre_pend", None)
+    await _responder(target, texto_pedir_nombre(usuario), teclado_cancelar())
+
+
+async def _pedir_foto(target, context, usuario: str, foto_tipo: str) -> None:
+    """Pide la imagen por Telegram."""
+    context.user_data["cli_espera"] = {
+        "tipo": "foto",
+        "foto_tipo": foto_tipo,
+        "usuario": usuario,
+    }
+    context.user_data.pop("cli_foto_pend", None)
+    await _responder(target, texto_pedir_foto(foto_tipo, usuario), teclado_cancelar())
+
+
+# --------------------------------------------------------------------------- #
+# Comandos publicos
+# --------------------------------------------------------------------------- #
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/start: saludo + menu de botones (lo unico que el cliente necesita)."""
+    ctx = await _guard(update)
+    if ctx is None:
+        return
+    uid, cliente, admin = ctx
+    _limpiar(context)
+    cuentas = _cuentas_disponibles(uid, cliente, admin)
+    await update.effective_message.reply_text(
+        texto_menu(cliente, admin, cuentas), reply_markup=menu_principal()
+    )
+
+
+async def ayuda(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Guia sencilla de cada boton y que hacer si algo falla."""
+    ctx = await _guard(update)
+    if ctx is None:
+        return
+    _limpiar(context)
+    await update.effective_message.reply_text(
+        TEXTO_AYUDA, reply_markup=menu_principal()
+    )
+
+
+async def cancelar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/cancelar: detiene cualquier flujo en curso y vuelve al menu."""
+    ctx = await _guard(update)
+    if ctx is None:
+        return
+    _limpiar(context)
+    await update.effective_message.reply_text(
+        "Listo, cancelado. ✅\n\n¿Qué quieres hacer ahora? Toca un botón 👇",
+        reply_markup=menu_principal(),
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Callbacks del menu (`cli_*`)
+# --------------------------------------------------------------------------- #
+
+async def cli_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Menu principal y acciones: cli_menu, cli_codigo, cli_nombre, ..."""
+    query = update.callback_query
+    ctx = await _guard(update)
+    if ctx is None:
+        return
+    uid, cliente, admin = ctx
+    data = (query.data or "").strip()
+    await query.answer()
+
+    if data.startswith("cli_cuenta_"):
+        usuario = _resolver_cuenta(
+            data[len("cli_cuenta_"):], _cuentas_disponibles(uid, cliente, admin)
+        )
+        if not usuario:
+            try:
+                await query.answer("Esa cuenta ya no está disponible.", show_alert=True)
+            except Exception:
+                pass
+            return
+        _limpiar(context)
+        await _responder(
+            query.message,
+            f"¿Qué quieres hacer con @{usuario}?",
+            teclado_acciones_cuenta(usuario),
+        )
+        return
+
+    if data == "cli_menu":
+        _limpiar(context)
+        await _responder(
+            query.message,
+            texto_menu(cliente, admin, _cuentas_disponibles(uid, cliente, admin)),
+            menu_principal(),
+        )
+        return
+    if data == "cli_ayuda":
+        _limpiar(context)
+        await _responder(query.message, TEXTO_AYUDA, menu_principal())
+        return
+    if data == "cli_cancelar":
+        _limpiar(context)
+        await _responder(
+            query.message,
+            "Listo, cancelado. ✅\n\n¿Qué quieres hacer ahora? Toca un botón 👇",
+            menu_principal(),
+        )
+        return
+    if data == "cli_mis_cuentas":
+        _limpiar(context)
+        await _mostrar_mis_cuentas(query, uid, cliente, admin)
+        return
+
+    tipo = TIPO_POR_BOTON.get(data)
+    if tipo:
+        _limpiar(context)
+        await _elegir_cuenta_o_iniciar(query, context, uid, cliente, admin, tipo)
+
+
+async def cuenta_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Selector de cuenta (`cuenta_<usuario>`) segun el flujo pendiente."""
+    query = update.callback_query
+    ctx = await _guard(update)
+    if ctx is None:
+        return
+    uid, cliente, admin = ctx
+    usuario = _resolver_cuenta(
+        (query.data or "")[len("cuenta_"):],
+        _cuentas_disponibles(uid, cliente, admin),
+    )
+    if not usuario:
+        await query.answer("Esa cuenta ya no está disponible.", show_alert=True)
+        return
+    tipo = str(context.user_data.get("cli_flujo") or "").strip()
+    if tipo not in ("codigo", "nombre", "foto_perfil", "foto_portada"):
+        await query.answer("Primero elige qué quieres hacer 🙂", show_alert=True)
+        await _responder(query.message, "¿Qué quieres hacer? Toca un botón 👇", menu_principal())
+        return
+    await query.answer()
+    context.user_data.pop("cli_flujo", None)
+    await _iniciar_flujo(query.message, context, tipo, usuario, editar=True)
+
+
+async def codigo_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Codigo de verificacion y reintentos (`codigo_<usuario>`)."""
+    query = update.callback_query
+    ctx = await _guard(update)
+    if ctx is None:
+        return
+    uid, cliente, admin = ctx
+    usuario = _resolver_cuenta(
+        (query.data or "")[len("codigo_"):],
+        _cuentas_disponibles(uid, cliente, admin),
+    )
+    if not usuario:
+        await query.answer("Esa cuenta ya no está disponible.", show_alert=True)
+        return
+    await query.answer()
+    _limpiar(context)
+    await _flujo_codigo(query.message, context, usuario)
+
+
+async def nombre_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Nombre: elegir cuenta (`nombre_<u>`) o confirmar (`nombre_si/no_<u>`)."""
+    query = update.callback_query
+    ctx = await _guard(update)
+    if ctx is None:
+        return
+    uid, cliente, admin = ctx
+    data = (query.data or "").strip()
+    cuentas = _cuentas_disponibles(uid, cliente, admin)
+
+    for prefijo in ("nombre_si_", "nombre_no_"):
+        if not data.startswith(prefijo):
+            continue
+        usuario = _resolver_cuenta(data[len(prefijo):], cuentas)
+        pendiente = context.user_data.get("cli_nombre_pend") or {}
+        if (
+            not usuario
+            or pendiente.get("usuario") != usuario
+            or not pendiente.get("nombre")
+        ):
+            await query.answer(
+                "Este botón ya venció. Toca otra vez el menú 🙂", show_alert=True
+            )
+            return
+        await query.answer()
+        if prefijo == "nombre_no_":
+            context.user_data.pop("cli_nombre_pend", None)
+            await _responder(
+                query.message, "Está bien, no cambié nada. 👍", menu_principal()
+            )
+            return
+        nombre = str(pendiente.get("nombre"))
+        await _responder(
+            query.message,
+            f"⏳ Cambiando el nombre de @{usuario} a «{nombre}».\n\n"
+            "Esto tarda 1-2 minutos. No cierres el chat, por favor...",
+        )
+        ok, error = await ejecutar_cambiar_nombre(usuario, nombre)
+        context.user_data.pop("cli_nombre_pend", None)
+        if ok:
+            await query.message.reply_text(
+                f"✅ ¡Listo! Ahora el nombre de @{usuario} es «{nombre}».",
+                reply_markup=menu_principal(),
+            )
+        else:
+            logger.warning(f"No se pudo cambiar el nombre de @{usuario}: {error}")
+            await query.message.reply_text(
+                TEXTO_FALLO_NOMBRE,
+                reply_markup=teclado_reintentar_nombre(usuario),
+            )
+        return
+
+    if data.startswith("nombre_"):
+        usuario = _resolver_cuenta(data[len("nombre_"):], cuentas)
+        if not usuario:
+            await query.answer("Esa cuenta ya no está disponible.", show_alert=True)
+            return
+        await query.answer()
+        await _pedir_nombre(query.message, context, usuario)
+        return
+
+    await query.answer()
+
+
+async def foto_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Fotos: elegir cuenta/confirmar (`foto_perfil_`, `foto_si_`, ...)."""
+    query = update.callback_query
+    ctx = await _guard(update)
+    if ctx is None:
+        return
+    uid, cliente, admin = ctx
+    data = (query.data or "").strip()
+    cuentas = _cuentas_disponibles(uid, cliente, admin)
+
+    for accion in ("foto_si_", "foto_no_", "foto_otra_"):
+        if not data.startswith(accion):
+            continue
+        resto = data[len(accion):]
+        foto_tipo, _, usuario_raw = resto.partition("_")
+        foto_tipo = "portada" if foto_tipo.strip().lower() == "portada" else "perfil"
+        usuario = _resolver_cuenta(usuario_raw, cuentas)
+        pendiente = context.user_data.get("cli_foto_pend") or {}
+        if (
+            not usuario
+            or pendiente.get("usuario") != usuario
+            or pendiente.get("tipo") != foto_tipo
+        ):
+            await query.answer(
+                "Este botón ya venció. Toca otra vez el menú 🙂", show_alert=True
+            )
+            return
+        await query.answer()
+        etiqueta = "foto de perfil" if foto_tipo == "perfil" else "portada"
+        if accion == "foto_no_":
+            context.user_data.pop("cli_foto_pend", None)
+            _limpiar(context)
+            await _responder(
+                query.message, "Está bien, no cambié nada. 👍", menu_principal()
+            )
+            return
+        if accion == "foto_otra_":
+            context.user_data.pop("cli_foto_pend", None)
+            await _pedir_foto(query.message, context, usuario, foto_tipo)
+            return
+        ruta = str(pendiente.get("ruta") or "")
+        context.user_data.pop("cli_espera", None)
+        await _responder(
+            query.message,
+            f"⏳ Subiendo tu nueva {etiqueta} de @{usuario}.\n\n"
+            "Esto tarda 1-2 minutos. No cierres el chat, por favor...",
+        )
+        ok, error = await ejecutar_cambiar_foto(usuario, foto_tipo, ruta)
+        context.user_data.pop("cli_foto_pend", None)
+        if ok:
+            try:
+                if ruta and os.path.isfile(ruta):
+                    os.remove(ruta)
+            except OSError:
+                pass
+            await query.message.reply_text(
+                f"✅ ¡Listo! Ya cambié tu {etiqueta}.",
+                reply_markup=menu_principal(),
+            )
+        else:
+            logger.warning(f"No se pudo subir {foto_tipo} de @{usuario}: {error}")
+            await query.message.reply_text(
+                TEXTO_FALLO_FOTO,
+                reply_markup=teclado_reintentar_foto(foto_tipo, usuario),
+            )
+        return
+
+    if data.startswith("foto_perfil_") or data.startswith("foto_portada_"):
+        foto_tipo = "perfil" if data.startswith("foto_perfil_") else "portada"
+        prefijo = "foto_perfil_" if foto_tipo == "perfil" else "foto_portada_"
+        usuario = _resolver_cuenta(data[len(prefijo):], cuentas)
+        if not usuario:
+            await query.answer("Esa cuenta ya no está disponible.", show_alert=True)
+            return
+        await query.answer()
+        await _pedir_foto(query.message, context, usuario, foto_tipo)
+        return
+
+    await query.answer()
+
+
+# --------------------------------------------------------------------------- #
+# Mensajes de texto (solo con flujo pendiente) y fotos
+# --------------------------------------------------------------------------- #
+
+async def texto_recibido(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Texto libre: SOLO se procesa si hay un flujo pendiente (nombre nuevo)."""
+    espera = context.user_data.get("cli_espera") or {}
+    if espera.get("tipo") != "nombre":
+        return
+    ctx = await _guard(update)
+    if ctx is None:
+        return
+    uid, cliente, admin = ctx
+    usuario = _resolver_cuenta(
+        espera.get("usuario") or "", _cuentas_disponibles(uid, cliente, admin)
+    )
+    if not usuario:
+        _limpiar(context)
+        await update.effective_message.reply_text(
+            "😕 La cuenta ya no está disponible. Vuelve a empezar con /start."
+        )
+        return
+    texto = str(getattr(update.effective_message, "text", "") or "")
+    ok, nombre, error = validar_nombre(texto)
+    if not ok:
+        await update.effective_message.reply_text(
+            f"🤔 {error}\n\nEscríbelo otra vez, por favor."
+        )
+        return
+    context.user_data.pop("cli_espera", None)
+    context.user_data["cli_nombre_pend"] = {"usuario": usuario, "nombre": nombre}
+    await update.effective_message.reply_text(
+        f"Voy a cambiar el nombre de @{usuario} a:\n\n«{nombre}»\n\n¿Lo hago?",
+        reply_markup=teclado_confirmar_nombre(usuario),
+    )
+
+
+async def foto_recibida(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Foto de Telegram: la guarda en data/temp y pide confirmacion."""
+    espera = context.user_data.get("cli_espera") or {}
+    if espera.get("tipo") != "foto":
+        ctx = await _guard(update)
+        if ctx is None:
+            return
+        await update.effective_message.reply_text(
+            "📸 No esperaba ninguna foto.\n\n"
+            "Primero toca el botón 📸 o 🖼️ y después mándame la imagen. 🙂"
+        )
+        return
+    ctx = await _guard(update)
+    if ctx is None:
+        return
+    uid, cliente, admin = ctx
+    usuario = _resolver_cuenta(
+        espera.get("usuario") or "", _cuentas_disponibles(uid, cliente, admin)
+    )
+    foto_tipo = "portada" if espera.get("foto_tipo") == "portada" else "perfil"
+    if not usuario:
+        _limpiar(context)
+        await update.effective_message.reply_text(
+            "😕 La cuenta ya no está disponible. Vuelve a empezar con /start."
+        )
+        return
+    fotos = list(getattr(update.effective_message, "photo", []) or [])
+    if not fotos:
+        await update.effective_message.reply_text(
+            "📸 Mándala como FOTO (no como archivo 📎), por favor."
+        )
+        return
+    ruta, error = await _descargar_foto(
+        update.effective_message, fotos[-1], usuario, foto_tipo
+    )
+    if not ruta:
+        logger.warning(f"No se pudo bajar la foto de @{usuario}: {error}")
+        await update.effective_message.reply_text(
+            "❌ No se pudo recibir la foto. Inténtalo otra vez, por favor."
+        )
+        return
+    context.user_data.pop("cli_espera", None)
+    context.user_data["cli_foto_pend"] = {
+        "usuario": usuario,
+        "tipo": foto_tipo,
+        "ruta": ruta,
+    }
+    etiqueta = "foto de perfil" if foto_tipo == "perfil" else "portada"
+    try:
+        await update.effective_message.reply_photo(
+            photo=fotos[-1].file_id,
+            caption=f"¿Uso esta foto como tu nueva {etiqueta} de @{usuario}?",
+            reply_markup=teclado_confirmar_foto(foto_tipo, usuario),
+        )
+    except Exception as e:
+        logger.warning(f"No se pudo reenviar la vista previa a @{usuario}: {e}")
+        await update.effective_message.reply_text(
+            f"¿Uso esta foto como tu nueva {etiqueta} de @{usuario}?",
+            reply_markup=teclado_confirmar_foto(foto_tipo, usuario),
+        )
+
+
+# --------------------------------------------------------------------------- #
+# Comandos de admin (/clientes, /asignar, /quitar)
+# --------------------------------------------------------------------------- #
+
+def solo_admins(func):
+    """Decorador: solo TELEGRAM_ADMIN_IDS puede ejecutar el comando."""
+
+    @functools.wraps(func)
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
+        uid = _telegram_id(update)
+        if uid is None or not es_admin(uid):
+            message = getattr(update, "effective_message", None) if update else None
+            if message is not None:
+                try:
+                    await message.reply_text(
+                        "⛔ Este comando es solo para el equipo."
+                    )
+                except Exception:
+                    pass
+            return
+        return await func(update, context, *args, **kwargs)
+
+    return wrapper
+
+
+def _usuarios_en_bd(usuarios) -> set | None:
+    """Set en minusculas de los usuarios que EXISTEN en la BD; None si falla."""
+    nombres = [str(u).strip() for u in (usuarios or []) if str(u).strip()]
+    if not nombres:
+        return set()
+    try:
+        from sqlalchemy import func
+
+        from core.database import get_db_session
+        from core.models import Cuenta
+
+        with get_db_session() as db:
+            filas = (
+                db.query(func.lower(Cuenta.usuario))
+                .filter(func.lower(Cuenta.usuario).in_([n.lower() for n in nombres]))
+                .all()
+            )
+        return {str(fila[0]).lower() for fila in filas if fila and fila[0]}
+    except Exception as e:
+        logger.warning(f"No se pudo consultar la BD para /asignar: {e}")
+        return None
+
+
+def _texto_uso_asignar() -> str:
+    return (
+        "Uso: /asignar <telegram_id> [nombre] <usuario1> <usuario2> ...\n\n"
+        "Ejemplo: /asignar 123456789 Juan MiCuenta OtraCuenta\n"
+        "Si el primer dato no es una cuenta de la BD, se toma como nombre del "
+        "cliente (o usa nombre=Juan sin espacios)."
+    )
+
+
+@solo_admins
+async def comando_clientes(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/clientes: lista los clientes registrados y sus cuentas (solo admin)."""
+    clientes = clientes_store.todos_los_clientes()
+    if not clientes:
+        await update.effective_message.reply_text(
+            "👥 Todavía no hay clientes registrados.\n\n"
+            "Usa: /asignar <telegram_id> [nombre] <usuario1> <usuario2> ..."
+        )
+        return
+    lineas = [f"👥 Clientes del bot ({len(clientes)}):", ""]
+    for telegram_id in sorted(clientes, key=lambda x: int(x) if str(x).isdigit() else 0):
+        info = clientes[telegram_id]
+        lineas.append(f"• {telegram_id} — {info.get('nombre') or 'Cliente'}")
+        for usuario in info.get("cuentas") or []:
+            lineas.append(f"   - @{usuario}")
+        lineas.append("")
+    lineas.append("Para agregar cuentas: /asignar <id> [nombre] <usuario...>")
+    lineas.append("Para quitar cuentas: /quitar <id> <usuario...>")
+    await update.effective_message.reply_text("\n".join(lineas))
+
+
+@solo_admins
+async def comando_asignar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/asignar <telegram_id> [nombre] <usuario1> ...: da cuentas a un cliente."""
+    args = [str(a) for a in (context.args or [])]
+    if len(args) < 2:
+        await update.effective_message.reply_text(_texto_uso_asignar())
+        return
+    telegram_id = args[0].strip()
+    resto = [a for a in args[1:] if a.strip()]
+    nombre = ""
+    tokens_usuarios = resto
+
+    if resto and resto[0].lower().startswith("nombre="):
+        nombre = resto[0].split("=", 1)[1].replace("_", " ").strip()
+        tokens_usuarios = resto[1:]
+    elif resto:
+        conocidos = _usuarios_en_bd(resto[:2])
+        primero = resto[0].lower()
+        segundo = resto[1].lower() if len(resto) >= 2 else ""
+        if conocidos and primero not in conocidos and segundo in conocidos:
+            nombre, tokens_usuarios = resto[0], resto[1:]
+
+    usuarios = clientes_store.limpiar_usuarios(tokens_usuarios)
+    previos = {
+        str(u).lower() for u in clientes_store.cuentas_de(telegram_id)
+    }
+    error = clientes_store.asignar(telegram_id, nombre, usuarios)
+    if error:
+        await update.effective_message.reply_text(f"❌ {error}")
+        return
+    info = clientes_store.cliente_de(telegram_id) or {}
+    agregadas = [u for u in usuarios if u.lower() not in previos]
+    lineas = [f"✅ Listo. Cliente {telegram_id} — {info.get('nombre') or 'Cliente'}."]
+    if agregadas:
+        lineas.append("Cuentas agregadas: " + ", ".join(f"@{u}" for u in agregadas))
+    todas = info.get("cuentas") or []
+    if todas:
+        lineas.append("Ahora tiene: " + ", ".join(f"@{u}" for u in todas))
+    lineas.append("\nDile a esa persona que abra el bot y escriba /start.")
+    conocidos = _usuarios_en_bd(usuarios)
+    if conocidos is not None:
+        faltantes = [u for u in usuarios if u.lower() not in conocidos]
+        if faltantes:
+            lineas.append(
+                "⚠️ Ojo: no están en la base de datos: "
+                + ", ".join(f"@{u}" for u in faltantes)
+            )
+    await update.effective_message.reply_text("\n".join(lineas))
+
+
+@solo_admins
+async def comando_quitar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/quitar <telegram_id> <usuario1> ...: quita cuentas a un cliente."""
+    args = [str(a) for a in (context.args or [])]
+    if len(args) < 2:
+        await update.effective_message.reply_text(
+            "Uso: /quitar <telegram_id> <usuario1> <usuario2> ..."
+        )
+        return
+    telegram_id = args[0].strip()
+    usuarios = clientes_store.limpiar_usuarios(args[1:])
+    error = clientes_store.quitar(telegram_id, usuarios)
+    if error:
+        await update.effective_message.reply_text(f"❌ {error}")
+        return
+    info = clientes_store.cliente_de(telegram_id) or {}
+    lineas = [f"✅ Listo. Cliente {telegram_id} — {info.get('nombre') or 'Cliente'}."]
+    restantes = info.get("cuentas") or []
+    if restantes:
+        lineas.append("Le quedan: " + ", ".join(f"@{u}" for u in restantes))
+    else:
+        lineas.append("Ya no tiene cuentas asignadas.")
+    await update.effective_message.reply_text("\n".join(lineas))

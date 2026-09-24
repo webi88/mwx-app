@@ -23,6 +23,13 @@ Sale con codigo `0` si todo pasa y `1` si hay fallos.
   `publicar_tweet`/`responder_tweet`/cita, eleccion del editor
   no ocluido/dialogo, cita de `solo_retwittear` y los refrescos de
   `navegar_tolerante`/`_recuperar_interstitial`.
+- `tests/test_bot_clientes.py`: 92 checks del bot de clientes
+  (`bot_clientes/`, sin Telegram real ni Chrome): store JSON temporal
+  (asignar/quitar/duplicados/IDs invalidos/atomicidad), teclados, validacion
+  del nombre, TOTP con semilla fake y lector de correo mockeado en sus 3
+  ramas, guard de no autorizado, admin detectado, flujos con fakes PTB
+  (start/codigo/confirmacion de nombre/foto) y `/asignar` escribiendo un JSON
+  temporal.
 
 Tambien se puede correr un archivo suelto:
 

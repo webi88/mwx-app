@@ -150,6 +150,49 @@ class EjecutorTareas:
     #: "post"/"publicacion"/"mantenimiento"/"calentamiento"/"hilo" -> "hashtags".
     TIPOS_PROHIBIDOS_TIER3 = ("hashtags", "cita", "comentario")
 
+    #: Tipos de tarea que son de ACTIVACION MASIVA: una cuenta PAUSADA
+    #: (`Cuenta.pausada_activacion`) NO los ejecuta (se entrega a clientes).
+    #: Los tipos de mantenimiento ("post", "mantenimiento", "calentamiento",
+    #: "hilo", "visualizacion" y vacios/desconocidos) SI se permiten: la pausa
+    #: solo aplica a la activacion.
+    TIPOS_ACTIVACION_PAUSA = (
+        "rt",
+        "retweet",
+        "repost",
+        "cita",
+        "quote",
+        "comentario",
+        "respuesta",
+        "reply",
+        "like",
+    )
+
+    @classmethod
+    def _bloqueada_por_pausa(cls, cuenta, tipo) -> bool:
+        """True si la cuenta esta pausada para activacion y la tarea es de activacion.
+
+        Una cuenta PAUSADA (`pausada_activacion=True`) queda excluida de los
+        tipos de `TIPOS_ACTIVACION_PAUSA` (rt/retweet/repost, cita/quote,
+        comentario/respuesta/reply y like) SIN abrir navegador y SIN reintento;
+        los tipos de MANTENIMIENTO (post/mantenimiento/calentamiento/hilo/
+        visualizacion y vacios/desconocidos) siguen funcionando. Nunca lanza:
+        ante cualquier fallo devuelve False (no bloquear de mas).
+        """
+        try:
+            from core.pausas import esta_pausada
+
+            if not esta_pausada(cuenta):
+                return False
+            return str(tipo or "").strip().lower() in cls.TIPOS_ACTIVACION_PAUSA
+        except Exception:  # noqa: BLE001
+            return False
+
+    @staticmethod
+    def _motivo_pausa(cuenta) -> str:
+        """Motivo del bloqueo por pausa (jamas coincide con los reintentables)."""
+        usuario = str(getattr(cuenta, "usuario", "") or "").strip()
+        return f"⏸️ @{usuario} — pausada para activación (solo mantenimiento)"
+
     @classmethod
     def _bloqueada_por_tier(cls, tarea, cuenta) -> bool:
         """True si el tier de la cuenta prohibe el tipo de la tarea.
@@ -195,12 +238,29 @@ class EjecutorTareas:
         TIER 3: post/hashtags, cita y comentario se cortan ANTES de crear el
         bot (sin abrir Chrome) y se registran como fallido con un motivo que
         NO es reintentable (`retweet`/`like`/`visualizacion` si pasan).
+
+        PAUSA: las cuentas pausadas para activacion masiva se cortan ANTES de
+        crear el bot y de la logica de tier SOLO en tareas de activacion
+        (rt/retweet/repost, cita/quote, comentario/respuesta/reply y like); las
+        de mantenimiento (post/mantenimiento/calentamiento/hilo/visualizacion y
+        desconocidas) se ejecutan normal.
         """
         bot = None
         motivo = ""
         cerrado = False
         registrado = False
         try:
+            if self._bloqueada_por_pausa(cuenta, getattr(tarea, "tipo", "")):
+                motivo = self._motivo_pausa(cuenta)
+                logger.warning(
+                    f"Accion {tarea.tipo} de activacion OMITIDA para "
+                    f"@{cuenta.usuario}: pausada para activacion (solo "
+                    f"mantenimiento); no se abre navegador"
+                )
+                self._registrar(cuenta, tarea, False, None, motivo)
+                registrado = True
+                return False, motivo
+
             if self._bloqueada_por_tier(tarea, cuenta):
                 motivo = self._motivo_tier3(tarea)
                 logger.warning(

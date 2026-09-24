@@ -228,9 +228,87 @@ def bloqueo_tier_ejecucion(cuenta, tipo) -> str:
     return ""
 
 
+def es_pausada_activacion(cuenta) -> bool:
+    """True si `cuenta` esta pausada para la activacion masiva (`core.pausas`).
+
+    Acepta objetos `Cuenta` (atributo `pausada_activacion`) y las filas-dict de
+    las paginas (clave `pausada_activacion`): a los dicts se les pasa un
+    adaptador porque `core.pausas.esta_pausada` solo lee atributos. Nunca
+    lanza: sin `core.pausas` (version vieja) devuelve False (nada se filtra)."""
+    try:
+        from core.pausas import esta_pausada
+    except Exception:
+        return False
+    try:
+        if isinstance(cuenta, dict):
+            from types import SimpleNamespace
+
+            return bool(
+                esta_pausada(
+                    SimpleNamespace(
+                        pausada_activacion=cuenta.get("pausada_activacion")
+                    )
+                )
+            )
+        return bool(esta_pausada(cuenta))
+    except Exception:
+        return False
+
+
+def separar_pausadas(cuentas, incluir_pausadas: bool = False) -> tuple[list, list]:
+    """Separa (elegibles, pausadas) para la activacion masiva (`core.pausas`).
+
+    Con `incluir_pausadas=True` la primera lista conserva TODO (las pausadas
+    solo se reportan): lo usan los flujos de mantenimiento. Nunca lanza."""
+    try:
+        lista = list(cuentas or [])
+    except Exception:
+        return [], []
+    elegibles: list = []
+    pausadas: list = []
+    for cuenta in lista:
+        if es_pausada_activacion(cuenta):
+            pausadas.append(cuenta)
+        else:
+            elegibles.append(cuenta)
+    if incluir_pausadas:
+        return lista, pausadas
+    return elegibles, pausadas
+
+
+# Texto UNICO del aviso de cuentas pausadas excluidas de la activacion
+# (mismo caption en rts/likes/activacion masiva/reparto por hora).
+MENSAJE_PAUSADAS = (
+    "⏸️ {n} cuentas pausadas para activación quedaron fuera "
+    "(siguen en mantenimiento)"
+)
+
+
+def texto_pausadas(total) -> str:
+    """Texto unico del aviso de pausadas ('' si no hay ninguna). Nunca lanza."""
+    try:
+        n = int(total or 0)
+    except Exception:
+        n = 0
+    if n <= 0:
+        return ""
+    return MENSAJE_PAUSADAS.format(n=n)
+
+
+def aviso_pausadas(pausadas) -> None:
+    """Caption unico: cuentas pausadas excluidas de la activacion masiva."""
+    try:
+        total = len(list(pausadas or []))
+    except Exception:
+        total = 0
+    texto = texto_pausadas(total)
+    if texto:
+        st.caption(texto)
+
+
 def ejecutar_en_cuentas(cuentas: list[Cuenta], accion, plataforma: str = "twitter",
                         progreso: st.progress = None, estado: st.empty = None,
-                        tipo: str = "post") -> dict:
+                        tipo: str = "post", incluir_pausadas: bool = False) -> dict:
     """Ejecuta 'accion(bot)' sobre cada cuenta y acumula resultados.
 
     'accion' puede ser un callable o una lista/tupla de callables (uno por
@@ -240,7 +318,13 @@ def ejecutar_en_cuentas(cuentas: list[Cuenta], accion, plataforma: str = "twitte
     ANTES de crear el bot de cada cuenta se valida su Tier: Tier 3 solo RT y
     likes y Tier 2 no puede hashtags (`bloqueo_tier_ejecucion`). Las cuentas
     bloqueadas NO abren navegador ni registran `RegistroAccion`: suman a
-    `resultados["omitidas"]` con un detalle "⛔ ..."."""
+    `resultados["omitidas"]` con un detalle "⛔ ...".
+
+    Las cuentas pausadas para la activacion masiva (`Cuenta.pausada_activacion`,
+    ver `core.pausas`) tampoco se ejecutan: suman a `resultados["omitidas"]` con
+    el detalle "⏸️ ...", sin abrir navegador ni registrar nada. SOLO los flujos
+    de mantenimiento pasan `incluir_pausadas=True` (mantenimiento programado,
+    publicar texto e IA de `posts.py`): ahi las pausadas siguen publicando."""
     from plataformas.base import PlataformaFactory
     
     resultados = {"exitos": 0, "fallidos": 0, "detalles": [], "omitidas": 0}
@@ -251,6 +335,15 @@ def ejecutar_en_cuentas(cuentas: list[Cuenta], accion, plataforma: str = "twitte
         acciones = [accion] * total
     
     for i, cuenta in enumerate(cuentas):
+        if not incluir_pausadas and es_pausada_activacion(cuenta):
+            usuario = getattr(cuenta, "usuario", "?")
+            resultados["omitidas"] += 1
+            resultados["detalles"].append(
+                f"⏸️ @{usuario} — pausada para activación (solo mantenimiento)"
+            )
+            if progreso and total > 0:
+                progreso.progress((i + 1) / total)
+            continue
         motivo_tier = bloqueo_tier_ejecucion(cuenta, tipo)
         if motivo_tier:
             resultados["omitidas"] += 1
@@ -317,8 +410,8 @@ def mostrar_resultados(resultados: dict):
     omitidas = int(resultados.get("omitidas") or 0)
     if omitidas:
         st.caption(
-            f"⛔ {omitidas} cuenta(s) omitida(s) por su Tier "
-            "(no se abrió navegador ni se registró nada)."
+            f"⛔ {omitidas} cuenta(s) omitida(s) (por su Tier o por estar "
+            "pausadas para activación): no se abrió navegador ni se registró nada."
         )
 
     if resultados.get("detalles"):

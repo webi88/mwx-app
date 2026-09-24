@@ -96,6 +96,11 @@ class Cuenta(Base):
     # rt/likes, el resto de roles prohibido). "" = sin clasificar (sin
     # restriccion). Ver core/tiers.py.
     tier_calidad = Column(String(20), default="")
+    # Cuentas de CLIENTE: True = pausada para activación masiva (campañas,
+    # RT/likes, reparto por hora y tareas de activación del scheduler) pero
+    # PERMITIDA en mantenimiento (mantenimiento programado, calentamiento
+    # continuo, publicaciones manuales y el bot de clientes). Ver core/pausas.py.
+    pausada_activacion = Column(Boolean, default=False)
     fecha_creacion = Column(DateTime, default=datetime.utcnow)
     totp_secret = Column(String(100), default="")
     email_password = Column(String(200), default="")
