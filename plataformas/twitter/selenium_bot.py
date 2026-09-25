@@ -5592,53 +5592,966 @@ try {
         
         return resultados
     
-    def reportar_post(self, url_tweet: str, motivo: str = "spam") -> bool:
+    # ------------------------------------------------------------------
+    # Reportar contenido en X (posts y cuentas)
+    # ------------------------------------------------------------------
+    # La UI de X alterna espanol/ingles y cambia textos/estructura con
+    # frecuencia: este flujo se resuelve por TEXTO visible bilingue (con
+    # selectores de respaldo) y verifica el resultado REAL. Nunca se declara
+    # exito solo por hacer clic; si el motivo pedido no coincide con ninguna
+    # opcion VISIBLE no se elige al azar: las opciones reales quedan en
+    # `self.ultimo_error` y se falla.
+    #
+    # `dry_run=True` es SOLO para verificacion (smoke): recorre el flujo hasta
+    # el boton de envio y cierra con Escape/boton cerrar SIN enviar el reporte.
+
+    # Motivos EN/ES que la UI de X usa (posts). El orden importa: los textos
+    # mas especificos van primero para no confundir opciones parecidas
+    # ("It's abusive or harmful" vs "It's spam").
+    # Textos REALES observados en el modal espanol de X (2026): "Spam; Odio,
+    # abuso o acoso; Discurso violento; Contenido multimedia de caracter
+    # grafico o violento; Suplantacion de identidad; Contenido sexual para
+    # adultos; Suicidio o autolesiones; Integridad civica..." + boton
+    # "Siguiente" (segunda pantalla de sub-opciones antes del envio final).
+    _MOTIVOS_REPORTE_POST = {
+        "spam": ("spam", "it's spam", "es spam", "esto es spam"),
+        "hate": (
+            "odio, abuso o acoso", "hateful", "discurso de odio",
+            "incitacion al odio", "acoso o incitacion al odio", "odio",
+            "acoso", "hate",
+        ),
+        "abuse": (
+            "odio, abuso o acoso", "abuso o acoso", "it's abusive or harmful",
+            "es abusivo o danino", "abusive", "abusivo", "abuso",
+        ),
+        "violence": (
+            "discurso violento", "contenido multimedia de caracter grafico o violento",
+            "violent", "violencia", "violento",
+        ),
+        "self_harm": (
+            "suicidio o autolesiones", "self-harm", "self harm",
+            "intentions of self-harm", "autolesion", "autolesiones",
+            "suicide", "suicidio",
+        ),
+        "sensitive": (
+            "contenido sexual para adultos",
+            "contenido multimedia de caracter grafico o violento",
+            "sensitive photo or video", "sensitive media",
+            "muestra una foto o video sensible", "contenido sensible",
+            "sensitive", "sensible",
+        ),
+        "impersonation": (
+            "suplantacion de identidad", "pretending to be someone else",
+            "se hacen pasar por", "impersonation", "suplantacion",
+            "suplantar",
+        ),
+        "nudity": (
+            "contenido sexual para adultos", "contenido sexual", "nudity",
+            "desnudez", "sexual",
+        ),
+        "false_info": (
+            "integridad civica", "false information", "informacion falsa",
+            "misleading", "enganoso",
+        ),
+    }
+
+    # Motivos EN/ES para reportar CUENTAS (los textos de X difieren de los de
+    # posts: "Their account is spam", "They're being abusive or harmful"...).
+    # La pantalla de motivos de CUENTA de X usa la MISMA lista de categorias
+    # (sin "Integridad civica" en el smoke real) y tambien boton "Siguiente".
+    _MOTIVOS_REPORTE_CUENTA = {
+        "spam": (
+            "spam", "their account is spam", "su cuenta es spam",
+            "account is spam", "es spam",
+        ),
+        "hate": (
+            "odio, abuso o acoso", "hateful", "discurso de odio",
+            "incitacion al odio", "odio", "acoso", "hate",
+        ),
+        "abuse": (
+            "odio, abuso o acoso", "abuso o acoso",
+            "they're being abusive or harmful", "es abusivo o danino",
+            "abusive or harmful", "abusive", "abusivo", "abuso",
+        ),
+        "violence": (
+            "discurso violento", "contenido multimedia de caracter grafico o violento",
+            "violent", "violencia", "violento",
+        ),
+        "self_harm": (
+            "suicidio o autolesiones", "self-harm", "self harm",
+            "intentions of self-harm", "autolesion", "autolesiones",
+            "suicide", "suicidio",
+        ),
+        "sensitive": (
+            "contenido sexual para adultos",
+            "contenido multimedia de caracter grafico o violento",
+            "contenido sensible", "sensitive", "sensible",
+        ),
+        "impersonation": (
+            "suplantacion de identidad", "pretending to be someone else",
+            "se hacen pasar por", "impersonation", "suplantacion",
+            "suplantar",
+        ),
+        "nudity": (
+            "contenido sexual para adultos", "contenido sexual", "nudity",
+            "desnudez", "sexual",
+        ),
+        "false_info": (
+            "integridad civica", "false information", "informacion falsa",
+            "misleading", "enganoso",
+        ),
+    }
+
+    # Alias tolerantes (la web puede mandar claves historicas como "nudity" o
+    # "false_info"; el motivo se normaliza antes de buscar la tabla).
+    _ALIAS_MOTIVO_REPORTE = {
+        "selfharm": "self_harm",
+        "autolesion": "self_harm",
+        "autolesiones": "self_harm",
+        "odio": "hate",
+        "acoso": "hate",
+        "harassment": "hate",
+        "abuso": "abuse",
+        "abusivo": "abuse",
+        "violento": "violence",
+        "sensible": "sensitive",
+        "desnudez": "nudity",
+        "sexual": "nudity",
+        "suplantacion": "impersonation",
+        "false_information": "false_info",
+        "misleading": "false_info",
+        "informacion_falsa": "false_info",
+    }
+
+    # Confirmacion de X (toast/alert): reporte enviado o YA existente
+    # (idempotente -> True).
+    _FRASES_CONFIRMACION_REPORTE = (
+        "thanks for letting us know",
+        "gracias por informarnos",
+        "gracias por avisarnos",
+        "tu reporte fue enviado",
+        "report submitted",
+        "we received your report",
+        "already reported",
+        "ya reportaste",
+        "ya lo reportaste",
+        "has reportado",
+        "thanks",
+        "gracias",
+    )
+
+    # Frases fuertes que se pueden buscar en `page_source` sin falsos positivos
+    # por un simple "gracias" de la UI normal.
+    _FRASES_FUERTES_CONFIRMACION = (
+        "thanks for letting us know",
+        "gracias por informarnos",
+        "gracias por avisarnos",
+        "tu reporte fue enviado",
+        "report submitted",
+        "we received your report",
+        "already reported",
+        "ya reportaste",
+        "ya lo reportaste",
+        "has reportado",
+    )
+
+    # Botones de avance/envio del flujo de reporte (EN/ES). "denunciar" es el
+    # boton final de la variante espanola de X ("Denunciar" / "Denunciar post").
+    _FRASES_ENVIO_REPORTE = (
+        "submit", "next", "done", "enviar", "siguiente", "listo", "hecho",
+        "denunciar",
+    )
+
+    # Rutas de x.com que NO son perfiles (para `reportar_objetivo`).
+    _RUTAS_NO_PERFIL = frozenset({
+        "home", "explore", "notifications", "messages", "i", "search",
+        "settings", "compose", "tos", "privacy", "about", "login", "logout",
+        "signup", "intent", "share",
+    })
+
+    @staticmethod
+    def _normalizar_texto_ui(texto) -> str:
+        """Normaliza texto de UI para comparar EN/ES sin depender de acentos.
+
+        Minusculas, comillas tipograficas unificadas, espacios colapsados y
+        sin marcas diacriticas. Nunca lanza (texto invalido -> str vacio).
+        """
+        try:
+            t = str(texto or "").strip().lower()
+            t = (
+                t.replace("\u2019", "'")
+                .replace("\u2018", "'")
+                .replace("\u201c", '"')
+                .replace("\u201d", '"')
+                .replace("\u00a0", " ")
+                .replace("\u200b", "")
+            )
+            t = unicodedata.normalize("NFKD", t)
+            t = "".join(c for c in t if not unicodedata.combining(c))
+            return re.sub(r"\s+", " ", t).strip()
+        except Exception:
+            return str(texto or "").strip().lower()
+
+    def _opciones_visibles(self, contenedor) -> list:
+        """Devuelve `[(elemento, texto)]` de opciones/razones VISIBLES.
+
+        Cubre los `role` que X ha usado para las razones del reporte
+        (`menuitem`/`radio`/`option`/`label`) y, como respaldo, botones
+        (`role='button'`/`button`). Deduplica por texto normalizado para no
+        procesar dos veces el mismo nodo envuelto. Nunca lanza.
+        """
+        opciones = []
+        vistos = set()
+        selectores = (
+            "[role='menuitem']",
+            "[role='radio']",
+            "[role='option']",
+            "label",
+            "[role='button']",
+            "button",
+        )
+        for sel in selectores:
+            try:
+                elementos = contenedor.find_elements(By.CSS_SELECTOR, sel)
+            except Exception:
+                continue
+            for el in elementos:
+                try:
+                    if not el.is_displayed():
+                        continue
+                    texto = (el.text or "").strip()
+                except Exception:
+                    continue
+                clave = self._normalizar_texto_ui(texto)
+                if not clave or clave in vistos:
+                    continue
+                vistos.add(clave)
+                opciones.append((el, texto))
+        return opciones
+
+    def _textos_opciones(self, opciones, excluir=()) -> str:
+        """Junta los textos visibles de `opciones` (para el diagnostico)."""
+        excluir_norm = tuple(self._normalizar_texto_ui(x) for x in (excluir or ()))
+        textos = []
+        for _, texto in opciones or ():
+            limpio = (texto or "").strip()
+            norm = self._normalizar_texto_ui(limpio)
+            if not norm or any(x and x in norm for x in excluir_norm):
+                continue
+            if limpio not in textos:
+                textos.append(limpio)
+        return "; ".join(textos)[:400]
+
+    def _elegir_opcion_visible(self, opciones, candidatos):
+        """Elige la opcion VISIBLE que coincide con `candidatos` (o `(None, "")`).
+
+        Estrategia por candidato en orden: coincidencia EXACTA, luego
+        `startswith`, luego contenido. Asi "It's abusive or harmful" no se
+        confunde con "It's spam" y el primer candidato especifico gana.
+        """
+        normalizadas = []
+        for el, texto in opciones or ():
+            norm = self._normalizar_texto_ui(texto)
+            if norm:
+                normalizadas.append((el, norm, (texto or "").strip()))
+        for candidato in candidatos or ():
+            cand = self._normalizar_texto_ui(candidato)
+            if not cand:
+                continue
+            for el, norm, original in normalizadas:
+                if norm == cand:
+                    return el, original
+            for el, norm, original in normalizadas:
+                if norm.startswith(cand):
+                    return el, original
+            for el, norm, original in normalizadas:
+                if cand in norm:
+                    return el, original
+        return None, ""
+
+    def _elemento_habilitado(self, elemento) -> bool:
+        """True si el elemento es visible y no esta deshabilitado (aria)."""
+        try:
+            if not elemento.is_displayed():
+                return False
+        except Exception:
+            return False
+        try:
+            if not elemento.is_enabled():
+                return False
+        except Exception:
+            return False
+        try:
+            if (elemento.get_attribute("aria-disabled") or "").lower() == "true":
+                return False
+        except Exception:
+            pass
+        return True
+
+    def _contenedor_dialogo(self, timeout: float = 8.0):
+        """Primer modal visible (`[role=dialog]` y respaldos) o None."""
+        fin = time.time() + max(0.2, float(timeout))
+        while True:
+            for sel in (
+                "[role='dialog']",
+                "[data-testid='modal']",
+                "div[aria-modal='true']",
+            ):
+                try:
+                    for el in self.driver.find_elements(By.CSS_SELECTOR, sel):
+                        if el.is_displayed():
+                            return el
+                except Exception:
+                    continue
+            if time.time() >= fin:
+                return None
+            time.sleep(0.4)
+
+    def _esperar_menu_opciones(self, timeout: float = 8.0):
+        """Primer menu visible (`[role=menu]` y respaldos) o None."""
+        fin = time.time() + max(0.2, float(timeout))
+        while True:
+            for sel in ("[role='menu']", "[data-testid='Dropdown']"):
+                try:
+                    for el in self.driver.find_elements(By.CSS_SELECTOR, sel):
+                        if el.is_displayed():
+                            return el
+                except Exception:
+                    continue
+            if time.time() >= fin:
+                return None
+            time.sleep(0.4)
+
+    def _buscar_boton_mas_opciones(self, contenedor=None, timeout: float = 12.0):
+        """Boton '...' (mas opciones) del tweet/perfil.
+
+        Intenta DENTRO del articulo (`[data-testid='caret']` y aria-labels
+        "More"/"Más"/"More options"/"Más opciones") y, si no aparece, a nivel
+        documento. Devuelve None si no hay un boton visible en el plazo.
+        """
+        css = (
+            "[data-testid='caret']",
+            "button[data-testid='caret']",
+            "div[role='button'][data-testid='caret']",
+        )
+        xpaths_rel = (
+            ".//*[@data-testid='caret']",
+            ".//*[@aria-label='More']",
+            ".//*[@aria-label='Más']",
+            ".//*[@aria-label='Mas']",
+            ".//*[@aria-label='More options']",
+            ".//*[@aria-label='Más opciones']",
+        )
+        xpaths_abs = (
+            "//*[@data-testid='caret']",
+            "//*[@aria-label='More']",
+            "//*[@aria-label='Más']",
+            "//*[@aria-label='Mas']",
+            "//*[@aria-label='More options']",
+            "//*[@aria-label='Más opciones']",
+        )
+        fin = time.time() + max(0.5, float(timeout))
+        while True:
+            candidatos = []
+            if contenedor is not None:
+                for sel in css:
+                    try:
+                        candidatos.extend(contenedor.find_elements(By.CSS_SELECTOR, sel))
+                    except Exception:
+                        continue
+                for xp in xpaths_rel:
+                    try:
+                        candidatos.extend(contenedor.find_elements(By.XPATH, xp))
+                    except Exception:
+                        continue
+            if not candidatos:
+                for sel in css:
+                    try:
+                        candidatos.extend(self.driver.find_elements(By.CSS_SELECTOR, sel))
+                    except Exception:
+                        continue
+                for xp in xpaths_abs:
+                    try:
+                        candidatos.extend(self.driver.find_elements(By.XPATH, xp))
+                    except Exception:
+                        continue
+            for el in candidatos:
+                if self._elemento_habilitado(el):
+                    return el
+            if time.time() >= fin:
+                return None
+            time.sleep(0.5)
+
+    def _buscar_boton_por_texto(self, frases, contenedor=None, timeout: float = 6.0):
+        """Boton visible/habilitado cuyo texto coincide con `frases`.
+
+        Busca dentro del modal visible (o `contenedor`/documento) por texto
+        exacto o `startswith` de la frase. Devuelve None en el plazo. No elige
+        a ciegas: solo botones de avance/envio (`_FRASES_ENVIO_REPORTE`).
+        """
+        fin = time.time() + max(0.5, float(timeout))
+        while True:
+            if contenedor is not None:
+                opciones = self._opciones_visibles(contenedor)
+            else:
+                dialogo = self._contenedor_dialogo(timeout=0.3)
+                opciones = self._opciones_visibles(dialogo or self.driver)
+            for frase in frases:
+                objetivo = self._normalizar_texto_ui(frase)
+                if not objetivo:
+                    continue
+                for el, texto in opciones:
+                    norm = self._normalizar_texto_ui(texto)
+                    if norm == objetivo or norm.startswith(objetivo + " "):
+                        if self._elemento_habilitado(el):
+                            return el
+            if time.time() >= fin:
+                return None
+            time.sleep(0.4)
+
+    def _candidatos_opcion_reporte(self, es_cuenta: bool, handle: str = "") -> tuple:
+        """Textos EN/ES de la opcion de reporte en el menu '...'."""
+        h = (handle or "").strip().lstrip("@").lower()
+        if es_cuenta:
+            candidatos = []
+            if h:
+                candidatos.extend(
+                    (
+                        f"report @{h}", f"reportar a @{h}", f"reportar @{h}",
+                        f"denunciar a @{h}", f"denunciar @{h}",
+                    )
+                )
+            candidatos.extend(
+                (
+                    "report account", "report profile", "reportar cuenta",
+                    "reportar perfil", "denunciar cuenta", "denunciar perfil",
+                    "report @", "reportar a @", "reportar @",
+                    "denunciar a @", "denunciar @", "denunciar", "reportar",
+                    "report",
+                )
+            )
+            return tuple(candidatos)
+        # UI espanola real: "Denunciar post"/"Denunciar publicacion"; la
+        # inglesa: "Report post". Se aceptan ambas y las variantes con
+        # "Reportar" por si X vuelve a esa cadena.
+        return (
+            "report post", "report tweet", "denunciar post",
+            "denunciar publicacion", "denunciar tweet", "reportar publicacion",
+            "reportar post", "reportar tweet", "denunciar", "reportar",
+            "report",
+        )
+
+    def _candidatos_motivo_reporte(self, motivo: str, es_cuenta: bool) -> tuple:
+        """Textos EN/ES de las razones del modal para `motivo`."""
+        tabla = (
+            self._MOTIVOS_REPORTE_CUENTA if es_cuenta else self._MOTIVOS_REPORTE_POST
+        )
+        clave = self._normalizar_texto_ui(motivo).replace(" ", "_").replace("-", "_")
+        clave = self._ALIAS_MOTIVO_REPORTE.get(clave, clave)
+        return tuple(tabla.get(clave) or tabla["spam"])
+
+    def _reporte_confirmado(self) -> bool:
+        """True si X confirmo el reporte (o dice que YA estaba reportado).
+
+        Revisa el toast/`[role=alert]` y `page_source` con frases fuertes
+        (evita falsos positivos de un "gracias" suelto de la UI). Nunca lanza.
+        """
+        try:
+            toast = self._normalizar_texto_ui(self._texto_toast())
+        except Exception:
+            toast = ""
+        if toast:
+            for frase in self._FRASES_CONFIRMACION_REPORTE:
+                if self._normalizar_texto_ui(frase) in toast:
+                    return True
+        try:
+            fuente = self._normalizar_texto_ui(self.driver.page_source)
+        except Exception:
+            fuente = ""
+        if fuente:
+            for frase in self._FRASES_FUERTES_CONFIRMACION:
+                if self._normalizar_texto_ui(frase) in fuente:
+                    return True
+        try:
+            dialogo = self._contenedor_dialogo(timeout=0.2)
+            if dialogo is not None:
+                texto = self._normalizar_texto_ui(dialogo.text)
+                for frase in ("gracias por", "thanks for"):
+                    if frase in texto:
+                        return True
+        except Exception:
+            pass
+        return False
+
+    def _dialogo_abierto(self) -> bool:
+        """True si sigue montado un modal de reporte (post-avance)."""
+        try:
+            return self._contenedor_dialogo(timeout=0.2) is not None
+        except Exception:
+            return False
+
+    def _cerrar_flujo_reporte(self) -> bool:
+        """Cierra el menu/modal del reporte (boton cerrar o Escape). Nunca lanza."""
+        for sel in (
+            "[data-testid='app-bar-close']",
+            "[aria-label='Close']",
+            "[aria-label='Cerrar']",
+        ):
+            try:
+                for el in self.driver.find_elements(By.CSS_SELECTOR, sel):
+                    if el.is_displayed():
+                        self.driver.execute_script("arguments[0].click();", el)
+                        return True
+            except Exception:
+                continue
+        try:
+            body = self.driver.find_element(By.TAG_NAME, "body")
+            body.send_keys(Keys.ESCAPE)
+            return True
+        except Exception:
+            pass
+        try:
+            activo = self.driver.switch_to.active_element
+            if activo is not None:
+                activo.send_keys(Keys.ESCAPE)
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _clic_js(self, elemento) -> bool:
+        """Clic tolerante (JS y, si falla, clic nativo). Nunca lanza."""
+        try:
+            self.driver.execute_script("arguments[0].click();", elemento)
+            return True
+        except Exception as e:
+            logger.debug(
+                f"clic JS del reporte fallo ({type(e).__name__}: {e}); "
+                "probando clic nativo"
+            )
+        try:
+            elemento.click()
+            return True
+        except Exception as e:
+            logger.warning(
+                f"No se pudo clicar el elemento del reporte "
+                f"({type(e).__name__}: {e})"
+            )
+            return False
+
+    @staticmethod
+    def _handle_desde_url(url: str) -> str:
+        """Handle del perfil en una URL de x.com ('' si no es un perfil)."""
+        try:
+            m = re.match(
+                r"^https?://(?:www\.|mobile\.)?(?:x|twitter)\.com/([^/?#]+)",
+                (url or "").strip(),
+                re.IGNORECASE,
+            )
+            if not m:
+                return ""
+            handle = m.group(1)
+            if handle.lower() in TwitterBot._RUTAS_NO_PERFIL:
+                return ""
+            return handle
+        except Exception:
+            return ""
+
+    def _esperar_perfil(self, timeout: float = 10.0) -> bool:
+        """Espera (sin abortar) a que monte la cabecera del perfil."""
+        selectores = (
+            "[data-testid='UserName']",
+            "[data-testid='primaryColumn']",
+            "[data-testid='UserProfileHeader_Items']",
+        )
+        fin = time.time() + max(0.2, float(timeout))
+        while True:
+            for sel in selectores:
+                try:
+                    for el in self.driver.find_elements(By.CSS_SELECTOR, sel):
+                        if el.is_displayed():
+                            return True
+                except Exception:
+                    continue
+            if time.time() >= fin:
+                return False
+            time.sleep(0.5)
+
+    def _ejecutar_reporte(
+        self, url: str, es_cuenta: bool, motivo: str, dry_run: bool
+    ) -> bool:
+        """Flujo comun de reporte (post o cuenta) con verificacion real.
+
+        Asume que hay driver y que el llamador limpio `self.ultimo_error`.
+        Devuelve True solo con confirmacion (toast/alert/"gracias"/ya
+        reportado) o, en `dry_run`, cuando llego al boton de envio SIN
+        pulsarlo. Nunca lanza hacia afuera (el llamador tambien envuelve).
+        """
+        etiqueta = "cuenta" if es_cuenta else "post"
+        t_inicio = self._ahora()
+        try:
+            titulo = (self.driver.title or "")[:80]
+        except Exception:
+            titulo = ""
+        logger.info(
+            f"perf @{self.usuario}: reportar {etiqueta} {url} inicio "
+            f"(title='{titulo}', motivo={motivo}, dry_run={bool(dry_run)})"
+        )
+
+        # 1) Navegacion con timeouts acotados (misma semantica que el resto).
+        self._get_acotado(url, timeout_max=20.0)
+        time.sleep(0.3)
+
+        estado = self._recuperar_interstitial(url)
+        if estado == "anti-bot":
+            self.ultimo_error = (
+                "X pidió verificación anti-bot (Cloudflare) al abrir el "
+                f"{etiqueta} ({self._diagnostico_pagina()})"
+            )
+            logger.warning(self.ultimo_error)
+            return False
+        if estado == "error":
+            self.ultimo_error = (
+                f"pagina de error de X (interstitial) al abrir el {etiqueta} "
+                f"({self._diagnostico_pagina()})"
+            )
+            logger.warning(self.ultimo_error)
+            return False
+        if estado == "driver":
+            self.ultimo_error = self.ultimo_error or (
+                f"tab crashed/navegador sin navegar al abrir el {etiqueta}"
+            )
+            logger.warning(self.ultimo_error)
+            return False
+
+        if self._sesion_cdp and self._hay_muro_login():
+            # Sesion CDP invalida: UN fallback a login lento y UN reintento de
+            # la navegacion (misma semantica que el resto de flujos).
+            if self._revivir_sesion_cdp():
+                self._get_acotado(url, timeout_max=20.0)
+                time.sleep(0.3)
+            if self._hay_muro_login():
+                self.ultimo_error = (
+                    "sesión de X expirada o inválida: se pidió login al abrir "
+                    f"el {etiqueta}"
+                )
+                logger.warning(self.ultimo_error)
+                return False
+
+        try:
+            self._asegurar_pagina_tweet(url)
+        except Exception as e:
+            self.ultimo_error = str(e)
+            logger.warning(self.ultimo_error)
+            return False
+
+        if self._detectar_limite_cuenta():
+            self.ultimo_error = "cuenta limitada por X"
+            logger.warning(self.ultimo_error)
+            return False
+
+        contenedor = None
+        if es_cuenta:
+            self._esperar_perfil(timeout=8.0)
+        else:
+            contenedor = self._esperar_article_tweet(timeout=12)
+            if contenedor is None:
+                self.ultimo_error = (
+                    "no se encontro el tweet a reportar "
+                    f"({self._diagnostico_pagina()})"
+                )
+                logger.warning(self.ultimo_error)
+                return False
+
+        # 2) Menu '...' (dentro del articulo; si no, a nivel documento).
+        caret = self._buscar_boton_mas_opciones(contenedor, timeout=12.0)
+        if caret is None:
+            logger.warning(
+                f"timeout esperando '...' del {etiqueta} (12s); refrescando "
+                "y reintentando"
+            )
+            self._refresh_corto(8.0)
+            time.sleep(0.3)
+            if es_cuenta:
+                self._esperar_perfil(timeout=8.0)
+            else:
+                contenedor = self._esperar_article_tweet(timeout=8) or contenedor
+            caret = self._buscar_boton_mas_opciones(contenedor, timeout=8.0)
+        if caret is None:
+            self.ultimo_error = (
+                f"no se encontro el boton de mas opciones ('...') del {etiqueta} "
+                f"({self._diagnostico_pagina()})"
+            )
+            logger.warning(self.ultimo_error)
+            return False
+        self._clic_js(caret)
+        time.sleep(random.uniform(0.3, 0.6))
+
+        # 3) Opcion de reporte en el menu (texto bilingue, nunca por indice).
+        handle = self._handle_desde_url(url) if es_cuenta else ""
+        menu = self._esperar_menu_opciones(timeout=8.0)
+        opciones_menu = self._opciones_visibles(menu or self.driver)
+        opcion, texto_opcion = self._elegir_opcion_visible(
+            opciones_menu, self._candidatos_opcion_reporte(es_cuenta, handle)
+        )
+        if opcion is None:
+            self.ultimo_error = (
+                f"no se encontro la opcion de reporte del {etiqueta} en el menu "
+                f"(handle='{handle}'); opciones visibles: "
+                f"{self._textos_opciones(opciones_menu)}"
+            )
+            logger.warning(self.ultimo_error)
+            self._cerrar_flujo_reporte()
+            return False
+        logger.info(f"reporte {etiqueta}: opcion de menu elegida -> '{texto_opcion}'")
+        self._clic_js(opcion)
+        time.sleep(random.uniform(0.4, 0.8))
+
+        # Idempotencia: "ya reportaste"/"already reported" puede aparecer AQUI.
+        if self._reporte_confirmado():
+            self.ultimo_error = ""
+            logger.info(
+                f"perf @{self.usuario}: reportar {etiqueta} {url} -> ya estaba "
+                f"reportado en {self._ahora() - t_inicio:.1f}s"
+            )
+            return True
+
+        # 4) Motivo en el modal (opciones VISIBLES; sin elegir al azar).
+        dialogo = self._contenedor_dialogo(timeout=10.0)
+        opciones_motivo = self._opciones_visibles(dialogo or self.driver)
+        try:
+            logger.info(
+                f"reporte {etiqueta}: opciones VISIBLES del modal: "
+                f"{self._textos_opciones(opciones_motivo)}"
+            )
+        except Exception:
+            pass
+        eleccion, texto_motivo = self._elegir_opcion_visible(
+            opciones_motivo, self._candidatos_motivo_reporte(motivo, es_cuenta)
+        )
+        if eleccion is None:
+            excluir = tuple(self._FRASES_ENVIO_REPORTE) + (
+                "close", "cancel", "cerrar", "cancelar",
+            )
+            self.ultimo_error = (
+                f"motivo '{motivo}' no encontrado entre las opciones VISIBLES "
+                f"del reporte de {etiqueta}: "
+                f"{self._textos_opciones(opciones_motivo, excluir=excluir)}"
+            )
+            logger.warning(self.ultimo_error)
+            self._cerrar_flujo_reporte()
+            return False
+        logger.info(
+            f"reporte {etiqueta}: motivo '{motivo}' -> '{texto_motivo}'"
+        )
+        self._clic_js(eleccion)
+        time.sleep(random.uniform(0.4, 0.8))
+
+        # 5) Avanzar por las pantallas intermedias y verificar el envio real.
+        # X usa una segunda pantalla de SUB-opciones (p.ej. tras "Spam" +
+        # "Siguiente") antes del envio final. Si el boton de avance no aparece,
+        # se elige la sub-opcion VISIBLE que coincida con el motivo pedido
+        # (nunca al azar) y se sigue; si ninguna coincide, se falla con las
+        # opciones reales.
+        clics = 0
+        sub_pendiente = 0
+        for _ in range(6):
+            if self._reporte_confirmado():
+                self.ultimo_error = ""
+                logger.info(
+                    f"perf @{self.usuario}: reportar {etiqueta} {url} -> ok en "
+                    f"{self._ahora() - t_inicio:.1f}s (motivo={motivo}, "
+                    f"opcion='{texto_motivo}')"
+                )
+                return True
+            boton = self._buscar_boton_por_texto(
+                self._FRASES_ENVIO_REPORTE, timeout=6.0
+            )
+            if boton is None:
+                if self._reporte_confirmado():
+                    self.ultimo_error = ""
+                    logger.info(
+                        f"perf @{self.usuario}: reportar {etiqueta} {url} -> ok "
+                        f"en {self._ahora() - t_inicio:.1f}s "
+                        f"(motivo={motivo}, opcion='{texto_motivo}')"
+                    )
+                    return True
+                if clics and not self._dialogo_abierto():
+                    # El modal desaparecio tras enviar (algunas variantes no
+                    # muestran toast): el reporte se envio.
+                    logger.info(
+                        f"El modal de reporte se cerro tras {clics} clic(s); se "
+                        f"asume reporte enviado de {url}"
+                    )
+                    self.ultimo_error = ""
+                    return True
+                if sub_pendiente < 2:
+                    dialogo_actual = self._contenedor_dialogo(timeout=0.3)
+                    opciones_sub = self._opciones_visibles(
+                        dialogo_actual or self.driver
+                    )
+                    sub, texto_sub = self._elegir_opcion_visible(
+                        opciones_sub,
+                        self._candidatos_motivo_reporte(motivo, es_cuenta),
+                    )
+                    if sub is not None and self._elemento_habilitado(sub):
+                        sub_pendiente += 1
+                        logger.info(
+                            f"reporte {etiqueta}: pantalla intermedia, sub-opcion "
+                            f"elegida -> '{texto_sub}'"
+                        )
+                        self._clic_js(sub)
+                        clics += 1
+                        time.sleep(random.uniform(0.4, 0.8))
+                        continue
+                self.ultimo_error = (
+                    f"no se encontro el boton de envio del reporte de {etiqueta} "
+                    f"({self._diagnostico_pagina()})"
+                )
+                logger.warning(self.ultimo_error)
+                self._cerrar_flujo_reporte()
+                return False
+            if dry_run:
+                # Verificacion: NO se envia nada. Cerrar el modal y reportar
+                # que el flujo llego hasta el boton de envio.
+                try:
+                    texto_boton = (boton.text or "").strip()
+                except Exception:
+                    texto_boton = ""
+                self._cerrar_flujo_reporte()
+                self.ultimo_error = ""
+                logger.info(
+                    f"perf @{self.usuario}: reportar {etiqueta} {url} -> "
+                    f"dry-run ok en {self._ahora() - t_inicio:.1f}s "
+                    f"(boton '{texto_boton}' sin pulsar; motivo={motivo}, "
+                    f"opcion='{texto_motivo}')"
+                )
+                return True
+            self._clic_js(boton)
+            clics += 1
+            time.sleep(random.uniform(0.6, 1.2))
+
+        if self._reporte_confirmado():
+            self.ultimo_error = ""
+            logger.info(
+                f"perf @{self.usuario}: reportar {etiqueta} {url} -> ok en "
+                f"{self._ahora() - t_inicio:.1f}s (motivo={motivo})"
+            )
+            return True
+        if clics and not self._dialogo_abierto():
+            # El modal desaparecio tras enviar (algunas variantes no muestran
+            # toast): el reporte se envio.
+            logger.info(
+                f"El modal de reporte se cerro tras {clics} clic(s); se asume "
+                f"reporte enviado de {url}"
+            )
+            self.ultimo_error = ""
+            return True
+        self.ultimo_error = (
+            f"X no confirmo el reporte del {etiqueta} ({self._diagnostico_pagina()})"
+        )
+        logger.error(self.ultimo_error)
+        return False
+
+    def reportar_post(
+        self, url_tweet: str, motivo: str = "spam", dry_run: bool = False
+    ) -> bool:
+        """Reporta un tweet y devuelve True SOLO con confirmacion real de X.
+
+        Flujo: navega al tweet con timeouts acotados, abre el menu '...'
+        (`[data-testid='caret']` o aria-label "More"/"Más"), elige la opcion
+        de reporte por texto bilingüe, elige el motivo entre las opciones
+        VISIBLES del modal (EN/ES) y avanza con Enviar/Siguiente/Listo hasta
+        que X confirma (toast/alert "Thanks for letting us know"/"Gracias") o
+        dice que YA estaba reportado (idempotente -> True). Si el motivo no
+        coincide con ninguna opcion no se elige al azar: queda en
+        `self.ultimo_error` con las opciones reales. Nunca lanza.
+
+        `dry_run=True` es SOLO para verificacion (smoke): llega hasta el boton
+        de envio y cierra el modal sin pulsarlo; devuelve True si el flujo
+        llego hasta ahi.
+        """
+        self.ultimo_error = ""
+        if not (url_tweet or "").strip():
+            self.ultimo_error = "falta la URL del tweet a reportar"
+            return False
         if not self.driver:
             if not self.login_con_cookies():
+                self.ultimo_error = (
+                    self.ultimo_error or "no se pudo iniciar sesion"
+                )
                 return False
-        
         try:
-            self.driver.get(url_tweet)
-            time.sleep(3)
-            
-            mas_opciones = self.driver.find_element(By.CSS_SELECTOR, "[data-testid='caret']")
-            mas_opciones.click()
-            time.sleep(1)
-            
-            reportar_btn = self.driver.find_element(By.XPATH, "//span[text()='Reportar']")
-            reportar_btn.click()
-            time.sleep(2)
-            
-            motivos = {
-                "spam": "Spam",
-                "hate": "Odio o acoso",
-                "abuse": "Abuso",
-                "impersonation": "Suplantacion de identidad",
-                "violence": "Violencia",
-                "self_harm": "Autolesion",
-                "sensitive": "Contenido sensible"
-            }
-            
-            motivo_texto = motivos.get(motivo, "Spam")
-            
-            opcion = self.driver.find_element(By.XPATH, f"//span[contains(text(),'{motivo_texto}')]")
-            opcion.click()
-            time.sleep(1)
-            
-            siguiente_btn = self.driver.find_element(By.XPATH, "//span[text()='Siguiente']")
-            siguiente_btn.click()
-            time.sleep(1)
-            
-            listo_btn = self.driver.find_element(By.XPATH, "//span[text()='Listo']")
-            listo_btn.click()
-            
-            time.sleep(2)
-            logger.info(f"Post reportado: {url_tweet}")
-            return True
-        
+            return self._ejecutar_reporte(
+                url_tweet, es_cuenta=False, motivo=motivo, dry_run=dry_run
+            )
         except Exception as e:
-            logger.error(f"Error reportando post: {e}")
+            self.ultimo_error = f"{type(e).__name__}: {e}"
+            logger.error(f"Error reportando post {url_tweet}: {e}")
             return False
+
+    def reportar_cuenta(
+        self, url_perfil: str, motivo: str = "spam", dry_run: bool = False
+    ) -> bool:
+        """Reporta una CUENTA/perfil y devuelve True SOLO con confirmacion.
+
+        Mismo flujo que `reportar_post` pero sobre un perfil (sin `/status/`):
+        menu '...' del perfil, opcion "Report @user"/"Reportar a @user"/
+        "Reportar cuenta", modal con las razones de CUENTA ("They're being
+        abusive or harmful"/"Es abusivo o dañino", "Their account is spam"/
+        "Su cuenta es spam", "They're pretending to be someone else"/"Se hacen
+        pasar por otra persona"...) y verificacion del envio. Si la URL trae
+        `/status/`, se recorta al perfil. Nunca lanza.
+
+        `dry_run=True`: llega hasta el boton de envio y cierra sin pulsarlo.
+        """
+        self.ultimo_error = ""
+        objetivo = (url_perfil or "").strip()
+        if not objetivo:
+            self.ultimo_error = "falta la URL del perfil a reportar"
+            return False
+        # Aunque llegue una URL de tweet, aqui se reporta la CUENTA.
+        objetivo = re.sub(r"/status/\d+.*$", "", objetivo).rstrip("/")
+        if not self.driver:
+            if not self.login_con_cookies():
+                self.ultimo_error = (
+                    self.ultimo_error or "no se pudo iniciar sesion"
+                )
+                return False
+        try:
+            return self._ejecutar_reporte(
+                objetivo, es_cuenta=True, motivo=motivo, dry_run=dry_run
+            )
+        except Exception as e:
+            self.ultimo_error = f"{type(e).__name__}: {e}"
+            logger.error(f"Error reportando cuenta {url_perfil}: {e}")
+            return False
+
+    def reportar_objetivo(
+        self, url: str, motivo: str = "spam", dry_run: bool = False
+    ) -> bool:
+        """Reporta una URL cualquiera: post si tiene `/status/`, si no cuenta.
+
+        Si no se puede decidir (URL rara), intenta reportar como POST y cae a
+        CUENTA. Misma semantica de verificacion y `dry_run` que los otros dos.
+        """
+        self.ultimo_error = ""
+        objetivo = (url or "").strip()
+        if not objetivo:
+            self.ultimo_error = "falta la URL a reportar"
+            return False
+        if re.search(r"/status/\d+", objetivo):
+            return self.reportar_post(objetivo, motivo=motivo, dry_run=dry_run)
+        if re.match(
+            r"^https?://(?:www\.|mobile\.)?(?:x|twitter)\.com/[^/?#]+/?$",
+            objetivo,
+            re.IGNORECASE,
+        ) and self._handle_desde_url(objetivo):
+            return self.reportar_cuenta(objetivo, motivo=motivo, dry_run=dry_run)
+        # No decidible: post primero, cuenta despues.
+        if self.reportar_post(objetivo, motivo=motivo, dry_run=dry_run):
+            return True
+        return self.reportar_cuenta(objetivo, motivo=motivo, dry_run=dry_run)
     
     # ------------------------------------------------------------------
     # Perfil: cambio de nombre visible y de @handle (Selenium)
