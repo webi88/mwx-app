@@ -235,6 +235,13 @@ class FakeDriver:
         self.get_calls = []
         self.refresh_calls = 0
         self.cookies_added = []
+        # Inyeccion de cookies (bug real Chrome 154/Railway):
+        #   - `add_cookie_falla`: simula "invalid cookie domain" en el documento.
+        #   - `cdp_setcookie_falla`: simula `Network.setCookie` caido.
+        #   - `cdp_setcookie_success_false`: CDP responde {"success": False}.
+        self.add_cookie_falla = False
+        self.cdp_setcookie_falla = False
+        self.cdp_setcookie_success_false = False
         self.page_load_timeout = 60
         self.current_url = "https://x.com/home"
         self.title = "X"
@@ -251,6 +258,8 @@ class FakeDriver:
         self.refresh_calls += 1
 
     def add_cookie(self, cookie):
+        if self.add_cookie_falla:
+            raise WebDriverException("invalid cookie domain (test)")
         self.cookies_added.append(dict(cookie))
 
     def get_cookies(self):
@@ -290,6 +299,14 @@ class FakeDriver:
 
     def execute_cdp_cmd(self, cmd, params):
         self.cdp_calls.append((cmd, params))
+        if cmd == "Network.setCookie":
+            if self.cdp_setcookie_falla:
+                raise WebDriverException("CDP setCookie roto (test)")
+            if self.cdp_setcookie_success_false:
+                return {"success": False}
+            # Cookie aceptada: queda disponible como las reales (get_cookies).
+            self.cookies_added.append(dict(params))
+            return {"success": True}
         if cmd == "Input.dispatchKeyEvent":
             key = params.get("key")
             self.eventos.append(("cdp_tecla", key))
@@ -1551,6 +1568,165 @@ def test_login_pkl_muro_de_login(check):
 
 
 # --------------------------------------------------------------------------- #
+# Inyeccion de cookies por CDP (fix "invalid cookie domain" Chrome 154)
+# --------------------------------------------------------------------------- #
+def _con_navegacion_real(driver):
+    """`driver.get` que actualiza `current_url` como Chrome real."""
+
+    def get(url):
+        driver.get_calls.append(url)
+        driver.current_url = url
+
+    driver.get = get
+    return driver
+
+
+def test_login_cdp_inyeccion(check):
+    print("P0-F: login inyecta cookies por CDP (sin 'invalid cookie domain')")
+
+    # (a) CDP primero y funciona aunque `add_cookie` fallaria (documento
+    # invalido: el bug real de Railway) y sin navegar antes de inyectar.
+    driver = _con_navegacion_real(FakeDriver())
+    driver.add_cookie_falla = True
+    driver.current_url = "https://x.com/i/flow/login"
+    bot = preparar_bot_login(driver)
+    bot._brandear_cuenta = lambda cookies: None
+    with _db_falsa(CuentaFake(cookies_json=json.dumps(COOKIES_JSON_VALIDAS))):
+        resultado = bot.login_con_cookies_json()
+    setcookies = [c for c in driver.cdp_calls if c[0] == "Network.setCookie"]
+    check(
+        "CDP: Network.setCookie para TODAS las cookies",
+        len(setcookies) == len(COOKIES_JSON_VALIDAS),
+        str([c[0] for c in driver.cdp_calls]),
+    )
+    check(
+        "CDP: sesion confirmada sin add_cookie (documento invalido)",
+        resultado is True,
+        bot.ultimo_error,
+    )
+    check(
+        "CDP: NO navega al viejo /404 antes de inyectar",
+        all("404" not in url for url in driver.get_calls),
+        str(driver.get_calls),
+    )
+    check(
+        "CDP: /home si se visita tras inyectar",
+        "https://x.com/home" in driver.get_calls,
+        str(driver.get_calls),
+    )
+    check(
+        "CDP: ultimo_error vacio",
+        bot.ultimo_error == "",
+        bot.ultimo_error,
+    )
+
+    # (b) CDP cae del todo -> UN fallback add_cookie tras navegar a base_url.
+    driver = _con_navegacion_real(FakeDriver())
+    driver.cdp_setcookie_falla = True
+    driver.current_url = "https://x.com/i/flow/login"
+    bot = preparar_bot_login(driver)
+    bot._brandear_cuenta = lambda cookies: None
+    with _db_falsa(CuentaFake(cookies_json=json.dumps(COOKIES_JSON_VALIDAS))):
+        resultado = bot.login_con_cookies_json()
+    check(
+        "CDP caido: se intento Network.setCookie",
+        any(c[0] == "Network.setCookie" for c in driver.cdp_calls),
+        str([c[0] for c in driver.cdp_calls]),
+    )
+    check(
+        "CDP caido: navego a base_url para el fallback",
+        "https://x.com" in driver.get_calls,
+        str(driver.get_calls),
+    )
+    check(
+        "CDP caido: add_cookie inyecto las cookies",
+        any(c.get("name") == "auth_token" for c in driver.cookies_added),
+        str(driver.cookies_added),
+    )
+    check(
+        "CDP caido: sesion confirmada por el fallback",
+        resultado is True,
+        bot.ultimo_error,
+    )
+
+    # (c) CDP y add_cookie fallan -> mensaje (i) de INYECCION, nunca "ct0".
+    driver = _con_navegacion_real(FakeDriver())
+    driver.cdp_setcookie_falla = True
+    driver.add_cookie_falla = True
+    driver.current_url = "https://x.com/i/flow/login"
+    bot = preparar_bot_login(driver)
+    with _db_falsa(CuentaFake(cookies_json=json.dumps([COOKIES_PKL[0]]))):
+        resultado = bot.login_con_cookies_json()
+    error = bot.ultimo_error or ""
+    check("ambos fallan: devuelve False", resultado is False, repr(resultado))
+    check(
+        "ambos fallan: ultimo_error = no se pudieron inyectar (CDP/add_cookie)",
+        "no se pudieron inyectar las cookies en el navegador (CDP/add_cookie)"
+        in error,
+        error,
+    )
+    check(
+        "ambos fallan: NO afirma 'X no emitio ct0'",
+        "ct0" not in error.lower(),
+        error,
+    )
+    check(
+        "ambos fallan: no se navega a /home (corta antes)",
+        all("/home" not in url for url in driver.get_calls),
+        str(driver.get_calls),
+    )
+
+    # (d) auth_token invalido real: las cookies SI entran (CDP) pero X no
+    # emite ct0 -> se conserva el mensaje (ii), NO el de inyeccion.
+    driver = _con_navegacion_real(FakeDriver())
+    bot = preparar_bot_login(driver)
+    bot._brandear_cuenta = lambda cookies: None
+    with _db_falsa(CuentaFake(cookies_json=json.dumps([COOKIES_PKL[0]]))):
+        resultado = bot.login_con_cookies_json()
+    error = bot.ultimo_error or ""
+    check("auth_token invalido: devuelve False", resultado is False, repr(resultado))
+    check(
+        "auth_token invalido: mensaje (ii) de ct0",
+        ("no emitió ct0" in error) or ("no emitio ct0" in error),
+        error,
+    )
+    check(
+        "auth_token invalido: NO es el error de inyeccion",
+        "no se pudieron inyectar" not in error,
+        error,
+    )
+
+    # (e) .pkl: tambien por CDP (proba que `add_cookie` no se usa).
+    driver = _con_navegacion_real(FakeDriver())
+    driver.add_cookie_falla = True
+    driver.current_url = "https://x.com/home"
+    bot = preparar_bot_login(driver)
+    with _pkl_falso(COOKIES_PKL):
+        resultado = bot.login_con_cookies()
+    check(
+        ".pkl: usa CDP y confirma la sesion sin add_cookie",
+        resultado is True
+        and any(c[0] == "Network.setCookie" for c in driver.cdp_calls)
+        and any(c.get("name") == "auth_token" for c in driver.cookies_added),
+        f"{resultado} | {bot.ultimo_error} | {driver.get_calls}",
+    )
+
+    # (f) .pkl con CDP caido -> fallback add_cookie (mismo contrato).
+    driver = _con_navegacion_real(FakeDriver())
+    driver.cdp_setcookie_falla = True
+    driver.current_url = "https://x.com/home"
+    bot = preparar_bot_login(driver)
+    with _pkl_falso(COOKIES_PKL):
+        resultado = bot.login_con_cookies()
+    check(
+        ".pkl CDP caido: cae a add_cookie y confirma",
+        resultado is True
+        and any(c.get("name") == "auth_token" for c in driver.cookies_added),
+        f"{resultado} | {bot.ultimo_error}",
+    )
+
+
+# --------------------------------------------------------------------------- #
 # Blindaje del compositor: recuperacion final de interstitial + reintento limpio
 # --------------------------------------------------------------------------- #
 class LoggerFalso:
@@ -1874,6 +2050,7 @@ def run(check):
         test_navegar_tolerante_p1(check)
         test_recuperar_interstitial(check)
         test_login_pkl_muro_de_login(check)
+        test_login_cdp_inyeccion(check)
         test_abrir_compositor_reintento_final(check)
         test_pegar_texto_reintento_mask(check)
         test_publicar_tweet_ciclo_limpio(check)

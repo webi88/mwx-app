@@ -692,12 +692,37 @@ class TwitterBot:
             
             with open(self.cookies_path, "rb") as f:
                 cookies = pickle.load(f)
-            
-            for cookie in cookies:
-                try:
-                    self.driver.add_cookie(cookie)
-                except:
-                    continue
+
+            # Misma via CDP que `login_con_cookies_json` (helper compartido):
+            # `add_cookie` puede fallar con "invalid cookie domain" en
+            # contenedores/redirecciones (bug real Chrome 154 en Railway).
+            cookies_selenium = normalizar_cookies(cookies)
+            nombres_inyectados: set = set()
+            inyectadas_cdp, _fallidas_cdp = self._inyectar_cookies_cdp(
+                cookies_selenium, nombres_inyectados
+            )
+            if inyectadas_cdp:
+                logger.info(
+                    f"login: cookies inyectadas via CDP "
+                    f"({inyectadas_cdp}/{len(cookies_selenium or [])})"
+                )
+            nombres_lista = {
+                str(c.get("name")) for c in cookies_selenium if isinstance(c, dict)
+            }
+            falta_auth_token = (
+                "auth_token" in nombres_lista
+                and "auth_token" not in nombres_inyectados
+            )
+            if inyectadas_cdp == 0 or falta_auth_token:
+                logger.warning(
+                    f"login: CDP no inyecto las cookies del .pkl de "
+                    f"{self.usuario}; fallback add_cookie"
+                )
+                for cookie in cookies_selenium:
+                    try:
+                        self.driver.add_cookie(cookie)
+                    except Exception:
+                        continue
             
             self.driver.refresh()
             self._esperar_documento_listo()
@@ -817,12 +842,6 @@ class TwitterBot:
                 return False
 
         try:
-            # /404 en vez de home: evita las redirecciones agresivas que X hace
-            # desde "/" cuando aun no hay sesion (te manda a /i/flow/login).
-            self.driver.get(f"{self.base_url}/404")
-            self._esperar_documento_listo()
-            time.sleep(0.3)
-
             # Normaliza TODAS las cookies (auth_token, ct0, twid, etc.) desde
             # formatos de vendedor/EditThisCookie/Selenium al que acepta Chrome.
             cookies_selenium = normalizar_cookies(cookies_json)
@@ -831,16 +850,78 @@ class TwitterBot:
                 self.ultimo_error = "cookies_json sin cookies utilizables"
                 return False
 
-            for cookie in cookies_selenium:
-                try:
-                    self.driver.add_cookie(cookie)
-                except Exception as e:
-                    logger.debug(f"Cookie {cookie.get('name')} no inyectada: {e}")
-                    continue
+            # (a) CDP PRIMERO: `Network.setCookie` NO depende del documento
+            # actual. Bug real de Chrome 154 en Railway: `driver.add_cookie`
+            # lanzaba "invalid cookie domain" para CADA cookie (el documento
+            # quedaba en un 404/redireccion/interstitial) y las cuentas sin
+            # `.pkl` nunca inyectaban la sesion (52/52 fallos de "Reportar").
+            nombres_inyectados: set = set()
+            inyectadas_cdp, fallidas_cdp = self._inyectar_cookies_cdp(
+                cookies_selenium, nombres_inyectados
+            )
+            if inyectadas_cdp:
+                logger.info(
+                    f"login: cookies inyectadas via CDP "
+                    f"({inyectadas_cdp}/{len(cookies_selenium)})"
+                )
 
-            self.driver.refresh()
-            self._esperar_documento_listo()
-            time.sleep(0.3)
+            nombres_lista = {
+                str(c.get("name")) for c in cookies_selenium if isinstance(c, dict)
+            }
+            falta_auth_token = (
+                "auth_token" in nombres_lista
+                and "auth_token" not in nombres_inyectados
+            )
+
+            # (b) Fallback UNICO con add_cookie si el CDP no inyecto NADA o
+            # dejo fuera la cookie critica: navegar al dominio base (para que
+            # el documento sea valido) y reintentar.
+            if inyectadas_cdp == 0 or falta_auth_token:
+                logger.warning(
+                    f"login: CDP inyecto {inyectadas_cdp}/{len(cookies_selenium)} "
+                    f"cookies para {self.usuario}; fallback add_cookie"
+                )
+                try:
+                    self.driver.get(self.base_url)
+                    self._esperar_documento_listo()
+                    time.sleep(0.3)
+                except Exception as e:
+                    logger.debug(f"No se pudo navegar a {self.base_url}: {e}")
+                for cookie in cookies_selenium:
+                    try:
+                        self.driver.add_cookie(cookie)
+                        inyectadas_cdp += 1
+                        if isinstance(cookie, dict) and cookie.get("name"):
+                            nombres_inyectados.add(str(cookie["name"]))
+                    except Exception as e:
+                        logger.debug(
+                            f"Cookie {cookie.get('name') if isinstance(cookie, dict) else '?'} "
+                            f"no inyectada por add_cookie: {e}"
+                        )
+                        continue
+
+            # (c) La cookie critica DEBE haber entrado. Si no, es un fallo de
+            # INYECCION (bug/entorno), NO de validez del auth_token: cortar
+            # aqui sin llegar a afirmar "X no emitio ct0".
+            if "auth_token" in nombres_lista and "auth_token" not in nombres_inyectados:
+                self.ultimo_error = (
+                    "no se pudieron inyectar las cookies en el navegador "
+                    "(CDP/add_cookie)"
+                )
+                logger.error(
+                    f"Login {self.usuario}: {self.ultimo_error} "
+                    f"(CDP={inyectadas_cdp}, fallidas={fallidas_cdp})"
+                )
+                return False
+
+            # Refrescar para que Chrome aplique las cookies recien inyectadas
+            # (con CDP no hizo falta navegar antes de inyectar).
+            try:
+                self.driver.refresh()
+                self._esperar_documento_listo()
+                time.sleep(0.3)
+            except Exception as e:
+                logger.debug(f"Refresh tras inyectar cookies fallo: {e}")
 
             # Entrar a /home para que X ejecute su JS autenticado y emita ct0.
             try:
@@ -993,6 +1074,124 @@ class TwitterBot:
             logger.debug(f"No se pudo preparar el auth_token de {self.usuario}: {e}")
         return []
 
+    # ------------------------------------------------------------------ #
+    # Inyeccion de cookies por CDP (comun a logins y motor de activaciones)
+    # ------------------------------------------------------------------ #
+    # Bug real de Chrome 154 en Railway: `driver.add_cookie` lanzaba
+    # "invalid cookie domain" para TODAS las cookies cuando el documento
+    # actual no era valido (get fallido/redireccion/interstitial en el
+    # contenedor), asi que las cuentas sin `.pkl` nunca entraban y TODOS los
+    # flujos de pagina fallaban. La via CDP `Network.setCookie` NO depende
+    # del documento actual (es la que ya usaba el motor de activaciones).
+    #
+    # Contrato de error para el dashboard (NO confundir):
+    #   (i)  "no se pudieron inyectar las cookies en el navegador
+    #        (CDP/add_cookie)"  -> bug/entorno de inyeccion.
+    #   (ii) "X no emitio ct0 (auth_token invalido o sesion bloqueada)"
+    #        -> las cookies SI entraron; el auth_token no vale.
+
+    def _set_cookie_cdp(self, payload: dict) -> bool:
+        """Inyecta UNA cookie con `Network.setCookie`; True si Chrome la acepto.
+
+        No depende del documento actual (a diferencia de `add_cookie`). Trata
+        como fallo tanto las excepciones como la respuesta `{"success": False}`.
+        Nunca lanza.
+        """
+        try:
+            respuesta = self.driver.execute_cdp_cmd("Network.setCookie", payload)
+        except Exception as e:
+            logger.debug(
+                f"Network.setCookie fallo ({payload.get('name')}): "
+                f"{type(e).__name__}: {e}"
+            )
+            return False
+        if isinstance(respuesta, dict) and respuesta.get("success") is False:
+            logger.debug(
+                f"Network.setCookie rechazo la cookie {payload.get('name')} "
+                "(success=False)"
+            )
+            return False
+        return True
+
+    @staticmethod
+    def _payload_cookie_cdp(cookie: dict) -> Optional[dict]:
+        """Payload de `Network.setCookie` para una cookie normalizada (o None).
+
+        Mapea `expiry`/`expirationDate` a `expirationDate`; usa `domain`/`path`
+        (o la `url` de la cookie si viene) y descarta cookies sin name/value.
+        """
+        if not isinstance(cookie, dict):
+            return None
+        nombre = cookie.get("name")
+        valor = cookie.get("value")
+        if not nombre or valor is None or str(valor) == "":
+            return None
+        domain = str(cookie.get("domain") or ".x.com")
+        path = str(cookie.get("path") or "/")
+        payload = {
+            "name": str(nombre),
+            "value": valor if isinstance(valor, str) else str(valor),
+            "domain": domain,
+            "path": path,
+            "secure": bool(cookie.get("secure", True)),
+            "httpOnly": bool(cookie.get("httpOnly", False)),
+        }
+        url_cookie = cookie.get("url")
+        if url_cookie:
+            payload["url"] = str(url_cookie)
+        expira = cookie.get("expiry", cookie.get("expirationDate"))
+        if expira:
+            try:
+                payload["expirationDate"] = float(expira)
+            except (TypeError, ValueError):
+                pass
+        return payload
+
+    def _inyectar_cookies_cdp(
+        self, cookies: list, inyectadas_nombres: Optional[set] = None
+    ) -> tuple:
+        """Inyecta TODAS las cookies por CDP `Network.setCookie` (sin navegar).
+
+        Misma via que `preparar_sesion_cdp` (motor de activaciones): no depende
+        del documento actual y acepta cookies de cualquier formato normalizado
+        (`normalizar_cookies`). Si el payload por `domain`/`path` falla, se
+        reintenta UNA vez con una `url` derivada (algunos renderers exigen
+        `url`). Si se pasa un set en `inyectadas_nombres`, se agregan los
+        NOMBRES realmente inyectados (para validar la cookie critica). Nunca
+        lanza.
+
+        Devuelve `(inyectadas, fallidas)`.
+        """
+        inyectadas = 0
+        fallidas = 0
+        for cookie in cookies or ():
+            payload = self._payload_cookie_cdp(cookie)
+            if payload is None:
+                fallidas += 1
+                continue
+            entregada = self._set_cookie_cdp(payload)
+            if not entregada:
+                # Reintento con `url` derivada del dominio (sin domain/path).
+                domain = str(payload.get("domain") or ".x.com")
+                path = str(payload.get("path") or "/")
+                if not path.startswith("/"):
+                    path = "/" + path
+                payload_url = {
+                    k: v for k, v in payload.items() if k not in ("domain", "path")
+                }
+                payload_url["url"] = f"https://{domain.lstrip('.')}{path}"
+                entregada = self._set_cookie_cdp(payload_url)
+            if entregada:
+                inyectadas += 1
+                if isinstance(inyectadas_nombres, set):
+                    inyectadas_nombres.add(str(payload["name"]))
+            else:
+                fallidas += 1
+                logger.debug(
+                    f"Cookie {payload.get('name')} no inyectada por CDP"
+                )
+        return inyectadas, fallidas
+
     def preparar_sesion_cdp(self, cookies: Optional[list] = None) -> bool:
         """Inyecta las cookies guardadas por CDP SIN navegar (sesion rapida).
 
@@ -1026,37 +1225,13 @@ class TwitterBot:
                 logger.debug(f"CDP no disponible para {self.usuario}: {e}")
                 return False
 
-            inyectadas = 0
-            for cookie in cookies:
-                try:
-                    if not isinstance(cookie, dict):
-                        continue
-                    name = cookie.get("name")
-                    value = cookie.get("value")
-                    if not name or value is None or str(value) == "":
-                        continue
-                    payload = {
-                        "name": str(name),
-                        "value": value if isinstance(value, str) else str(value),
-                        "domain": str(cookie.get("domain") or ".x.com"),
-                        "path": str(cookie.get("path") or "/"),
-                        "secure": bool(cookie.get("secure", True)),
-                        "httpOnly": bool(cookie.get("httpOnly", False)),
-                    }
-                    expira = cookie.get("expiry", cookie.get("expirationDate"))
-                    if expira:
-                        try:
-                            payload["expirationDate"] = float(expira)
-                        except (TypeError, ValueError):
-                            pass
-                    self.driver.execute_cdp_cmd("Network.setCookie", payload)
-                    inyectadas += 1
-                except Exception as e:
-                    logger.debug(
-                        f"Cookie {cookie.get('name') if isinstance(cookie, dict) else '?'} "
-                        f"no inyectada por CDP: {e}"
-                    )
-                    continue
+            # Misma via CDP que `login_con_cookies_json` (helper compartido).
+            inyectadas, fallidas = self._inyectar_cookies_cdp(cookies)
+            if fallidas:
+                logger.debug(
+                    f"sesion CDP: {inyectadas} inyectadas, {fallidas} fallidas "
+                    f"para {self.usuario}"
+                )
 
             if inyectadas >= 1:
                 self._sesion_cdp = True
