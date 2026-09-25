@@ -251,12 +251,6 @@ class FakeReportDriver:
             return self._visibles(self.toasts)
         if sel == "[data-testid='mask']":
             return []
-        if sel in (
-            "[data-testid='UserName']",
-            "[data-testid='primaryColumn']",
-            "[data-testid='UserProfileHeader_Items']",
-        ):
-            return self._visibles(self.profile_elements)
         if sel == "[data-testid='caret']":
             return self._visibles(self.caret_documento)
         if sel in (
@@ -731,7 +725,9 @@ def test_flujo_feliz_cuenta(check):
 def test_flujo_feliz_cuenta_es(check):
     print("Reporte: cuenta ES (Reportar a @user / Es abusivo o danino)")
     driver = FakeReportDriver()
-    driver.profile_elements = [FakeNodo(driver, testid="primaryColumn")]
+    # El caret del perfil vive DENTRO de `primaryColumn` (como en X real).
+    perfil = FakeNodo(driver, testid="primaryColumn")
+    driver.profile_elements = [perfil]
 
     def enviar():
         driver.dialogs = []
@@ -752,8 +748,9 @@ def test_flujo_feliz_cuenta_es(check):
             [None, lambda: abrir_dialogo()],
         )
 
-    driver.caret_documento = [FakeNodo(driver, testid="caret")]
-    driver.caret_documento[0].al_click = abrir_menu
+    caret_perfil = FakeNodo(driver, testid="caret")
+    caret_perfil.al_click = abrir_menu
+    perfil.hijos.append(caret_perfil)
     bot = _bot(driver)
     with _reloj_falso():
         ok = bot.reportar_cuenta(
@@ -1079,6 +1076,278 @@ def test_menu_sin_opcion_reporte(check):
     )
 
 
+# --------------------------------------------------------------------------- #
+# FIX B: robustez del reporte (menu ajeno, article lento, respaldo Spam)
+# --------------------------------------------------------------------------- #
+def _refrescar_limpia_menus(driver):
+    """`refresh` del fake que desmonta menus/dialogos (como Chrome real)."""
+
+    def refrescar():
+        driver.refresh_calls += 1
+        driver.menus = []
+        driver.dialogs = []
+
+    driver.refresh = refrescar
+
+
+def test_menu_ajeno_reintenta(check):
+    print("Reporte: menu ajeno (About/Get App/Developers) -> cierra, refresh, 2o intento")
+    driver = FakeReportDriver()
+    _refrescar_limpia_menus(driver)
+    estado = {"caret": 0, "submit": None}
+
+    def enviar():
+        driver.dialogs = []
+        driver.toasts = [
+            FakeNodo(driver, texto="Thanks for letting us know", role="alert")
+        ]
+
+    def abrir_menu():
+        estado["caret"] += 1
+        if estado["caret"] == 1:
+            _menu(driver, ["About", "Get App", "Developers"])
+            return
+
+        def abrir_dialogo():
+            _, _, submit = _dialogo(driver, ["It's spam"], "Submit", enviar)
+            estado["submit"] = submit
+
+        _menu(driver, ["Mute", "Report post"], [None, lambda: abrir_dialogo()])
+
+    _, caret = _articulo_con_caret(driver, abrir_menu)
+    bot = _bot(driver)
+    with _reloj_falso():
+        ok = bot.reportar_post("https://x.com/u/status/100", motivo="spam")
+
+    check("menu ajeno: reporta en el 2o intento (True)", ok is True, bot.ultimo_error)
+    check(
+        "menu ajeno: el caret se pulso 2 veces",
+        estado["caret"] == 2,
+        estado["caret"],
+    )
+    check(
+        "menu ajeno: NUNCA clickeo About/Get App/Developers",
+        not any(
+            e[0] == "click" and e[1] in ("About", "Get App", "Developers")
+            for e in driver.eventos
+        ),
+        str(driver.eventos),
+    )
+    check(
+        "menu ajeno: cerro el menu con Escape y refresco",
+        driver.escape_recibido >= 1 and driver.refresh_calls >= 1,
+        f"escape={driver.escape_recibido} refresh={driver.refresh_calls}",
+    )
+    check(
+        "menu ajeno: eligio la opcion correcta",
+        ("click", "Report post") in driver.eventos,
+        str(driver.eventos),
+    )
+
+
+def test_menu_ajeno_dos_intentos_falla(check):
+    print("Reporte: menu ajeno en AMBOS intentos -> falla sin clickear opciones")
+    driver = FakeReportDriver()
+    _refrescar_limpia_menus(driver)
+
+    def abrir_menu():
+        _menu(driver, ["About", "Get App", "Developers"])
+
+    _, caret = _articulo_con_caret(driver, abrir_menu)
+    bot = _bot(driver)
+    with _reloj_falso():
+        ok = bot.reportar_post("https://x.com/u/status/101", motivo="spam")
+
+    check("menu ajeno x2: devuelve False", ok is False, repr(ok))
+    check(
+        "menu ajeno x2: error claro con opciones visibles",
+        "no se encontro la opcion de reporte" in bot.ultimo_error
+        and "About" in bot.ultimo_error,
+        bot.ultimo_error,
+    )
+    check(
+        "menu ajeno x2: ninguna opcion fue clickeada (solo el caret)",
+        not any(
+            e[0] == "click" and e[1] not in ("caret",)
+            for e in driver.eventos
+        ),
+        str(driver.eventos),
+    )
+    check(
+        "menu ajeno x2: caret pulsado 2 veces",
+        caret.click_count == 2,
+        caret.click_count,
+    )
+
+
+def test_article_tardio_reintenta(check):
+    print("Reporte: article tardio -> navega de nuevo y reporta")
+    driver = FakeReportDriver()
+    contador = {"gets": 0}
+    holder = {}
+
+    def get(url):
+        driver.get_calls.append(url)
+        driver.current_url = url
+        contador["gets"] += 1
+        # El article recien aparece en la SEGUNDA navegacion (proxy lento).
+        if contador["gets"] >= 2 and holder.get("article") is not None:
+            if not driver.articles:
+                driver.articles = [holder["article"]]
+
+    driver.get = get
+
+    def enviar():
+        driver.dialogs = []
+        driver.toasts = [
+            FakeNodo(driver, texto="Thanks for letting us know", role="alert")
+        ]
+
+    def abrir_dialogo():
+        _dialogo(driver, ["It's spam"], "Submit", enviar)
+
+    def abrir_menu():
+        _menu(driver, ["Report post"], [lambda: abrir_dialogo()])
+
+    article = FakeNodo(driver, tag="article", testid="tweet")
+    caret = FakeNodo(driver, testid="caret")
+    caret.al_click = abrir_menu
+    article.hijos.append(caret)
+    holder["article"] = article
+
+    bot = _bot(driver)
+    with _reloj_falso():
+        ok = bot.reportar_post("https://x.com/u/status/102", motivo="spam")
+
+    check("article tardio: reporta tras re-navegar (True)", ok is True, bot.ultimo_error)
+    check(
+        "article tardio: al menos 2 navegaciones",
+        contador["gets"] >= 2,
+        contador["gets"],
+    )
+    check(
+        "article tardio: eligio el motivo y confirmo",
+        ("click", "It's spam") in driver.eventos
+        and ("click", "Submit") in driver.eventos,
+        str(driver.eventos),
+    )
+
+
+def test_article_ausente_dos_intentos(check):
+    print("Reporte: article ausente en ambos intentos -> fallo claro sin menús")
+    driver = FakeReportDriver()
+    bot = _bot(driver)
+    with _reloj_falso():
+        ok = bot.reportar_post("https://x.com/u/status/103", motivo="spam")
+
+    check("article ausente: devuelve False", ok is False, repr(ok))
+    check(
+        "article ausente: mensaje 'no se encontro el tweet a reportar'",
+        "no se encontro el tweet a reportar" in bot.ultimo_error,
+        bot.ultimo_error,
+    )
+    check(
+        "article ausente: navego >= 2 veces",
+        len(driver.get_calls) >= 2,
+        str(driver.get_calls),
+    )
+    check(
+        "article ausente: ningun click ni menu abierto",
+        driver.eventos == [] and driver.menus == [],
+        f"{driver.eventos} | {driver.menus}",
+    )
+
+
+def test_caret_no_global_si_hay_article(check):
+    print("Reporte: article sin caret -> NO usa el caret global (barra lateral)")
+    driver = FakeReportDriver()
+    article = FakeNodo(driver, tag="article", testid="tweet")
+    driver.articles = [article]
+    lateral = FakeNodo(driver, testid="caret", aria_label="More")
+    driver.caret_documento = [lateral]
+    bot = _bot(driver)
+    with _reloj_falso():
+        ok = bot.reportar_post("https://x.com/u/status/106", motivo="spam")
+
+    check("caret no global: devuelve False", ok is False, repr(ok))
+    check(
+        "caret no global: NO pulso el caret de la barra lateral",
+        lateral.click_count == 0,
+        lateral.click_count,
+    )
+    check(
+        "caret no global: mensaje de '...' no encontrado",
+        "no se encontro el boton de mas opciones" in bot.ultimo_error,
+        bot.ultimo_error,
+    )
+
+
+def test_motivo_spam_respaldo(check):
+    print("Reporte: motivo pedido ausente pero hay categorias -> respaldo Spam")
+    driver = FakeReportDriver()
+
+    def enviar():
+        driver.dialogs = []
+        driver.toasts = [FakeNodo(driver, texto="Gracias por informarnos", role="alert")]
+
+    def abrir_dialogo():
+        _dialogo(
+            driver,
+            ["Discurso violento", "Spam", "Suplantación de identidad"],
+            "Denunciar",
+            enviar,
+        )
+
+    _articulo_con_caret(
+        driver, lambda: _menu(driver, ["Denunciar post"], [lambda: abrir_dialogo()])
+    )
+    bot = _bot(driver)
+    with _reloj_falso():
+        ok = bot.reportar_post("https://x.com/u/status/104", motivo="hate")
+
+    check("respaldo spam: devuelve True", ok is True, bot.ultimo_error)
+    check(
+        "respaldo spam: eligio 'Spam'",
+        ("click", "Spam") in driver.eventos,
+        str(driver.eventos),
+    )
+    check(
+        "respaldo spam: NO eligio la categoria equivocada",
+        ("click", "Discurso violento") not in driver.eventos,
+        str(driver.eventos),
+    )
+
+
+def test_motivo_sin_categorias_falla(check):
+    print("Reporte: modal sin categorias y sin spam -> fallo claro, sin clickear")
+    driver = FakeReportDriver()
+    estado = {"razon": None, "submit": None}
+
+    def abrir_dialogo():
+        _, razones, submit = _dialogo(driver, ["Siguiente"], "Enviar", lambda: None)
+        estado["razon"] = razones[0]
+        estado["submit"] = submit
+
+    _articulo_con_caret(
+        driver, lambda: _menu(driver, ["Denunciar post"], [lambda: abrir_dialogo()])
+    )
+    bot = _bot(driver)
+    with _reloj_falso():
+        ok = bot.reportar_post("https://x.com/u/status/105", motivo="spam")
+
+    check("sin categorias: devuelve False", ok is False, repr(ok))
+    check(
+        "sin categorias: mensaje con motivo/opciones visibles",
+        "motivo 'spam' no encontrado" in bot.ultimo_error,
+        bot.ultimo_error,
+    )
+    check(
+        "sin categorias: NO clickeo 'Siguiente' ni el motivo",
+        estado["razon"].click_count == 0 and estado["submit"].click_count == 0,
+        f"{estado['razon'].click_count}/{estado['submit'].click_count}",
+    )
+
+
 def test_reportar_objetivo_dispatch(check):
     print("Reporte: reportar_objetivo distingue tweet de perfil")
     driver = FakeReportDriver()
@@ -1298,6 +1567,13 @@ def run(check):
     test_dialogo_cerrado_tras_envio(check)
     test_sin_confirmacion(check)
     test_menu_sin_opcion_reporte(check)
+    test_menu_ajeno_reintenta(check)
+    test_menu_ajeno_dos_intentos_falla(check)
+    test_article_tardio_reintenta(check)
+    test_article_ausente_dos_intentos(check)
+    test_caret_no_global_si_hay_article(check)
+    test_motivo_spam_respaldo(check)
+    test_motivo_sin_categorias_falla(check)
     test_reportar_objetivo_dispatch(check)
     test_reportar_objetivo_indeciso(check)
     test_reportar_url_vacia(check)

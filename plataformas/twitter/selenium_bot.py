@@ -794,7 +794,13 @@ class TwitterBot:
     
     def login_con_cookies_json(self) -> bool:
         """Inicia sesión inyectando las cookies nativas de X guardadas en BD
-        (`Cuenta.cookies_json`) en lugar del archivo .pkl."""
+        (`Cuenta.cookies_json`) en lugar del archivo .pkl.
+
+        Si X NO emite `ct0` (auth_token muerto) o redirige a login, y la cuenta
+        tiene `password` en la BD, intenta UN login con password/TOTP
+        (`_revivir_sesion_con_password`) y sigue el flujo normal si revive;
+        si falla, deja un mensaje que dice la verdad.
+        """
         import json
 
         cookies_json = None
@@ -966,8 +972,16 @@ class TwitterBot:
                     )
                     return False
 
+            # Sesion pedida explicitamente por X (redirect a login): el
+            # auth_token esta muerto. Si la cuenta tiene password en BD, UN
+            # intento de revivir con password/TOTP antes de fallar.
             if "login" in self.driver.current_url.lower():
+                if self._revivir_sesion_con_password(password, totp_secret):
+                    self.ultimo_error = ""
+                    return True
                 self.ultimo_error = "sesión expirada (auth_token/cookies inválidos)"
+                if (password or "").strip():
+                    self.ultimo_error += "; también falló el login con contraseña"
                 logger.warning(f"Sesion expirada para {self.usuario} (cookies_json)")
                 return False
 
@@ -976,29 +990,84 @@ class TwitterBot:
             # cuenta para no repetir este proceso en la siguiente ejecucion.
             try:
                 cookies_navegador = self.driver.get_cookies()
-                if cookies_navegador and any(c.get("name") == "ct0" for c in cookies_navegador):
-                    self._brandear_cuenta(cookies_navegador)
-                    logger.info(
-                        f"Cookies (incl. ct0) guardadas para {self.usuario} "
-                        f"({len(cookies_navegador)}), cuenta brandeada"
-                    )
-                else:
-                    logger.warning(f"X no emitio ct0 para {self.usuario}; sesion no confirmada")
-                    self.ultimo_error = "X no emitió ct0 (auth_token inválido o sesión bloqueada)"
-                    return False
             except Exception as e:
-                logger.warning(f"No se pudieron guardar las cookies del navegador: {e}")
+                logger.warning(
+                    f"No se pudieron leer las cookies del navegador: {e}"
+                )
+                cookies_navegador = []
 
-            logger.info(f"Login exitoso para {self.usuario} via cookies_json")
-            # Limpia un error previo (p.ej. del .pkl vencido) ya que la sesion
-            # quedo confirmada.
-            self.ultimo_error = ""
-            return True
+            if cookies_navegador and any(
+                c.get("name") == "ct0" for c in cookies_navegador
+            ):
+                self._brandear_cuenta(cookies_navegador)
+                logger.info(
+                    f"Cookies (incl. ct0) guardadas para {self.usuario} "
+                    f"({len(cookies_navegador)}), cuenta brandeada"
+                )
+                logger.info(f"Login exitoso para {self.usuario} via cookies_json")
+                # Limpia un error previo (p.ej. del .pkl vencido) ya que la
+                # sesion quedo confirmada.
+                self.ultimo_error = ""
+                return True
+
+            # FIX A: X no emitio ct0 (auth_token muerto). Si la cuenta tiene
+            # password/totp_secret en la BD, UN intento de login con password.
+            logger.warning(
+                f"X no emitio ct0 para {self.usuario}; sesion no confirmada"
+            )
+            if self._revivir_sesion_con_password(password, totp_secret):
+                self.ultimo_error = ""
+                return True
+            self.ultimo_error = (
+                "X no emitió ct0 (auth_token inválido o sesión bloqueada)"
+            )
+            if (password or "").strip():
+                self.ultimo_error += "; también falló el login con contraseña"
+            return False
 
         except Exception as e:
             self.ultimo_error = f"{type(e).__name__}: {e}"
             logger.exception(f"Error en login con cookies_json {self.usuario}: {e}")
             return False
+
+    def _revivir_sesion_con_password(self, password: str, totp_secret: str) -> bool:
+        """UN login con password/TOTP cuando el auth_token no da sesion.
+
+        Se usa SOLO desde `login_con_cookies_json` (auth_token muerto): el
+        motor de activaciones conserva su gate `ACTIVACION_PERMITIR_PASSWORD`.
+        Si `login_con_password` funciona, brandea la cuenta (cookies ct0) y
+        deja INFO "revivida con password"; si falla, WARNING claro. Nunca
+        lanza.
+        """
+        if not (password or "").strip():
+            return False
+        logger.info(
+            f"{self.usuario}: auth_token sin sesion; intentando revivir con "
+            "password/TOTP (UN intento)"
+        )
+        try:
+            ok = bool(self.login_con_password(password, totp_secret=totp_secret))
+        except Exception as e:
+            logger.warning(
+                f"login_con_password fallo para {self.usuario}: "
+                f"{type(e).__name__}: {e}"
+            )
+            ok = False
+        if not ok:
+            logger.warning(
+                f"{self.usuario}: login con password/TOTP tambien fallo"
+            )
+            return False
+        try:
+            cookies = self.driver.get_cookies()
+            if cookies:
+                self._brandear_cuenta(cookies)
+        except Exception as e:
+            logger.debug(
+                f"No se pudieron guardar las cookies tras revivir {self.usuario}: {e}"
+            )
+        logger.info(f"Login exitoso para {self.usuario} (revivida con password)")
+        return True
 
     def _esperar_documento_listo(self, timeout: int = 10) -> bool:
         """Espera a que `document.readyState` sea `interactive`/`complete`.
@@ -1777,7 +1846,28 @@ class TwitterBot:
         except Exception as e:
             logger.error(f"Error en login manual: {e}")
             return False
-    
+
+    def _limpiar_cookies_navegador(self) -> bool:
+        """Borra TODAS las cookies del navegador (CDP + Selenium best-effort).
+
+        Se usa antes de un login con password para no arrastrar el auth_token
+        invalido de la sesion anterior. El CDP no depende del documento actual.
+        Nunca lanza.
+        """
+        self._sesion_cdp = False
+        limpio = False
+        try:
+            self.driver.execute_cdp_cmd("Network.clearBrowserCookies", {})
+            limpio = True
+        except Exception as e:
+            logger.debug(f"clearBrowserCookies CDP fallo: {e}")
+        try:
+            self.driver.delete_all_cookies()
+            limpio = True
+        except Exception as e:
+            logger.debug(f"delete_all_cookies fallo: {e}")
+        return limpio
+
     def login_con_password(self, password: str, timeout: int = 60, totp_secret: str = "") -> bool:
         """Login automatizado con usuario + contraseña y guarda las cookies.
 
@@ -1790,8 +1880,14 @@ class TwitterBot:
         logins automatizados) y hay `totp_secret`, intenta resolverlo antes
         de declarar el intento como fallido.
         """
-        if not self.iniciar_driver():
+        # Reuso seguro: si ya hay un driver (fallback desde
+        # `login_con_cookies_json` con un auth_token muerto) NO se lanza otro
+        # Chrome y se limpian las cookies de la sesion anterior para que X
+        # muestre el flow de login limpio.
+        if not self.driver and not self.iniciar_driver():
             return False
+        if self.driver:
+            self._limpiar_cookies_navegador()
 
         if not totp_secret:
             try:
@@ -1886,21 +1982,41 @@ class TwitterBot:
             logger.error(f"Error en login con password para {self.usuario}: {e}")
             return False
 
+    # XPath 1.0: minúsculas + sin acentos para comparar textos de botones.
+    _XPATH_TXT_MAYUS = (
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZÁÉÍÓÚÑÜáéíóúñü"
+    )
+    _XPATH_TXT_MINUS = (
+        "abcdefghijklmnopqrstuvwxyzaeiounuaeiounu"
+    )
+
     def _clic_texto_visible(self, *textos) -> bool:
-        """Clica el primer elemento clickeable cuyo texto contiene alguno de 'textos'."""
+        """Clica el primer elemento clickeable cuyo texto contiene alguno de 'textos'.
+
+        La UI de X usa `div[role='button']` ademas de `button` y acentos
+        ("Iniciar sesión"): se comparan AMBOS, en minusculas y sin acentos
+        (XPath `translate`). Sin esto, `login_con_password` no encontraba el
+        boton "Siguiente"/"Iniciar sesion" y el flujo moria en el primer paso.
+        """
         for texto in textos:
-            try:
-                xpath = (
-                    "//button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', "
-                    "'abcdefghijklmnopqrstuvwxyz'), '" + texto.lower() + "')]"
-                )
-                elem = WebDriverWait(self.driver, 8).until(
-                    EC.element_to_be_clickable((By.XPATH, xpath))
-                )
-                elem.click()
-                return True
-            except Exception:
+            t = str(texto or "").strip().lower()
+            if not t:
                 continue
+            xpaths = (
+                "//button[contains(translate(., "
+                f"'{self._XPATH_TXT_MAYUS}', '{self._XPATH_TXT_MINUS}'), '{t}')]",
+                "//*[@role='button'][contains(translate(., "
+                f"'{self._XPATH_TXT_MAYUS}', '{self._XPATH_TXT_MINUS}'), '{t}')]",
+            )
+            for xpath in xpaths:
+                try:
+                    elem = WebDriverWait(self.driver, 8).until(
+                        EC.element_to_be_clickable((By.XPATH, xpath))
+                    )
+                    elem.click()
+                    return True
+                except Exception:
+                    continue
         return False
 
     def guardar_cookies(self) -> bool:
@@ -6097,12 +6213,19 @@ try {
                 return None
             time.sleep(0.4)
 
-    def _buscar_boton_mas_opciones(self, contenedor=None, timeout: float = 12.0):
+    def _buscar_boton_mas_opciones(
+        self, contenedor=None, timeout: float = 12.0, solo_contenedor: bool = False
+    ):
         """Boton '...' (mas opciones) del tweet/perfil.
 
         Intenta DENTRO del articulo (`[data-testid='caret']` y aria-labels
         "More"/"Más"/"More options"/"Más opciones") y, si no aparece, a nivel
         documento. Devuelve None si no hay un boton visible en el plazo.
+
+        `solo_contenedor=True`: si `contenedor` es None o no tiene caret, NO se
+        busca a nivel documento. Evita abrir menus ajenos (barra lateral
+        "About; Get App; Developers", tendencias "This trend is spam...") cuando
+        el article del tweet SI existe pero su caret no aparecio.
         """
         css = (
             "[data-testid='caret']",
@@ -6139,7 +6262,7 @@ try {
                         candidatos.extend(contenedor.find_elements(By.XPATH, xp))
                     except Exception:
                         continue
-            if not candidatos:
+            if not candidatos and not solo_contenedor:
                 for sel in css:
                     try:
                         candidatos.extend(self.driver.find_elements(By.CSS_SELECTOR, sel))
@@ -6352,10 +6475,71 @@ try {
                 return False
             time.sleep(0.5)
 
+    # Textos de menus que NO son del tweet (barra lateral, tendencias,
+    # busqueda, cuenta): si el caret abre uno de estos, es el menu EQUIVOCADO.
+    # Solo se usa como diagnostico: la validacion real es que exista una opcion
+    # de reporte en el menu ANTES de elegir cualquier cosa.
+    _TEXTOS_MENU_AJENO = (
+        "about", "get app", "developers", "acerca de", "descargar la app",
+        "desarrolladores", "this trend is spam", "esta tendencia es spam",
+        "settings and privacy", "configuracion y privacidad", "help center",
+        "centro de ayuda", "keyboard shortcuts", "atajos de teclado",
+        "log out", "cerrar sesion", "add an existing account",
+        "agregar una cuenta existente", "create new account",
+        "crear cuenta nueva",
+    )
+
+    def _contenedor_perfil(self):
+        """Contenedor del perfil (`primaryColumn`/`main`) o None.
+
+        Scope del caret del perfil: evita que `_buscar_boton_mas_opciones`
+        caiga en el boton '...' de la barra lateral/tendencias.
+        """
+        for sel in ("[data-testid='primaryColumn']", "main[role='main']"):
+            try:
+                for el in self.driver.find_elements(By.CSS_SELECTOR, sel):
+                    if el.is_displayed():
+                        return el
+            except Exception:
+                continue
+        return None
+
+    def _es_menu_ajeno(self, opciones) -> bool:
+        """True si el menu visible es de la pagina/tendencias (no del tweet)."""
+        for _, texto in opciones or ():
+            norm = self._normalizar_texto_ui(texto)
+            if not norm:
+                continue
+            if any(frase in norm for frase in self._TEXTOS_MENU_AJENO):
+                return True
+        return False
+
+    def _opciones_son_categorias_reporte(self, opciones, es_cuenta: bool) -> bool:
+        """True si las opciones VISIBLES parecen categorias de reporte de X.
+
+        Se usa para decidir el respaldo a Spam: solo se aplica si la pantalla
+        SI es el modal de categorias (no un modal cualquiera con un "Next").
+        """
+        tabla = (
+            self._MOTIVOS_REPORTE_CUENTA if es_cuenta else self._MOTIVOS_REPORTE_POST
+        )
+        candidatos = []
+        for lista in tabla.values():
+            candidatos.extend(lista)
+        elegido, _ = self._elegir_opcion_visible(opciones, tuple(candidatos))
+        return elegido is not None
+
     def _ejecutar_reporte(
         self, url: str, es_cuenta: bool, motivo: str, dry_run: bool
     ) -> bool:
         """Flujo comun de reporte (post o cuenta) con verificacion real.
+
+        Hasta 2 intentos completos: navega, espera el article/el perfil
+        (15s con recuperacion de interstitial), localiza el caret '...' DENTRO
+        del tweet (NUNCA el global si hay article), valida que el menu traiga
+        una opcion de reporte y recien entonces abre el modal. Un menu ajeno
+        (barra lateral/tendencias) o un article lento se cierra/reintenta; solo
+        tras los 2 intentos falla con el mensaje claro.
 
         Asume que hay driver y que el llamador limpio `self.ultimo_error`.
         Devuelve True solo con confirmacion (toast/alert/"gracias"/ya
@@ -6373,114 +6557,188 @@ try {
             f"(title='{titulo}', motivo={motivo}, dry_run={bool(dry_run)})"
         )
 
-        # 1) Navegacion con timeouts acotados (misma semantica que el resto).
-        self._get_acotado(url, timeout_max=20.0)
-        time.sleep(0.3)
+        handle = self._handle_desde_url(url) if es_cuenta else ""
+        max_intentos = 2
+        opciones_menu: list = []
+        opcion = None
+        texto_opcion = ""
+        contenedor = None
 
-        estado = self._recuperar_interstitial(url)
-        if estado == "anti-bot":
-            self.ultimo_error = (
-                "X pidió verificación anti-bot (Cloudflare) al abrir el "
-                f"{etiqueta} ({self._diagnostico_pagina()})"
-            )
-            logger.warning(self.ultimo_error)
-            return False
-        if estado == "error":
-            self.ultimo_error = (
-                f"pagina de error de X (interstitial) al abrir el {etiqueta} "
-                f"({self._diagnostico_pagina()})"
-            )
-            logger.warning(self.ultimo_error)
-            return False
-        if estado == "driver":
-            self.ultimo_error = self.ultimo_error or (
-                f"tab crashed/navegador sin navegar al abrir el {etiqueta}"
-            )
-            logger.warning(self.ultimo_error)
-            return False
+        for intento in range(1, max_intentos + 1):
+            # 1) Navegacion con timeouts acotados (misma semantica que el resto).
+            self._get_acotado(url, timeout_max=20.0)
+            time.sleep(0.3)
 
-        if self._sesion_cdp and self._hay_muro_login():
-            # Sesion CDP invalida: UN fallback a login lento y UN reintento de
-            # la navegacion (misma semantica que el resto de flujos).
-            if self._revivir_sesion_cdp():
-                self._get_acotado(url, timeout_max=20.0)
-                time.sleep(0.3)
-            if self._hay_muro_login():
+            estado = self._recuperar_interstitial(url)
+            if estado == "anti-bot":
                 self.ultimo_error = (
-                    "sesión de X expirada o inválida: se pidió login al abrir "
-                    f"el {etiqueta}"
+                    "X pidió verificación anti-bot (Cloudflare) al abrir el "
+                    f"{etiqueta} ({self._diagnostico_pagina()})"
                 )
                 logger.warning(self.ultimo_error)
                 return False
-
-        try:
-            self._asegurar_pagina_tweet(url)
-        except Exception as e:
-            self.ultimo_error = str(e)
-            logger.warning(self.ultimo_error)
-            return False
-
-        if self._detectar_limite_cuenta():
-            self.ultimo_error = "cuenta limitada por X"
-            logger.warning(self.ultimo_error)
-            return False
-
-        contenedor = None
-        if es_cuenta:
-            self._esperar_perfil(timeout=8.0)
-        else:
-            contenedor = self._esperar_article_tweet(timeout=12)
-            if contenedor is None:
+            if estado == "driver":
+                self.ultimo_error = self.ultimo_error or (
+                    f"tab crashed/navegador sin navegar al abrir el {etiqueta}"
+                )
+                logger.warning(self.ultimo_error)
+                return False
+            if estado == "error":
+                logger.warning(
+                    f"intento {intento}/{max_intentos}: pagina de error de X "
+                    f"({self._diagnostico_pagina()})"
+                )
+                if intento < max_intentos:
+                    continue
                 self.ultimo_error = (
-                    "no se encontro el tweet a reportar "
+                    f"pagina de error de X (interstitial) al abrir el {etiqueta} "
                     f"({self._diagnostico_pagina()})"
                 )
                 logger.warning(self.ultimo_error)
                 return False
 
-        # 2) Menu '...' (dentro del articulo; si no, a nivel documento).
-        caret = self._buscar_boton_mas_opciones(contenedor, timeout=12.0)
-        if caret is None:
-            logger.warning(
-                f"timeout esperando '...' del {etiqueta} (12s); refrescando "
-                "y reintentando"
-            )
-            self._refresh_corto(8.0)
-            time.sleep(0.3)
+            # Sesion caida (muro de login): UN fallback CDP y reintento de la
+            # navegacion; si sigue, se falla CLARO (antes se confundia con
+            # "no se encontro el tweet a reportar").
+            if estado == "login" or self._hay_muro_login():
+                if self._sesion_cdp and self._revivir_sesion_cdp():
+                    self._get_acotado(url, timeout_max=20.0)
+                    time.sleep(0.3)
+                if self._hay_muro_login():
+                    self.ultimo_error = (
+                        "sesión de X expirada o inválida: se pidió login al abrir "
+                        f"el {etiqueta}"
+                    )
+                    logger.warning(self.ultimo_error)
+                    return False
+
+            try:
+                self._asegurar_pagina_tweet(url)
+            except Exception as e:
+                self.ultimo_error = str(e)
+                logger.warning(self.ultimo_error)
+                return False
+
+            if self._detectar_limite_cuenta():
+                self.ultimo_error = "cuenta limitada por X"
+                logger.warning(self.ultimo_error)
+                return False
+
+            # 2) Esperar el objetivo: article del tweet (15s, con recuperacion
+            # de interstitial en medio) o cabecera del perfil.
+            contenedor = None
             if es_cuenta:
                 self._esperar_perfil(timeout=8.0)
+                contenedor = self._contenedor_perfil()
             else:
-                contenedor = self._esperar_article_tweet(timeout=8) or contenedor
-            caret = self._buscar_boton_mas_opciones(contenedor, timeout=8.0)
-        if caret is None:
-            self.ultimo_error = (
-                f"no se encontro el boton de mas opciones ('...') del {etiqueta} "
-                f"({self._diagnostico_pagina()})"
-            )
-            logger.warning(self.ultimo_error)
-            return False
-        self._clic_js(caret)
-        time.sleep(random.uniform(0.3, 0.6))
+                contenedor = self._esperar_article_tweet(timeout=8)
+                if contenedor is None:
+                    estado_art = self._recuperar_interstitial(url)
+                    if estado_art == "anti-bot":
+                        self.ultimo_error = (
+                            "X pidió verificación anti-bot (Cloudflare) al abrir "
+                            f"el {etiqueta} ({self._diagnostico_pagina()})"
+                        )
+                        logger.warning(self.ultimo_error)
+                        return False
+                    if estado_art == "login":
+                        self.ultimo_error = (
+                            "sesión de X expirada o inválida: se pidió login al "
+                            f"abrir el {etiqueta}"
+                        )
+                        logger.warning(self.ultimo_error)
+                        return False
+                    if estado_art == "driver":
+                        self.ultimo_error = self.ultimo_error or (
+                            f"tab crashed/navegador sin navegar al abrir el {etiqueta}"
+                        )
+                        logger.warning(self.ultimo_error)
+                        return False
+                    contenedor = self._esperar_article_tweet(timeout=7)
+                if contenedor is None:
+                    logger.warning(
+                        f"intento {intento}/{max_intentos}: article del tweet no "
+                        f"aparecio (15s) ({self._diagnostico_pagina()}); "
+                        "navegando de nuevo"
+                    )
+                    if intento < max_intentos:
+                        continue
+                    self.ultimo_error = (
+                        "no se encontro el tweet a reportar "
+                        f"({self._diagnostico_pagina()})"
+                    )
+                    logger.warning(self.ultimo_error)
+                    return False
 
-        # 3) Opcion de reporte en el menu (texto bilingue, nunca por indice).
-        handle = self._handle_desde_url(url) if es_cuenta else ""
-        menu = self._esperar_menu_opciones(timeout=8.0)
-        opciones_menu = self._opciones_visibles(menu or self.driver)
-        opcion, texto_opcion = self._elegir_opcion_visible(
-            opciones_menu, self._candidatos_opcion_reporte(es_cuenta, handle)
-        )
-        if opcion is None:
-            self.ultimo_error = (
-                f"no se encontro la opcion de reporte del {etiqueta} en el menu "
-                f"(handle='{handle}'); opciones visibles: "
-                f"{self._textos_opciones(opciones_menu)}"
+            # 3) Caret '...' DENTRO del article/perfil (sin fallback global si
+            # hay contenedor): el fallback al documento abria menus ajenos
+            # ("About; Get App; Developers", tendencias "This trend is spam...").
+            solo_contenedor = contenedor is not None
+            caret = self._buscar_boton_mas_opciones(
+                contenedor, timeout=10.0, solo_contenedor=solo_contenedor
             )
-            logger.warning(self.ultimo_error)
-            self._cerrar_flujo_reporte()
-            return False
-        logger.info(f"reporte {etiqueta}: opcion de menu elegida -> '{texto_opcion}'")
-        self._clic_js(opcion)
-        time.sleep(random.uniform(0.4, 0.8))
+            if caret is None:
+                logger.warning(
+                    f"intento {intento}/{max_intentos}: timeout esperando '...' "
+                    f"del {etiqueta}; refrescando y reintentando"
+                )
+                self._refresh_corto(8.0)
+                time.sleep(0.3)
+                if es_cuenta:
+                    self._esperar_perfil(timeout=8.0)
+                    contenedor = self._contenedor_perfil() or contenedor
+                else:
+                    contenedor = self._esperar_article_tweet(timeout=10) or contenedor
+                solo_contenedor = contenedor is not None
+                caret = self._buscar_boton_mas_opciones(
+                    contenedor, timeout=8.0, solo_contenedor=solo_contenedor
+                )
+            if caret is None:
+                if intento < max_intentos:
+                    continue
+                self.ultimo_error = (
+                    f"no se encontro el boton de mas opciones ('...') del "
+                    f"{etiqueta} ({self._diagnostico_pagina()})"
+                )
+                logger.warning(self.ultimo_error)
+                return False
+            self._clic_js(caret)
+            time.sleep(random.uniform(0.3, 0.6))
+
+            # 4) VALIDAR el menu ANTES de elegir nada: debe traer una opcion de
+            # reporte. Si es el menu de la pagina/tendencias, cerrar, refresh y
+            # reintentar; jamas elegir opciones de esos menus.
+            menu = self._esperar_menu_opciones(timeout=8.0)
+            opciones_menu = self._opciones_visibles(menu or self.driver)
+            opcion, texto_opcion = self._elegir_opcion_visible(
+                opciones_menu, self._candidatos_opcion_reporte(es_cuenta, handle)
+            )
+            if opcion is None:
+                ajeno = self._es_menu_ajeno(opciones_menu)
+                logger.warning(
+                    f"intento {intento}/{max_intentos}: menu "
+                    f"{'ajeno (barra/tendencias)' if ajeno else 'sin opcion de reporte'}"
+                    f"; opciones visibles: {self._textos_opciones(opciones_menu)}"
+                )
+                self._cerrar_flujo_reporte()
+                if intento < max_intentos:
+                    self._refresh_corto(6.0)
+                    time.sleep(0.3)
+                    continue
+                self.ultimo_error = (
+                    f"no se encontro la opcion de reporte del {etiqueta} en el "
+                    f"menu (handle='{handle}'); opciones visibles: "
+                    f"{self._textos_opciones(opciones_menu)}"
+                )
+                logger.warning(self.ultimo_error)
+                return False
+
+            logger.info(
+                f"reporte {etiqueta}: opcion de menu elegida -> '{texto_opcion}'"
+            )
+            self._clic_js(opcion)
+            time.sleep(random.uniform(0.4, 0.8))
+            break
 
         # Idempotencia: "ya reportaste"/"already reported" puede aparecer AQUI.
         if self._reporte_confirmado():
@@ -6504,6 +6762,24 @@ try {
         eleccion, texto_motivo = self._elegir_opcion_visible(
             opciones_motivo, self._candidatos_motivo_reporte(motivo, es_cuenta)
         )
+        if eleccion is None and self._opciones_son_categorias_reporte(
+            opciones_motivo, es_cuenta
+        ):
+            # FIX B: el motivo pedido no esta entre las opciones VISIBLES pero
+            # la pantalla SI es el modal de categorias de X: se usa "Spam" (la
+            # categoria mas amplia) como respaldo. Nunca se elige "Siguiente".
+            tabla = (
+                self._MOTIVOS_REPORTE_CUENTA if es_cuenta
+                else self._MOTIVOS_REPORTE_POST
+            )
+            eleccion, texto_motivo = self._elegir_opcion_visible(
+                opciones_motivo, tuple(tabla["spam"])
+            )
+            if eleccion is not None:
+                logger.info(
+                    f"reporte {etiqueta}: motivo '{motivo}' no visible; se usa "
+                    f"la categoria Spam ('{texto_motivo}') como respaldo"
+                )
         if eleccion is None:
             excluir = tuple(self._FRASES_ENVIO_REPORTE) + (
                 "close", "cancel", "cerrar", "cancelar",

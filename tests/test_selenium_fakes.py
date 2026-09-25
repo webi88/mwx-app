@@ -265,6 +265,9 @@ class FakeDriver:
     def get_cookies(self):
         return [dict(cookie) for cookie in self.cookies_added]
 
+    def delete_all_cookies(self):
+        self.cookies_added = []
+
     def execute_script(self, script, *args):
         self.js_calls.append((script, args))
         if any(isinstance(a, FakeElement) and a.stale for a in args):
@@ -1727,6 +1730,162 @@ def test_login_cdp_inyeccion(check):
 
 
 # --------------------------------------------------------------------------- #
+# FIX A: revivir la sesion con password cuando el auth_token no da ct0
+# --------------------------------------------------------------------------- #
+def test_login_password_revival(check):
+    print("P0-G: auth_token muerto -> UN login con password para revivir la sesion")
+
+    # (a) sin ct0 + password -> revivida con password (una sola llamada).
+    driver = _con_navegacion_real(FakeDriver())
+    bot = preparar_bot_login(driver)
+    brandeadas = []
+    bot._brandear_cuenta = lambda cookies: brandeadas.append(list(cookies))
+    llamadas_pw = []
+    bot.login_con_password = (
+        lambda password, timeout=60, totp_secret="":
+        llamadas_pw.append((password, totp_secret)) or True
+    )
+    with _db_falsa(
+        CuentaFake(
+            cookies_json=json.dumps([COOKIES_PKL[0]]),
+            password="Clave123",
+            totp_secret="TOTP123",
+        )
+    ), _logger_falso() as log:
+        resultado = bot.login_con_cookies_json()
+    info = " ".join(log.llamadas["info"])
+    check("revivir: devuelve True", resultado is True, bot.ultimo_error)
+    check(
+        "revivir: login_con_password UNA vez con password/totp",
+        llamadas_pw == [("Clave123", "TOTP123")],
+        str(llamadas_pw),
+    )
+    check(
+        "revivir: brandeo la cuenta resultante",
+        len(brandeadas) >= 1,
+        str(len(brandeadas)),
+    )
+    check(
+        "revivir: log INFO 'revivida con password'",
+        "revivida con password" in info,
+        info,
+    )
+
+    # (b) password fallido -> mensaje verdadero (ct0 + password tambien fallo).
+    driver = _con_navegacion_real(FakeDriver())
+    bot = preparar_bot_login(driver)
+    bot._brandear_cuenta = lambda cookies: None
+    llamadas_pw = []
+    bot.login_con_password = (
+        lambda password, timeout=60, totp_secret="":
+        llamadas_pw.append((password, totp_secret)) or False
+    )
+    with _db_falsa(
+        CuentaFake(
+            cookies_json=json.dumps([COOKIES_PKL[0]]),
+            password="mala",
+            totp_secret="",
+        )
+    ), _logger_falso():
+        resultado = bot.login_con_cookies_json()
+    error = bot.ultimo_error or ""
+    check("revivir falla: devuelve False", resultado is False, repr(resultado))
+    check("revivir falla: UNA sola llamada", len(llamadas_pw) == 1, str(llamadas_pw))
+    check(
+        "revivir falla: mensaje (ii) + 'tambien fallo el login con contrasena'",
+        "no emitió ct0" in error
+        and "también falló el login con contraseña" in error,
+        error,
+    )
+
+    # (c) X redirige a login (auth_token muerto): tambien reviva con password.
+    driver = _con_navegacion_real(FakeDriver())
+
+    def get_redirige(url):
+        driver.get_calls.append(url)
+        driver.current_url = (
+            "https://x.com/i/flow/login" if url.endswith("/home") else url
+        )
+
+    driver.get = get_redirige
+    bot = preparar_bot_login(driver)
+    bot._brandear_cuenta = lambda cookies: None
+    llamadas_pw = []
+    bot.login_con_password = (
+        lambda password, timeout=60, totp_secret="":
+        llamadas_pw.append(password) or True
+    )
+    with _db_falsa(
+        CuentaFake(
+            cookies_json=json.dumps([COOKIES_PKL[0]]),
+            password="pw",
+            totp_secret="",
+        )
+    ), _logger_falso():
+        resultado = bot.login_con_cookies_json()
+    check("revivir (redirect login): True", resultado is True, bot.ultimo_error)
+    check(
+        "revivir (redirect login): una llamada",
+        len(llamadas_pw) == 1,
+        str(llamadas_pw),
+    )
+
+    # (d) sin password NO se intenta password: se conserva el mensaje (ii).
+    driver = _con_navegacion_real(FakeDriver())
+    bot = preparar_bot_login(driver)
+    bot._brandear_cuenta = lambda cookies: None
+    llamadas_pw = []
+    bot.login_con_password = lambda *a, **k: llamadas_pw.append(1) or True
+    with _db_falsa(
+        CuentaFake(
+            cookies_json=json.dumps([COOKIES_PKL[0]]), password="", totp_secret=""
+        )
+    ), _logger_falso():
+        resultado = bot.login_con_cookies_json()
+    error = bot.ultimo_error or ""
+    check(
+        "sin password: NO intenta password y mantiene el mensaje (ii)",
+        resultado is False and llamadas_pw == [] and "no emitió ct0" in error,
+        f"{resultado} | {llamadas_pw} | {error}",
+    )
+
+    # (e) reuso seguro del driver: `login_con_password` NO lanza otro Chrome y
+    # limpia las cookies de la sesion muerta (CDP + delete_all_cookies).
+    driver = _con_navegacion_real(FakeDriver())
+    driver.cookies_added = [{"name": "auth_token", "value": "muerto"}]
+    bot = preparar_bot_login(driver)
+    llamadas_inicio = []
+    bot.iniciar_driver = lambda *a, **k: llamadas_inicio.append(1) or True
+    with _sin_esperas():
+        resultado = bot.login_con_password("pw", timeout=1)
+    check(
+        "reuso password: NO arranca otro Chrome",
+        llamadas_inicio == [],
+        str(llamadas_inicio),
+    )
+    check(
+        "reuso password: limpia cookies por CDP",
+        ("Network.clearBrowserCookies", {}) in driver.cdp_calls,
+        str([c[0] for c in driver.cdp_calls[:4]]),
+    )
+    check(
+        "reuso password: limpia cookies con delete_all_cookies",
+        driver.cookies_added == [],
+        str(driver.cookies_added),
+    )
+    check(
+        "reuso password: navega al flow de login",
+        "https://x.com/i/flow/login" in driver.get_calls,
+        str(driver.get_calls),
+    )
+    check(
+        "reuso password: sin campo de usuario devuelve False",
+        resultado is False,
+        repr(resultado),
+    )
+
+
+# --------------------------------------------------------------------------- #
 # Blindaje del compositor: recuperacion final de interstitial + reintento limpio
 # --------------------------------------------------------------------------- #
 class LoggerFalso:
@@ -2051,6 +2210,7 @@ def run(check):
         test_recuperar_interstitial(check)
         test_login_pkl_muro_de_login(check)
         test_login_cdp_inyeccion(check)
+        test_login_password_revival(check)
         test_abrir_compositor_reintento_final(check)
         test_pegar_texto_reintento_mask(check)
         test_publicar_tweet_ciclo_limpio(check)
