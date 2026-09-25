@@ -32,14 +32,19 @@ def main():
     try:
         from scheduler.manager import SchedulerManager
 
-        # Unico proceso que corre el calentamiento continuo; el dashboard
-        # instancia SchedulerManager() sin argumentos y NO lo registra.
-        SchedulerManager(con_calentamiento=True)
+        # Unico proceso que corre el calentamiento continuo y las alertas 24/7;
+        # el dashboard instancia SchedulerManager() sin argumentos y NO los
+        # registra (si lo hiciera, cada pagina buscaria y enviaria las MISMAS
+        # alertas a Telegram: envios duplicados).
+        SchedulerManager(con_calentamiento=True, con_alertas=True)
     except Exception:
         logger.exception("Error iniciando SchedulerManager")
         raise
 
-    logger.info("Scheduler standalone en ejecución (revisando tareas cada 30s)")
+    logger.info(
+        "Scheduler standalone en ejecución (tareas cada 30s + calentamiento y "
+        "alertas 24/7 según ALERTAS_*)"
+    )
 
     # Mantener vivo el hilo principal. El BackgroundScheduler de APScheduler
     # corre en un hilo aparte. Usamos sleep(1) para responder rápido a SIGTERM.

@@ -24,6 +24,8 @@ openai==0.28.0
 requests==2.32.3
 httpx==0.28.1
 feedparser==6.0.11
+# Resolucion real de links de Google News (alertas) - lo usaba el proyecto viejo
+googlenewsdecoder==0.2.1
 
 # Image Processing
 Pillow==10.4.0

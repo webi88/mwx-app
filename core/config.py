@@ -182,6 +182,57 @@ class Settings(BaseSettings):
     alertas_timeout: int = 120
     alertas_dedup_days: int = 7
 
+    # Alertas 24/7 (job del scheduler standalone; ver scheduler/manager.py y
+    # scheduler/standalone.py). El job SOLO se registra con con_alertas=True,
+    # que pasa UNICAMENTE el proceso standalone: el dashboard instancia
+    # SchedulerManager() en varias paginas y registraria el job en cada una
+    # (envios duplicados a Telegram). Los int se leen como 1/0 (tolerante a
+    # "abc"/None: el manager los normaliza a su default).
+    # pydantic-settings v2 ignora el kwarg `env=` de Field: el alias efectivo
+    # es `validation_alias`; se aceptan MAYUSCULAS (Railway) y el nombre del
+    # campo en minusculas.
+    alertas_activo: int = Field(
+        default=1,
+        env="ALERTAS_ACTIVO",
+        validation_alias=AliasChoices("ALERTAS_ACTIVO", "alertas_activo"),
+    )
+    alertas_intervalo_min: int = Field(
+        default=60,
+        env="ALERTAS_INTERVALO_MIN",
+        validation_alias=AliasChoices(
+            "ALERTAS_INTERVALO_MIN", "alertas_intervalo_min"
+        ),
+    )
+    alertas_ventana_horas: int = Field(
+        default=6,
+        env="ALERTAS_VENTANA_HORAS",
+        validation_alias=AliasChoices("ALERTAS_VENTANA_HORAS", "alertas_ventana_horas"),
+    )
+    alertas_resumen_diario: int = Field(
+        default=1,
+        env="ALERTAS_RESUMEN_DIARIO",
+        validation_alias=AliasChoices(
+            "ALERTAS_RESUMEN_DIARIO", "alertas_resumen_diario"
+        ),
+    )
+    alertas_resumen_diario_hora: int = Field(
+        default=22,
+        env="ALERTAS_RESUMEN_DIARIO_HORA",
+        validation_alias=AliasChoices(
+            "ALERTAS_RESUMEN_DIARIO_HORA", "alertas_resumen_diario_hora"
+        ),
+    )
+    # Pausa de envio a Telegram: 0 (default) = solo detectar y registrar en el
+    # dashboard (MencionDia + historial de dedup); 1 = enviar tambien a los
+    # grupos. Lo consulta `alertas/notificador.py`.
+    alertas_enviar_telegram: int = Field(
+        default=0,
+        env="ALERTAS_ENVIAR_TELEGRAM",
+        validation_alias=AliasChoices(
+            "ALERTAS_ENVIAR_TELEGRAM", "alertas_enviar_telegram"
+        ),
+    )
+
     # Smartproxy residencial (México, sticky 15 min)
     smartproxy_host: str = Field(default="proxy.smartproxy.net", env="SMARTPROXY_HOST")
     smartproxy_port: int = Field(default=3120, env="SMARTPROXY_PORT")

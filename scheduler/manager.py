@@ -1,4 +1,5 @@
 from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 from core.database import get_db_session
 from core.models import Tarea
@@ -7,8 +8,76 @@ from scheduler.ejecutor import EjecutorTareas, _es_error_reintentable
 from loguru import logger
 
 
+#: Defaults de las alertas 24/7 (se leen de core.config.settings.alertas_*).
+_DEFECTOS_ALERTAS = {
+    "activo": 1,
+    "intervalo_min": 180,
+    "ventana_horas": 6,
+    "resumen_diario": 1,
+    "resumen_diario_hora": 22,
+}
+
+
+def config_alertas() -> dict:
+    """Ajustes efectivos de las alertas 24/7 (nunca lanza; invalidos -> default).
+
+    Lee `core.config.settings` (campos `alertas_*`, env `ALERTAS_*`). Devuelve
+    ``{"activo","intervalo_min","ventana_horas","resumen_diario",
+    "resumen_diario_hora"}`` con:
+      - `activo`/`resumen_diario`: bool (0/None/"abc" -> default 1);
+      - `intervalo_min`: int >= 0 (0 = apagar el job);
+      - `ventana_horas`: int >= 1 (horas hacia atras por busqueda);
+      - `resumen_diario_hora`: int acotado a 0..23.
+    El registro real del job depende ademas de `con_alertas=True`, que SOLO
+    pasa `scheduler.standalone` (el dashboard nunca lo activa).
+    """
+    try:
+        from core.config import settings
+
+        def _int(nombre: str, defecto: int) -> int:
+            try:
+                return int(getattr(settings, nombre, defecto) or 0)
+            except (TypeError, ValueError):
+                return int(defecto)
+
+        return {
+            "activo": _int("alertas_activo", _DEFECTOS_ALERTAS["activo"]) != 0,
+            "intervalo_min": _int(
+                "alertas_intervalo_min", _DEFECTOS_ALERTAS["intervalo_min"]
+            ),
+            "ventana_horas": max(
+                1, _int("alertas_ventana_horas", _DEFECTOS_ALERTAS["ventana_horas"])
+            ),
+            "resumen_diario": _int(
+                "alertas_resumen_diario", _DEFECTOS_ALERTAS["resumen_diario"]
+            )
+            != 0,
+            "resumen_diario_hora": min(
+                23,
+                max(
+                    0,
+                    _int(
+                        "alertas_resumen_diario_hora",
+                        _DEFECTOS_ALERTAS["resumen_diario_hora"],
+                    ),
+                ),
+            ),
+        }
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"Alertas: config invalida, uso defaults: {e}")
+        return {
+            "activo": bool(_DEFECTOS_ALERTAS["activo"]),
+            "intervalo_min": int(_DEFECTOS_ALERTAS["intervalo_min"]),
+            "ventana_horas": int(_DEFECTOS_ALERTAS["ventana_horas"]),
+            "resumen_diario": bool(_DEFECTOS_ALERTAS["resumen_diario"]),
+            "resumen_diario_hora": int(_DEFECTOS_ALERTAS["resumen_diario_hora"]),
+        }
+
+
 class SchedulerManager:
-    def __init__(self, con_calentamiento: bool = False):
+    def __init__(
+        self, con_calentamiento: bool = False, con_alertas: bool = False
+    ):
         # max_instances=1: evita que _verificar_tareas se encime consigo mismo
         # (una corrida lenta con ejecuciones Selenium no debe solaparse con la
         # siguiente pasada del IntervalTrigger de 30s).
@@ -17,9 +86,15 @@ class SchedulerManager:
         # (python -m scheduler.standalone) lo activa con True. Las instancias
         # del dashboard (SchedulerManager() sin argumentos) NO registran el
         # calentamiento continuo para que no corra en 2+ procesos a la vez.
+        #
+        # `con_alertas` (default False): mismo gate para las alertas 24/7
+        # (`alertas_periodicas` + `alertas_resumen_diario`). Si el dashboard lo
+        # activara, cada pagina que instancia SchedulerManager() buscaria y
+        # enviaria las MISMAS alertas a Telegram (envios duplicados).
         self.scheduler = BackgroundScheduler(max_instances=1)
         self.ejecutor = EjecutorTareas()
         self.con_calentamiento = bool(con_calentamiento)
+        self.con_alertas = bool(con_alertas)
         self._iniciar()
     
     def _iniciar(self):
@@ -31,6 +106,8 @@ class SchedulerManager:
         )
         if self.con_calentamiento:
             self._registrar_calentamiento()
+        if self.con_alertas:
+            self._registrar_alertas()
         
         self.scheduler.start()
         logger.info("Scheduler iniciado")
@@ -67,6 +144,105 @@ class SchedulerManager:
             calentamiento.ejecutar_tanda_si_toca()
         except Exception as e:
             logger.debug(f"Error en el calentamiento continuo: {e}")
+    
+    def _registrar_alertas(self):
+        """Registra las alertas 24/7 (job periodico + resumen diario opcional).
+
+        Solo se llama con `con_alertas=True` (lo pasa UNICAMENTE
+        `scheduler/standalone.py`). Con `ALERTAS_ACTIVO=0` o
+        `ALERTAS_INTERVALO_MIN=0` no se registra NADA. El resumen diario se
+        registra solo si `ALERTAS_RESUMEN_DIARIO=1`, a la hora local
+        `ALERTAS_RESUMEN_DIARIO_HORA` (0-23). Tolerante a fallos: un error aqui
+        nunca tumba el scheduler.
+        """
+        try:
+            cfg = config_alertas()
+            if not cfg["activo"]:
+                logger.info("Alertas periodicas desactivadas (ALERTAS_ACTIVO=0)")
+                return
+            intervalo = int(cfg["intervalo_min"])
+            if intervalo <= 0:
+                logger.info(
+                    "Alertas periodicas desactivadas (ALERTAS_INTERVALO_MIN=0)"
+                )
+                return
+
+            self.scheduler.add_job(
+                self._alertas,
+                trigger=IntervalTrigger(minutes=intervalo),
+                id="alertas_periodicas",
+                replace_existing=True,
+                max_instances=1,
+                coalesce=True,
+            )
+            logger.info(
+                f"Alertas periodicas registradas (cada {intervalo} min; "
+                f"ventana {int(cfg['ventana_horas'])} h)"
+            )
+
+            if cfg["resumen_diario"]:
+                hora = int(cfg["resumen_diario_hora"])
+                self.scheduler.add_job(
+                    self._resumen_diario_alertas,
+                    trigger=CronTrigger(hour=hora),
+                    id="alertas_resumen_diario",
+                    replace_existing=True,
+                    max_instances=1,
+                    coalesce=True,
+                )
+                logger.info(
+                    f"Resumen diario de alertas registrado (todos los dias {hora:02d}:00)"
+                )
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"No se pudieron registrar las alertas 24/7: {e}")
+    
+    def _alertas(self):
+        """Job periodico de alertas: jamas deja escapar una excepcion.
+
+        Llama al motor con la ventana de `ALERTAS_VENTANA_HORAS`. Tolerante a
+        motores viejos: si `enviar`/`horas` aun no existen o la firma cambia,
+        cae a la llamada sin argumentos o se omite con log DEBUG.
+        """
+        try:
+            from alertas.motor import MotorAlertas
+
+            cfg = config_alertas()
+            motor = MotorAlertas()
+            ejecutar = getattr(motor, "ejecutar_alertas", None)
+            if not callable(ejecutar):
+                logger.debug("MotorAlertas.ejecutar_alertas no existe todavia; se omite")
+                return
+            try:
+                resultado = ejecutar(horas=int(cfg["ventana_horas"]))
+            except TypeError:
+                # Firma vieja/sin kwargs: ejecutar con los defaults del motor.
+                resultado = ejecutar()
+            if isinstance(resultado, dict):
+                logger.info(
+                    "Alertas: "
+                    f"total={resultado.get('total', 0)} "
+                    f"enviadas={resultado.get('enviadas', 0)} "
+                    f"duplicadas={resultado.get('duplicadas', 0)}"
+                )
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"Error en las alertas periodicas: {e}")
+    
+    def _resumen_diario_alertas(self):
+        """Job del resumen diario: tolerante si el motor aun no expone el metodo."""
+        try:
+            from alertas.motor import MotorAlertas
+
+            motor = MotorAlertas()
+            enviar = getattr(motor, "enviar_resumen_diario", None)
+            if not callable(enviar):
+                logger.debug(
+                    "MotorAlertas.enviar_resumen_diario aun no existe; se omite"
+                )
+                return
+            enviar()
+            logger.info("Resumen diario de alertas enviado")
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"Error en el resumen diario de alertas: {e}")
     
     def _verificar_tareas(self):
         try:
