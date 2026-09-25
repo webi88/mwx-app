@@ -30,6 +30,10 @@ Reglas de diseno:
   - Admin: `/nombre <usuario> <Nuevo Nombre>` (solo privado) actualiza SOLO el
     nombre registrado en la BD (sin Chrome); el nombre EN X lo cambia el
     admin con el boton ✏️.
+  - `/id` funciona en CUALQUIER chat (grupo permitido o no, privado admin o
+    ajeno): muestra el ID de ese chat para descubrir el grupo cuando
+    `TELEGRAM_CLIENTES_CHAT_ID` todavia no esta configurado; NO pasa por
+    `_guard_contexto` para que responda siempre.
 
 Callbacks (ver bot_clientes/keyboards.py):
   cli_*    menu/acciones            -> cli_callback
@@ -296,6 +300,56 @@ def texto_inicio(contexto: str, cuentas) -> str:
         "Opciones: 🔑 código, ✏️ nombre, 📸 foto, 🖼️ portada, 📋 cuentas.",
         "¿Qué quieres hacer? Toca un botón 👇",
     ]
+    return "\n".join(lineas)
+
+
+def _tipo_chat(chat) -> str:
+    """Tipo de chat en español (privado, grupo, supergrupo, canal...)."""
+    tipo = str(getattr(chat, "type", "") or "").strip().lower()
+    return {
+        "private": "privado",
+        "group": "grupo",
+        "supergroup": "supergrupo",
+        "channel": "canal",
+    }.get(tipo, tipo or "desconocido")
+
+
+def _nombre_chat(chat) -> str:
+    """Título del grupo o nombre de la persona ('' si no se puede leer)."""
+    for atributo in ("title", "full_name", "first_name"):
+        valor = str(getattr(chat, atributo, "") or "").strip()
+        if valor:
+            return valor
+    return ""
+
+
+def texto_id_chat(chat) -> str:
+    """Mensaje (HTML) de `/id`: el ID de este chat y si es el configurado.
+
+    El ID va dentro de `<code>...</code>` para poder copiarlo con un toque.
+    """
+    chat_id = getattr(chat, "id", None)
+    configurado = clientes_store.chat_id()
+    lineas = [f"🆔 <b>ID de este chat:</b> <code>{_esc(chat_id)}</code>"]
+    tipo = _tipo_chat(chat)
+    linea = f"Tipo: {_esc(tipo)}"
+    nombre = _nombre_chat(chat)
+    if nombre:
+        etiqueta = "Título" if tipo in ("grupo", "supergrupo", "canal") else "Nombre"
+        linea += f" · {etiqueta}: {_esc(nombre)}"
+    lineas.append(linea)
+    lineas.append(f"📌 Configurado en el bot: <code>{_esc(configurado)}</code>")
+    try:
+        coincide = chat_id is not None and int(chat_id) == int(configurado)
+    except (TypeError, ValueError):
+        coincide = False
+    if coincide:
+        lineas.append("✅ Este ES el grupo de clientes configurado")
+    else:
+        lineas.append(
+            "⚠️ Este NO es el grupo configurado: pega este ID en "
+            "TELEGRAM_CLIENTES_CHAT_ID para que el bot funcione aquí."
+        )
     return "\n".join(lineas)
 
 
@@ -813,6 +867,31 @@ async def cancelar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         ),
         reply_markup=menu_principal(completo=completo),
     )
+
+
+async def comando_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/id: muestra el ID de este chat (funciona en CUALQUIER chat).
+
+    Sirve para descubrir el chat_id del grupo donde agregaron el bot cuando
+    `TELEGRAM_CLIENTES_CHAT_ID` todavia no esta configurado; por eso NO pasa
+    por `_guard_contexto` y responde siempre, aunque el chat no este permitido.
+    Nunca lanza: si el mensaje no se puede enviar, no rompe nada.
+    """
+    try:
+        texto = texto_id_chat(getattr(update, "effective_chat", None))
+    except Exception as e:
+        logger.debug(f"No se pudo armar el texto de /id: {e}")
+        chat_id = getattr(getattr(update, "effective_chat", None), "id", None)
+        texto = f"🆔 <b>ID de este chat:</b> <code>{_esc(chat_id)}</code>"
+    try:
+        mensaje = getattr(update, "effective_message", None)
+        if mensaje is not None:
+            await mensaje.reply_text(texto, parse_mode="HTML")
+            return
+        chat_id = getattr(getattr(update, "effective_chat", None), "id", None)
+        await context.bot.send_message(chat_id=chat_id, text=texto, parse_mode="HTML")
+    except Exception as e:
+        logger.debug(f"No se pudo responder /id: {e}")
 
 
 # --------------------------------------------------------------------------- #

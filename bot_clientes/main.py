@@ -10,6 +10,7 @@ Las cuentas son GLOBALES del grupo (`data/clientes_bot.json`).
 
 Comandos registrados:
   Cliente: /start /ayuda /help /cancelar
+  Cualquier chat: /id (muestra el ID de este chat)
   Admin:   /nombre <usuario> <Nuevo Nombre>   (solo privado del admin)
 Callbacks: cli_* (menu), cuenta_* (selector), codigo_*, nombre_*, foto_*.
 Mensajes: texto (solo con flujo pendiente) y fotos (filters.PHOTO).
@@ -116,6 +117,9 @@ def construir_app(token: str) -> Application:
     app.add_handler(CommandHandler("ayuda", handlers.ayuda))
     app.add_handler(CommandHandler("help", handlers.ayuda))
     app.add_handler(CommandHandler("cancelar", handlers.cancelar))
+    # /id: funciona en CUALQUIER chat (incluso no permitidos), para descubrir
+    # el chat_id del grupo donde agregaron el bot.
+    app.add_handler(CommandHandler("id", handlers.comando_id))
 
     # Comando de admin (nombre REGISTRADO en el bot, sin Chrome).
     app.add_handler(CommandHandler("nombre", handlers.comando_nombre))
@@ -171,7 +175,7 @@ def main() -> None:
     app = construir_app(token)
     log.info(
         "Bot de clientes iniciado (PTB v21, polling). "
-        "Cliente: /start /ayuda /cancelar | Admin: /nombre"
+        "Cliente: /start /ayuda /cancelar | Cualquier chat: /id | Admin: /nombre"
     )
     app.run_polling(
         allowed_updates=["message", "callback_query", "my_chat_member"]

@@ -197,6 +197,13 @@ class _MensajeFake:
         return self
 
 
+class _MensajeRotoFake:
+    """Mensaje cuyo `reply_text` siempre falla (prueba el try/except de /id)."""
+
+    async def reply_text(self, *args, **kwargs):
+        raise RuntimeError("reply roto")
+
+
 class _QueryFake:
     def __init__(self, data, message=None):
         self.data = data
@@ -637,6 +644,68 @@ def run(check) -> None:  # noqa: C901 - seccionado por bloques tematicos
             and query.answers[-1][1]
             and h.TEXTO_FLUJO_SOLO_ADMIN in query.answers[-1][0],
         )
+
+    # ------------------------------------------------------ COMANDO /id ----
+    with _store_temporal() as ruta, _env("TELEGRAM_CLIENTES_CHAT_ID", None), _env(
+        "TELEGRAM_ADMIN_IDS", "555"
+    ):
+        # Grupo permitido: ID en <code>, tipo/título y aviso ✅.
+        grupo = _chat_grupo()
+        grupo.title = "Mi Grupo"
+        update = _UpdateFake(uid=500, texto="/id", chat=grupo, username="fulano")
+        _correr(h.comando_id(update, _ContextoFake()))
+        texto, kwargs = update.effective_message.replies[-1]
+        lineas = texto.splitlines()
+        check(
+            "id: en el grupo permitido responde el ID en <code> y avisa que ES",
+            lineas[0] == f"🆔 <b>ID de este chat:</b> <code>{CHAT_GRUPO}</code>"
+            and lineas[1] == "Tipo: supergrupo · Título: Mi Grupo"
+            and lineas[2] == f"📌 Configurado en el bot: <code>{CHAT_GRUPO}</code>"
+            and lineas[3] == "✅ Este ES el grupo de clientes configurado"
+            and kwargs.get("parse_mode") == "HTML",
+        )
+        # Grupo NO permitido: responde igual (SIN pasar por el guard) y avisa
+        # cómo configurarlo.
+        update = _UpdateFake(
+            uid=500, texto="/id", chat=_chat_grupo(CHAT_OTRO), username="fulano"
+        )
+        _correr(h.comando_id(update, _ContextoFake()))
+        texto, kwargs = update.effective_message.replies[-1]
+        lineas = texto.splitlines()
+        check(
+            "id: en un grupo NO configurado responde el ID y cómo configurarlo",
+            lineas[0] == f"🆔 <b>ID de este chat:</b> <code>{CHAT_OTRO}</code>"
+            and lineas[2] == f"📌 Configurado en el bot: <code>{CHAT_GRUPO}</code>"
+            and lineas[3]
+            == (
+                "⚠️ Este NO es el grupo configurado: pega este ID en "
+                "TELEGRAM_CLIENTES_CHAT_ID para que el bot funcione aquí."
+            )
+            and kwargs.get("parse_mode") == "HTML",
+        )
+        # Privado (aunque NO sea admin): responde el ID, no el aviso del guard.
+        privado = _ChatFake(987654321, "private")
+        privado.full_name = "Persona"
+        update = _UpdateFake(uid=777, texto="/id", chat=privado)
+        _correr(h.comando_id(update, _ContextoFake()))
+        texto, kwargs = update.effective_message.replies[-1]
+        check(
+            "id: en privado (aunque no sea admin) responde el ID",
+            "<code>987654321</code>" in texto
+            and "Tipo: privado" in texto
+            and "Nombre: Persona" in texto
+            and "⚠️" in texto
+            and h.TEXTO_SOLO_ADMIN_PRIVADO not in texto,
+        )
+        # Nunca lanza: si el reply falla, el comando termina en silencio.
+        update = _UpdateFake(uid=777, texto="/id", chat=privado)
+        update.effective_message = _MensajeRotoFake()
+        try:
+            _correr(h.comando_id(update, _ContextoFake()))
+            roto_ok = True
+        except Exception:
+            roto_ok = False
+        check("id: si el reply falla no lanza (try/except)", roto_ok)
 
     # ------------------------------------------------- FLUJO DE CODIGO ----
     with _store_temporal() as ruta, _env("TELEGRAM_CLIENTES_CHAT_ID", None), _env(
@@ -1262,8 +1331,8 @@ def run(check) -> None:  # noqa: C901 - seccionado por bloques tematicos
                     if kw.arg == "pattern":
                         patrones.add(ast.literal_eval(kw.value))
     check(
-        "main: registra los comandos del cliente y el /nombre de admin",
-        {"start", "ayuda", "cancelar", "nombre"}.issubset(comandos)
+        "main: registra los comandos del cliente, /id y el /nombre de admin",
+        {"start", "ayuda", "cancelar", "id", "nombre"}.issubset(comandos)
         and not ({"asignar", "quitar", "clientes"} & comandos),
     )
     check(
@@ -1397,7 +1466,7 @@ def _app_ok() -> bool:
         return False
     handlers = [handler for grupo in app.handlers.values() for handler in grupo]
     return (
-        sum(isinstance(x, CommandHandler) for x in handlers) == 5
+        sum(isinstance(x, CommandHandler) for x in handlers) == 6
         and sum(isinstance(x, CallbackQueryHandler) for x in handlers) == 5
         # texto + fotos + new_chat_members
         and sum(isinstance(x, MessageHandler) for x in handlers) == 3
