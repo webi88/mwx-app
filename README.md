@@ -41,20 +41,21 @@ docker-compose up -d
 
 ## Bot para clientes (`bot_clientes/`)
 
-Bot de Telegram **independiente** del bot interno. Funciona **solo en el grupo
-de clientes** (`TELEGRAM_CLIENTES_CHAT_ID`, por defecto `-1005538610567`): en
-privado responde un aviso corto y en otros grupos no responde nada. Las
-**cuentas son globales del grupo** (cualquier miembro puede elegirlas) y todo
-se hace con **botones** (solo `/start`, `/ayuda` y `/cancelar`):
+Bot de Telegram **independiente** del bot interno. Tiene dos modos de uso:
+
+| Contexto | Quién | Opciones |
+|----------|-------|----------|
+| **Grupo de clientes** (`-1005538610567`) | Cualquier miembro | **Solo 🔑 código de verificación (TOTP)** + ❓ ayuda (`/start /ayuda /cancelar`) |
+| **Privado del administrador** (`TELEGRAM_ADMIN_IDS`) | Dueño/equipo | **Todo**: 🔑 código, ✏️ cambiar nombre EN X, 📸 foto, 🖼️ portada, 📋 cuentas, ❓ ayuda y `/nombre` |
+| **Privado de alguien que no es admin** | — | Mensaje corto ("solo funciona para el administrador; en el grupo pide tu código 2FA"), sin menú |
+| **Otros grupos** | — | Silencio total |
 
 - 🔑 **Código de verificación (TOTP)**: se genera al momento desde la semilla
   2FA guardada en `Cuenta.totp_secret` (`pyotp`). El bot **ya no revisa
-  correos**: el correo lo tienen los propios clientes. Si una cuenta no tiene
-  semilla, el bot pide ayuda a quien le entregó la cuenta.
-- ✏️ **Cambiar el nombre** de la cuenta EN X (con Selenium).
-- 📸 **Foto de perfil** y 🖼️ **portada** (el cliente envía la imagen por
-  Telegram y el bot la sube con Selenium).
-- 📋 **Cuentas**: lista las cuentas del grupo y su nombre **registrado** en el
+  correos**. Si una cuenta no tiene semilla, el bot pide ayuda al equipo.
+- ✏️📸🖼️ **Nombre/fotos/cuentas**: solo en el **privado del administrador**
+  (los clientes entran a X por su cuenta con el código).
+- 📋 **Cuentas**: lista las cuentas globales y su nombre **registrado** en el
   bot (desde la BD; sin credenciales).
 
 ```bash
@@ -72,30 +73,22 @@ Requisitos y configuración:
    `{"chat_id": -1005538610567, "cuentas": ["usuario1", ...]}`. Se siembra solo
    con las 15 cuentas si no existe y migra automáticamente el formato viejo
    (`{"clientes": {...}}`). No guarda credenciales y está en `.gitignore`.
-4. **Admin** (`TELEGRAM_ADMIN_IDS`): `/nombre <usuario> <Nuevo Nombre>`
-   actualiza el **nombre registrado en el bot** (escribe `Cuenta.nombre_mostrado`
-   en la BD, sin Chrome). Para cambiar el nombre **EN X** se usa el botón
-   ✏️ Cambiar nombre de los clientes.
+4. **Admin** (`TELEGRAM_ADMIN_IDS`), en el privado:
+   - `/nombre <usuario> <Nuevo Nombre>` actualiza el **nombre registrado en el
+     bot** (escribe `Cuenta.nombre_mostrado` en la BD, sin Chrome).
+   - El botón ✏️ Cambiar nombre actualiza el nombre **EN X** (Selenium).
 
 ### Uso en GRUPO (bot @vrf2fa_bot)
 
-El bot está pensado para usarse dentro del grupo de clientes: cada miembro
-pulsa SUS botones y responde a los mensajes del bot. El bot contesta en el
-grupo anteponiendo `👤 @fulano, ...` para que se sepa a quién responde (cada
-usuario tiene su propio estado: los flujos nunca se mezclan) y saluda una sola
-vez al agregarlo al grupo (`new_chat_members`/`my_chat_member`).
+En el grupo los clientes solo ven **🔑 Quiero mi código de X** y **❓ Ayuda**:
+eligen la cuenta (las 15 son globales del grupo) y el bot responde con el TOTP
+y la mención `👤 @fulano, ...`. El bot saluda una sola vez al agregarlo
+(`new_chat_members`/`my_chat_member`).
 
-⚠️ **Group Privacy en @BotFather**: para que los clientes puedan ESCRIBIR el
-nombre nuevo o ENVIAR la foto directamente en el grupo (sin responder al
-mensaje del bot) hay que desactivar el modo privacidad del bot:
-
-1. Abre @BotFather → `/setprivacy` → elige **@vrf2fa_bot**.
-2. Pulsa **Disable**.
-
-Con la privacidad **ON** el bot igual recibe las **respuestas** a sus propios
-mensajes (name/photo como *reply*), pero con **Disable** funciona mejor: acepta
-el mensaje suelto y la respuesta. Los comandos `/start`, `/ayuda` y `/cancelar`
-funcionan en el grupo en ambos casos.
+✅ **Group Privacy NO hace falta**: en el grupo solo se usan **botones y
+comandos** (`/start`, `/ayuda`, `/cancelar`), no texto libre ni fotos, así que
+el modo privacidad de @BotFather puede quedarse como está (con *Disable*
+tampoco pasa nada).
 
 ## Comandos de Telegram
 

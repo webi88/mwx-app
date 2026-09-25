@@ -17,11 +17,17 @@ CONVENCION DE CALLBACKS (cada prefijo tiene su manejador en handlers.py):
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 
-def menu_principal() -> InlineKeyboardMarkup:
-    """Menu principal del /start: UN boton por cosa que el cliente quiere."""
-    return InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton("🔑 Quiero mi código de X", callback_data="cli_codigo")],
+def menu_principal(completo: bool = True) -> InlineKeyboardMarkup:
+    """Menu del /start.
+
+    - `completo=True` (privado del ADMIN): todas las opciones.
+    - `completo=False` (grupo de clientes): SOLO el codigo 2FA y la ayuda.
+    """
+    filas = [
+        [InlineKeyboardButton("🔑 Quiero mi código de X", callback_data="cli_codigo")],
+    ]
+    if completo:
+        filas += [
             [InlineKeyboardButton("✏️ Cambiar el nombre", callback_data="cli_nombre")],
             [
                 InlineKeyboardButton(
@@ -34,9 +40,9 @@ def menu_principal() -> InlineKeyboardMarkup:
                 )
             ],
             [InlineKeyboardButton("📋 Cuentas", callback_data="cli_cuentas")],
-            [InlineKeyboardButton("❓ Ayuda", callback_data="cli_ayuda")],
         ]
-    )
+    filas.append([InlineKeyboardButton("❓ Ayuda", callback_data="cli_ayuda")])
+    return InlineKeyboardMarkup(filas)
 
 
 def teclado_cuentas(usuarios) -> InlineKeyboardMarkup:

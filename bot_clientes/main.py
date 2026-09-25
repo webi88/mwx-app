@@ -1,17 +1,20 @@
 """Entry point del bot de CLIENTES (PTB v21, async).
 
 Bot INDEPENDIENTE del bot interno (`bot/`): token propio
-(`TELEGRAM_CLIENTES_BOT_TOKEN`, creado con @BotFather). Funciona SOLO en el
-grupo de clientes (`TELEGRAM_CLIENTES_CHAT_ID`, por defecto -1005538610567) y
-las cuentas son GLOBALES del grupo (`data/clientes_bot.json`).
+(`TELEGRAM_CLIENTES_BOT_TOKEN`, creado con @BotFather). Matriz de acceso:
+  - Grupo de clientes (`TELEGRAM_CLIENTES_CHAT_ID`, default -1005538610567):
+    cualquier miembro, SOLO codigo 2FA (TOTP) + ayuda.
+  - Privado del admin (`TELEGRAM_ADMIN_IDS`): TODAS las opciones y /nombre.
+  - Privado ajeno: mensaje corto; otros grupos: silencio.
+Las cuentas son GLOBALES del grupo (`data/clientes_bot.json`).
 
 Comandos registrados:
   Cliente: /start /ayuda /help /cancelar
-  Admin:   /nombre <usuario> <Nuevo Nombre>   (solo TELEGRAM_ADMIN_IDS)
+  Admin:   /nombre <usuario> <Nuevo Nombre>   (solo privado del admin)
 Callbacks: cli_* (menu), cuenta_* (selector), codigo_*, nombre_*, foto_*.
 Mensajes: texto (solo con flujo pendiente) y fotos (filters.PHOTO).
 Grupos: bienvenida al agregar el bot (new_chat_members + my_chat_member);
-en privado solo un aviso corto y en otros grupos, silencio.
+privado del admin con todo; privado ajeno con aviso corto; otros grupos, silencio.
 
 Arranque:
     python -m bot_clientes.main

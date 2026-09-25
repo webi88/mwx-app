@@ -1,50 +1,50 @@
 """Flujos del bot de clientes de X (PTB v21, async).
 
-Bot INDEPENDIENTE del bot interno (`bot/`): aqui el cliente no tecnico
-obtiene el codigo de verificacion 2FA (TOTP) generado al momento desde la
-semilla guardada en `Cuenta.totp_secret`, cambia el nombre, la foto de perfil y
-la portada de sus cuentas de X. Todo con BOTONES; el cliente solo necesita
-escribir `/start`.
+Bot INDEPENDIENTE del bot interno (`bot/`). Matriz de acceso:
+
+  - GRUPO de clientes (`clientes_store.chat_id()`, default -1005538610567):
+    cualquier miembro puede usar el bot, pero SOLO la opcion de codigo 2FA
+    (TOTP desde `Cuenta.totp_secret`) + ayuda. Nada de nombre/fotos/cuentas
+    (cada cliente entra a X por su cuenta con el codigo).
+  - PRIVADO del ADMIN (`TELEGRAM_ADMIN_IDS`): TODAS las opciones (codigo,
+    cambiar nombre EN X, foto, portada, cuentas, ayuda y `/nombre`).
+  - PRIVADO de alguien que no es admin: mensaje corto ("Por privado solo
+    funciona para el administrador. En el grupo puedes pedir tu código 2FA.")
+    sin menu; en callbacks, alerta corta y no se ejecuta nada.
+  - OTROS grupos: silencio absoluto.
 
 Reglas de diseno:
   - Mensajes cortos y sencillos ("como si fueran tontos"): sin terminos
     tecnicos, sin comandos, con ejemplos.
-  - El bot funciona SOLO en el grupo de clientes (`clientes_store.chat_id()`,
-    por defecto -1005538610567): en privado responde un aviso corto y en
-    OTROS grupos se queda en silencio absoluto. Ya NO hay registro por
-    Telegram ID ni `/asignar`/`/quitar`/`/clientes`.
   - Las cuentas son GLOBALES del grupo (`clientes_store.cuentas()`): cualquier
-    miembro puede elegirlas y usar sus funciones.
+    miembro puede elegirlas para pedir su codigo.
+  - DEFENSA: los flujos de nombre/fotos y `/nombre` SOLO corren en
+    `admin_privado`; un boton viejo desde el grupo se rechaza sin ejecutar.
   - Selenium NUNCA en el hilo del bot: `asyncio.to_thread(...)` con import
     perezoso de `plataformas.twitter.selenium_bot` y `bot.cerrar()` SIEMPRE en
     `finally`.
   - El codigo 2FA es SOLO TOTP (`pyotp.TOTP(semilla).now()`): el bot ya NO
-    revisa correos ni usa `utils.lector_correo` (el correo lo tienen los
-    propios clientes). Si no hay semilla, se pide ayuda al que dio la cuenta.
-  - El secreto TOTP NUNCA se muestra.
+    revisa correos ni usa `utils.lector_correo`. Si no hay semilla, se pide
+    ayuda al que dio la cuenta. El secreto NUNCA se muestra.
   - Nada de credenciales en mensajes ni en `data/clientes_bot.json`.
-  - Admin: `/nombre <usuario> <Nuevo Nombre>` actualiza SOLO el nombre
-    registrado en la BD (sin Chrome); el nombre EN X lo cambia el cliente con
-    el boton ✏️.
+  - Admin: `/nombre <usuario> <Nuevo Nombre>` (solo privado) actualiza SOLO el
+    nombre registrado en la BD (sin Chrome); el nombre EN X lo cambia el
+    admin con el boton ✏️.
 
 Callbacks (ver bot_clientes/keyboards.py):
   cli_*    menu/acciones            -> cli_callback
   cuenta_* selector de cuenta       -> cuenta_callback
   codigo_* codigo / otro codigo     -> codigo_callback
-  nombre_* elegir / confirmar       -> nombre_callback
-  foto_*   elegir / confirmar foto  -> foto_callback
-Mensajes: texto -> texto_recibido (solo si ESE usuario tiene flujo pendiente);
-fotos -> foto_recibida.
+  nombre_* elegir / confirmar       -> nombre_callback (solo admin privado)
+  foto_*   elegir / confirmar foto  -> foto_callback (solo admin privado)
+Mensajes: texto -> texto_recibido (solo flujo de nombre del admin);
+fotos -> foto_recibida (solo admin privado).
 
-GRUPOS (el bot vive en un grupo con los clientes):
+GRUPOS:
   - `context.user_data` de PTB v21 es POR USUARIO: los flujos de un miembro
-    nunca se mezclan con los de otro (los callbacks validan la cuenta contra
-    la lista del que pulsa el boton).
+    nunca se mezclan con los de otro.
   - En grupo, cada respuesta antepone "👤 @fulano, " para que se sepa a quien
     le habla el bot (`mencion_grupo`/`con_mencion`).
-  - Los mensajes de otros miembros sin flujo pendiente se ignoran en silencio
-    (sin spam al grupo); el mensaje suelto y la RESPUESTA a un mensaje del bot
-    se aceptan igual.
   - `bienvenida_grupo` (new_chat_members) y `bienvenida_miembro`
     (my_chat_member) saludan UNA sola vez al agregar el bot (anti-duplicado).
 """
@@ -82,8 +82,21 @@ from bot_clientes.keyboards import (
 # Textos (sencillos, en segunda persona, con emojis)
 # --------------------------------------------------------------------------- #
 
-# Mensaje en privado: el bot es exclusivo del grupo de clientes.
-TEXTO_SOLO_GRUPO = "ℹ️ Este bot funciona únicamente en el grupo de clientes."
+# Mensaje en privado para quien NO es admin.
+TEXTO_SOLO_ADMIN_PRIVADO = (
+    "ℹ️ Por privado solo funciona para el administrador. "
+    "En el grupo puedes pedir tu código 2FA."
+)
+
+# Defensa: nombre/fotos/cuentas solo en el privado del administrador.
+TEXTO_FLUJO_SOLO_ADMIN = (
+    "🔒 Esa opción solo funciona en el privado del administrador."
+)
+
+# /nombre en el grupo (solo admin privado).
+TEXTO_NOMBRE_SOLO_PRIVADO = (
+    "🔒 /nombre solo funciona en el privado del administrador."
+)
 
 TEXTO_SIN_CUENTAS = (
     "😕 Todavía no hay cuentas configuradas en el bot.\n\n"
@@ -98,10 +111,25 @@ TEXTO_FALLO_FOTO = (
     "❌ No se pudo subir la foto. Inténtalo otra vez o pide ayuda a quien te dio la cuenta."
 )
 
-TEXTO_AYUDA = (
+TEXTO_AYUDA_GRUPO = (
     "❓ Cómo usar este bot\n\n"
-    "Este bot funciona únicamente en este grupo y todas las cuentas son del "
-    "grupo: cualquier miembro puede elegir la cuenta y usar sus funciones.\n\n"
+    "Este bot funciona solo en este grupo y todas las cuentas son del grupo: "
+    "cualquier miembro puede elegir la cuenta y pedir su código 2FA.\n\n"
+    "1️⃣ Toca «🔑 Quiero mi código de X».\n"
+    "2️⃣ Elige la cuenta.\n"
+    "3️⃣ Te doy el código de 6 números (2FA) que X te pide al entrar; "
+    "cópialo y pégalo en X.\n\n"
+    "Si algo falla:\n"
+    "• Espera un momento y toca otra vez el botón (o 🔄 Intentar de nuevo).\n"
+    "• Si sigue fallando, pide ayuda a quien te dio la cuenta.\n\n"
+    "Escribe /cancelar para detener lo que estés haciendo.\n\n"
+    "🤫 No compartas el código con nadie."
+)
+
+TEXTO_AYUDA_ADMIN = (
+    "❓ Cómo usar este bot (privado del administrador)\n\n"
+    "Aquí funcionan TODAS las opciones; en el grupo los clientes solo pueden "
+    "pedir su código 2FA.\n\n"
     "1️⃣ Toca un botón de abajo para decirme qué quieres hacer.\n"
     "2️⃣ Elige la cuenta (si hay varias, te muestro la lista).\n"
     "3️⃣ Sigue lo que dice el mensaje (escribir un nombre o enviar una foto).\n\n"
@@ -110,19 +138,16 @@ TEXTO_AYUDA = (
     "📸 Foto de perfil y 🖼️ Portada: me envías la imagen y yo la pongo.\n"
     "📋 Cuentas: te muestro las cuentas y su nombre registrado en el bot.\n\n"
     "Si algo falla:\n"
-    "• Espera un momento y toca otra vez el botón (o 🔄 Intentar de nuevo).\n"
-    "• Si sigue fallando, pide ayuda a la persona que te dio la cuenta.\n\n"
+    "• Espera un momento y toca otra vez el botón (o 🔄 Intentar de nuevo).\n\n"
     "Escribe /cancelar para detener lo que estés haciendo.\n\n"
-    "👥 En grupo: cada quien pulsa SUS botones y responde a MIS mensajes; "
-    "el bot contesta con el nombre de quien preguntó.\n"
-    "🔧 Equipo: /nombre <usuario> <Nuevo Nombre> actualiza el nombre REGISTRADO "
-    "en el bot (sin abrir X); para cambiarlo EN X usa el botón ✏️."
+    "🔧 /nombre <usuario> <Nuevo Nombre> actualiza el nombre REGISTRADO en el "
+    "bot (sin abrir X); para cambiarlo EN X usa el botón ✏️."
 )
 
 TEXTO_BIENVENIDA = (
-    "👋 ¡Hola! Soy el bot que te ayuda con las cuentas de X del grupo.\n\n"
-    "Escribe /start y te muestro los botones: 🔑 código de verificación, "
-    "✏️ cambiar el nombre, 📸 foto de perfil, 🖼️ portada y 📋 cuentas."
+    "👋 ¡Hola! Soy el bot que te da los códigos de verificación de las cuentas "
+    "de X del grupo.\n\n"
+    "Escribe /start, elige la cuenta y te doy su código 2FA."
 )
 
 # Cuenta sin semilla 2FA en la BD: mensaje claro y amable, sin correos ni
@@ -139,6 +164,17 @@ TIPO_POR_BOTON = {
     "cli_foto_perfil": "foto_perfil",
     "cli_foto_portada": "foto_portada",
 }
+
+# Contextos de uso (ver `_contexto`).
+CONTEXTO_GRUPO = "grupo"
+CONTEXTO_ADMIN_PRIVADO = "admin_privado"
+CONTEXTO_BLOQUEADO = "bloqueado"
+
+# Botones del menu que SOLO funcionan en el privado del administrador.
+BOTONES_SOLO_ADMIN = ("cli_nombre", "cli_foto_perfil", "cli_foto_portada", "cli_cuentas")
+
+# Flujos que SOLO corren en el privado del administrador.
+FLUJOS_SOLO_ADMIN = ("nombre", "foto_perfil", "foto_portada")
 
 # Codigo 2FA: SOLO TOTP desde Cuenta.totp_secret (ya no se usa el correo).
 VENTANA_TOTP = 30
@@ -236,19 +272,30 @@ def texto_codigo(codigo: str, segundos=None) -> str:
     return "\n".join(lineas)
 
 
-def texto_menu(admin: bool, cuentas) -> str:
-    """Saludo + menu, MUY simple (cuentas GLOBALES del grupo)."""
+def texto_inicio(contexto: str, cuentas) -> str:
+    """Saludo + que se puede hacer segun el contexto (grupo vs admin privado)."""
     cuentas = list(cuentas or [])
-    lineas = ["👋 ¡Hola! Soy el bot de las cuentas de X del grupo.", ""]
+    if contexto == CONTEXTO_GRUPO:
+        lineas = ["👋 ¡Hola! Soy el bot de las cuentas de X del grupo.", ""]
+        if not cuentas:
+            lineas.append("Todavía no hay cuentas configuradas. Pide ayuda al equipo.")
+        else:
+            lineas.append(f"Hay {len(cuentas)} cuentas disponibles.")
+        lineas += [
+            "",
+            "Elige la cuenta y te doy su código de verificación. Toca el botón 👇",
+        ]
+        return "\n".join(lineas)
+    lineas = ["👋 ¡Hola! Soy el bot de las cuentas de X.", ""]
     if not cuentas:
-        lineas.append("Todavía no hay cuentas configuradas. Pide ayuda al equipo.")
+        lineas.append("Todavía no hay cuentas configuradas.")
     else:
-        lineas.append(
-            f"Hay {len(cuentas)} cuentas disponibles; elige la que quieras."
-        )
-    if admin:
-        lineas.append("🔧 Equipo: /nombre <usuario> <Nuevo Nombre> actualiza el nombre registrado.")
-    lineas += ["", "¿Qué quieres hacer? Toca un botón 👇"]
+        lineas.append(f"Hay {len(cuentas)} cuentas disponibles; elige la que quieras.")
+    lineas += [
+        "",
+        "Opciones: 🔑 código, ✏️ nombre, 📸 foto, 🖼️ portada, 📋 cuentas.",
+        "¿Qué quieres hacer? Toca un botón 👇",
+    ]
     return "\n".join(lineas)
 
 
@@ -363,36 +410,50 @@ async def _avisar(update, texto: str) -> None:
             pass
 
 
-async def _guard_chat(update) -> bool:
-    """True SOLO si el update viene del grupo de clientes permitido.
+def _contexto(update) -> str:
+    """Contexto de uso del update.
 
-    - Privado: responde UNA vez "ℹ️ Este bot funciona únicamente en el grupo
-      de clientes." (alerta si es callback).
-    - Otro grupo/canal: silencio absoluto (en callbacks solo se quita el
-      spinner, sin texto).
-    - Grupo permitido: True.
-
-    El modo deja de depender del Telegram ID: las cuentas son globales del
-    grupo (`clientes_store.cuentas()`).
+    - "grupo": grupo de clientes permitido (cualquier miembro).
+    - "admin_privado": chat privado de alguien en TELEGRAM_ADMIN_IDS.
+    - "bloqueado": cualquier otro caso (privado ajeno / otro grupo).
     """
     chat = getattr(update, "effective_chat", None) if update else None
     chat_id = getattr(chat, "id", None)
     if clientes_store.es_chat_permitido(chat_id):
-        return True
+        return CONTEXTO_GRUPO
+    es_privado = str(getattr(chat, "type", "") or "").lower() == "private"
+    if es_privado and _es_admin_update(update):
+        return CONTEXTO_ADMIN_PRIVADO
+    return CONTEXTO_BLOQUEADO
+
+
+async def _guard_contexto(update) -> str | None:
+    """Devuelve el contexto permitido ("grupo"/"admin_privado") o None.
+
+    - Privado NO admin: responde UNA vez "Por privado solo funciona para el
+      administrador. En el grupo puedes pedir tu código 2FA." (alerta corta si
+      es callback).
+    - Otro grupo/canal: silencio absoluto (en callbacks solo se quita el
+      spinner, sin texto).
+    """
+    contexto = _contexto(update)
+    if contexto != CONTEXTO_BLOQUEADO:
+        return contexto
+    chat = getattr(update, "effective_chat", None) if update else None
     es_privado = str(getattr(chat, "type", "") or "").lower() == "private"
     query = getattr(update, "callback_query", None)
     if query is not None:
         try:
             if es_privado:
-                await query.answer(TEXTO_SOLO_GRUPO, show_alert=True)
+                await query.answer(TEXTO_SOLO_ADMIN_PRIVADO, show_alert=True)
             else:
                 await query.answer()  # quita el spinner sin responder al grupo
         except Exception:
             pass
-        return False
+        return None
     if es_privado:
-        await _avisar(update, TEXTO_SOLO_GRUPO)
-    return False
+        await _avisar(update, TEXTO_SOLO_ADMIN_PRIVADO)
+    return None
 
 
 def _cuentas() -> list:
@@ -712,37 +773,45 @@ async def _pedir_foto(
 # --------------------------------------------------------------------------- #
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/start: saludo + menu de botones (lo unico que el cliente necesita)."""
-    if not await _guard_chat(update):
+    """/start: saludo + menu segun contexto (grupo: 2FA; privado admin: todo)."""
+    contexto = await _guard_contexto(update)
+    if contexto is None:
         return
     _limpiar(context)
+    completo = contexto == CONTEXTO_ADMIN_PRIVADO
     await update.effective_message.reply_text(
-        con_mencion(texto_menu(_es_admin_update(update), _cuentas()), mencion_grupo(update)),
-        reply_markup=menu_principal(),
+        con_mencion(texto_inicio(contexto, _cuentas()), mencion_grupo(update)),
+        reply_markup=menu_principal(completo=completo),
     )
 
 
 async def ayuda(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Guia sencilla de cada boton y que hacer si algo falla."""
-    if not await _guard_chat(update):
+    """Guia sencilla segun contexto (grupo: solo 2FA; privado admin: todo)."""
+    contexto = await _guard_contexto(update)
+    if contexto is None:
         return
     _limpiar(context)
+    completo = contexto == CONTEXTO_ADMIN_PRIVADO
+    texto = TEXTO_AYUDA_ADMIN if completo else TEXTO_AYUDA_GRUPO
     await update.effective_message.reply_text(
-        con_mencion(TEXTO_AYUDA, mencion_grupo(update)), reply_markup=menu_principal()
+        con_mencion(texto, mencion_grupo(update)),
+        reply_markup=menu_principal(completo=completo),
     )
 
 
 async def cancelar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/cancelar: detiene cualquier flujo en curso y vuelve al menu."""
-    if not await _guard_chat(update):
+    contexto = await _guard_contexto(update)
+    if contexto is None:
         return
     _limpiar(context)
+    completo = contexto == CONTEXTO_ADMIN_PRIVADO
     await update.effective_message.reply_text(
         con_mencion(
             "Listo, cancelado. ✅\n\n¿Qué quieres hacer ahora? Toca un botón 👇",
             mencion_grupo(update),
         ),
-        reply_markup=menu_principal(),
+        reply_markup=menu_principal(completo=completo),
     )
 
 
@@ -753,11 +822,23 @@ async def cancelar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def cli_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Menu principal y acciones: cli_menu, cli_codigo, cli_nombre, ..."""
     query = update.callback_query
-    if not await _guard_chat(update):
+    contexto = await _guard_contexto(update)
+    if contexto is None:
         return
     data = (query.data or "").strip()
     mencion = mencion_grupo(update)
+
+    # DEFENSA: en el grupo solo hay 2FA; cualquier boton viejo de
+    # nombre/fotos/cuentas se rechaza SIN ejecutar nada.
+    if contexto == CONTEXTO_GRUPO and data in BOTONES_SOLO_ADMIN:
+        try:
+            await query.answer(TEXTO_FLUJO_SOLO_ADMIN, show_alert=True)
+        except Exception:
+            pass
+        return
+
     await query.answer()
+    completo = contexto == CONTEXTO_ADMIN_PRIVADO
 
     if data.startswith("cli_cuenta_"):
         usuario = _resolver_cuenta(data[len("cli_cuenta_"):], _cuentas())
@@ -780,21 +861,26 @@ async def cli_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         _limpiar(context)
         await _responder(
             query.message,
-            texto_menu(_es_admin_update(update), _cuentas()),
-            menu_principal(),
+            texto_inicio(contexto, _cuentas()),
+            menu_principal(completo=completo),
             mencion=mencion,
         )
         return
     if data == "cli_ayuda":
         _limpiar(context)
-        await _responder(query.message, TEXTO_AYUDA, menu_principal(), mencion=mencion)
+        await _responder(
+            query.message,
+            TEXTO_AYUDA_ADMIN if completo else TEXTO_AYUDA_GRUPO,
+            menu_principal(completo=completo),
+            mencion=mencion,
+        )
         return
     if data == "cli_cancelar":
         _limpiar(context)
         await _responder(
             query.message,
             "Listo, cancelado. ✅\n\n¿Qué quieres hacer ahora? Toca un botón 👇",
-            menu_principal(),
+            menu_principal(completo=completo),
             mencion=mencion,
         )
         return
@@ -812,7 +898,8 @@ async def cli_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 async def cuenta_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Selector de cuenta (`cuenta_<usuario>`) segun el flujo pendiente."""
     query = update.callback_query
-    if not await _guard_chat(update):
+    contexto = await _guard_contexto(update)
+    if contexto is None:
         return
     mencion = mencion_grupo(update)
     usuario = _resolver_cuenta((query.data or "")[len("cuenta_"):], _cuentas())
@@ -820,12 +907,18 @@ async def cuenta_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await query.answer("Esa cuenta ya no está disponible.", show_alert=True)
         return
     tipo = str(context.user_data.get("cli_flujo") or "").strip()
+    # DEFENSA: un flujo de nombre/fotos pendiente no puede ejecutarse fuera
+    # del privado del administrador (p. ej. boton viejo desde el grupo).
+    if contexto != CONTEXTO_ADMIN_PRIVADO and tipo in FLUJOS_SOLO_ADMIN:
+        context.user_data.pop("cli_flujo", None)
+        await query.answer(TEXTO_FLUJO_SOLO_ADMIN, show_alert=True)
+        return
     if tipo not in ("codigo", "nombre", "foto_perfil", "foto_portada"):
         await query.answer("Primero elige qué quieres hacer 🙂", show_alert=True)
         await _responder(
             query.message,
             "¿Qué quieres hacer? Toca un botón 👇",
-            menu_principal(),
+            menu_principal(completo=contexto == CONTEXTO_ADMIN_PRIVADO),
             mencion=mencion,
         )
         return
@@ -839,7 +932,7 @@ async def cuenta_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 async def codigo_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Codigo de verificacion y reintentos (`codigo_<usuario>`)."""
     query = update.callback_query
-    if not await _guard_chat(update):
+    if await _guard_contexto(update) is None:
         return
     mencion = mencion_grupo(update)
     usuario = _resolver_cuenta((query.data or "")[len("codigo_"):], _cuentas())
@@ -852,9 +945,17 @@ async def codigo_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 async def nombre_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Nombre: elegir cuenta (`nombre_<u>`) o confirmar (`nombre_si/no_<u>`)."""
+    """Nombre: elegir cuenta (`nombre_<u>`) o confirmar (`nombre_si/no_<u>`).
+
+    SOLO funciona en el privado del administrador: un boton viejo desde el
+    grupo se rechaza sin ejecutar nada.
+    """
     query = update.callback_query
-    if not await _guard_chat(update):
+    contexto = await _guard_contexto(update)
+    if contexto is None:
+        return
+    if contexto != CONTEXTO_ADMIN_PRIVADO:
+        await query.answer(TEXTO_FLUJO_SOLO_ADMIN, show_alert=True)
         return
     data = (query.data or "").strip()
     cuentas = _cuentas()
@@ -922,9 +1023,17 @@ async def nombre_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 async def foto_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Fotos: elegir cuenta/confirmar (`foto_perfil_`, `foto_si_`, ...)."""
+    """Fotos: elegir cuenta/confirmar (`foto_perfil_`, `foto_si_`, ...).
+
+    SOLO funciona en el privado del administrador: un boton viejo desde el
+    grupo se rechaza sin ejecutar nada.
+    """
     query = update.callback_query
-    if not await _guard_chat(update):
+    contexto = await _guard_contexto(update)
+    if contexto is None:
+        return
+    if contexto != CONTEXTO_ADMIN_PRIVADO:
+        await query.answer(TEXTO_FLUJO_SOLO_ADMIN, show_alert=True)
         return
     data = (query.data or "").strip()
     cuentas = _cuentas()
@@ -1010,17 +1119,20 @@ async def foto_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 # --------------------------------------------------------------------------- #
 
 async def texto_recibido(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Texto libre: SOLO se procesa si ESE usuario tiene un flujo pendiente.
+    """Texto libre: SOLO el flujo de nombre del ADMIN en privado.
 
-    En grupos (con privacy ON alcanza con responder a un mensaje del bot; con
-    privacy OFF se reciben todos): los mensajes de otros miembros sin flujo se
-    IGNORAN en silencio (sin spam al grupo) porque `context.user_data` es por
+    En el grupo no hay flujos de texto (solo 2FA); el texto de cualquier otro
+    contexto se ignora en silencio (sin spam). `context.user_data` es por
     usuario en PTB v21.
     """
     espera = context.user_data.get("cli_espera") or {}
     if espera.get("tipo") != "nombre":
         return
-    if not await _guard_chat(update):
+    contexto = await _guard_contexto(update)
+    if contexto is None:
+        return
+    if contexto != CONTEXTO_ADMIN_PRIVADO:
+        _limpiar(context)
         return
     mencion = mencion_grupo(update)
     usuario = _resolver_cuenta(espera.get("usuario") or "", _cuentas())
@@ -1052,12 +1164,16 @@ async def texto_recibido(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 async def foto_recibida(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Foto de Telegram: la guarda en data/temp y pide confirmacion."""
+    """Foto de Telegram: la guarda en data/temp y pide confirmacion.
+
+    SOLO admin privado (en el grupo no hay fotos: silencio).
+    """
     espera = context.user_data.get("cli_espera") or {}
     mencion = mencion_grupo(update)
     if espera.get("tipo") != "foto":
-        if not await _guard_chat(update):
-            return
+        contexto = await _guard_contexto(update)
+        if contexto is None or contexto == CONTEXTO_GRUPO:
+            return  # privado ajeno ya avisa; en el grupo, silencio
         await update.effective_message.reply_text(
             con_mencion(
                 "📸 No esperaba ninguna foto.\n\n"
@@ -1066,7 +1182,11 @@ async def foto_recibida(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             )
         )
         return
-    if not await _guard_chat(update):
+    contexto = await _guard_contexto(update)
+    if contexto is None:
+        return
+    if contexto != CONTEXTO_ADMIN_PRIVADO:
+        _limpiar(context)
         return
     usuario = _resolver_cuenta(espera.get("usuario") or "", _cuentas())
     foto_tipo = "portada" if espera.get("foto_tipo") == "portada" else "perfil"
@@ -1234,14 +1354,20 @@ async def _responder_admin(update, texto: str) -> None:
 
 
 def solo_admins(func):
-    """Decorador: SOLO el grupo de clientes y TELEGRAM_ADMIN_IDS."""
+    """Decorador: SOLO en el privado de TELEGRAM_ADMIN_IDS.
+
+    - Privado ajeno: `_guard_contexto` responde el aviso corto y no ejecuta.
+    - Grupo de clientes: responde "solo por privado del administrador".
+    - Otro grupo: silencio.
+    """
 
     @functools.wraps(func)
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
-        if not await _guard_chat(update):
+        contexto = await _guard_contexto(update)
+        if contexto is None:
             return
-        if not _es_admin_update(update):
-            await _responder_admin(update, "⛔ Este comando es solo para el equipo.")
+        if contexto != CONTEXTO_ADMIN_PRIVADO:
+            await _responder_admin(update, TEXTO_NOMBRE_SOLO_PRIVADO)
             return
         return await func(update, context, *args, **kwargs)
 

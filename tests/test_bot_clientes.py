@@ -384,10 +384,10 @@ def run(check) -> None:  # noqa: C901 - seccionado por bloques tematicos
             )
 
     # ------------------------------------------------------------ KEYBOARDS --
-    menu = k.menu_principal()
-    callbacks_menu = _callbacks(menu)
+    menu_completo = k.menu_principal(completo=True)
+    callbacks_menu = _callbacks(menu_completo)
     check(
-        "teclados: el menu tiene los 6 botones del cliente (Cuentas global)",
+        "teclados: el menu completo (privado admin) tiene las 6 opciones",
         callbacks_menu
         == [
             "cli_codigo",
@@ -397,6 +397,11 @@ def run(check) -> None:  # noqa: C901 - seccionado por bloques tematicos
             "cli_cuentas",
             "cli_ayuda",
         ],
+    )
+    check(
+        "teclados: el menu del GRUPO es reducido (solo codigo + ayuda)",
+        _callbacks(k.menu_principal(completo=False)) == ["cli_codigo", "cli_ayuda"]
+        and _callbacks(k.menu_principal()) == callbacks_menu,  # default = completo
     )
     check(
         "teclados: selector de cuenta tiene un boton por cuenta",
@@ -519,28 +524,46 @@ def run(check) -> None:  # noqa: C901 - seccionado por bloques tematicos
         and not hasattr(h, "TIEMPO_CORREO"),
     )
 
-    # ------------------------------------------------ GUARD POR CHAT / START --
+    # ------------------------------------- MATRIZ DE ACCESO / START ------
     with _store_temporal() as ruta, _env("TELEGRAM_CLIENTES_CHAT_ID", None), _env(
-        "TELEGRAM_ADMIN_IDS", None
+        "TELEGRAM_ADMIN_IDS", "555"
     ):
-        # Privado: mensaje corto y nada mas.
-        update = _UpdateFake(uid=500, texto="/start")
+        # Privado NO admin: mensaje claro y sin menu.
+        update = _UpdateFake(uid=777, texto="/start")
         _correr(h.start(update, _ContextoFake()))
         check(
-            "guard: privado recibe el aviso corto (sin menu)",
+            "guard: privado ajeno recibe el mensaje claro (sin menu)",
             update.effective_message.replies
-            and h.TEXTO_SOLO_GRUPO in update.effective_message.replies[0][0]
+            and h.TEXTO_SOLO_ADMIN_PRIVADO in update.effective_message.replies[0][0]
             and not update.effective_message.replies[0][1],
         )
-        # Callback privado: alerta corta, sin editar nada.
+        # Callback privado ajeno: alerta corta, sin editar nada.
         query = _QueryFake("cli_menu")
-        _correr(h.cli_callback(_UpdateFake(uid=500, query=query), _ContextoFake()))
+        _correr(h.cli_callback(_UpdateFake(uid=777, query=query), _ContextoFake()))
         check(
-            "guard: callback privado responde alerta corta",
+            "guard: callback privado ajeno responde alerta corta",
             query.answers
             and query.answers[-1][1]
-            and h.TEXTO_SOLO_GRUPO in query.answers[-1][0]
+            and h.TEXTO_SOLO_ADMIN_PRIVADO in query.answers[-1][0]
             and not query.message.edits,
+        )
+        # Privado del ADMIN: menu COMPLETO.
+        update = _UpdateFake(uid=555, texto="/start")
+        _correr(h.start(update, _ContextoFake()))
+        texto, kwargs = update.effective_message.replies[0]
+        check(
+            "guard: privado del ADMIN recibe el menu completo",
+            set(
+                [
+                    "cli_codigo",
+                    "cli_nombre",
+                    "cli_foto_perfil",
+                    "cli_foto_portada",
+                    "cli_cuentas",
+                    "cli_ayuda",
+                ]
+            ).issubset(set(_callbacks(kwargs["reply_markup"])))
+            and "Opciones:" in texto,
         )
         # Otro grupo: silencio absoluto (mensaje y callback).
         update = _UpdateFake(uid=500, texto="/start", chat=_chat_grupo(CHAT_OTRO))
@@ -562,15 +585,57 @@ def run(check) -> None:  # noqa: C901 - seccionado por bloques tematicos
             and query.answers
             and query.answers[-1] == ("", False),
         )
-        # Grupo correcto: menu con las 15 cuentas.
+        # Grupo correcto: cualquier miembro, menu REDUCIDO (solo 2FA + ayuda).
         update = _UpdateFake(uid=500, texto="/start", chat=_chat_grupo(), username="fulano")
         _correr(h.start(update, _ContextoFake()))
         texto, kwargs = update.effective_message.replies[0]
+        callbacks = _callbacks(kwargs["reply_markup"])
         check(
-            "guard: el grupo correcto recibe el menu con las 15 cuentas",
+            "guard: el grupo recibe SOLO el menu 2FA (codigo + ayuda)",
             "15 cuentas disponibles" in texto
+            and "código de verificación" in texto
             and "👤 @fulano," in texto
-            and "cli_codigo" in _callbacks(kwargs["reply_markup"]),
+            and callbacks == ["cli_codigo", "cli_ayuda"],
+        )
+        check(
+            "guard: en el grupo NO aparecen nombre/fotos/cuentas",
+            not any(
+                boton in callbacks
+                for boton in ("cli_nombre", "cli_foto_perfil", "cli_foto_portada", "cli_cuentas")
+            ),
+        )
+        # Defensa: boton viejo de cambiar nombre en el grupo -> rechazado.
+        query = _QueryFake("cli_nombre")
+        _correr(
+            h.cli_callback(
+                _UpdateFake(uid=500, query=query, chat=_chat_grupo(), username="fulano"),
+                _ContextoFake(),
+            )
+        )
+        check(
+            "guard: boton de cambiar nombre en el grupo se rechaza sin ejecutar",
+            not query.message.edits
+            and query.answers
+            and query.answers[-1][1]
+            and h.TEXTO_FLUJO_SOLO_ADMIN in query.answers[-1][0],
+        )
+        # Defensa: flujo de nombre pendiente + seleccion de cuenta en grupo.
+        contexto = _ContextoFake()
+        contexto.user_data["cli_flujo"] = "nombre"
+        query = _QueryFake("cuenta_3ranuii97")
+        with _parches((h, "_datos_cuenta", lambda u: {"totp_secret": SECRETO_FAKE})):
+            _correr(
+                h.cuenta_callback(
+                    _UpdateFake(uid=500, query=query, chat=_chat_grupo(), username="fulano"),
+                    contexto,
+                )
+            )
+        check(
+            "guard: flujo de nombre pendiente no corre en el grupo (defensa)",
+            contexto.user_data.get("cli_flujo") is None
+            and not query.message.edits
+            and query.answers[-1][1]
+            and h.TEXTO_FLUJO_SOLO_ADMIN in query.answers[-1][0],
         )
 
     # ------------------------------------------------- FLUJO DE CODIGO ----
@@ -729,64 +794,47 @@ def run(check) -> None:  # noqa: C901 - seccionado por bloques tematicos
             and "no tiene configurado el código 2FA" in query.message.edits[-1][0],
         )
 
-    # ------------------------------------------------ FLUJO DE NOMBRE -----
+    # -------------------------------------- FLUJO DE NOMBRE (admin privado) --
     with _store_temporal() as ruta, _env("TELEGRAM_CLIENTES_CHAT_ID", None), _env(
-        "TELEGRAM_ADMIN_IDS", None
+        "TELEGRAM_ADMIN_IDS", "555"
     ):
         clientes_store.guardar({"chat_id": CHAT_GRUPO, "cuentas": ["CuentaNombre"]}, ruta)
         query = _QueryFake("cli_nombre", _MensajeFake())
         contexto = _ContextoFake()
-        _correr(
-            h.cli_callback(
-                _UpdateFake(uid=704, query=query, chat=_chat_grupo(), username="fulano"),
-                contexto,
-            )
-        )
+        _correr(h.cli_callback(_UpdateFake(uid=555, query=query), contexto))
         check(
-            "nombre: pide el nombre por texto y deja flujo pendiente",
+            "nombre (admin privado): pide el nombre por texto y deja flujo pendiente",
             "Escríbeme el nombre" in query.message.edits[-1][0]
             and contexto.user_data.get("cli_espera", {}).get("tipo") == "nombre",
         )
-        update = _UpdateFake(
-            uid=704, texto="http://spam.com", chat=_chat_grupo(), username="fulano"
-        )
+        update = _UpdateFake(uid=555, texto="http://spam.com")
         _correr(h.texto_recibido(update, contexto))
         check(
-            "nombre: texto invalido pide escribirlo otra vez",
+            "nombre (admin privado): texto invalido pide escribirlo otra vez",
             "No uses links" in update.effective_message.replies[-1][0]
             and contexto.user_data.get("cli_espera", {}).get("tipo") == "nombre",
         )
-        update = _UpdateFake(
-            uid=704, texto="María López", chat=_chat_grupo(), username="fulano"
-        )
+        update = _UpdateFake(uid=555, texto="María López")
         _correr(h.texto_recibido(update, contexto))
         texto, kwargs = update.effective_message.replies[-1]
         check(
-            "nombre: pide confirmacion con el nombre y botones si/no",
+            "nombre (admin privado): pide confirmacion con el nombre y botones si/no",
             "«María López»" in texto
             and "¿Lo hago?" in texto
-            and "👤 @fulano," in texto
             and _callbacks(kwargs["reply_markup"])
             == ["nombre_si_CuentaNombre", "nombre_no_CuentaNombre"]
             and contexto.user_data["cli_nombre_pend"]["nombre"] == "María López",
         )
         # ❌ No.
         query = _QueryFake("nombre_no_CuentaNombre")
-        _correr(
-            h.nombre_callback(
-                _UpdateFake(uid=704, query=query, chat=_chat_grupo(), username="fulano"),
-                contexto,
-            )
-        )
+        _correr(h.nombre_callback(_UpdateFake(uid=555, query=query), contexto))
         check(
-            "nombre: el boton No no cambia nada y limpia el pendiente",
+            "nombre (admin privado): el boton No no cambia nada y limpia el pendiente",
             "no cambié nada" in query.message.edits[-1][0]
             and "cli_nombre_pend" not in contexto.user_data,
         )
         # ✅ Sí (con Selenium mockeado).
-        update = _UpdateFake(
-            uid=704, texto="Nuevo Nombre", chat=_chat_grupo(), username="fulano"
-        )
+        update = _UpdateFake(uid=555, texto="Nuevo Nombre")
         contexto.user_data["cli_espera"] = {"tipo": "nombre", "usuario": "CuentaNombre"}
         _correr(h.texto_recibido(update, contexto))
         llamado = {}
@@ -798,14 +846,9 @@ def run(check) -> None:  # noqa: C901 - seccionado por bloques tematicos
 
         query = _QueryFake("nombre_si_CuentaNombre")
         with _parches((h, "ejecutar_cambiar_nombre", _cambiar_ok)):
-            _correr(
-                h.nombre_callback(
-                    _UpdateFake(uid=704, query=query, chat=_chat_grupo(), username="fulano"),
-                    contexto,
-                )
-            )
+            _correr(h.nombre_callback(_UpdateFake(uid=555, query=query), contexto))
         check(
-            "nombre: el boton Si ejecuta el cambio y avisa Listo",
+            "nombre (admin privado): el boton Si ejecuta el cambio y avisa Listo",
             llamado == {"usuario": "CuentaNombre", "nombre": "Nuevo Nombre"}
             and "Cambiando el nombre" in query.message.edits[-1][0]
             and any("¡Listo!" in t for t, _ in query.message.replies),
@@ -818,59 +861,56 @@ def run(check) -> None:  # noqa: C901 - seccionado por bloques tematicos
             return False, "sin sesion"
 
         with _parches((h, "ejecutar_cambiar_nombre", _cambiar_falla)):
-            _correr(
-                h.nombre_callback(
-                    _UpdateFake(uid=704, query=query, chat=_chat_grupo(), username="fulano"),
-                    contexto,
-                )
-            )
+            _correr(h.nombre_callback(_UpdateFake(uid=555, query=query), contexto))
         check(
-            "nombre: fallo muestra mensaje simple y reintento",
+            "nombre (admin privado): fallo muestra mensaje simple y reintento",
             any("No se pudo cambiar" in t for t, _ in query.message.replies)
             and "nombre_CuentaNombre" in _callbacks(query.message.replies[-1][1]["reply_markup"]),
         )
         # Boton vencido.
         query = _QueryFake("nombre_si_CuentaNombre")
+        _correr(h.nombre_callback(_UpdateFake(uid=555, query=query), contexto))
+        check(
+            "nombre (admin privado): confirmacion vencida avisa sin ejecutar",
+            query.answers and query.answers[-1][1],
+        )
+        # DEFENSA: en el grupo el flujo de nombre no arranca.
+        query = _QueryFake("nombre_CuentaNombre", _MensajeFake())
         _correr(
             h.nombre_callback(
-                _UpdateFake(uid=704, query=query, chat=_chat_grupo(), username="fulano"),
-                contexto,
+                _UpdateFake(uid=500, query=query, chat=_chat_grupo(), username="alguien"),
+                _ContextoFake(),
             )
         )
         check(
-            "nombre: confirmacion vencida avisa sin ejecutar",
-            query.answers and query.answers[-1][1],
+            "nombre: en el grupo se rechaza (solo admin privado)",
+            not query.message.edits
+            and query.answers[-1][1]
+            and h.TEXTO_FLUJO_SOLO_ADMIN in query.answers[-1][0],
         )
 
-    # -------------------------------------------------- FLUJO DE FOTO -----
+    # ---------------------------------------- FLUJO DE FOTO (admin privado) --
     with _store_temporal() as ruta, _env("TELEGRAM_CLIENTES_CHAT_ID", None), _env(
-        "TELEGRAM_ADMIN_IDS", None
+        "TELEGRAM_ADMIN_IDS", "555"
     ):
         clientes_store.guardar({"chat_id": CHAT_GRUPO, "cuentas": ["CuentaFoto"]}, ruta)
         with tempfile.TemporaryDirectory() as temporal:
             query = _QueryFake("cli_foto_perfil", _MensajeFake())
             contexto = _ContextoFake()
-            _correr(
-                h.cli_callback(
-                    _UpdateFake(uid=705, query=query, chat=_chat_grupo(), username="fulano"),
-                    contexto,
-                )
-            )
+            _correr(h.cli_callback(_UpdateFake(uid=555, query=query), contexto))
             check(
-                "foto: pide la imagen por Telegram",
+                "foto (admin privado): pide la imagen por Telegram",
                 "Envíame la foto de perfil" in query.message.edits[-1][0]
                 and contexto.user_data.get("cli_espera", {}).get("tipo") == "foto",
             )
-            update = _UpdateFake(
-                uid=705, fotos=[_FotoFake()], chat=_chat_grupo(), username="fulano"
-            )
+            update = _UpdateFake(uid=555, fotos=[_FotoFake()])
             with _parches((h, "_data_temp", lambda: temporal)):
                 _correr(h.foto_recibida(update, contexto))
             caption = update.effective_message.photos[-1][1]
             kwargs = update.effective_message.photos[-1][2]
             pendiente = contexto.user_data.get("cli_foto_pend") or {}
             check(
-                "foto: vista previa pide confirmacion con botones",
+                "foto (admin privado): vista previa pide confirmacion con botones",
                 "¿Uso esta foto como tu nueva foto de perfil de @CuentaFoto?"
                 in caption
                 and "foto_si_perfil_CuentaFoto" in _callbacks(kwargs["reply_markup"])
@@ -878,39 +918,22 @@ def run(check) -> None:  # noqa: C901 - seccionado por bloques tematicos
             )
             # ❌ No.
             query = _QueryFake("foto_no_perfil_CuentaFoto")
-            _correr(
-                h.foto_callback(
-                    _UpdateFake(uid=705, query=query, chat=_chat_grupo(), username="fulano"),
-                    contexto,
-                )
-            )
+            _correr(h.foto_callback(_UpdateFake(uid=555, query=query), contexto))
             check(
-                "foto: el boton No limpia la pendiente",
+                "foto (admin privado): el boton No limpia la pendiente",
                 "no cambié nada" in query.message.edits[-1][0]
                 and "cli_foto_pend" not in contexto.user_data,
             )
             # 🔁 Otra foto.
             query = _QueryFake("cli_foto_perfil", _MensajeFake())
-            _correr(
-                h.cli_callback(
-                    _UpdateFake(uid=705, query=query, chat=_chat_grupo(), username="fulano"),
-                    contexto,
-                )
-            )
-            update = _UpdateFake(
-                uid=705, fotos=[_FotoFake()], chat=_chat_grupo(), username="fulano"
-            )
+            _correr(h.cli_callback(_UpdateFake(uid=555, query=query), contexto))
+            update = _UpdateFake(uid=555, fotos=[_FotoFake()])
             with _parches((h, "_data_temp", lambda: temporal)):
                 _correr(h.foto_recibida(update, contexto))
             query = _QueryFake("foto_otra_perfil_CuentaFoto")
-            _correr(
-                h.foto_callback(
-                    _UpdateFake(uid=705, query=query, chat=_chat_grupo(), username="fulano"),
-                    contexto,
-                )
-            )
+            _correr(h.foto_callback(_UpdateFake(uid=555, query=query), contexto))
             check(
-                "foto: el boton Otra foto vuelve a pedirla",
+                "foto (admin privado): el boton Otra foto vuelve a pedirla",
                 "Envíame la foto de perfil" in query.message.edits[-1][0]
                 and contexto.user_data.get("cli_espera", {}).get("tipo") == "foto",
             )
@@ -931,29 +954,44 @@ def run(check) -> None:  # noqa: C901 - seccionado por bloques tematicos
 
             query = _QueryFake("foto_si_perfil_CuentaFoto")
             with _parches((h, "ejecutar_cambiar_foto", _foto_ok)):
-                _correr(
-                    h.foto_callback(
-                        _UpdateFake(uid=705, query=query, chat=_chat_grupo(), username="fulano"),
-                        contexto,
-                    )
-                )
+                _correr(h.foto_callback(_UpdateFake(uid=555, query=query), contexto))
             check(
-                "foto: el boton Si sube la foto y limpia la pendiente",
+                "foto (admin privado): el boton Si sube la foto y limpia la pendiente",
                 llamado["usuario"] == "CuentaFoto"
                 and llamado["tipo"] == "perfil"
                 and "Subiendo" in query.message.edits[-1][0]
                 and any("¡Listo!" in t for t, _ in query.message.replies),
             )
-            # Foto sin flujo pendiente.
+            # Foto sin flujo pendiente (admin privado): aviso.
             contexto.user_data.pop("cli_espera", None)
-            update = _UpdateFake(
-                uid=705, fotos=[_FotoFake()], chat=_chat_grupo(), username="fulano"
-            )
+            update = _UpdateFake(uid=555, fotos=[_FotoFake()])
             _correr(h.foto_recibida(update, contexto))
             check(
-                "foto: sin flujo pendiente avisa que no la esperaba",
+                "foto (admin privado): sin flujo pendiente avisa que no la esperaba",
                 "No esperaba ninguna foto"
                 in update.effective_message.replies[-1][0],
+            )
+            # En el GRUPO no hay fotos: silencio (ni aviso ni ejecucion).
+            update = _UpdateFake(uid=500, fotos=[_FotoFake()], chat=_chat_grupo())
+            _correr(h.foto_recibida(update, _ContextoFake()))
+            check(
+                "foto: en el grupo se ignora en silencio (solo 2FA)",
+                update.effective_message.replies == []
+                and update.effective_message.photos == [],
+            )
+            # DEFENSA: boton viejo de foto en el grupo -> rechazado.
+            query = _QueryFake("foto_perfil_CuentaFoto")
+            _correr(
+                h.foto_callback(
+                    _UpdateFake(uid=500, query=query, chat=_chat_grupo(), username="alguien"),
+                    _ContextoFake(),
+                )
+            )
+            check(
+                "foto: en el grupo el boton se rechaza (solo admin privado)",
+                not query.message.edits
+                and query.answers[-1][1]
+                and h.TEXTO_FLUJO_SOLO_ADMIN in query.answers[-1][0],
             )
 
         # 📋 Cuentas muestra el @ y el nombre REGISTRADO (BD fake).
@@ -967,14 +1005,9 @@ def run(check) -> None:  # noqa: C901 - seccionado por bloques tematicos
 
         query = _QueryFake("cli_cuentas", _MensajeFake())
         with _parches((h, "_datos_cuenta", _datos_registrado)):
-            _correr(
-                h.cli_callback(
-                    _UpdateFake(uid=705, query=query, chat=_chat_grupo(), username="fulano"),
-                    _ContextoFake(),
-                )
-            )
+            _correr(h.cli_callback(_UpdateFake(uid=555, query=query), _ContextoFake()))
         check(
-            "cuentas: lista las cuentas del grupo con su nombre registrado",
+            "cuentas (admin privado): lista las cuentas con su nombre registrado",
             "@HandleReal" in query.message.edits[-1][0]
             and "«Nombre Registrado»" in query.message.edits[-1][0]
             and "cli_cuenta_CuentaFoto" in _callbacks(query.message.edits[-1][1]["reply_markup"]),
@@ -990,12 +1023,10 @@ def run(check) -> None:  # noqa: C901 - seccionado por bloques tematicos
                 "cli_foto_pend": {"usuario": "x"},
             }
         )
-        update = _UpdateFake(
-            uid=705, texto="/cancelar", chat=_chat_grupo(), username="fulano"
-        )
+        update = _UpdateFake(uid=555, texto="/cancelar")
         _correr(h.cancelar(update, contexto))
         check(
-            "/cancelar: limpia flujos y vuelve al menu",
+            "/cancelar (admin privado): limpia flujos y vuelve al menu",
             "cancelado" in update.effective_message.replies[-1][0]
             and not any(clave in contexto.user_data for clave in (
                 "cli_flujo",
@@ -1034,9 +1065,10 @@ def run(check) -> None:  # noqa: C901 - seccionado por bloques tematicos
         ctx = _ContextoFake()
         _correr(h.bienvenida_grupo(update, ctx))
         check(
-            "grupo: bienvenida al agregar el bot con instrucciones",
+            "grupo: bienvenida al agregar el bot (flujo 2FA)",
             bool(update.effective_message.replies)
-            and "Escribe /start" in update.effective_message.replies[-1][0],
+            and "Escribe /start" in update.effective_message.replies[-1][0]
+            and "código 2FA" in update.effective_message.replies[-1][0],
         )
         _correr(h.bienvenida_grupo(update, ctx))
         check(
@@ -1122,10 +1154,8 @@ def run(check) -> None:  # noqa: C901 - seccionado por bloques tematicos
             and "cli_espera" in ctx_a.user_data,
         )
 
-        # Texto como RESPUESTA al mensaje del bot -> tambien se captura.
-        clientes_store.guardar(
-            {"chat_id": CHAT_GRUPO, "cuentas": ["CuentaFoto"]}, ruta
-        )
+        # En el GRUPO no hay flujo de texto (solo 2FA): aunque haya un pendiente
+        # viejo, el texto se descarta en silencio (y se limpia).
         ctx_a.user_data["cli_espera"] = {"tipo": "nombre", "usuario": "CuentaFoto"}
         update = _UpdateFake(uid=800, texto="Otro Nombre", chat=grupo, username="fulano")
         update.effective_message.reply_to_message = _MensajeFake(
@@ -1133,11 +1163,12 @@ def run(check) -> None:  # noqa: C901 - seccionado por bloques tematicos
         )
         _correr(h.texto_recibido(update, ctx_a))
         check(
-            "grupo: la RESPUESTA al mensaje del bot tambien se captura",
-            any("Otro Nombre" in t for t, _ in update.effective_message.replies),
+            "grupo: el texto NO arranca el flujo de nombre (se descarta)",
+            update.effective_message.replies == []
+            and "cli_espera" not in ctx_a.user_data,
         )
 
-        # Boton de confirmacion ajeno: no puede confirmar el pendiente de otro.
+        # Boton de confirmacion en el grupo: se rechaza (solo admin privado).
         query = _QueryFake("nombre_si_CuentaFoto")
         _correr(
             h.nombre_callback(
@@ -1146,18 +1177,17 @@ def run(check) -> None:  # noqa: C901 - seccionado por bloques tematicos
             )
         )
         check(
-            "grupo: otro miembro no confirma el nombre ajeno (boton vencido)",
+            "grupo: la confirmacion de nombre se rechaza (solo admin privado)",
             not query.message.edits
             and bool(query.answers)
             and query.answers[-1][1]
-            and "venció" in query.answers[-1][0],
+            and h.TEXTO_FLUJO_SOLO_ADMIN in query.answers[-1][0],
         )
 
-    # ---------------------------------------------------- ADMIN /nombre ----
+    # ---------------------------------- ADMIN /nombre (solo privado admin) --
     with _store_temporal() as ruta, _env("TELEGRAM_CLIENTES_CHAT_ID", None), _env(
         "TELEGRAM_ADMIN_IDS", "555"
     ):
-        grupo = _chat_grupo()
         # BD fake: la cuenta existe y se actualiza nombre_mostrado.
         cuenta_fake = _CuentaBDFake("MiCuenta", "")
         with _db_fake(cuenta_fake):
@@ -1172,35 +1202,36 @@ def run(check) -> None:  # noqa: C901 - seccionado por bloques tematicos
             "admin /nombre: cuenta no encontrada devuelve error claro",
             not ok and "No encontré la cuenta" in error,
         )
-        # Handler completo con la BD fake.
-        update = _UpdateFake(uid=555, texto="/nombre", chat=grupo, username="jefe")
+        # Handler completo en el PRIVADO del admin, con la BD fake.
+        update = _UpdateFake(uid=555, texto="/nombre")
         with _db_fake(cuenta_fake):
             _correr(h.comando_nombre(update, _ContextoFake(args=["MiCuenta", "Nuevo"])))
         check(
-            "admin /nombre: confirma el cambio con el nombre completo",
+            "admin /nombre: en privado confirma el cambio con el nombre completo",
             "Nuevo" in cuenta_fake.nombre_mostrado
             and "ahora es «Nuevo»" in update.effective_message.replies[-1][0],
         )
         # Sin args -> uso.
-        update = _UpdateFake(uid=555, texto="/nombre", chat=grupo, username="jefe")
+        update = _UpdateFake(uid=555, texto="/nombre")
         _correr(h.comando_nombre(update, _ContextoFake(args=[])))
         check(
             "admin /nombre: sin args muestra el uso",
             "Uso: /nombre" in update.effective_message.replies[-1][0],
         )
-        # No-admin -> rechazado.
-        update = _UpdateFake(uid=666, texto="/nombre", chat=grupo, username="curioso")
+        # Privado NO admin -> mensaje claro (guard por contexto).
+        update = _UpdateFake(uid=666, texto="/nombre")
         _correr(h.comando_nombre(update, _ContextoFake(args=["MiCuenta", "Nuevo"])))
         check(
-            "admin /nombre: no-admin recibe 'solo para el equipo'",
-            "solo para el equipo" in update.effective_message.replies[-1][0],
+            "admin /nombre: privado ajeno recibe el mensaje claro",
+            h.TEXTO_SOLO_ADMIN_PRIVADO in update.effective_message.replies[-1][0],
         )
-        # Privado -> aviso corto (guard por chat antes del admin).
-        update = _UpdateFake(uid=555, texto="/nombre")
+        # En el GRUPO -> "solo por privado del administrador".
+        update = _UpdateFake(uid=555, texto="/nombre", chat=_chat_grupo(), username="jefe")
         _correr(h.comando_nombre(update, _ContextoFake(args=["MiCuenta", "Nuevo"])))
         check(
-            "admin /nombre: en privado responde el aviso corto",
-            h.TEXTO_SOLO_GRUPO in update.effective_message.replies[-1][0],
+            "admin /nombre: en el grupo avisa que es solo por privado",
+            h.TEXTO_NOMBRE_SOLO_PRIVADO in update.effective_message.replies[-1][0]
+            and "privado" in update.effective_message.replies[-1][0],
         )
         # Otro grupo -> silencio.
         update = _UpdateFake(uid=555, texto="/nombre", chat=_chat_grupo(CHAT_OTRO))
