@@ -14,6 +14,7 @@ from core.perfiles import (
 )
 from core.registros import normalizar_tipo_cuenta
 from ia.prompts import (
+    ANGULOS_QUEJA_CHANGE,
     REGLA_MAX_100,
     TEMAS_MANTENIMIENTO,
     bloque_estilo_perfil,
@@ -22,6 +23,7 @@ from ia.prompts import (
     get_prompt_verificado_ambiental,
     get_prompt_harfuch,
     get_prompt_por_tipo,
+    get_prompt_queja_change,
     instrucciones_tema,
     _normalizar_tema,
     _reglas_registro,
@@ -5688,3 +5690,555 @@ def generar_textos_actividad_por_cuenta(
         except Exception:
             pass
     return salida
+
+
+# =========================================================================== #
+# Reporte de peticiones en Change.org (formulario de violacion de politicas):
+# UNA queja ORIGINAL por llamada, con angulos rotativos, anti-repeticion y
+# fallback local que nunca deja la queja vacia. Contrato CONGELADO:
+# ``generar_queja_change(contexto, evitar=None, variante=None) -> dict``.
+# =========================================================================== #
+_MAX_LARGO_QUEJA_CHANGE = 1200
+
+# Plantillas del fallback local (>=5 por angulo). No copian el contexto
+# literal: a lo sumo aluden a el con ``_referencia_queja_change`` cuando es
+# corto y jamas inventan nombres, fechas, cifras ni hechos.
+_PLANTILLAS_QUEJA_CHANGE = {
+    "desinformacion": (
+        "Escribo como ciudadano para pedir que se revise {ref} en Change.org: "
+        "presenta acusaciones como hechos comprobados y no aporta ninguna "
+        "prueba verificable. Eso incumple las normas de la comunidad, que "
+        "prohíben difundir desinformación, porque quienes firman pueden quedar "
+        "convencidos de algo falso y el daño crece con cada persona que la "
+        "comparte. No pido que se censure una opinión ni un debate legítimo: "
+        "pido que la plataforma aplique sus propias reglas y revise lo que no "
+        "puede sostenerse con datos.",
+        "Uso Change.org para apoyar causas reales y me preocupa que {ref} "
+        "afirme cosas que nadie puede comprobar. Las normas de la comunidad "
+        "piden información verificable, y aquí se mezclan rumores con "
+        "acusaciones presentadas como certezas. Eso engaña a la gente que "
+        "firma de buena fe y desgasta la confianza en la plataforma. Solicito "
+        "que el equipo revise el contenido y actúe conforme a las reglas, "
+        "retirando lo que no tenga sustento.",
+        "Como ciudadano que revisa las peticiones antes de firmar, considero "
+        "que {ref} no debería seguir en Change.org. El texto da por ciertos "
+        "hechos que no están demostrados y los presenta de forma que confunde "
+        "a quien lo lee rápido. Las normas de la comunidad existen justamente "
+        "para evitar ese tipo de desinformación, y su incumplimiento perjudica "
+        "a todas las causas legítimas. Pido una revisión honesta y, si "
+        "corresponde, la retirada del contenido.",
+        "Pido respetuosamente a Change.org que revise {ref}, porque se apoya "
+        "en afirmaciones sin respaldo y las presenta como verdades. No se "
+        "trata de una diferencia de opinión: se trata de información que puede "
+        "llevar a firmar bajo una idea falsa. Las normas de la comunidad "
+        "prohíben la desinformación, y este caso encaja en esa prohibición. "
+        "Confío en que la plataforma revise el fondo del asunto y actúe con "
+        "transparencia.",
+        "Me sumo al reporte de {ref} por desinformación. El texto repite "
+        "acusaciones que no se pueden verificar y las usa como base de una "
+        "causa, lo que puede arrastrar a miles de personas a un error. Las "
+        "normas de la comunidad de Change.org piden hechos comprobables y "
+        "contexto honesto, así que este contenido no debería permanecer "
+        "publicado como si fuera cierto. Solicito que se evalúe y se apliquen "
+        "las medidas que correspondan.",
+    ),
+    "odio_acoso": (
+        "Reporto {ref} porque el texto ataca y estigmatiza a personas por su "
+        "identidad, su condición o sus creencias. Ese tipo de discurso está "
+        "prohibido por las normas de la comunidad de Change.org, que existen "
+        "para que la plataforma sea un espacio seguro y no un altavoz de "
+        "hostigamiento. No se trata de una opinión fuerte ni de una crítica "
+        "legítima: se trata de señalar a un grupo entero y exponerlo a "
+        "represalias. Pido que el contenido se revise y se retire si confirma "
+        "el incumplimiento.",
+        "Como usuario de Change.org no puedo pasar por alto que {ref} utilice "
+        "un lenguaje que deshumaniza o culpabiliza a un grupo social. Las "
+        "normas de la comunidad prohíben el discurso de odio y el acoso, y ese "
+        "tono no aporta a un debate democrático: solo genera miedo y "
+        "confrontación. Firmar algo así da apariencia de respaldo a la "
+        "agresión. Solicito que la plataforma evalúe el contenido conforme a "
+        "sus reglas y actúe en consecuencia.",
+        "Escribo para reportar {ref}: más que una petición, parece una campaña "
+        "para hostigar a personas concretas por lo que son. Las normas de la "
+        "comunidad de Change.org son claras al prohibir el acoso y el discurso "
+        "de odio, porque las causas legítimas se construyen con argumentos, no "
+        "con ataques. Ese contenido pone en riesgo a la gente señalada y "
+        "contamina la conversación pública. Pido una revisión pronta y una "
+        "decisión apegada a las reglas.",
+        "Reporto {ref} porque su redacción señala a un colectivo y lo presenta "
+        "como culpable de todos los males, sin matices ni respeto. Eso es "
+        "discurso de odio, y las normas de la comunidad de Change.org lo "
+        "prohíben expresamente. Una petición puede ser crítica y hasta "
+        "incómoda, pero no puede convertir a un grupo de personas en blanco de "
+        "rechazo. Solicito que se analice el texto y se tomen las medidas que "
+        "la plataforma considere pertinentes.",
+        "Como parte de la comunidad de Change.org, pido que se revise {ref} "
+        "por incitar al acoso contra personas identificables. El texto no "
+        "discute ideas: descalifica a quienes piensan distinto y los expone a "
+        "agresiones. Las normas de la comunidad existen para proteger a las "
+        "personas usuarias, no para amparar campañas de hostigamiento. Pido "
+        "que se actúe conforme a las reglas y que se evite que el daño siga "
+        "creciendo.",
+    ),
+    "violencia": (
+        "Reporto {ref} porque su llamado va más allá de la protesta y puede "
+        "leerse como una invitación a la agresión o a tomar represalias. Las "
+        "normas de la comunidad de Change.org prohíben la incitación a la "
+        "violencia, y con razón: ninguna causa justifica poner en riesgo la "
+        "integridad de otras personas. Una petición puede exigir cambios con "
+        "firmeza, pero siempre por vías pacíficas y legales. Solicito que el "
+        "contenido se revise y se tomen las medidas necesarias.",
+        "Como usuario de Change.org me alarma que {ref} use un tono que parece "
+        "convocar a la fuerza contra personas o instituciones. Las normas de "
+        "la comunidad no permiten la incitación a la violencia, aunque el "
+        "mensaje venga envuelto en una causa legítima. Ese tipo de llamado "
+        "puede derivar en hechos graves y la plataforma no debería prestarle "
+        "su vitrina. Pido que se evalúe el contenido y se actúe conforme a las "
+        "reglas.",
+        "Escribo para reportar {ref}: su lenguaje sugiere tomar la justicia "
+        "por mano propia y hostigar a quienes no piensan igual. Las normas de "
+        "la comunidad de Change.org prohíben expresamente la incitación a la "
+        "violencia, porque la seguridad de las personas está por encima de "
+        "cualquier causa. Hay formas civilizadas de exigir cambios y este "
+        "contenido se aparta de ellas. Solicito una revisión seria y una "
+        "respuesta clara de la plataforma.",
+        "Me preocupa que {ref} pueda interpretarse como un llamado a atacar a "
+        "otras personas. No se trata de un simple desacuerdo: se trata de un "
+        "mensaje que puede empujar a alguien a la agresión. Las normas de la "
+        "comunidad de Change.org prohíben la incitación a la violencia y este "
+        "caso parece encajar en esa prohibición. Pido que se analice el texto "
+        "con cuidado y se tomen las medidas que correspondan.",
+        "Reporto {ref} por su tono amenazante y su llamado implícito a la "
+        "confrontación física. Las normas de la comunidad de Change.org "
+        "existen para que las peticiones sean un instrumento cívico y no un "
+        "detonante de violencia. Una causa puede ser urgente y aun así "
+        "plantearse con respeto y dentro de la ley. Solicito que la plataforma "
+        "revise el contenido y, si confirma el riesgo, lo retire de inmediato.",
+    ),
+    "suplantacion": (
+        "Reporto {ref} porque parece hablar en nombre de personas, colectivos "
+        "u organizaciones que no han autorizado esa petición. Las normas de la "
+        "comunidad de Change.org prohíben la suplantación de identidad, y esa "
+        "regla protege tanto a quien es nombrado sin permiso como a quienes "
+        "firman creyendo que hay un respaldo real. Sin esa autorización, la "
+        "petición induce a error y carece de legitimidad. Pido que se verifique "
+        "el vínculo y se actúe conforme a las reglas.",
+        "Como ciudadano que usa Change.org, considero que {ref} no debería "
+        "publicarse si detrás no hay un vínculo verificable con las personas o "
+        "instancias que menciona. Usar un nombre ajeno para pedir firmas es "
+        "suplantación de identidad, algo que las normas de la comunidad "
+        "prohíben expresamente. La gente firma confiando en que quien convoca "
+        "existe y está de acuerdo. Solicito que la plataforma revise la "
+        "autorización y tome las medidas que correspondan.",
+        "Escribo para reportar {ref} por posible suplantación. El texto se "
+        "presenta como si contara con el aval de una organización o de un "
+        "grupo de personas, pero no hay forma de comprobar ese vínculo. Las "
+        "normas de la comunidad de Change.org exigen que quien crea la "
+        "petición sea quien dice ser, y este caso genera dudas razonables. "
+        "Pido que se verifique la identidad del promotor y, si no se acredita, "
+        "que el contenido sea retirado.",
+        "Me preocupa que {ref} induzca a error al atribuir posturas o acciones "
+        "a personas que quizá ni conocen la petición. Eso es una forma de "
+        "suplantación de identidad y las normas de la comunidad de Change.org "
+        "la prohíben para proteger la confianza en la plataforma. Sin un "
+        "respaldo comprobable, cada firma se convierte en un engaño "
+        "involuntario. Solicito que se revise el caso y se actúe conforme a "
+        "las reglas.",
+        "Reporto {ref} porque da la impresión de hablar en nombre de una "
+        "institución o colectivo sin autorización. Las normas de la comunidad "
+        "de Change.org son claras: no se puede usar la identidad de otros para "
+        "impulsar una causa. Esa práctica engaña a quienes firman y a la gente "
+        "cuya voz se está usando. Pido que se acredite la autorización "
+        "correspondiente o, en su defecto, que la petición sea retirada.",
+    ),
+    "datos_personales": (
+        "Reporto {ref} porque expone datos personales de personas "
+        "identificables, como nombres completos, contactos o señas "
+        "particulares. Las normas de la comunidad de Change.org protegen la "
+        "privacidad y prohíben publicar información privada sin "
+        "consentimiento. Ese contenido puede derivar en acoso, fraude o daños "
+        "difíciles de reparar. Pido que se revise y se proteja a las personas "
+        "afectadas antes de que el daño sea mayor.",
+        "Como usuario de Change.org, considero que {ref} va demasiado lejos al "
+        "incluir información privada de terceros que no eligieron ser "
+        "exhibidos. Las normas de la comunidad prohíben publicar datos "
+        "personales, y esa protección no cambia porque la causa parezca justa. "
+        "La seguridad de las personas está primero. Solicito que la plataforma "
+        "evalúe el contenido y lo ajuste o retire conforme a sus reglas.",
+        "Escribo para señalar que {ref} incluye detalles que permiten "
+        "identificar a personas concretas, lo cual no corresponde a una "
+        "petición respetuosa. Las normas de la comunidad de Change.org "
+        "prohíben exponer datos personales porque ese tipo de información "
+        "puede usarse para hostigar o cometer fraudes. Una causa legítima no "
+        "necesita señalar a nadie con nombre y apellido. Pido que se revise el "
+        "texto y se actúe en consecuencia.",
+        "Me preocupa que {ref} publique datos de personas que no dieron su "
+        "consentimiento. Eso viola las normas de la comunidad de Change.org "
+        "sobre privacidad, y el riesgo no es menor: basta una vez en internet "
+        "para que la exposición sea permanente. Pido que el contenido se "
+        "evalúe con cuidado y que, de confirmarse, se elimine la información "
+        "personal antes de permitir que la petición siga recibiendo firmas.",
+        "Reporto {ref} por contener información privada que puede poner en "
+        "peligro a las personas mencionadas. Las normas de la comunidad de "
+        "Change.org prohíben compartir datos personales sin autorización y "
+        "este caso parece incumplirlas. El derecho a exigir un cambio no puede "
+        "ejercerse a costa de la seguridad de otros. Solicito que la "
+        "plataforma revise el contenido y aplique las medidas que sus reglas "
+        "contemplan.",
+    ),
+    "spam_estafa": (
+        "Reporto {ref} porque más que una causa parece un vehículo para "
+        "difundir enlaces promocionales o esquemas engañosos. Las normas de la "
+        "comunidad de Change.org prohíben el spam y las prácticas que buscan "
+        "aprovecharse de la buena voluntad de quienes firman. Eso daña la "
+        "confianza en la plataforma y desvía la atención de las causas reales. "
+        "Pido que se revise el contenido y se actúe conforme a las reglas.",
+        "Como usuario de Change.org, desconfío de {ref}: el texto incluye "
+        "llamados a entrar a sitios, compartir datos o dar dinero que no "
+        "tienen relación con una petición legítima. Las normas de la comunidad "
+        "prohíben el spam y las estafas, precisamente para proteger a la gente "
+        "que firma con buena fe. Solicito que la plataforma investigue el caso "
+        "y tome las medidas que correspondan.",
+        "Escribo para reportar {ref} por su apariencia de campaña fraudulenta. "
+        "En lugar de plantear una causa y sus argumentos, el contenido empuja "
+        "a la gente hacia enlaces o promesas que no se pueden verificar. Las "
+        "normas de la comunidad de Change.org prohíben ese tipo de spam y "
+        "engaño, y su permanencia afecta a todas las peticiones serias. Pido "
+        "una revisión pronta y una decisión apegada a las reglas.",
+        "Me preocupa que {ref} se use para recolectar información o dinero con "
+        "promesas dudosas. Las normas de la comunidad de Change.org prohíben "
+        "el spam y las prácticas engañosas, porque las personas que firman "
+        "merecen saber a qué están apoyando. Una causa legítima se sostiene "
+        "con transparencia, no con anzuelos. Solicito que se revise el "
+        "contenido y se actúe en consecuencia.",
+        "Reporto {ref} porque su difusión parece automática o promocional, sin "
+        "el contenido propio de una petición ciudadana. Las normas de la "
+        "comunidad de Change.org prohíben el spam y las estafas, y este caso "
+        "encaja en ese patrón: promesas vagas, enlaces insistentes y ningún "
+        "responsable claro. Pido que la plataforma evalúe el contenido y lo "
+        "retire si confirma el incumplimiento.",
+    ),
+    "contenido_sexual": (
+        "Reporto {ref} porque incluye contenido sexual que no corresponde a "
+        "una petición y puede exponer a menores o a personas vulnerables. Las "
+        "normas de la comunidad de Change.org prohíben el contenido sexual y "
+        "la explotación, ya que la plataforma está abierta a todo público. Ese "
+        "material puede causar daños graves y no tiene cabida como causa "
+        "ciudadana. Pido que se revise de inmediato y se tomen las medidas "
+        "necesarias.",
+        "Como usuario de Change.org, considero que {ref} no debería permanecer "
+        "publicada si contiene referencias sexuales explícitas o material de "
+        "explotación. Las normas de la comunidad prohíben ese contenido para "
+        "proteger a las personas, en especial a menores y víctimas. Una "
+        "petición debe servir para proponer cambios, no para exhibir o "
+        "normalizar este tipo de material. Solicito una revisión urgente.",
+        "Escribo para reportar {ref} por incluir contenido sexual o "
+        "referencias que pueden constituir explotación. Las normas de la "
+        "comunidad de Change.org prohíben expresamente ese material porque la "
+        "seguridad de las personas está primero. No importa que la causa se "
+        "presente como legítima: hay límites que no se pueden cruzar. Pido que "
+        "la plataforma evalúe el caso con prioridad y actúe conforme a sus "
+        "reglas.",
+        "Me alarma que {ref} pueda estar usando la plataforma para exponer o "
+        "sexualizar a personas sin su consentimiento. Las normas de la "
+        "comunidad de Change.org prohíben el contenido sexual y la "
+        "explotación, y este caso merece una revisión cuidadosa por el riesgo "
+        "que implica. Pido que se proteja a las personas afectadas y que, de "
+        "confirmarse, el contenido sea retirado sin demora.",
+        "Reporto {ref} porque su contenido tiene un carácter sexual "
+        "incompatible con las normas de la comunidad de Change.org, que "
+        "prohíben ese tipo de material y cualquier forma de explotación. La "
+        "plataforma es un espacio cívico y debe seguir siéndolo, sobre todo "
+        "para las personas más jóvenes. Solicito que se revise el texto y se "
+        "apliquen las medidas que las reglas contemplan.",
+    ),
+    "manipulacion": (
+        "Reporto {ref} porque parece una campaña manipulada: simula apoyos, "
+        "repite firmas o utiliza tácticas engañosas para aparentar más "
+        "respaldo del que tiene. Las normas de la comunidad de Change.org "
+        "prohíben ese tipo de prácticas porque desvirtúan la voz ciudadana y "
+        "engañan a quien firma. La legitimidad de una petición se construye "
+        "con transparencia, no con artificios. Pido que se investigue y se "
+        "actúe conforme a las reglas.",
+        "Como usuario de Change.org, considero que {ref} no debería seguir "
+        "recibiendo firmas si su alcance se infla de forma artificial. Las "
+        "normas de la comunidad prohíben duplicar campañas y simular apoyos "
+        "para presionar con datos falsos. Eso perjudica a las causas "
+        "auténticas y a las personas que deciden con base en el número de "
+        "firmas. Solicito que la plataforma revise el caso y tome las medidas "
+        "correspondientes.",
+        "Escribo para reportar {ref} por posibles tácticas de manipulación, "
+        "como incentivos engañosos o identidades falsas entre quienes firman. "
+        "Las normas de la comunidad de Change.org buscan que cada petición sea "
+        "lo que dice ser, y este caso genera serias dudas. La confianza en la "
+        "plataforma depende de que sus causas sean genuinas. Pido una revisión "
+        "a fondo y una decisión apegada a las reglas.",
+        "Me preocupa que {ref} engañe a las personas firmantes con promesas o "
+        "información que no corresponden a una petición real. Las normas de la "
+        "comunidad de Change.org prohíben la manipulación y el uso engañoso de "
+        "la plataforma, porque cada firma debe ser una decisión libre e "
+        "informada. Solicito que se evalúe el contenido y se actúe en "
+        "consecuencia.",
+        "Reporto {ref} porque su forma de difundirse parece artificial y "
+        "orientada a inflar el apoyo con cuentas o dinámicas que no "
+        "representan a la ciudadanía. Las normas de la comunidad de Change.org "
+        "prohíben esas prácticas: una causa honesta no necesita simular "
+        "respaldo. Pido que la plataforma investigue el origen de las firmas y "
+        "actúe conforme a sus reglas.",
+    ),
+}
+
+
+def _referencia_queja_change(contexto: str) -> str:
+    """Referencia suave al contexto para las plantillas locales.
+
+    Devuelve "esta petición" cuando no hay contexto (o es largo: nunca se
+    copia literal). Si el contexto es corto (<=40 caracteres) lo menciona de
+    forma suave; siempre sin inventar hechos. Nunca lanza.
+    """
+    try:
+        t = " ".join(str(contexto or "").split())
+        t = re.sub(r"[-–—]{2,}", " ", t).strip()
+    except Exception:
+        return "esta petición"
+    if not t or len(t) > 40:
+        return "esta petición"
+    return f"una petición sobre «{t}»"
+
+
+def _normalizar_queja_change(texto) -> str:
+    """Deja la respuesta de la IA en UN parrafo limpio de <=1200 caracteres.
+
+    - Toma solo el primer fragmento si el modelo devolvio varias opciones
+      separadas con ``---``.
+    - Convierte saltos de linea y espacios multiples en un parrafo corrido.
+    - Quita fences de markdown, prefijos numerados/vinetas y comillas.
+    - Si viene larguisimo, recorta a ``_MAX_LARGO_QUEJA_CHANGE`` en frase
+      completa (o en la ultima palabra completa si no hay puntuacion).
+    Nunca lanza; devuelve "" solo si no hay texto util.
+    """
+    try:
+        t = str(texto or "")
+    except Exception:
+        return ""
+    if not t.strip():
+        return ""
+    try:
+        t = t.replace("\r\n", "\n").replace("\r", "\n")
+        t = t.replace("```", " ")
+        if "---" in t:
+            t = t.split("---", 1)[0]
+        t = t.replace("\\n", " ")
+        t = " ".join(t.split())
+        t = re.sub(r"\s+", " ", t).strip()
+        if not t:
+            return ""
+        try:
+            t = GeneradorContenido._limpiar_texto(t)
+        except Exception:
+            pass
+        t = t.strip().strip('"').strip("'").strip()
+        t = re.sub(r"\s+", " ", t).strip()
+        if len(t) > _MAX_LARGO_QUEJA_CHANGE:
+            t = _cortar_texto_a_limite(t, _MAX_LARGO_QUEJA_CHANGE)
+            t = re.sub(r"\s+", " ", t).strip()
+        return t
+    except Exception as e:
+        logger.error(f"Error normalizando queja de Change: {e}")
+        return ""
+
+
+def _comparar_queja_change(texto) -> str:
+    """Clave de comparacion (lower + espacios colapsados); nunca lanza."""
+    try:
+        return re.sub(r"\s+", " ", str(texto or "").strip()).lower()
+    except Exception:
+        return ""
+
+
+def _normalizar_evitar_queja_change(evitar) -> set:
+    """Convierte ``evitar`` en un set de claves normalizadas.
+
+    Tolera None, un string suelto, listas/tuplas/sets (con None o espacios
+    dentro) y cualquier iterable; ignora lo vacio. Nunca lanza.
+    """
+    usados: set = set()
+    if evitar is None:
+        return usados
+    if isinstance(evitar, str):
+        candidatos = [evitar]
+    else:
+        try:
+            candidatos = list(evitar)
+        except TypeError:
+            candidatos = [evitar]
+    for x in candidatos:
+        if x is None:
+            continue
+        clave = _comparar_queja_change(x)
+        if clave:
+            usados.add(clave)
+    return usados
+
+
+def _queja_change_local(contexto: str, semilla: int = 0) -> str:
+    """Genera una queja local (sin IA) rotando angulo y plantilla.
+
+    Hay >=5 plantillas por angulo (``_PLANTILLAS_QUEJA_CHANGE``); ``semilla``
+    elige el angulo (``semilla % n``) y la plantilla de forma determinista,
+    para que semillas distintas produzcan textos distintos. No copia el
+    contexto literal (a lo sumo alude a el si es corto) y nunca inventa
+    nombres, fechas ni cifras. Devuelve SIEMPRE un parrafo no vacio; nunca
+    lanza.
+    """
+    texto = ""
+    try:
+        total = len(ANGULOS_QUEJA_CHANGE)
+        try:
+            valor = int(semilla)
+        except (TypeError, ValueError):
+            valor = 0
+        indice = valor % total if total else 0
+        slug = ANGULOS_QUEJA_CHANGE[indice] if total else ""
+        plantillas = (
+            _PLANTILLAS_QUEJA_CHANGE.get(slug)
+            or _PLANTILLAS_QUEJA_CHANGE["desinformacion"]
+        )
+        rng = random.Random(valor)
+        plantilla = rng.choice(list(plantillas))
+        texto = plantilla.format(ref=_referencia_queja_change(contexto))
+    except Exception as e:
+        logger.error(f"Error generando queja local de Change: {e}")
+        texto = ""
+    if not texto:
+        texto = (
+            "Considero que esta petición incumple las normas de la comunidad "
+            "de Change.org porque presenta afirmaciones sin respaldo y no "
+            "ofrece pruebas verificables; por eso pido que la plataforma la "
+            "revise y actúe conforme a sus reglas."
+        )
+    return _normalizar_queja_change(texto)
+
+
+def _queja_change_fallback_unico(contexto: str, usados: set) -> str:
+    """Fallback local garantizando que el texto NO este en ``usados``.
+
+    Prueba varias semillas aleatorias y, como ultima red, agrega un cierre
+    extra numerado. Devuelve SIEMPRE un parrafo no vacio; nunca lanza.
+    """
+    for _ in range(12):
+        try:
+            semilla = random.randrange(1, 10 ** 9)
+        except Exception:
+            semilla = 7
+        candidato = _queja_change_local(contexto, semilla)
+        if candidato and _comparar_queja_change(candidato) not in usados:
+            return candidato
+    base = _queja_change_local(contexto, 0)
+    if not base:
+        base = (
+            "Considero que esta petición incumple las normas de la comunidad "
+            "de Change.org porque difunde afirmaciones sin respaldo y no "
+            "ofrece pruebas verificables; pido que la plataforma la revise y "
+            "actúe conforme a sus reglas."
+        )
+    cierres = (
+        "",
+        " Por todo lo anterior, pido a Change.org que revise esta petición y "
+        "actúe conforme a sus normas de comunidad.",
+        " Asimismo, solicito que la decisión se comunique a quienes seguimos "
+        "la petición.",
+        " Insisto en que la revisión se haga con transparencia y perspectiva "
+        "de derechos.",
+    )
+    for cierre in cierres:
+        candidato = _normalizar_queja_change(base + cierre)
+        if candidato and _comparar_queja_change(candidato) not in usados:
+            return candidato
+    for intento in range(1, 6):
+        candidato = _normalizar_queja_change(base + f" (reporte {intento})")
+        if candidato and _comparar_queja_change(candidato) not in usados:
+            return candidato
+    return _normalizar_queja_change(base)
+
+
+def generar_queja_change(contexto: str, evitar=None, variante: int = None) -> dict:
+    """Genera UNA queja ORIGINAL para el formulario de reporte de Change.org.
+
+    Entrada:
+      - contexto: tema general de la queja (texto libre del operador).
+      - evitar: iterable de textos ya usados en la campana que NO deben repetirse.
+      - variante: int para forzar un angulo; None = aleatorio.
+
+    Salida (dict):
+      {"ok": bool, "queja": str, "usada_ia": bool, "error": str}
+      - queja SIEMPRE no vacia (fallback local si la IA falla o repite).
+      - usada_ia=True solo si el texto vino del modelo.
+      - error="" si todo bien; si la IA fallo, describe el motivo (corto).
+    """
+    error = ""
+    texto = ""
+    usados = _normalizar_evitar_queja_change(evitar)
+    try:
+        try:
+            v = (
+                int(variante)
+                if variante is not None
+                else random.randrange(1, 10 ** 9)
+            )
+        except (TypeError, ValueError):
+            v = random.randrange(1, 10 ** 9)
+        generador = GeneradorContenido()
+        prompt = get_prompt_queja_change(contexto, v)
+
+        try:
+            content = generador._chat(prompt, temperature=0.9)
+            texto = _normalizar_queja_change(content)
+        except Exception as e:
+            error = str(e)[:300]
+            texto = ""
+
+        if not error:
+            if not texto:
+                error = "la IA devolvio una respuesta vacia"
+            elif _comparar_queja_change(texto) in usados:
+                # Un unico reintento avisando del texto ya usado.
+                try:
+                    prompt_retry = (
+                        prompt
+                        + "\n\nNO repitas este texto ya usado: "
+                        + texto
+                        + "\nGenera una queja NUEVA, distinta y con otro "
+                        "enfoque."
+                    )
+                    content2 = generador._chat(prompt_retry, temperature=0.9)
+                    texto2 = _normalizar_queja_change(content2)
+                except Exception as e:
+                    texto2 = ""
+                    error = str(e)[:300]
+                if texto2 and _comparar_queja_change(texto2) not in usados:
+                    texto = texto2
+                    error = ""
+                else:
+                    texto = ""
+                    if not error:
+                        error = "la IA repitio un texto ya usado"
+    except Exception as e:
+        error = str(e)[:300]
+        texto = ""
+
+    if texto and not error:
+        return {"ok": True, "queja": texto, "usada_ia": True, "error": ""}
+
+    try:
+        queja = _queja_change_fallback_unico(contexto, usados)
+    except Exception:
+        queja = ""
+    if not queja:
+        queja = (
+            "Considero que esta petición incumple las normas de la comunidad "
+            "de Change.org porque presenta afirmaciones sin respaldo y no "
+            "ofrece pruebas verificables; por eso pido que la plataforma la "
+            "revise y actúe conforme a sus reglas."
+        )
+    return {"ok": True, "queja": queja, "usada_ia": False, "error": error}

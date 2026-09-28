@@ -64,6 +64,16 @@ def get_db_session() -> Generator:
         db.close()
 
 
+def obtener_sesion():
+    """Alias publico de `get_db_session()` (context manager de sesion SQLAlchemy).
+
+    Uso: `with obtener_sesion() as db: db.add(...)`.
+    Se expone con este nombre porque la granja de identidades de Change.org
+    (`cuentas/change_org.py`) lo consume asi y asi queda una sola puerta de
+    entrada a la BD del proyecto."""
+    return get_db_session()
+
+
 def init_db():
     # Importa los modelos para que queden registrados en Base.metadata antes
     # de create_all, sin importar el orden en que se llame desde fuera.

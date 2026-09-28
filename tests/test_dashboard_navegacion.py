@@ -14,7 +14,8 @@ Verifica (sin Chrome y sin Streamlit runtime) que:
   - El default recomendado de "Navegadores simultaneos" de Activacion Masiva
     es 2.
   - `iniciar_dashboard` se importa sin arrancar Streamlit (def main + guard) y
-    `web/operaciones/change.py` NO borra `builtins.input` (lo restaura).
+    `web/operaciones/change.py` es el ATAQUE DE REPORTES (sin `builtins.input`
+    ni la logica vieja de firmas).
   - El reparto por porcentajes `_repartir_por_porcentajes` de Activacion
     Masiva (helper puro: resto mayor, roles con peso 0 nunca reciben cuentas)
     y que los widgets/botones viejos (rol aleatorio, preset trending, reparto
@@ -42,7 +43,6 @@ El recorrido completo de operaciones visibles con `AppTest` se corre aparte
 from __future__ import annotations
 
 import ast
-import builtins
 import subprocess
 import sys
 from pathlib import Path
@@ -164,41 +164,6 @@ def _tiene_guard_main(ruta: Path) -> tuple[bool, bool]:
             ):
                 tiene_guard = True
     return tiene_guard, tiene_main
-
-
-def _change_no_borra_input() -> tuple[bool, bool, bool]:
-    """(no borra builtins.input, restaura `_INPUT_ORIGINAL`, lo define) via AST."""
-    fuente = (RAIZ / "web" / "operaciones" / "change.py").read_text(encoding="utf-8")
-    arbol = ast.parse(fuente)
-    borra = False
-    restaura = False
-    for nodo in ast.walk(arbol):
-        if isinstance(nodo, ast.Delete):
-            for objetivo in nodo.targets:
-                if (
-                    isinstance(objetivo, ast.Attribute)
-                    and objetivo.attr == "input"
-                    and isinstance(objetivo.value, ast.Name)
-                    and objetivo.value.id == "builtins"
-                ):
-                    borra = True
-        if isinstance(nodo, ast.Assign) and len(nodo.targets) == 1:
-            objetivo = nodo.targets[0]
-            if (
-                isinstance(objetivo, ast.Attribute)
-                and objetivo.attr == "input"
-                and isinstance(objetivo.value, ast.Name)
-                and objetivo.value.id == "builtins"
-                and isinstance(nodo.value, ast.Name)
-                and nodo.value.id == "_INPUT_ORIGINAL"
-            ):
-                restaura = True
-    define_original = (
-        '_INPUT_ORIGINAL = getattr(builtins, "input", None)' in fuente
-    )
-    # Chequeo literal pedido: el archivo NO debe contener `del builtins.input`.
-    sin_del = "del builtins.input" not in fuente
-    return (not borra) and sin_del, restaura, define_original
 
 
 def _tipo_mapa_nombres() -> dict:
@@ -1266,14 +1231,23 @@ def run(check):
 
     from web.operaciones import change as change_page
 
-    check(
-        "change: guarda el input() original del proceso",
-        change_page._INPUT_ORIGINAL is builtins.input,
+    fuente_change = (RAIZ / "web" / "operaciones" / "change.py").read_text(
+        encoding="utf-8"
     )
-    no_borra, restaura, define_original = _change_no_borra_input()
     check(
-        "change: sin 'del builtins.input' y con restauracion del original",
-        no_borra and restaura and define_original,
+        "change reportes: la pagina ya no toca builtins.input ni _INPUT_ORIGINAL",
+        not hasattr(change_page, "_INPUT_ORIGINAL")
+        and "builtins" not in dir(change_page)
+        and '_INPUT_ORIGINAL = getattr' not in fuente_change
+        and "del builtins.input" not in fuente_change,
+    )
+    check(
+        "change reportes: ataque de reportes con backend y panel persistente",
+        callable(getattr(change_page, "render", None))
+        and "ejecutar_campana_reportes" in fuente_change
+        and "_render_proceso_activo" in fuente_change
+        and "CuentaChange" in fuente_change
+        and "firmas_por_ip" not in fuente_change,
     )
 
     # ---------------- Pestana Nombres: nombres masivos con IA ----------------

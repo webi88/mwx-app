@@ -1821,3 +1821,101 @@ def get_prompt_identidades_contexto(
         return _construir_prompt_identidades(seccion, registro, tipo, contexto)
     except Exception:
         return ""
+
+
+# --------------------------------------------------------------------------- #
+# Reporte de peticiones en Change.org (violacion de politicas): UNA queja (un
+# parrafo) sobre por que la peticion viola las NORMAS DE LA COMUNIDAD. El
+# parametro `variante` rota el ANGULO para que cada llamada de la campana
+# enfoque algo distinto; el contexto del operador es solo referencia (prohibido
+# copiarlo literal o inventar nombres, fechas, cifras o hechos).
+# --------------------------------------------------------------------------- #
+ANGULOS_QUEJA_CHANGE = (
+    "desinformacion",
+    "odio_acoso",
+    "violencia",
+    "suplantacion",
+    "datos_personales",
+    "spam_estafa",
+    "contenido_sexual",
+    "manipulacion",
+)
+
+_ANGULOS_QUEJA_CHANGE_DETALLE = (
+    "DESINFORMACIÓN: la petición presenta como hechos comprobados afirmaciones "
+    "o acusaciones sin respaldo verificable",
+    "DISCURSO DE ODIO O ACOSO: la petición ataca, estigmatiza o señala a "
+    "personas o grupos por su identidad, condición o creencias",
+    "INCITACIÓN A LA VIOLENCIA: la petición llama a la agresión, a las "
+    "represalias o al hostigamiento contra personas o instituciones",
+    "SUPLANTACIÓN DE IDENTIDAD: la petición habla en nombre de personas, "
+    "colectivos u organizaciones sin autorización ni vínculo real",
+    "DATOS PERSONALES: la petición expone o solicita información privada de "
+    "personas identificables",
+    "SPAM O ESTAFA: la petición se usa para difundir enlaces, promociones o "
+    "esquemas engañosos ajenos a una causa legítima",
+    "CONTENIDO SEXUAL O EXPLOTACIÓN: la petición incluye contenido sexual o "
+    "pone en riesgo a menores o personas vulnerables",
+    "MANIPULACIÓN DE LA PLATAFORMA: la petición simula apoyos, duplica "
+    "campañas o engaña a las personas firmantes para inflar su alcance",
+)
+
+
+def get_prompt_queja_change(contexto: str, variante: int = 0) -> str:
+    """Prompt de UNA queja ciudadana para reportar una peticion de Change.org.
+
+    Genera el prompt de un párrafo único (60-140 palabras, primera persona,
+    tono firme pero civil) que explica por qué la petición viola las NORMAS DE
+    LA COMUNIDAD de Change.org. ``variante`` rota por la lista
+    ``ANGULOS_QUEJA_CHANGE`` (``variante % n``) para que cada llamada de la
+    campaña enfoque un incumplimiento distinto (desinformación, odio/acoso,
+    violencia, suplantación, datos personales, spam/estafa, contenido sexual,
+    manipulación de la plataforma).
+
+    ``contexto`` es el TEMA DE REFERENCIA del operador: va en un bloque
+    etiquetado y el prompt prohíbe copiarlo literalmente o inventar nombres,
+    fechas, cifras o hechos específicos. Devuelve SOLO el prompt (string),
+    listo para el cliente de chat. Nunca lanza: ante un ``variante`` inválido
+    usa el ángulo 0.
+    """
+    try:
+        total = len(ANGULOS_QUEJA_CHANGE)
+        indice = int(variante) % total if total else 0
+    except Exception:
+        indice = 0
+    angulo = _ANGULOS_QUEJA_CHANGE_DETALLE[indice] if total else ""
+    tema = " ".join(str(contexto or "").split())[:300]
+    if not tema:
+        tema = (
+            "(sin tema especifico: reporta de forma general el incumplimiento "
+            "de las normas de la comunidad)"
+        )
+    return (
+        "Eres un ciudadano mexicano que usa Change.org y quiere REPORTAR una "
+        "petición por incumplir las NORMAS DE LA COMUNIDAD de la plataforma.\n"
+        "\nTAREA: redacta UN ÚNICO PÁRRAFO, en español, de 60 a 140 palabras, "
+        "en primera persona (como ciudadano que usa o firma en la plataforma), "
+        "con tono firme pero civil, que explique por qué esa petición viola "
+        "las normas de la comunidad de Change.org.\n"
+        "\nREGLAS:\n"
+        "1. UN solo párrafo corrido: PROHIBIDO escribir títulos, encabezados, "
+        "numeración, viñetas, comillas decorativas o saltos de línea; solo el "
+        "párrafo final.\n"
+        f"2. Enfoque OBLIGATORIO de esta queja: {angulo}.\n"
+        "3. Justifica el incumplimiento en términos de las NORMAS DE LA "
+        "COMUNIDAD de Change.org (menciona la plataforma y sus normas) y "
+        "explica por qué el caso encaja en ese enfoque; no te limites a "
+        "insultar o descalificar.\n"
+        "4. PROHIBIDO copiar el TEMA DE REFERENCIA: puedes reutilizar 3 o 4 "
+        "palabras sueltas como máximo si de verdad hacen falta; el resto debe "
+        "ser redacción propia.\n"
+        "5. PROHIBIDO inventar nombres propios, fechas, cifras, lugares o "
+        "hechos específicos que no estén en el tema de referencia: si algo no "
+        "se puede saber, dilo de forma general.\n"
+        "6. Tono firme pero civil: sin insultos, sin amenazas y sin hablar en "
+        "nombre de Change.org.\n"
+        "7. Devuelve ÚNICAMENTE el párrafo, sin etiquetas, explicaciones ni "
+        "comentarios adicionales.\n"
+        "\nTEMA DE REFERENCIA (puedes aludir a él, nunca copiarlo literal):\n"
+        f"{tema}"
+    )

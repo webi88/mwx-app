@@ -9,7 +9,9 @@ Comprueba que:
   1. `Network.setCookie` (CDP) inyecta las cookies SIN depender del documento.
   2. Desaparece `invalid cookie domain` (bug de `driver.add_cookie`).
   3. Reporta el resultado real: sesion confirmada con ct0, o
-     "X no emitio ct0"/"sesion expirada" (auth_token vencido => NO es bug).
+     "X no emitio ct0"/"sesion expirada"; y si el auth_token esta muerto,
+     informa si el fallback de password/TOTP la revivio
+     ("revivida con password") o si ese login tambien fallo.
 
 PROHIBIDO publicar/reportar/enviar: este script SOLO hace login y cierra Chrome
 (`bot.cerrar()` en `finally`).
@@ -110,6 +112,11 @@ def main() -> int:
                 l for l in lineas
                 if ("no emitio ct0" in l) or ("no emitió ct0" in l)
             ]
+            pw_intento = [l for l in lineas if "revivir con" in l]
+            pw_ok = [l for l in lineas if "revivida con password" in l]
+            pw_fallo = [
+                l for l in lineas if "login con password/TOTP tambien fallo" in l
+            ]
             error = (bot.ultimo_error or "").strip()
 
             total += 1
@@ -135,6 +142,26 @@ def main() -> int:
                    if sin_ct0 else "emitido o sesion no evaluada"),
                 flush=True,
             )
+            if pw_intento:
+                print(
+                    "    fallback password: "
+                    + ("REVIVIDA" if pw_ok else ("tambien fallo" if pw_fallo else "en curso")),
+                    flush=True,
+                )
+                pistas = []
+                for linea in lineas:
+                    if any(
+                        frag in linea
+                        for frag in (
+                            "campo de usuario", "campo de contraseña",
+                            "Resolviendo challenge", "Timeout en login",
+                            "login_con_password fallo", "revivir con",
+                        )
+                    ):
+                        if linea not in pistas:
+                            pistas.append(linea)
+                for pista in pistas[:6]:
+                    print(f"    pista: {pista}", flush=True)
             print(f"    ultimo_error: {error or '(vacio)'}", flush=True)
         finally:
             try:

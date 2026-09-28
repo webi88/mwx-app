@@ -51,7 +51,7 @@ OPCIONES = [
     "💬 Crisis: Respuestas",
     "👥 Grupos: Reciprocidad",
     "📋 Resúmenes Ejecutivos",
-    "✍️ Change.org: Peticiones",
+    "✍️ Change.org: Reportes",
     "📊 Reportes",
     "📈 Monitor: Actividad",
 ]
@@ -91,7 +91,7 @@ CATEGORIAS = [
             "💬 Crisis: Respuestas",
             "👥 Grupos: Reciprocidad",
             "📋 Resúmenes Ejecutivos",
-            "✍️ Change.org: Peticiones",
+            "✍️ Change.org: Reportes",
         ],
     ),
     (

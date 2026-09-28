@@ -186,3 +186,34 @@ class RegistroAccion(Base):
     url_publicacion = Column(Text, default="")
     detalle = Column(Text, default="")
     fecha = Column(DateTime, default=datetime.utcnow)
+
+
+class CuentaChange(Base):
+    """Granja de identidades de Change.org (Nombre / Apellido / Correo).
+
+    Cada fila es una identidad lista para usarse en reportes de violacion de
+    politicas (y, mas adelante, en firmas masivas) de Change.org. 'contexto' es
+    el motivo general de la queja que captura el operador y 'queja' es el texto
+    final que la IA genero y se envio en el reporte. 'usada_firma' es el flag
+    pensado para el futuro modulo de firmas masivas (True = la identidad ya se
+    uso para firmar). 'origen' registra de donde salio la identidad: "reporte"
+    ahora; mas adelante "firma"/"manual".
+
+    El email es UNIQUE a proposito: la granja no debe duplicar identidades.
+
+    Nota: la tabla se crea sola con `Base.metadata.create_all` (via `init_db`),
+    por lo que no requiere migracion ALTER en core/database.py."""
+
+    __tablename__ = "cuenta_change"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    nombre = Column(String(120), default="")
+    apellido = Column(String(120), default="")
+    email = Column(String(200), default="", unique=True)  # unico: la granja no debe duplicar identidades
+    codigo_postal = Column(String(20), default="")
+    url_peticion = Column(Text, default="")
+    contexto = Column(Text, default="")   # motivo general de la queja (input del operador)
+    queja = Column(Text, default="")      # texto que la IA genero y se envio en el reporte
+    origen = Column(String(30), default="reporte")  # "reporte" ahora; futuro "firma"/"manual"
+    usada_firma = Column(Boolean, default=False)    # flag para el futuro modulo de firmas masivas
+    fecha_creacion = Column(DateTime, default=datetime.utcnow)
