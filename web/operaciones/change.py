@@ -1,10 +1,18 @@
-"""Operacion CHANGE.ORG: REPORTES (ataque masivo de reportes de politicas).
+"""Operacion CHANGE.ORG: REPORTES DE POLITICAS + REGISTRO DE CUENTAS.
 
-Antes esta pagina era un formulario de FIRMAS con `ChangeOrgBot` y un
-monkeypatch de `builtins.input()` para las pausas de reconexion de IP. Eso se
-elimino por completo: ahora lanza un ATAQUE DE REPORTES masivo en Change.org
-con identidades generadas por IA (nombre, apellido, email, codigo postal y la
-queja redactada por la IA a partir del motivo del operador).
+La pagina tiene DOS pestanas:
+
+1. "🚩 Ataque de reportes": reporta una peticion de Change.org por violar sus
+   normas. Dos modos:
+     - "🧾 Con cuentas registradas (recomendado)": cada reporte sale con una
+       cuenta de X (reparto round-robin); el backend inicia sesion o registra
+       la cuenta en Change.org antes de reportar (asi los avisos de Change
+       llegan al correo de esa cuenta).
+     - "🎭 Anonimo (identidades IA)": comportamiento clasico con identidades
+       generadas por IA que quedan en la granja `CuentaChange`.
+2. "🧾 Cuentas Change.org": registra o inicia sesion en Change.org con el
+   correo y la contrasena de las cuentas de X (los avisos de Change llegan a
+   esos correos; si el correo ya tiene cuenta, solo inicia sesion).
 
 Backend congelado (`cuentas/change_org.py`), importado PEREZOSAMENTE dentro
 del handler del boton para que la pagina cargue sin Chrome:
@@ -13,22 +21,53 @@ del handler del boton para que la pagina cargue sin Chrome:
         url_peticion=..., contexto=..., cantidad=..., max_workers=...,
         usar_proxies=..., pais_proxy=..., guardar_identidades=...,
         headless=..., cancelar=<threading.Event>, callback=cb,
+        cuentas=[{usuario,email,email_password,nombre_mostrado}] | None,
+        esperar_captcha_seg=None,   # modo asistido (solo si la firma lo acepta)
     )
 
-El callback llega en los hilos worker del backend ("inicio" + un evento por
-reporte) y SOLO muta el registro de campanas a nivel modulo (`_CAMPANAS` +
+    ejecutar_campana_registros(
+        cuentas=[...], max_workers=..., usar_proxies=..., pais_proxy=...,
+        headless=..., cancelar=<threading.Event>, callback=cb,
+        esperar_captcha_seg=None,   # modo asistido (solo si la firma lo acepta)
+    )
+
+Callbacks (llegan en los hilos worker del backend):
+  - "inicio": ``{"tipo":"inicio","total":N}``.
+  - "reporte": ``{"tipo":"reporte","hechas":i,"total":N,"ok":bool,
+    "email":str,"usuario":str (solo con cuentas),"con_cuenta":bool,
+    "identidad":{...} (solo anonimo),"detalle":str}``.
+  - "registro": ``{"tipo":"registro","hechas":i,"total":N,"ok":bool,
+    "usuario":str,"email":str,"estado":"nueva"|"existente"|"fallo"|"omitida",
+    "detalle":str}``.
+  - "espera_captcha": ``{"tipo":"espera_captcha","hechas":i,"total":N,
+    "usuario":str,"email":str,"detalle":"esperando captcha (Ns)"}``: el modo
+    asistido espera a que el humano resuelva el reto de Cloudflare; solo
+    agrega una linea al log (NO cuenta como exito/fallo).
+
+Modo asistido anti-bot (Cloudflare): en "⚙️ Opciones avanzadas" de AMBAS
+pestanas esta el checkbox "🧠 Esperar a que resuelvas el captcha a mano
+(requiere Chrome visible)". Con el marcado, la pagina fuerza Chrome visible
+(el checkbox de visible queda deshabilitado), muestra los segundos maximos de
+espera y pasa `esperar_captcha_seg=N` al backend SOLO si su firma lo acepta
+(`_acepta_kwarg`, retrocompatible): con un backend viejo se lanza sin el kwarg
+y se avisa con `st.warning`. El backend espera N segundos a que un humano
+resuelva el reto y luego continua solo.
+
+El callback SOLO muta el registro de campanas a nivel modulo (`_CAMPANAS` +
 `_CAMPANAS_LOCK`): jamas toca `st.*`. El panel `_render_proceso_activo()` se
 pinta SIEMPRE al inicio de `render()` (no en `st.session_state`), asi el
 avance/log sobrevive a un rerun o a navegar a otra operacion, con
 `st.fragment(run_every=1s)` cuando existe y fallback `time.sleep(1)+st.rerun()`
-solo mientras el ataque corre.
+solo mientras la campana corre. El guard de campana unica es COMPARTIDO entre
+reportes y registros.
 
-La granja de identidades (`CuentaChange`) se muestra en un expander con el
-total de filas y las ultimas 20, SIEMPRE envuelta en try/except: si la tabla o
-la BD no existen, la pagina sigue funcionando con un caption informativo.
+La granja de identidades (`CuentaChange`) se muestra al final en un expander
+con el total de filas y las ultimas 20, SIEMPRE envuelta en try/except: si la
+tabla o la BD no existen, la pagina sigue funcionando con un caption.
 """
 from __future__ import annotations
 
+import inspect
 import os
 import threading
 import time
@@ -38,23 +77,48 @@ import streamlit as st
 
 from web.ui import cabecera
 
+# ============================ CONSTANTES ============================
+
+# Tipos de campana del registro/panel (etiquetan el panel en vivo).
+TIPO_REPORTES = "reportes"
+TIPO_REGISTROS = "registros"
+
+# Modos del ataque de reportes (radio de la pestana 1).
+MODO_CON_CUENTAS = "🧾 Con cuentas registradas (recomendado)"
+MODO_ANONIMO = "🎭 Anónimo (identidades IA)"
+
 # ============================ REGISTRO DE CAMPANAS ============================
-# Las campanas de reportes de ESTE proceso (en curso y terminadas). La UI lee
-# el estado desde aqui y no desde `st.session_state`, por lo que el panel
-# reaparece aunque el usuario recargue o cambie de operacion. Los callbacks del
-# backend corren en hilos worker: SIEMPRE mutan el registro bajo lock y NUNCA
-# llaman a `st.*` (Streamlit no es thread-safe).
+# Las campanas de Change.org de ESTE proceso (en curso y terminadas), tanto de
+# reportes como de registros. La UI lee el estado desde aqui y no desde
+# `st.session_state`, por lo que el panel reaparece aunque el usuario recargue
+# o cambie de operacion. Los callbacks del backend corren en hilos worker:
+# SIEMPRE mutan el registro bajo lock y NUNCA llaman a `st.*` (Streamlit no es
+# thread-safe).
 _CAMPANAS: dict = {}
 _CAMPANAS_LOCK = threading.RLock()
 
-# Estados que cuentan como "ataque en curso" (bloquean lanzar otro).
+# Estados que cuentan como "campana en curso" (bloquean lanzar otra).
 _ESTADOS_ACTIVOS = ("en_curso", "deteniendo")
 
-# Maximo de lineas del log en memoria (anti-fuga en campanas de 100 reportes).
+# Maximo de lineas del log en memoria (anti-fuga en campanas de 200 cuentas).
 LOG_MAX = 200
 
 # Etiqueta del pais "sin filtro" del selector de proxies.
 PAIS_TODAS = "Todas"
+
+# Modo asistido anti-bot (Cloudflare): textos compartidos por ambas pestanas.
+CAPTCHA_LABEL = (
+    "🧠 Esperar a que resuelvas el captcha a mano (requiere Chrome visible)"
+)
+CAPTCHA_CAPTION = (
+    "Se abrirá una ventana de Chrome: resuelve el reto de Cloudflare cuando "
+    "aparezca y el bot continuará solo. Usa 1 navegador para el modo asistido."
+)
+CAPTCHA_AVISO_BACKEND = (
+    "⚠️ El modo asistido no está disponible en este backend "
+    "(`esperar_captcha_seg`): la campaña se lanzó sin esperar a que resuelvas "
+    "el captcha."
+)
 
 
 def _entero(valor, default: int = 0) -> int:
@@ -95,16 +159,19 @@ def _campana_en_curso():
     return None
 
 
-def _registrar_campana(hilo=None, evento=None, parametros=None) -> str:
+def _registrar_campana(hilo=None, evento=None, parametros=None,
+                       tipo: str = TIPO_REPORTES) -> str:
     """Registra una campana nueva en estado `en_curso` y devuelve su id.
 
-    Contrato de la entrada: id, hilo, evento (threading.Event de paro),
-    estado, hechas, total, enviados, fallidos, identidades, log (lista),
-    resumen y error (mas inicio/fin/parametros internos)."""
+    Contrato de la entrada: id, tipo ("reportes"/"registros"), hilo, evento
+    (threading.Event de paro), estado, hechas, total, enviados (ok), fallidos,
+    nuevas, existentes, omitidas, identidades, log (lista), resumen y error
+    (mas inicio/fin/parametros internos)."""
     id_campana = f"{int(time.time())}-{uuid.uuid4().hex[:8]}"
     with _CAMPANAS_LOCK:
         _CAMPANAS[id_campana] = {
             "id": id_campana,
+            "tipo": str(tipo or TIPO_REPORTES),
             "hilo": hilo,
             "evento": evento if evento is not None else threading.Event(),
             "estado": "en_curso",
@@ -112,6 +179,9 @@ def _registrar_campana(hilo=None, evento=None, parametros=None) -> str:
             "total": 0,
             "enviados": 0,
             "fallidos": 0,
+            "nuevas": 0,
+            "existentes": 0,
+            "omitidas": 0,
             "identidades": 0,
             "log": [],
             "resumen": None,
@@ -123,14 +193,28 @@ def _registrar_campana(hilo=None, evento=None, parametros=None) -> str:
     return id_campana
 
 
+def _agregar_linea(entrada: dict, linea: str) -> None:
+    """Agrega una linea al log de la entrada y lo recorta a LOG_MAX."""
+    log = entrada.setdefault("log", [])
+    log.append(str(linea))
+    if len(log) > LOG_MAX:
+        del log[:-LOG_MAX]
+
+
 def _anotar_evento(id_campana, evento) -> None:
     """Procesa UN evento del callback del backend (puro: jamas toca `st.*`).
 
     - `{"tipo":"inicio","total":N}`: fija el total planificado.
     - `{"tipo":"reporte",...}`: incrementa hechas/enviados/fallidos, agrega la
-      linea al log (`✅ Reporte enviado por {email}` si ok; `❌ {email} —
-      {detalle}` si falla) y cuenta las identidades recibidas. El log se
-      recorta a `LOG_MAX` lineas.
+      linea al log (`✅ Reporte enviado por {email|@usuario}` si ok; `❌ ... —
+      {detalle}` si falla) y cuenta las identidades recibidas (solo modo
+      anonimo). El log se recorta a `LOG_MAX` lineas.
+    - `{"tipo":"registro",...}`: cuenta ok (nuevas/existentes) y fallidos, y
+      loggea `✅ @usuario — cuenta nueva`, `✅ @usuario — ya tenía cuenta (solo
+      inició sesión)` o `❌ @usuario — detalle`.
+    - `{"tipo":"espera_captcha",...}`: modo asistido; agrega al log
+      `🧠 {email|@usuario} — esperando a que resuelvas el captcha en Chrome
+      (Ns)…` y NO toca ningun contador (no es exito ni fallo).
     """
     if not isinstance(evento, dict) or not id_campana:
         return
@@ -144,10 +228,67 @@ def _anotar_evento(id_campana, evento) -> None:
                 evento.get("total"), _entero(entrada.get("total"))
             )
             return
+        if tipo == "registro":
+            usuario = str(evento.get("usuario") or "").strip().lstrip("@") or "?"
+            ok = bool(evento.get("ok"))
+            estado = str(evento.get("estado") or "").strip().lower()
+            detalle = str(evento.get("detalle") or "").strip()
+            entrada["hechas"] = _entero(
+                evento.get("hechas"), _entero(entrada.get("hechas")) + 1
+            )
+            total = _entero(evento.get("total"))
+            if total:
+                entrada["total"] = total
+            if ok:
+                entrada["enviados"] = _entero(entrada.get("enviados")) + 1
+                if estado == "nueva":
+                    entrada["nuevas"] = _entero(entrada.get("nuevas")) + 1
+                    linea = f"✅ @{usuario} — cuenta nueva"
+                elif estado == "existente":
+                    entrada["existentes"] = (
+                        _entero(entrada.get("existentes")) + 1
+                    )
+                    linea = f"✅ @{usuario} — ya tenía cuenta (solo inició sesión)"
+                else:
+                    linea = f"✅ @{usuario} — {detalle or 'ok'}"
+            elif estado == "omitida":
+                # Cuenta sin correo/contrasena: no abrio navegador (el backend
+                # la reporta aparte, no es un fallo).
+                entrada["omitidas"] = _entero(entrada.get("omitidas")) + 1
+                linea = f"➖ @{usuario} — {detalle or 'omitida'}"
+            else:
+                entrada["fallidos"] = _entero(entrada.get("fallidos")) + 1
+                linea = f"❌ @{usuario} — {detalle or 'fallo sin detalle'}"
+            _agregar_linea(entrada, linea)
+            return
+        if tipo == "espera_captcha":
+            # Modo asistido: el humano debe resolver el reto de Cloudflare en
+            # la ventana de Chrome. NO es exito ni fallo: solo deja la linea.
+            email = str(evento.get("email") or "").strip()
+            usuario = str(evento.get("usuario") or "").strip().lstrip("@")
+            identificador = email or (f"@{usuario}" if usuario else "?")
+            detalle = str(evento.get("detalle") or "").strip()
+            sufijo = ""
+            if detalle:
+                # El backend manda "esperando captcha (Ns)": se conserva "(Ns)".
+                inicio, fin = detalle.rfind("("), detalle.rfind(")")
+                sufijo = (
+                    f" ({detalle[inicio + 1:fin].strip()})"
+                    if 0 <= inicio < fin
+                    else f" ({detalle})"
+                )
+            _agregar_linea(
+                entrada,
+                f"🧠 {identificador} — esperando a que resuelvas el captcha "
+                f"en Chrome{sufijo}…",
+            )
+            return
         if tipo != "reporte":
             return
 
-        email = str(evento.get("email") or "").strip() or "?"
+        email = str(evento.get("email") or "").strip()
+        usuario = str(evento.get("usuario") or "").strip().lstrip("@")
+        identificador = email or (f"@{usuario}" if usuario else "?")
         ok = bool(evento.get("ok"))
         detalle = str(evento.get("detalle") or "").strip()
         entrada["hechas"] = _entero(
@@ -158,21 +299,20 @@ def _anotar_evento(id_campana, evento) -> None:
             entrada["total"] = total
         if ok:
             entrada["enviados"] = _entero(entrada.get("enviados")) + 1
-            linea = f"✅ Reporte enviado por {email}"
+            linea = f"✅ Reporte enviado por {identificador}"
         else:
             entrada["fallidos"] = _entero(entrada.get("fallidos")) + 1
-            linea = f"❌ {email} — {detalle}"
+            linea = f"❌ {identificador} — {detalle}"
         identidad = evento.get("identidad")
         if isinstance(identidad, dict) and identidad:
             entrada["identidades"] = _entero(entrada.get("identidades")) + 1
-        log = entrada.setdefault("log", [])
-        log.append(linea)
-        if len(log) > LOG_MAX:
-            del log[:-LOG_MAX]
+        _agregar_linea(entrada, linea)
 
 
 def _finalizar_campana(id_campana, resumen=None, error=None) -> None:
-    """Cierra la campana: estado final, resumen/error y fin (nunca lanza)."""
+    """Cierra la campana: estado final, resumen/error y fin (nunca lanza).
+
+    Acepta resumenes de reportes (`enviados`) y de registros (`exitosos`)."""
     with _CAMPANAS_LOCK:
         entrada = _CAMPANAS.get(id_campana)
         if entrada is None:
@@ -195,7 +335,8 @@ def _finalizar_campana(id_campana, resumen=None, error=None) -> None:
         if resumen_dict:
             entrada["resumen"] = resumen_dict
             entrada["enviados"] = _entero(
-                resumen_dict.get("enviados"), _entero(entrada.get("enviados"))
+                resumen_dict.get("enviados", resumen_dict.get("exitosos")),
+                _entero(entrada.get("enviados")),
             )
             entrada["fallidos"] = _entero(
                 resumen_dict.get("fallidos"), _entero(entrada.get("fallidos"))
@@ -203,13 +344,22 @@ def _finalizar_campana(id_campana, resumen=None, error=None) -> None:
             entrada["total"] = _entero(
                 resumen_dict.get("total"), _entero(entrada.get("total"))
             )
+            entrada["nuevas"] = _entero(
+                resumen_dict.get("nuevas"), _entero(entrada.get("nuevas"))
+            )
+            entrada["existentes"] = _entero(
+                resumen_dict.get("existentes"), _entero(entrada.get("existentes"))
+            )
+            entrada["omitidas"] = _entero(
+                resumen_dict.get("omitidas"), _entero(entrada.get("omitidas"))
+            )
 
 
 def _solicitar_paro() -> bool:
     """Setea el `threading.Event` de la campana activa. True si habia una.
 
-    Pasa el estado a `deteniendo` (el ataque sigue vivo hasta que el backend
-    termina el reporte en curso)."""
+    Pasa el estado a `deteniendo` (la campana sigue viva hasta que el backend
+    termina el reporte/registro en curso)."""
     with _CAMPANAS_LOCK:
         entrada = None
         for candidata in reversed(list(_CAMPANAS.values())):
@@ -252,6 +402,7 @@ def _snapshot(id_campana=None) -> dict | None:
         estado = str(entrada.get("estado") or "")
         return {
             "id": str(entrada.get("id") or ""),
+            "tipo": str(entrada.get("tipo") or TIPO_REPORTES),
             "estado": estado,
             "en_curso": estado in _ESTADOS_ACTIVOS,
             "deteniendo": estado == "deteniendo",
@@ -259,6 +410,9 @@ def _snapshot(id_campana=None) -> dict | None:
             "total": _entero(entrada.get("total")),
             "enviados": _entero(entrada.get("enviados")),
             "fallidos": _entero(entrada.get("fallidos")),
+            "nuevas": _entero(entrada.get("nuevas")),
+            "existentes": _entero(entrada.get("existentes")),
+            "omitidas": _entero(entrada.get("omitidas")),
             "identidades": _entero(entrada.get("identidades")),
             "log": list(entrada.get("log") or []),
             "resumen": (
@@ -271,7 +425,9 @@ def _snapshot(id_campana=None) -> dict | None:
 
 
 def _filas_resultados(resumen: dict) -> list:
-    """Filas (Email/OK/Detalle) del `resumen["resultados"]` para `st.dataframe`."""
+    """Filas (Email/OK/Detalle) del `resumen["resultados"]` para `st.dataframe`.
+
+    Es el formato del modo anonimo de reportes."""
     filas = []
     for resultado in (resumen or {}).get("resultados") or []:
         if not isinstance(resultado, dict):
@@ -286,44 +442,77 @@ def _filas_resultados(resumen: dict) -> list:
     return filas
 
 
-def _pintar_proceso(snap=None) -> None:
-    """Pinta UNA pasada del panel: en vivo o el resumen final (`st.*` aqui)."""
-    if snap is None:
-        snap = _snapshot()
-    if not snap:
-        return
+def _filas_resultados_registros(resumen: dict) -> list:
+    """Filas (Usuario/Email/Estado/Detalle) del resumen de registros.
 
-    if snap["en_curso"]:
-        st.markdown("#### 🚩 Ataque de reportes en vivo")
-        total = max(1, snap["total"])
-        hechas = min(snap["hechas"], total) if snap["total"] else snap["hechas"]
-        st.progress(min(1.0, hechas / total))
-        st.markdown(
-            f"✅ **{snap['enviados']} enviados** · ❌ {snap['fallidos']} "
-            f"fallidos · 🧾 {snap['identidades']} identidades"
-        )
-        lineas = snap["log"][-12:]
-        if lineas:
-            st.markdown("  \n".join(lineas))
+    `estado` del backend: "nueva" | "existente" | "fallo" | "omitida"
+    (cualquier otro valor se muestra tal cual)."""
+    filas = []
+    for resultado in (resumen or {}).get("resultados") or []:
+        if not isinstance(resultado, dict):
+            continue
+        ok = bool(resultado.get("ok"))
+        estado = str(resultado.get("estado") or "").strip().lower()
+        if ok and estado == "nueva":
+            etiqueta = "🆕 Nueva"
+        elif ok and estado == "existente":
+            etiqueta = "👤 Existente"
+        elif estado == "omitida":
+            etiqueta = "➖ Omitida"
+        elif ok:
+            etiqueta = "✅ OK"
         else:
-            st.markdown("⏳ Esperando los primeros reportes…")
-        if snap["deteniendo"]:
-            st.warning("⛔ Detención solicitada: terminando el reporte en curso…")
-        if st.button(
-            "⛔ Detener",
-            type="primary",
-            key="change_btn_detener",
-            disabled=snap["deteniendo"],
-            help=(
-                "Pide al backend que pare: no lanza reportes nuevos y cierra "
-                "los navegadores al terminar el reporte en curso."
-            ),
-        ):
-            _solicitar_paro()
-            st.rerun()
-        return
+            etiqueta = "❌ Fallo"
+        usuario = str(resultado.get("usuario") or "").strip().lstrip("@")
+        filas.append(
+            {
+                "Usuario": f"@{usuario}" if usuario else "",
+                "Email": str(resultado.get("email") or ""),
+                "Estado": etiqueta,
+                "Detalle": str(resultado.get("detalle") or ""),
+            }
+        )
+    return filas
 
-    # ---- Terminada (terminada/cancelada/error): resumen final ----
+
+def _boton_detener(snap: dict) -> None:
+    """Boton "⛔ Detener" compartido por los paneles en vivo de ambos tipos."""
+    if st.button(
+        "⛔ Detener",
+        type="primary",
+        key="change_btn_detener",
+        disabled=bool(snap.get("deteniendo")),
+        help=(
+            "Pide al backend que pare: no lanza acciones nuevas y cierra los "
+            "navegadores al terminar la acción en curso."
+        ),
+    ):
+        _solicitar_paro()
+        st.rerun()
+
+
+def _pintar_reportes_en_vivo(snap: dict) -> None:
+    """Panel en vivo del ataque de reportes (modo cuentas o anonimo)."""
+    st.markdown("#### 🚩 Ataque de reportes en vivo")
+    total = max(1, snap["total"])
+    hechas = min(snap["hechas"], total) if snap["total"] else snap["hechas"]
+    st.progress(min(1.0, hechas / total))
+    st.markdown(
+        f"✅ **{snap['enviados']} enviados** · ❌ {snap['fallidos']} "
+        f"fallidos · 🧾 {snap['identidades']} identidades"
+    )
+    lineas = snap["log"][-12:]
+    if lineas:
+        st.markdown("  \n".join(lineas))
+    else:
+        st.markdown("⏳ Esperando los primeros reportes…")
+    if snap["deteniendo"]:
+        st.warning("⛔ Detención solicitada: terminando el reporte en curso…")
+    _boton_detener(snap)
+
+
+def _pintar_reportes_final(snap: dict) -> None:
+    """Resumen final del ultimo ataque de reportes (terminado/cancelado/error)."""
     st.markdown("#### 🧾 Último ataque de reportes")
     resumen = snap["resumen"] or {}
     if snap["estado"] == "error" or snap["error"]:
@@ -344,10 +533,79 @@ def _pintar_proceso(snap=None) -> None:
     filas = _filas_resultados(resumen)
     if filas:
         st.dataframe(filas, use_container_width=True, hide_index=True)
-    st.caption(
-        f"🧾 Identidades guardadas: "
-        f"{_entero(resumen.get('identidades_guardadas'))}"
+    guardadas = _entero(resumen.get("identidades_guardadas"))
+    if guardadas > 0:
+        st.caption(f"🧾 Identidades guardadas: {guardadas}")
+
+
+def _pintar_registros_en_vivo(snap: dict) -> None:
+    """Panel en vivo del registro de cuentas en Change.org."""
+    st.markdown("#### 🧾 Registro de cuentas en vivo")
+    total = max(1, snap["total"])
+    hechas = min(snap["hechas"], total) if snap["total"] else snap["hechas"]
+    st.progress(min(1.0, hechas / total))
+    contador = (
+        f"✅ **{snap['enviados']} ok** (🆕 {snap['nuevas']} nuevas · "
+        f"👤 {snap['existentes']} existentes) · ❌ {snap['fallidos']} fallidos"
     )
+    if snap["omitidas"]:
+        contador += f" · ➖ {snap['omitidas']} omitidas"
+    st.markdown(contador)
+    lineas = snap["log"][-12:]
+    if lineas:
+        st.markdown("  \n".join(lineas))
+    else:
+        st.markdown("⏳ Esperando los primeros registros…")
+    if snap["deteniendo"]:
+        st.warning("⛔ Detención solicitada: terminando el registro en curso…")
+    _boton_detener(snap)
+
+
+def _pintar_registros_final(snap: dict) -> None:
+    """Resumen final del ultimo registro de cuentas (terminado/cancelado/error)."""
+    st.markdown("#### 🧾 Último registro de cuentas")
+    resumen = snap["resumen"] or {}
+    conteos = (
+        f"{snap['enviados']} ok (🆕 {snap['nuevas']} nuevas · "
+        f"👤 {snap['existentes']} existentes) / {snap['fallidos']} fallidos"
+    )
+    if snap["omitidas"]:
+        conteos += f" · ➖ {snap['omitidas']} omitidas"
+    if snap["estado"] == "error" or snap["error"]:
+        st.error(
+            "❌ Registro de cuentas interrumpido: "
+            + (snap["error"] or "error inesperado del backend")
+        )
+    elif snap["estado"] == "cancelada" or resumen.get("cancelada"):
+        st.warning(f"⛔ Registro detenido: {conteos}")
+    else:
+        st.success(f"✅ Registro terminado: {conteos}")
+    filas = _filas_resultados_registros(resumen)
+    if filas:
+        st.dataframe(filas, use_container_width=True, hide_index=True)
+    omitidas = _entero(resumen.get("omitidas"))
+    if omitidas > 0:
+        st.caption(f"➖ Omitidas: {omitidas}")
+
+
+def _pintar_proceso(snap=None) -> None:
+    """Pinta UNA pasada del panel: en vivo o el resumen final (`st.*` aqui).
+
+    Etiqueta el panel segun el tipo de campana ("reportes" o "registros")."""
+    if snap is None:
+        snap = _snapshot()
+    if not snap:
+        return
+    if str(snap.get("tipo") or TIPO_REPORTES) == TIPO_REGISTROS:
+        if snap["en_curso"]:
+            _pintar_registros_en_vivo(snap)
+        else:
+            _pintar_registros_final(snap)
+        return
+    if snap["en_curso"]:
+        _pintar_reportes_en_vivo(snap)
+    else:
+        _pintar_reportes_final(snap)
 
 
 def _refrescar_con_fragmento() -> bool:
@@ -355,7 +613,7 @@ def _refrescar_con_fragmento() -> bool:
 
     Mismo patron que `activacion_masiva._refrescar_con_fragmento`: devuelve
     False si esta version de Streamlit no soporta fragmentos (el llamador cae
-    al bucle `time.sleep(1); st.rerun()`). Cuando el ataque termina, el
+    al bucle `time.sleep(1); st.rerun()`). Cuando la campana termina, el
     fragmento dispara UN rerun completo y deja de refrescar."""
     fabrica = getattr(st, "fragment", None)
     if not callable(fabrica):
@@ -378,9 +636,9 @@ def _refrescar_con_fragmento() -> bool:
 def _render_proceso_activo(max_pasos=None) -> None:
     """Panel de proceso persistente (auto-refresco SOLO mientras corre).
 
-    - Con ataque en curso: `st.fragment(run_every=1s)` si esta disponible; si
+    - Con campana en curso: `st.fragment(run_every=1s)` si esta disponible; si
       no, bucle `time.sleep(1); st.rerun()`.
-    - Sin ataque en curso: UNA pasada (resumen final en memoria o nada).
+    - Sin campana en curso: UNA pasada (resumen final en memoria o nada).
 
     `max_pasos` es un flag interno para tests/llamadas acotadas: con un valor
     (p. ej. 1) se pinta UNA sola pasada, sin fragmentos ni bucles."""
@@ -423,7 +681,7 @@ def _paises_proxy() -> list:
 
 
 def _proxies_disponibles(pais: str = "") -> int:
-    """Cuantos proxies usaria el ataque (tolerante a fallos: 0)."""
+    """Cuantos proxies usaria la campana (tolerante a fallos: 0)."""
     try:
         from utils.proxies import ProxyManager
 
@@ -433,6 +691,133 @@ def _proxies_disponibles(pais: str = "") -> int:
         return len(gestor.cargar_proxies() or [])
     except Exception:
         return 0
+
+
+def _aviso_proxies(pais_proxy: str, pais_sel: str) -> None:
+    """Caption con los proxies disponibles o warning si el filtro esta vacio."""
+    disponibles = _proxies_disponibles(pais_proxy)
+    if disponibles:
+        etiqueta_pais = f" para {pais_sel}" if pais_proxy else ""
+        st.caption(f"🌐 {disponibles} proxies disponibles{etiqueta_pais}.")
+    else:
+        st.warning(
+            "No hay proxies disponibles con ese filtro: la campaña "
+            "continuará sin proxy."
+        )
+
+
+# ============================ CUENTAS DE X ============================
+
+def _cargar_cuentas_change() -> list:
+    """Cuentas twitter activas CON correo y contraseña (para Change.org).
+
+    Devuelve dicts compatibles con `_selector_masivo` (mismo patron que
+    `activacion_masiva._cargar_cuentas_con_roles`) mas `email`,
+    `email_password` y `nombre_mostrado` para pasarlos al backend. Nunca
+    lanza: ante error muestra el detalle y devuelve [] (la pagina sigue)."""
+    from core.database import get_db_session
+    from core.models import Cuenta
+    from core.registros import normalizar_tipo_cuenta
+    from core.roles import normalizar_rol_activacion
+    from core.secciones import normalizar_seccion
+
+    try:
+        from core.tiers import normalizar_tier
+    except Exception:
+        def normalizar_tier(valor):
+            return ""
+
+    try:
+        with get_db_session() as db:
+            cuentas = (
+                db.query(Cuenta)
+                .filter(Cuenta.plataforma == "twitter", Cuenta.activa == True)
+                .order_by(Cuenta.usuario)
+                .all()
+            )
+            filas = []
+            for cuenta in cuentas:
+                email = str(getattr(cuenta, "email", "") or "").strip()
+                email_password = str(
+                    getattr(cuenta, "email_password", "") or ""
+                ).strip()
+                if not email or not email_password:
+                    continue
+                filas.append(
+                    {
+                        "usuario": cuenta.usuario,
+                        "status": cuenta.status or "",
+                        "seccion": normalizar_seccion(
+                            getattr(cuenta, "seccion", "")
+                        ),
+                        "tipo_cuenta": normalizar_tipo_cuenta(
+                            getattr(cuenta, "tipo_cuenta", "")
+                        ),
+                        "handle_actual": (
+                            getattr(cuenta, "handle_actual", "") or ""
+                        ).strip(),
+                        "grupo": cuenta.grupo or "",
+                        "rol_activacion": normalizar_rol_activacion(
+                            getattr(cuenta, "rol_activacion", "")
+                        ),
+                        "tier_calidad": normalizar_tier(
+                            getattr(cuenta, "tier_calidad", "")
+                        ),
+                        "pausada_activacion": bool(
+                            getattr(cuenta, "pausada_activacion", False)
+                        ),
+                        "email": email,
+                        "email_password": email_password,
+                        "nombre_mostrado": str(
+                            getattr(cuenta, "nombre_mostrado", "") or ""
+                        ).strip(),
+                    }
+                )
+            return filas
+    except Exception as e:  # noqa: BLE001
+        st.error(f"No se pudieron cargar las cuentas de Change: {e}")
+        return []
+
+
+def _cuentas_para_backend(filas) -> list:
+    """Dicts `{"usuario","email","email_password","nombre_mostrado"}` limpios.
+
+    Solo incluye cuentas con usuario, correo y contraseña del correo no
+    vacios (lo que exige el backend). Nunca lanza."""
+    cuentas = []
+    for fila in filas or []:
+        if not isinstance(fila, dict):
+            continue
+        usuario = str(fila.get("usuario") or "").strip().lstrip("@")
+        email = str(fila.get("email") or "").strip()
+        email_password = str(fila.get("email_password") or "").strip()
+        if not usuario or not email or not email_password:
+            continue
+        cuentas.append(
+            {
+                "usuario": usuario,
+                "email": email,
+                "email_password": email_password,
+                "nombre_mostrado": str(
+                    fila.get("nombre_mostrado") or ""
+                ).strip(),
+            }
+        )
+    return cuentas
+
+
+def _acepta_kwarg(func, nombre: str) -> bool:
+    """True si `func` acepta el kwarg `nombre` (o tiene **kwargs). Nunca lanza."""
+    try:
+        parametros = inspect.signature(func).parameters
+    except (TypeError, ValueError):
+        return False
+    if nombre in parametros:
+        return True
+    return any(
+        parametro.kind == inspect.Parameter.VAR_KEYWORD
+        for parametro in parametros.values()
+    )
 
 
 # ============================ GRANJA DE IDENTIDADES ============================
@@ -497,13 +882,36 @@ def _visor_granja() -> None:
 
 # ============================ LANZAMIENTO ============================
 
+def _iniciar_hilo(id_campana, runner, nombre: str) -> bool:
+    """Arranca el hilo daemon de la campana (cierra la entrada si falla).
+
+    Nunca lanza: ante error marca la campana con la excepcion y avisa en la
+    UI. Devuelve True si el hilo arranco."""
+    hilo = threading.Thread(target=runner, daemon=True, name=nombre)
+    with _CAMPANAS_LOCK:
+        entrada = _CAMPANAS.get(id_campana)
+        if entrada is not None:
+            entrada["hilo"] = hilo
+    try:
+        hilo.start()
+    except BaseException as e:  # noqa: BLE001
+        _finalizar_campana(id_campana, error=e)
+        st.error(f"No se pudo iniciar la campaña de Change.org: {e}")
+        return False
+    return True
+
+
 def _lanzar_ataque(url, contexto, cantidad, workers, usar_proxies, pais_proxy,
-                   guardar_identidades, headless) -> None:
+                   guardar_identidades, headless, cuentas=None,
+                   esperar_captcha_seg=0) -> None:
     """Valida y lanza el ataque de reportes en un hilo daemon (nunca lanza).
 
-    El backend se importa AQUI (perezoso): la pagina carga sin Chrome. El
-    callback del backend solo muta `_CAMPANAS` bajo lock (`_anotar_evento`).
-    """
+    `cuentas` (opcional) = filas seleccionadas del selector; None/[] = modo
+    anonimo con identidades IA. `esperar_captcha_seg` > 0 pide el modo asistido
+    anti-bot: se pasa al backend SOLO si su firma lo acepta (`_acepta_kwarg`);
+    con un backend viejo se lanza sin el kwarg y se deja un `st.warning` para
+    el siguiente render. El backend se importa AQUI (perezoso): la pagina
+    carga sin Chrome. El callback solo muta `_CAMPANAS` bajo lock."""
     direccion = str(url or "").strip()
     if not direccion or "change.org" not in direccion.lower():
         st.warning(
@@ -518,6 +926,15 @@ def _lanzar_ataque(url, contexto, cantidad, workers, usar_proxies, pais_proxy,
             "redactar los reportes."
         )
         return
+    # `cuentas is None` = modo anónimo; `[]` = modo con cuentas sin selección.
+    es_modo_cuentas = cuentas is not None
+    cuentas_envio = _cuentas_para_backend(cuentas) if cuentas else []
+    if es_modo_cuentas and not cuentas_envio:
+        st.warning(
+            "Selecciona al menos una cuenta con correo y contraseña para "
+            "reportar (o cambia al modo anónimo)."
+        )
+        return
     if _campana_en_curso() is not None:
         st.warning(
             "⛔ Ya hay un ataque de reportes en curso: espera a que termine o "
@@ -530,9 +947,32 @@ def _lanzar_ataque(url, contexto, cantidad, workers, usar_proxies, pais_proxy,
     except Exception as e:  # noqa: BLE001
         st.error(f"No se pudo importar el backend de reportes: {e}")
         return
+    if cuentas_envio and not _acepta_kwarg(
+        ejecutar_campana_reportes, "cuentas"
+    ):
+        st.error(
+            "El backend de reportes todavía no soporta el modo con cuentas "
+            "registradas (`cuentas=`): actualiza `cuentas/change_org.py` o "
+            "usa el modo anónimo."
+        )
+        return
+
+    # Modo asistido anti-bot: el kwarg se pasa SOLO si la firma lo acepta.
+    asistido = bool(esperar_captcha_seg)
+    soporta_captcha = _acepta_kwarg(
+        ejecutar_campana_reportes, "esperar_captcha_seg"
+    )
+    if asistido and not soporta_captcha:
+        # Doble aviso: el `st.warning` inmediato y la bandera en
+        # `session_state` (el `st.rerun()` del lanzamiento descarta los
+        # elementos previos; `_formulario_reportes` repinta la bandera).
+        if _en_contexto_streamlit():
+            st.session_state["change_rep_aviso_asistido"] = CAPTCHA_AVISO_BACKEND
+        st.warning(CAPTCHA_AVISO_BACKEND)
 
     evento = threading.Event()
     id_campana = _registrar_campana(
+        tipo=TIPO_REPORTES,
         evento=evento,
         parametros={
             "url": direccion,
@@ -542,6 +982,9 @@ def _lanzar_ataque(url, contexto, cantidad, workers, usar_proxies, pais_proxy,
             "pais_proxy": str(pais_proxy or ""),
             "guardar_identidades": bool(guardar_identidades),
             "headless": bool(headless),
+            "esperar_captcha_seg": _entero(esperar_captcha_seg),
+            "modo": MODO_CON_CUENTAS if cuentas_envio else MODO_ANONIMO,
+            "cuentas_total": len(cuentas_envio),
         },
     )
 
@@ -553,7 +996,7 @@ def _lanzar_ataque(url, contexto, cantidad, workers, usar_proxies, pais_proxy,
         resumen = None
         error = None
         try:
-            resumen = ejecutar_campana_reportes(
+            kwargs = dict(
                 url_peticion=direccion,
                 contexto=motivo,
                 cantidad=int(cantidad),
@@ -565,38 +1008,182 @@ def _lanzar_ataque(url, contexto, cantidad, workers, usar_proxies, pais_proxy,
                 cancelar=evento,
                 callback=_cb,
             )
+            if _acepta_kwarg(ejecutar_campana_reportes, "cuentas"):
+                # Modo anonimo: None (comportamiento clasico intacto).
+                kwargs["cuentas"] = cuentas_envio or None
+            if soporta_captcha:
+                # 0 = sin modo asistido (falla rapido como siempre).
+                kwargs["esperar_captcha_seg"] = _entero(esperar_captcha_seg)
+            resumen = ejecutar_campana_reportes(**kwargs)
+
         except BaseException as e:  # noqa: BLE001
             error = e
         finally:
             _finalizar_campana(id_campana, resumen=resumen, error=error)
 
-    hilo = threading.Thread(target=_runner, daemon=True, name="change-reportes")
-    with _CAMPANAS_LOCK:
-        entrada = _CAMPANAS.get(id_campana)
-        if entrada is not None:
-            entrada["hilo"] = hilo
-    try:
-        hilo.start()
-    except BaseException as e:  # noqa: BLE001
-        _finalizar_campana(id_campana, error=e)
-        st.error(f"No se pudo iniciar el ataque de reportes: {e}")
+    if not _iniciar_hilo(id_campana, _runner, "change-reportes"):
         return
     if _en_contexto_streamlit():
         # El panel persistente (arriba) toma el relevo con el progreso en vivo.
         st.rerun()
 
 
-def render(usuario: dict):
-    """Pagina "✍️ Change.org: Reportes": ataque masivo con identidades IA."""
-    cabecera(
-        "✍️ CHANGE.ORG: REPORTES DE POLÍTICAS",
-        "Ataque masivo de reportes con identidades generadas por IA",
+def _lanzar_registros(cuentas, workers, usar_proxies, pais_proxy,
+                      headless, esperar_captcha_seg=0) -> None:
+    """Valida y lanza el registro de cuentas en Change.org (nunca lanza).
+
+    Importa `ejecutar_campana_registros` PEREZOSAMENTE; si el backend aun no
+    la tiene, muestra un `st.error` legible y no rompe la pagina. Con
+    `esperar_captcha_seg` > 0 (modo asistido) se pasa el kwarg SOLO si la
+    firma del backend lo acepta y, si no, se avisa para el siguiente render.
+    El callback solo muta `_CAMPANAS` bajo lock."""
+    cuentas_envio = _cuentas_para_backend(cuentas)
+    if not cuentas_envio:
+        st.warning(
+            "Selecciona al menos una cuenta con correo y contraseña para "
+            "registrar en Change.org."
+        )
+        return
+    if _campana_en_curso() is not None:
+        st.warning(
+            "⛔ Ya hay una campaña de Change.org en curso: espera a que "
+            "termine o pulsa «⛔ Detener» en el panel de arriba."
+        )
+        return
+
+    try:
+        from cuentas import change_org as backend
+    except Exception as e:  # noqa: BLE001
+        st.error(f"No se pudo importar el backend de Change.org: {e}")
+        return
+    funcion = getattr(backend, "ejecutar_campana_registros", None)
+    if not callable(funcion):
+        st.error(
+            "El backend todavía no incluye «ejecutar_campana_registros» "
+            "(cuentas/change_org.py): actualiza el backend para registrar "
+            "cuentas en Change.org."
+        )
+        return
+
+    # Modo asistido anti-bot: el kwarg se pasa SOLO si la firma lo acepta.
+    asistido = bool(esperar_captcha_seg)
+    soporta_captcha = _acepta_kwarg(funcion, "esperar_captcha_seg")
+    if asistido and not soporta_captcha:
+        # Doble aviso: el `st.warning` inmediato y la bandera en
+        # `session_state` (el `st.rerun()` del lanzamiento descarta los
+        # elementos previos; `_formulario_registros` repinta la bandera).
+        if _en_contexto_streamlit():
+            st.session_state["change_reg_aviso_asistido"] = CAPTCHA_AVISO_BACKEND
+        st.warning(CAPTCHA_AVISO_BACKEND)
+
+    evento = threading.Event()
+    id_campana = _registrar_campana(
+        tipo=TIPO_REGISTROS,
+        evento=evento,
+        parametros={
+            "workers": int(workers),
+            "usar_proxies": bool(usar_proxies),
+            "pais_proxy": str(pais_proxy or ""),
+            "headless": bool(headless),
+            "esperar_captcha_seg": _entero(esperar_captcha_seg),
+            "cuentas_total": len(cuentas_envio),
+        },
     )
 
-    # Panel persistente: SIEMPRE al inicio, para que el avance/log siga visible
-    # aunque el usuario recargue o navegue a otra operacion durante el ataque.
-    _render_proceso_activo()
+    def _cb(evento_cb):
+        # Corre en los hilos worker del backend: SOLO registro, jamas `st.*`.
+        _anotar_evento(id_campana, evento_cb)
 
+    def _runner():
+        resumen = None
+        error = None
+        try:
+            kwargs = dict(
+                cuentas=list(cuentas_envio),
+                max_workers=int(workers),
+                usar_proxies=bool(usar_proxies),
+                pais_proxy=str(pais_proxy or ""),
+                headless=bool(headless),
+                cancelar=evento,
+                callback=_cb,
+            )
+            if soporta_captcha:
+                # 0 = sin modo asistido (falla rapido como siempre).
+                kwargs["esperar_captcha_seg"] = _entero(esperar_captcha_seg)
+            resumen = funcion(**kwargs)
+        except BaseException as e:  # noqa: BLE001
+            error = e
+        finally:
+            _finalizar_campana(id_campana, resumen=resumen, error=error)
+
+    if not _iniciar_hilo(id_campana, _runner, "change-registros"):
+        return
+    if _en_contexto_streamlit():
+        # El panel persistente (arriba) toma el relevo con el progreso en vivo.
+        st.rerun()
+
+
+# ============================ FORMULARIOS ============================
+
+def _controles_modo_asistido(clave_captcha: str, clave_segundos: str,
+                             clave_visible: str) -> tuple:
+    """Controles del modo asistido anti-bot de una pestana.
+
+    Devuelve `(esperar_captcha_seg, chrome_visible)`. Con el checkbox marcado
+    se muestra el number_input de segundos (30-900, default 180) y se FUERZA
+    Chrome visible aunque el checkbox de visible venga apagado (queda
+    deshabilitado): el reto de Cloudflare solo se resuelve con la ventana a la
+    vista. `esperar_captcha_seg` = 0 con el modo apagado (clasico)."""
+    asistido = st.checkbox(
+        CAPTCHA_LABEL,
+        value=False,
+        key=clave_captcha,
+        help=(
+            "Change.org a veces pide un reto de Cloudflare («no eres un "
+            "bot»). Con esto marcado, el bot abre Chrome visible y espera a "
+            "que lo resuelvas antes de continuar."
+        ),
+    )
+    esperar_captcha_seg = 0
+    if asistido:
+        esperar_captcha_seg = int(
+            st.number_input(
+                "Segundos máximos de espera",
+                min_value=30,
+                max_value=900,
+                value=180,
+                step=30,
+                key=clave_segundos,
+                help=(
+                    "Tiempo máximo que el bot espera a que resuelvas el "
+                    "reto anti-bot antes de fallar."
+                ),
+            )
+        )
+        st.caption(CAPTCHA_CAPTION)
+    chrome_visible = st.checkbox(
+        "🖥️ Chrome visible (debug)",
+        value=bool(asistido),
+        key=clave_visible,
+        disabled=bool(asistido),
+        help=(
+            "Forzado por el modo asistido: el reto de Cloudflare solo se "
+            "puede resolver con la ventana de Chrome a la vista."
+            if asistido
+            else "Solo para depurar: en producción la campaña corre headless."
+        ),
+    )
+    if asistido:
+        # Forzado DESPUES de leer el checkbox (puede venir apagado).
+        chrome_visible = True
+    return esperar_captcha_seg, bool(chrome_visible)
+
+
+def _formulario_reportes(cuentas: list) -> None:
+    """Pestana "🚩 Ataque de reportes": objetivo, modo y lanzamiento."""
+    aviso = st.session_state.pop("change_rep_aviso_asistido", "")
+    if aviso:
+        st.warning(aviso)
     st.markdown("### 🎯 Objetivo del ataque")
     url = st.text_input(
         "URL de la petición objetivo",
@@ -618,6 +1205,37 @@ def render(usuario: dict):
         ),
     )
 
+    modo = st.radio(
+        "Modo de reporte",
+        [MODO_CON_CUENTAS, MODO_ANONIMO],
+        index=0,
+        key="change_rep_modo",
+        help=(
+            "Con cuentas registradas cada reporte sale con una cuenta de X "
+            "(round-robin) que inicia sesión en Change.org; en anónimo se "
+            "generan identidades con IA."
+        ),
+    )
+    es_cuentas = modo == MODO_CON_CUENTAS
+
+    seleccion: list = []
+    if es_cuentas:
+        if not cuentas:
+            st.info(
+                "No hay cuentas de X con correo y contraseña cargados. "
+                "Importa o edita cuentas con su email y la contraseña del "
+                "correo en «🗂️ Cuentas: Perfiles, Secciones & Nombres» para "
+                "reportar con cuentas registradas."
+            )
+        else:
+            from web.operaciones.cuentas import _selector_masivo
+
+            seleccion = _selector_masivo(cuentas, "change_rep_selector")
+            st.caption(
+                f"🧾 {len(seleccion)} cuenta(s) seleccionada(s): cada reporte "
+                "usa una cuenta en round-robin."
+            )
+
     col_cantidad, col_workers = st.columns(2)
     with col_cantidad:
         cantidad = st.number_input(
@@ -627,18 +1245,21 @@ def render(usuario: dict):
             value=5,
             step=1,
             key="change_rep_cantidad",
-            help="Un reporte por cada identidad generada (1-100).",
+            help=(
+                "Total de reportes; las cuentas se reparten en round-robin "
+                "(una cuenta por reporte) en el modo con cuentas."
+            ),
         )
     with col_workers:
         workers = st.number_input(
             "Navegadores simultáneos",
             min_value=1,
-            max_value=4,
+            max_value=5,
             value=2,
             step=1,
             key="change_rep_workers",
             help=(
-                "Reportes en paralelo (1-4). En Railway no conviene pasar de "
+                "Reportes en paralelo (1-5). En Railway no conviene pasar de "
                 "2-3: cada Chrome consume RAM/CPU/hilos."
             ),
         )
@@ -666,33 +1287,23 @@ def render(usuario: dict):
         )
         pais_proxy = "" if pais_sel == PAIS_TODAS else str(pais_sel)
         if rotar_proxies:
-            disponibles = _proxies_disponibles(pais_proxy)
-            if disponibles:
-                etiqueta_pais = (
-                    f" para {pais_sel}" if pais_proxy else ""
-                )
-                st.caption(
-                    f"🌐 {disponibles} proxies disponibles{etiqueta_pais}."
-                )
-            else:
-                st.warning(
-                    "No hay proxies disponibles con ese filtro: el ataque "
-                    "continuará sin proxy."
-                )
-        guardar_identidades = st.checkbox(
-            "🧾 Guardar identidades en la base de datos",
-            value=True,
-            key="change_rep_guardar",
-            help=(
-                "Las identidades usadas quedan en la granja (`CuentaChange`) "
-                "para reutilizarlas más adelante."
-            ),
-        )
-        chrome_visible = st.checkbox(
-            "🖥️ Chrome visible (debug)",
-            value=False,
-            key="change_rep_visible",
-            help="Solo para depurar: en producción el ataque corre headless.",
+            _aviso_proxies(pais_proxy, pais_sel)
+        if es_cuentas:
+            # En modo con cuentas no se generan identidades: el checkbox de la
+            # granja solo aplica al modo anónimo.
+            guardar_identidades = False
+        else:
+            guardar_identidades = st.checkbox(
+                "🧾 Guardar identidades en la base de datos",
+                value=True,
+                key="change_rep_guardar",
+                help=(
+                    "Las identidades usadas quedan en la granja "
+                    "(`CuentaChange`) para reutilizarlas más adelante."
+                ),
+            )
+        esperar_captcha_seg, chrome_visible = _controles_modo_asistido(
+            "change_rep_captcha", "change_rep_captcha_seg", "change_rep_visible"
         )
         headless = not bool(chrome_visible)
 
@@ -700,9 +1311,11 @@ def render(usuario: dict):
         "🚩 Lanzar ataque de reportes",
         type="primary",
         key="btn_change_reportes",
+        disabled=bool(es_cuentas and not cuentas),
         help=(
-            "Genera identidades con IA y reporta la petición con cada una. "
-            "El progreso se muestra arriba y sobrevive a las recargas."
+            "Con cuentas registradas: cada reporte inicia sesión en "
+            "Change.org con una cuenta de X. En anónimo: genera identidades "
+            "con IA. El progreso se muestra arriba y sobrevive a las recargas."
         ),
     ):
         _lanzar_ataque(
@@ -714,6 +1327,115 @@ def render(usuario: dict):
             pais_proxy=pais_proxy,
             guardar_identidades=bool(guardar_identidades),
             headless=headless,
+            cuentas=seleccion if es_cuentas else None,
+            esperar_captcha_seg=int(esperar_captcha_seg),
         )
+
+
+def _formulario_registros(cuentas: list) -> None:
+    """Pestana "🧾 Cuentas Change.org": registra/entra cuentas de X."""
+    aviso = st.session_state.pop("change_reg_aviso_asistido", "")
+    if aviso:
+        st.warning(aviso)
+    st.caption(
+        "Registra o inicia sesión en Change.org con el correo y la contraseña "
+        "de las cuentas de X (así los avisos de Change llegan a esos correos). "
+        "Si el correo ya tiene cuenta, solo inicia sesión."
+    )
+    if not cuentas:
+        st.info(
+            "No hay cuentas de X con correo y contraseña cargados. Importa o "
+            "edita cuentas con su email y la contraseña del correo en "
+            "«🗂️ Cuentas: Perfiles, Secciones & Nombres»."
+        )
+        return
+
+    from web.operaciones.cuentas import _selector_masivo
+
+    seleccion = _selector_masivo(cuentas, "change_reg_selector")
+    st.caption(f"🧾 Se registrarán **{len(seleccion)}** cuentas (las que ya "
+               "tengan cuenta en Change.org solo inician sesión).")
+
+    workers = st.number_input(
+        "Navegadores simultáneos",
+        min_value=1,
+        max_value=5,
+        value=2,
+        step=1,
+        key="change_reg_workers",
+        help=(
+            "Registros en paralelo (1-5). En Railway no conviene pasar de "
+            "2-3: cada Chrome consume RAM/CPU/hilos."
+        ),
+    )
+
+    with st.expander("⚙️ Opciones avanzadas", expanded=False):
+        rotar_proxies = st.checkbox(
+            "🌐 Rotar proxy residencial por cuenta",
+            value=True,
+            key="change_reg_proxies",
+            help=(
+                "Cada cuenta sale con una IP distinta (menos bloqueos de "
+                "Change.org). Si no hay proxies, la campaña sigue sin proxy."
+            ),
+        )
+        paises = _paises_proxy()
+        pais_sel = st.selectbox(
+            "País del proxy",
+            [PAIS_TODAS] + paises,
+            index=0,
+            key="change_reg_pais",
+            help=(
+                "Filtra los proxies por país (archivos de `data/proxies/`). "
+                "«Todas» usa cualquier proxy disponible."
+            ),
+        )
+        pais_proxy = "" if pais_sel == PAIS_TODAS else str(pais_sel)
+        if rotar_proxies:
+            _aviso_proxies(pais_proxy, pais_sel)
+        esperar_captcha_seg, chrome_visible = _controles_modo_asistido(
+            "change_reg_captcha", "change_reg_captcha_seg", "change_reg_visible"
+        )
+        headless = not bool(chrome_visible)
+
+    if st.button(
+        "🧾 Registrar en Change.org",
+        type="primary",
+        key="btn_change_registros",
+        help=(
+            "Crea la cuenta en Change.org (o inicia sesión si el correo ya "
+            "tiene una) con el correo y la contraseña de cada cuenta de X."
+        ),
+    ):
+        _lanzar_registros(
+            cuentas=seleccion,
+            workers=workers,
+            usar_proxies=bool(rotar_proxies),
+            pais_proxy=pais_proxy,
+            headless=headless,
+            esperar_captcha_seg=int(esperar_captcha_seg),
+        )
+
+
+def render(usuario: dict):
+    """Pagina "✍️ Change.org: Reportes": reportes y registro de cuentas."""
+    cabecera(
+        "✍️ CHANGE.ORG: REPORTES DE POLÍTICAS",
+        "Reportes masivos y registro de cuentas de X en Change.org",
+    )
+
+    # Panel persistente: SIEMPRE al inicio, para que el avance/log siga visible
+    # aunque el usuario recargue o navegue a otra operacion durante la campana.
+    _render_proceso_activo()
+
+    cuentas = _cargar_cuentas_change()
+
+    pestana_reportes, pestana_registros = st.tabs(
+        ["🚩 Ataque de reportes", "🧾 Cuentas Change.org"]
+    )
+    with pestana_reportes:
+        _formulario_reportes(cuentas)
+    with pestana_registros:
+        _formulario_registros(cuentas)
 
     _visor_granja()

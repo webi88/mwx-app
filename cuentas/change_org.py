@@ -1,16 +1,37 @@
-"""Reportes de violacion de politicas en Change.org + granja de identidades.
+"""Reportes de violacion de politicas en Change.org + registro + granja.
 
 Este modulo REEMPLAZA por completo al antiguo bot de FIRMAS (obsoleto). Tiene
-dos misiones:
+tres misiones:
 
 1. **Reportes**: `ChangeOrgReportBot` abre la peticion en Chrome, cierra el
    banner de cookies, localiza el enlace "Denunciar una violación de las
-   políticas" (ES/EN, con scroll humano incremental), llena el formulario con
-   una identidad sintetica y una queja generada por IA, y marca exito SOLO con
-   evidencia positiva (texto de gracias, URL de confirmacion o desaparicion del
-   formulario sin mensaje de error). Detecta captcha y errores de la pagina.
+   políticas" (ES/EN, con scroll humano incremental), abre el modal "Denunciar
+   abuso", marca el TERCER motivo ("No me gusta esta petición o no estoy de
+   acuerdo con ella"), garantiza "México" en "¿Dónde vives?", escribe la queja
+   generada por IA en el textarea que aparece y pulsa "Enviar". Marca exito SOLO
+   con evidencia positiva ("Gracias por tomarte el tiempo de denunciar
+   contenido...", URL de confirmacion o desaparicion del formulario sin error).
+   Detecta captcha y errores de la pagina.
 
-2. **Granja de identidades**: `generar_identidad_change()` produce
+2. **Registro/Login**: `ChangeOrgReportBot.registrar_o_entrar()` crea la cuenta
+   en Change.org (o entra a una existente) con el email/email_password de una
+   cuenta de la BD via `https://www.change.org/login_or_join?user_flow=nav`:
+   "Iniciar sesión" -> correo -> "Continuar" -> contraseña -> "Continuar" ->
+   (solo cuentas nuevas) "Nombres"/"Apellidos" -> "Continuar". Estado "nueva"
+   si vio "Crea tu contraseña", "existente" si entro por login y "fallo" si no
+   se pudo confirmar la sesion. `registrar_cuenta_change()` y
+   `ejecutar_campana_registros()` orquestan el lote.
+   Si Cloudflare interpone su reto anti-bot (widget Turnstile en sombra/iframe
+   "protegida"), se detecta (`_detectar_reto_humano`/`_detectar_captcha`) y se
+   falla con un error accionable (reintentar con otro proxy o con navegador
+   visible) en vez de agotar el timeout. MODO ASISTIDO: con
+   `esperar_captcha_seg > 0` y Chrome VISIBLE, el bot avisa al operador
+   (`aviso({"tipo":"espera_captcha","usuario":...,"email":...,"segundos":N,
+   "estado":"iniciando"})`), espera hasta N segundos a que un humano resuelva
+   el reto y sigue solo cuando desaparece; en headless nunca espera (no hay
+   quien lo resuelva) y el error lo aclara.
+
+3. **Granja de identidades**: `generar_identidad_change()` produce
    Nombre/Apellido/Correo/CP creibles (Faker es_MX) y
    `guardar_identidad_change()` las persiste en la tabla `cuenta_change` para
    las futuras firmas masivas (la columna `usada_firma` queda reservada).
@@ -18,6 +39,10 @@ dos misiones:
 Contrato congelado (el frontend y los tests dependen de el; no romper):
 
     MENSAJE_CANCELADO = "⛔ Ataque de reportes detenido por el usuario"
+
+    password_change_para(email_password) -> str
+        Determinista. "" -> "". Con len >= 10 se usa tal cual; si es mas corta
+        se deriva ``email_password + "Change.org"`` (resultado SIEMPRE >= 10).
 
     generar_identidad_change(faker=None, usados=None) -> dict
         {"nombre","apellido","email","codigo_postal"}; email creible
@@ -38,21 +63,79 @@ Contrato congelado (el frontend y los tests dependen de el; no romper):
           core.database.init_db() y reintenta. NUNCA lanza.
 
     ChangeOrgReportBot(url_peticion="", contexto="", proxy="", headless=None,
-                       timeout=45, cancelar=None)
+                       timeout=45, cancelar=None, cuenta=None,
+                       esperar_captcha_seg=None, aviso=None)
+        `cuenta` = dict {"usuario","email","password" o "email_password",
+                         "nombre","apellido","nombre_mostrado" (opcional)}.
+        `esperar_captcha_seg`: segundos del MODO ASISTIDO; None -> env
+            CHANGE_ESPERAR_CAPTCHA_SEG -> 0; acotado a [0, 900]. Con > 0 y
+            Chrome visible, si aparece el reto anti-bot (Cloudflare/captcha) el
+            bot emite `aviso({"tipo":"espera_captcha","usuario":...,"email":...,
+            "segundos":N,"estado":"iniciando"})` UNA vez y hace polling cada 1s
+            (cancelable) hasta que desaparezca; si se agota devuelve el error
+            "verificacion anti-bot de Change.org (Cloudflare): el reto no se
+            resolvio en Ns; usa el modo asistido con Chrome visible y
+            resuelvelo a mano". Con 0 (default) se conserva el fallo clasico y
+            en headless NUNCA espera (no hay humano).
         .preparar_driver() -> bool
+        .registrar_o_entrar() -> {"ok","estado","error","evidencia"}
+            estado in "nueva"|"existente"|"fallo"; nunca lanza.
         .reportar(identidad=None, queja="") -> dict
+            Con `cuenta`: ejecuta registrar_o_entrar() tras preparar_driver();
+            si el registro/login falla devuelve ok=False con ese error; si
+            entra bien, sigue con el flujo de reporte (estado_cuenta incluido).
         .cerrar() -> None   (driver.quit con fallbacks + cerrar SIEMPRE el fwd)
 
+    registrar_cuenta_change(usuario="", email="", password="", nombre="",
+                            apellido="", proxy="", headless=None,
+                            cancelar=None, esperar_captcha_seg=None) -> dict
+        Abre Chrome (crear_chrome + stealth + proxy), registra/entra y cierra
+        SIEMPRE. NUNCA lanza. Resultado: {"ok","usuario","email","estado",
+        "nombre","apellido","error","evidencia","url","cancelado"}.
+        `esperar_captcha_seg` activa el MODO ASISTIDO dentro del bot.
+
+    ejecutar_campana_registros(cuentas, max_workers=2, usar_proxies=True,
+                               pais_proxy="", headless=None, cancelar=None,
+                               callback=None, esperar_captcha_seg=None) -> dict
+        `cuentas`: lista de dicts {"usuario","email","email_password" (o
+        "password"),"nombre_mostrado" (opcional)}; lista cap 500 y workers
+        acotados a [1,5]; proxy round-robin por cuenta. Callback:
+        {"tipo":"inicio","total":N}, por cuenta terminada {"tipo":"registro",
+        "hechas":i,"total":N,"ok":bool,"usuario":str,"email":str,
+        "estado":str,"detalle":str} (las omitidas, sin email/contraseña,
+        tambien reportan con estado "omitida") y, si el modo asistido esta
+        activo y aparece el reto anti-bot, {"tipo":"espera_captcha","hechas":i,
+        "total":N,"usuario":str,"email":str,"detalle":"esperando captcha (Ns)"}.
+        Resumen: {"total","exitosos","fallidos","nuevas","existentes",
+        "omitidas","cancelada","resultados","proxies_total","sin_proxy",
+        "error"}; NUNCA lanza.
+
     ejecutar_un_reporte(url_peticion, contexto="", proxy="", headless=None,
-                        evitar=None, cancelar=None, guardar_identidad=True) -> dict
-        Genera identidad + queja IA, corre el bot y persiste la identidad si el
-        reporte fue OK. Cierra el navegador SIEMPRE (finally).
+                        evitar=None, cancelar=None, guardar_identidad=True,
+                        cuenta=None, esperar_captcha_seg=None) -> dict
+        Sin `cuenta`: genera identidad + queja IA, corre el bot y persiste la
+        identidad en la granja si el reporte fue OK (comportamiento clasico).
+        Con `cuenta`: NO llama a generar_identidad_change (usa los datos de la
+        cuenta), NO guarda en la granja (identidad_guardada=False) y agrega
+        "estado_cuenta" y "usuario" al resultado. `esperar_captcha_seg` activa
+        el MODO ASISTIDO del bot. Cierra SIEMPRE (finally).
 
     ejecutar_campana_reportes(url_peticion, contexto="", cantidad=5,
                               max_workers=2, usar_proxies=True, pais_proxy="",
                               guardar_identidades=True, headless=None,
-                              cancelar=None, callback=None) -> dict
-        ThreadPoolExecutor con proxy round-robin y callback de progreso.
+                              cancelar=None, callback=None, cuentas=None,
+                              esperar_captcha_seg=None) -> dict
+        Con `cuentas` no vacias: cada reporte usa la siguiente cuenta en
+        round-robin (login/registro primero); el evento "reporte" agrega
+        "usuario" y "con_cuenta": True (sin "identidad") y el resumen agrega
+        "con_cuentas" y "cuentas_total". Sin cuentas: flujo anonimo clasico.
+        Con el modo asistido activo tambien emite {"tipo":"espera_captcha",
+        "hechas":i,"total":N,"usuario":str,"email":str,
+        "detalle":"esperando captcha (Ns)"}.
+
+    _resolver_esperar_captcha_seg(valor=None) -> int
+        `valor` None -> env CHANGE_ESPERAR_CAPTCHA_SEG -> 0; acota a [0, 900];
+        valores invalidos -> 0.
 
 Reglas de oro del flujo Selenium:
     - `driver.get` tolera `TimeoutException` (sigue con esperas explicitas).
@@ -64,6 +147,7 @@ Reglas de oro del flujo Selenium:
 """
 from __future__ import annotations
 
+import os
 import random
 import re
 import threading
@@ -91,16 +175,23 @@ except ImportError:  # pragma: no cover - entorno sin anti_detection
 
 __all__ = [
     "MENSAJE_CANCELADO",
+    "password_change_para",
     "ChangeOrgReportBot",
     "generar_identidad_change",
     "proxies_disponibles",
     "guardar_identidad_change",
+    "registrar_cuenta_change",
     "ejecutar_un_reporte",
     "ejecutar_campana_reportes",
+    "ejecutar_campana_registros",
 ]
 
 
 MENSAJE_CANCELADO = "⛔ Ataque de reportes detenido por el usuario"
+
+_URL_LOGIN_CHANGE = "https://www.change.org/login_or_join?user_flow=nav"
+
+_SUFIJO_PASSWORD_CORTA = "Change.org"
 
 _DOMINIOS_EMAIL = ("gmail.com", "hotmail.com", "outlook.com", "yahoo.com")
 
@@ -131,6 +222,9 @@ _FRASES_ENVIAR = (
 )
 # Evidencia POSITIVA de exito (nada de "se hizo clic").
 _FRASES_EXITO = (
+    "gracias por tomarte el tiempo de denunciar contenido",
+    "gracias por tomarte el tiempo",
+    "denunciar contenido",
     "gracias por tu reporte",
     "gracias por tu denuncia",
     "gracias por denunciar",
@@ -141,6 +235,7 @@ _FRASES_EXITO = (
     "denuncia recibida",
     "reporte enviado",
     "reporte recibido",
+    "thank you for taking the time to report",
     "thank you for your report",
     "thank you for reporting",
     "we've received",
@@ -171,12 +266,108 @@ _FRASES_ERROR = (
 _FRASES_CAPTCHA = (
     "no soy un robot",
     "no soy robot",
+    "no eres un bot",
+    "pulsar y mantener",
+    "press and hold",
+    "demuestra que eres una persona",
+    "verifica que eres humano",
+    "verificar que eres humano",
+    "verify you are human",
     "i'm not a robot",
     "i am not a robot",
     "recaptcha",
     "hcaptcha",
     "captcha",
 )
+
+# --------------------------------------------------------------------------- #
+# Textos del flujo de registro/login (todos normalizados: sin acentos)
+# --------------------------------------------------------------------------- #
+# Botones para abrir el formulario de acceso.
+_FRASES_LOGIN = (
+    "iniciar sesion", "log in", "login", "sign in", "entrar",
+)
+# Botones "Continuar" (los sociales se descartan: Google/Facebook/etc).
+_FRASES_CONTINUAR = ("continuar", "continue", "siguiente", "next")
+_FRASES_CONTINUAR_EXCLUIR = (
+    "google", "facebook", "apple", "twitter", "microsoft", "enlace",
+    "magic link", "codigo", "code", "telefono", "phone",
+)
+# Pantallas detectadas por texto normalizado.
+_FRASES_PANTALLA_NUEVA = (
+    "crea tu contrasena",
+    "crea una contrasena",
+    "crear una contrasena",
+    "create your password",
+    "create a password",
+    "choose a password",
+    "elige una contrasena",
+)
+_FRASES_PANTALLA_NOMBRE = (
+    "escribe tu nombre",
+    "escribe tus nombres",
+    "enter your name",
+    "what's your name",
+    "cual es tu nombre",
+    "como te llamas",
+)
+# Errores de login (normalizados) con mensaje claro para el UI.
+_FRASES_ERROR_SESION = (
+    "contrasena incorrecta",
+    "clave incorrecta",
+    "incorrect password",
+    "wrong password",
+    "invalid password",
+    "contrasena invalida",
+    "la contrasena es incorrecta",
+    "no pudimos encontrarte",
+    "no encontramos ninguna cuenta",
+    "we couldn't find",
+    "we could not find",
+    "email no valido",
+    "correo no valido",
+    "invalid email",
+)
+# Señales que solo son error DESPUES de enviar la contraseña (en la pantalla
+# "Crea tu contraseña" el texto de requisitos incluye "al menos 10 caracteres").
+_FRASES_ERROR_SESION_TARDIAS = (
+    "demasiados intentos",
+    "too many attempts",
+    "too many requests",
+    "contrasena demasiado corta",
+    "password is too short",
+    "at least 10 characters",
+    "al menos 10 caracteres",
+)
+# Motivo TERCERO del modal "Denunciar abuso" (radio 3).
+_FRASES_MOTIVO_TERCERO = (
+    "no me gusta esta peticion",
+    "no estoy de acuerdo con ella",
+    "no estoy de acuerdo",
+    "no me gusta",
+    "i don't like this petition",
+    "i do not like this petition",
+    "i disagree",
+    "don't like",
+)
+# Etiqueta del campo "¿Dónde vives?" (select de ubicacion).
+_FRASES_UBICACION = ("donde vives", "where do you live")
+# Reto anti-bot de Cloudflare/Turnstile (normalizado). El widget vive en una
+# sombra/iframe protegida: ademas del texto se detecta por JS y por selectores.
+_FRASES_RETO_HUMANO = (
+    "no eres un bot",
+    "pulsar y mantener",
+    "press and hold",
+    "mantener pulsado",
+    "comprobar que eres una persona",
+    "demuestra que eres una persona",
+    "verificar que eres humano",
+    "verifica que eres humano",
+    "verify you are human",
+    "just a moment",
+)
+# Iteraciones (~10s) que se tolera el reto antes de fallar con error claro.
+_ITERACIONES_ESPERA_RETO = 20
 
 # Etiquetas (normalizadas) que identifican cada campo del formulario.
 _ETIQUETAS_CAMPOS = {
@@ -288,6 +479,102 @@ def _notificar(callback, info: dict) -> None:
         callback(info)
     except Exception as e:
         logger.warning(f"Change.org: el callback de progreso fallo: {e}")
+
+
+def _resolver_esperar_captcha_seg(valor=None) -> int:
+    """Resuelve el MODO ASISTIDO: kwarg > env > 0, acotado a [0, 900].
+
+    `None` lee `CHANGE_ESPERAR_CAPTCHA_SEG` (default 0). Valores invalidos o
+    negativos -> 0; mayores a 900 -> 900. Determinista y nunca lanza.
+    """
+    if valor is None:
+        valor = os.environ.get("CHANGE_ESPERAR_CAPTCHA_SEG", "0")
+    try:
+        segundos = int(float(str(valor).strip()))
+    except (TypeError, ValueError):
+        segundos = 0
+    return max(0, min(900, segundos))
+
+
+# --------------------------------------------------------------------------- #
+# Registro/Login: contraseña determinista y nombres
+# --------------------------------------------------------------------------- #
+def password_change_para(email_password: str) -> str:
+    """Deriva la contraseña de Change.org a partir de `email_password`.
+
+    DETERMINISTA (misma entrada -> misma salida) para no guardar columnas
+    nuevas en la BD:
+
+      - vacia/None -> ``""`` (cuenta NO elegible para registrar/entrar).
+      - con 10 o mas caracteres -> se usa tal cual.
+      - con menos de 10 -> ``email_password + "Change.org"`` (el resultado
+        SIEMPRE tiene >= 11 caracteres, minimo que exige Change.org).
+    """
+    base = str(email_password or "").strip()
+    if not base:
+        return ""
+    if len(base) >= 10:
+        return base
+    return base + _SUFIJO_PASSWORD_CORTA
+
+
+def _partir_nombre_mostrado(nombre_mostrado) -> tuple:
+    """Parte "Nombre Apellido..." en (Nombres, Apellidos) si trae >=2 palabras."""
+    partes = str(nombre_mostrado or "").split()
+    if len(partes) >= 2:
+        return partes[0], " ".join(partes[1:])
+    return "", ""
+
+
+def _resolver_nombres(nombre="", apellido="", nombre_mostrado="") -> tuple:
+    """Resuelve (Nombres, Apellidos) NUNCA vacios.
+
+    Precedencia: explicitos -> `nombre_mostrado` partido (>=2 palabras) ->
+    Faker es_MX (via `generar_identidad_change`, reutilizado) -> respaldo fijo.
+    """
+    nombre = str(nombre or "").strip()
+    apellido = str(apellido or "").strip()
+    if not (nombre and apellido):
+        parte_nombre, parte_apellido = _partir_nombre_mostrado(nombre_mostrado)
+        if not nombre:
+            nombre = parte_nombre
+        if not apellido:
+            apellido = parte_apellido
+    if not nombre or not apellido:
+        try:
+            identidad = generar_identidad_change()
+        except Exception:  # pragma: no cover - defensa extrema
+            identidad = {}
+        if not nombre:
+            nombre = str(identidad.get("nombre") or "").strip()
+        if not apellido:
+            apellido = str(identidad.get("apellido") or "").strip()
+    return nombre or "Usuario", apellido or "Change"
+
+
+def _identidad_desde_cuenta(cuenta: dict) -> dict:
+    """Identidad (solo metadata) de una cuenta de la BD, sin usar Faker/email.
+
+    En modo cuenta NO se llama a `generar_identidad_change`: los nombres salen
+    de `nombre`/`apellido` o de `nombre_mostrado` partido (pueden quedar vacios).
+    """
+    cuenta = dict(cuenta or {})
+    nombre = str(cuenta.get("nombre") or "").strip()
+    apellido = str(cuenta.get("apellido") or "").strip()
+    if not (nombre and apellido):
+        parte_nombre, parte_apellido = _partir_nombre_mostrado(
+            cuenta.get("nombre_mostrado")
+        )
+        if not nombre:
+            nombre = parte_nombre
+        if not apellido:
+            apellido = parte_apellido
+    return {
+        "nombre": nombre,
+        "apellido": apellido,
+        "email": str(cuenta.get("email") or "").strip(),
+        "codigo_postal": "",
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -494,6 +781,9 @@ class ChangeOrgReportBot:
         headless: bool = None,
         timeout: int = 45,
         cancelar=None,
+        cuenta: dict = None,
+        esperar_captcha_seg=None,
+        aviso=None,
     ):
         self.url_peticion = str(url_peticion or "")
         self.contexto = str(contexto or "")
@@ -501,9 +791,13 @@ class ChangeOrgReportBot:
         self.headless = headless
         self.timeout = int(timeout or 45)
         self.cancelar = cancelar
+        self.cuenta = dict(cuenta or {})
+        self.esperar_captcha_seg = _resolver_esperar_captcha_seg(esperar_captcha_seg)
+        self.aviso = aviso if callable(aviso) else None
         self.driver = None
         self._fwd_proxy = None
         self.ultimo_error = ""
+        self.estado_cuenta = ""
 
     # ------------------------------------------------------------------ #
     # Ciclo de vida del navegador
@@ -603,6 +897,15 @@ class ChangeOrgReportBot:
         except Exception:
             return False
 
+    def _es_headless(self) -> bool:
+        """True si el navegador corre sin ventana visible (nadie puede ayudar)."""
+        try:
+            return bool(
+                self.headless if self.headless is not None else settings.headless
+            )
+        except Exception:
+            return False
+
     # ------------------------------------------------------------------ #
     # Helpers Selenium basicos (tolerantes a fallos)
     # ------------------------------------------------------------------ #
@@ -635,6 +938,22 @@ class ChangeOrgReportBot:
             return str(elemento.text or "")
         except Exception:
             return ""
+
+    def _texto_visible(self) -> str:
+        """Texto VISIBLE de la pagina (body); fallback a `_texto_pagina`.
+
+        Para detectar pantallas/errores de registro se prefiere el texto real
+        del DOM: el `page_source` incluye bundles JS con frases traducidas que
+        podrian dar falsos positivos.
+        """
+        try:
+            cuerpo = self.driver.find_element(By.TAG_NAME, "body")
+            texto = self._texto_elemento(cuerpo)
+            if texto:
+                return texto
+        except Exception:
+            pass
+        return self._texto_pagina()
 
     def _url_actual(self) -> str:
         try:
@@ -797,6 +1116,513 @@ class ChangeOrgReportBot:
         return None
 
     # ------------------------------------------------------------------ #
+    # Registro / Login en Change.org
+    # ------------------------------------------------------------------ #
+    def _texto_boton_candidato(self, elemento) -> str:
+        """Texto normalizado de un boton (visible text -> value)."""
+        texto = _normalizar(self._texto_elemento(elemento))
+        if not texto:
+            try:
+                texto = _normalizar(elemento.get_attribute("value") or "")
+            except Exception:
+                texto = ""
+        return texto
+
+    def _buscar_boton_login(self):
+        """Boton/link 'Iniciar sesión' | 'Log in' (ES/EN), visible y habilitado."""
+        for by, selector in (
+            (By.TAG_NAME, "button"),
+            (By.CSS_SELECTOR, "[role='button']"),
+            (By.TAG_NAME, "a"),
+            (By.CSS_SELECTOR, "input[type='submit']"),
+        ):
+            for elemento in self._buscar_elementos(by, selector):
+                if not (self._visible(elemento) and self._interactuable(elemento)):
+                    continue
+                texto = self._texto_boton_candidato(elemento)
+                if not texto:
+                    continue
+                if any(
+                    texto == frase or texto.startswith(frase)
+                    for frase in _FRASES_LOGIN
+                ):
+                    return elemento
+        return None
+
+    def _buscar_boton_continuar(self):
+        """Boton 'Continuar'/'Continue' del formulario de acceso.
+
+        Prioriza el texto EXACTO y los `type=submit`; descarta los botones
+        sociales (Google/Facebook/...) y los de codigo por email/telefono.
+        """
+        candidatos = []
+        for by, selector in (
+            (By.TAG_NAME, "button"),
+            (By.CSS_SELECTOR, "[role='button']"),
+            (By.CSS_SELECTOR, "input[type='submit']"),
+        ):
+            for elemento in self._buscar_elementos(by, selector):
+                if not (self._visible(elemento) and self._interactuable(elemento)):
+                    continue
+                texto = self._texto_boton_candidato(elemento)
+                if not texto:
+                    continue
+                if any(excluir in texto for excluir in _FRASES_CONTINUAR_EXCLUIR):
+                    continue
+                if texto in _FRASES_CONTINUAR:
+                    return elemento
+                if any(texto.startswith(frase) for frase in _FRASES_CONTINUAR):
+                    candidatos.append(elemento)
+        return candidatos[0] if candidatos else None
+
+    def _campo_password(self):
+        """Input de contraseña visible (pantalla nueva o de login)."""
+        for by, selector in (
+            (By.CSS_SELECTOR, "input[type='password']"),
+            (By.CSS_SELECTOR, "input[name*='password']"),
+            (By.CSS_SELECTOR, "input[id*='password']"),
+        ):
+            for elemento in self._buscar_elementos(by, selector):
+                if self._visible(elemento) and self._interactuable(elemento):
+                    return elemento
+        return None
+
+    def _campo_email_login(self):
+        """Input de correo del acceso: prioriza el modal (`role='dialog']`)."""
+        for by, selector in (
+            (By.CSS_SELECTOR, "[role='dialog'] input[type='email']"),
+            (By.CSS_SELECTOR, "[role='dialog'] input[name*='email']"),
+            (By.CSS_SELECTOR, "[role='dialog'] input[name*='correo']"),
+        ):
+            for elemento in self._buscar_elementos(by, selector):
+                if self._visible(elemento) and self._interactuable(elemento):
+                    return elemento
+        return self._resolver_campo("email")
+
+    def _asegurar_campo_email(self, intentos: int = 8):
+        """Abre el login (clic 'Iniciar sesión') y devuelve el campo de correo.
+
+        En MODO ASISTIDO (`esperar_captcha_seg > 0`) el reto anti-bot puede
+        aparecer ANTES del campo de correo: se espera a que un humano lo
+        resuelva y se sigue buscando el campo (deja el motivo en
+        `self.ultimo_error` si no se pudo).
+        """
+        for _ in range(max(1, intentos)):
+            if self._cancelado():
+                return None
+            if self.esperar_captcha_seg > 0 and not self._esperar_reto_humano():
+                return None
+            boton = self._buscar_boton_login()
+            if boton is not None:
+                self._clic_elemento(boton)
+            elemento = self._campo_email_login()
+            if elemento is not None and self._visible(elemento):
+                return elemento
+            time.sleep(0.5)
+        elemento = self._campo_email_login()
+        if elemento is not None and self._visible(elemento):
+            return elemento
+        return None
+
+    def _pulsar_continuar(self, intentos: int = 10) -> bool:
+        """Localiza y pulsa el boton Continuar (~5s). False si no aparece."""
+        for _ in range(max(1, intentos)):
+            if self._cancelado():
+                return False
+            boton = self._buscar_boton_continuar()
+            if boton is not None and self._clic_elemento(boton):
+                return True
+            time.sleep(0.5)
+        return False
+
+    def _detectar_error_sesion(self, tardias: bool = False) -> str:
+        """Frase de error del login (normalizada), "" si no hay.
+
+        `tardias=True` agrega las señales que solo son error DESPUES de enviar
+        la contraseña (p. ej. "al menos 10 caracteres" tambien es un texto de
+        ayuda en la pantalla "Crea tu contraseña").
+        """
+        texto = _normalizar(self._texto_visible())
+        if not texto:
+            return ""
+        frases = _FRASES_ERROR_SESION + (
+            _FRASES_ERROR_SESION_TARDIAS if tardias else ()
+        )
+        for frase in frases:
+            if frase in texto:
+                return frase
+        return ""
+
+    def _detectar_reto_humano(self) -> str:
+        """Detecta el reto anti-bot de Cloudflare/Turnstile ("" si no hay).
+
+        El widget vive en una sombra/iframe "protegida" (su
+        `getBoundingClientRect` puede estar anulado para no poder medirlo), asi
+        que se revisa primero por JS y luego por selectores/texto visible.
+        Devuelve una etiqueta corta del reto o "".
+        """
+        try:
+            resultado = self.driver.execute_script(
+                "try {"
+                "  if (window.turnstile) return 'turnstile';"
+                "  const nodo = document.querySelector("
+                "    '.cf-turnstile, [class*=turnstile], [id*=cf-chl],"
+                "     [data-testid*=turnstile]');"
+                "  if (nodo) return 'turnstile-dom';"
+                "  const frames = document.querySelectorAll('iframe');"
+                "  for (const f of frames) {"
+                "    if (/challenges[.]cloudflare[.]com|turnstile/i.test(f.src || ''))"
+                "      return 'turnstile-iframe';"
+                "    try { if (!f.getBoundingClientRect()) return 'iframe-protegido'; }"
+                "    catch (e) { return 'iframe-protegido'; }"
+                "  }"
+                "} catch (e) {}"
+                "return '';"
+            )
+            if resultado:
+                return str(resultado)
+        except Exception:
+            pass
+        for by, selector in (
+            (By.CSS_SELECTOR, "iframe[src*='challenges.cloudflare.com']"),
+            (By.CSS_SELECTOR, "iframe[src*='turnstile']"),
+            (By.CSS_SELECTOR, ".cf-turnstile"),
+        ):
+            for elemento in self._buscar_elementos(by, selector):
+                if self._visible(elemento):
+                    return selector
+        texto = _normalizar(self._texto_visible())
+        for frase in _FRASES_RETO_HUMANO:
+            if frase in texto:
+                return frase
+        return ""
+
+    # ------------------------------------------------------------------ #
+    # MODO ASISTIDO: espera humana al reto anti-bot (Cloudflare/captcha)
+    # ------------------------------------------------------------------ #
+    def _avisar_espera_captcha(self, segundos: int) -> None:
+        """Emite UNA vez el aviso de espera asistida; jamas rompe el flujo."""
+        aviso = getattr(self, "aviso", None)
+        if not callable(aviso):
+            return
+        cuenta = dict(self.cuenta or {})
+        try:
+            aviso(
+                {
+                    "tipo": "espera_captcha",
+                    "usuario": str(cuenta.get("usuario") or ""),
+                    "email": str(cuenta.get("email") or ""),
+                    "segundos": int(segundos),
+                    "estado": "iniciando",
+                }
+            )
+        except Exception as e:  # pragma: no cover - callback de terceros
+            logger.debug(f"Change.org: el aviso de espera de captcha fallo: {e}")
+
+    def _esperar_reto_humano(self, reto: str = "") -> bool:
+        """MODO ASISTIDO: espera a que un humano resuelva el reto anti-bot.
+
+        Devuelve True si ya NO hay reto (o si nunca lo hubo). `reto` puede ser
+        la etiqueta ya detectada; vacio -> detecta aqui (Cloudflare o captcha).
+
+        - `esperar_captcha_seg <= 0` (default) o navegador headless: devuelve
+          False SIN esperar (fallo clasico) y deja el motivo en
+          `self.ultimo_error` ("" con la espera desactivada, para que el
+          llamador conserve su mensaje historico).
+        - Chrome visible + espera > 0: emite `aviso` UNA vez, hace polling cada
+          1s (cancelable) y, si el reto desaparece, devuelve True. Si se agota
+          deja el error accionable; si se cancela, MENSAJE_CANCELADO.
+        """
+        reto = str(reto or "")
+        if not reto:
+            reto = self._detectar_reto_humano() or self._detectar_captcha()
+        if not reto:
+            return True
+        segundos = int(getattr(self, "esperar_captcha_seg", 0) or 0)
+        if segundos <= 0:
+            # Comportamiento clasico EXACTO: el llamador decide el fallo.
+            self.ultimo_error = ""
+            return False
+        if self._es_headless():
+            self.ultimo_error = (
+                "verificacion anti-bot de Change.org (Cloudflare): el navegador "
+                "esta en headless y no hay un humano que resuelva el reto; usa "
+                "el modo asistido con Chrome visible y resuelvelo a mano"
+            )
+            return False
+        if self._cancelado():
+            self.ultimo_error = MENSAJE_CANCELADO
+            return False
+        self._avisar_espera_captcha(segundos)
+        self.ultimo_error = ""
+        for _ in range(segundos):
+            if self._cancelado():
+                self.ultimo_error = MENSAJE_CANCELADO
+                return False
+            if not (self._detectar_reto_humano() or self._detectar_captcha()):
+                return True
+            # ~1s en tramos cortos para reaccionar rapido al paro.
+            for _ in range(4):
+                if self._cancelado():
+                    self.ultimo_error = MENSAJE_CANCELADO
+                    return False
+                time.sleep(0.25)
+        if self._cancelado():
+            self.ultimo_error = MENSAJE_CANCELADO
+            return False
+        if not (self._detectar_reto_humano() or self._detectar_captcha()):
+            return True
+        self.ultimo_error = (
+            "verificacion anti-bot de Change.org (Cloudflare): el reto no se "
+            f"resolvio en {segundos}s; usa el modo asistido con Chrome visible "
+            "y resuelvelo a mano"
+        )
+        return False
+
+    def _mensaje_error_sesion(self, frase: str) -> str:
+        """Mensaje accionable para el UI a partir de la señal detectada."""
+        if frase in (
+            "contrasena incorrecta",
+            "clave incorrecta",
+            "incorrect password",
+            "wrong password",
+            "invalid password",
+            "contrasena invalida",
+            "la contrasena es incorrecta",
+        ):
+            return f"contraseña incorrecta en Change.org (señal: '{frase}')"
+        if (
+            "no pudimos encontrarte" in frase
+            or "no encontramos" in frase
+            or "couldn't find" in frase
+            or "could not find" in frase
+        ):
+            return f"Change.org no encontro una cuenta con ese correo (señal: '{frase}')"
+        return f"error de Change.org: '{frase}'"
+
+    def _evidencia_sesion(self, email: str = "") -> str:
+        """Evidencia POSITIVA de sesion iniciada; "" si aun no se confirma."""
+        selectores = (
+            (By.CSS_SELECTOR, "a[href*='/logout']"),
+            (By.CSS_SELECTOR, "a[href*='/profile']"),
+            (By.CSS_SELECTOR, "a[href*='/settings']"),
+            (By.CSS_SELECTOR, "[data-testid*='avatar']"),
+            (By.CSS_SELECTOR, "img[alt*='perfil' i]"),
+            (By.CSS_SELECTOR, "img[alt*='profile' i]"),
+        )
+        for by, selector in selectores:
+            for elemento in self._buscar_elementos(by, selector):
+                if self._visible(elemento):
+                    return f"sesion iniciada ({selector})"
+        texto = _normalizar(self._texto_visible())
+        for frase in (
+            "cerrar sesion",
+            "sign out",
+            "log out",
+            "mi cuenta",
+            "my account",
+            "configuracion de la cuenta",
+            "account settings",
+        ):
+            if frase in texto:
+                return f"confirmacion en pantalla: '{frase}'"
+        email_norm = _normalizar(email)
+        url_norm = _normalizar(self._url_actual())
+        en_login = "login_or_join" in url_norm or "/login" in url_norm
+        if email_norm and email_norm in texto:
+            if self._campo_password() is None and not en_login:
+                return "el correo de la cuenta aparece en la pagina"
+        if url_norm and not en_login:
+            for fragmento in ("/profile", "/dashboard", "/account", "/settings", "/user"):
+                if fragmento in url_norm:
+                    return f"URL de cuenta: {self._url_actual()}"
+        return ""
+
+    def registrar_o_entrar(self) -> dict:
+        """Registra (cuenta NUEVA) o inicia sesion en Change.org.
+
+        Flujo real: `login_or_join?user_flow=nav` -> "Iniciar sesión" ->
+        "Dirección de correo electrónico" -> "Continuar" -> contraseña (nueva o
+        de login) -> "Continuar" -> (solo nuevas) "Nombres"/"Apellidos" ->
+        "Continuar". La contraseña sale de `password_change_para`.
+
+        Devuelve ``{"ok","estado","error","evidencia"}`` con estado "nueva" si
+        vio "Crea tu contraseña" (o la pantalla de nombre), "existente" si entro
+        por login y "fallo" si no se pudo confirmar la sesion. NUNCA lanza.
+        """
+        resultado = {"ok": False, "estado": "fallo", "error": "", "evidencia": ""}
+        cuenta = dict(self.cuenta or {})
+        email = str(cuenta.get("email") or "").strip()
+        password = password_change_para(
+            cuenta.get("password") or cuenta.get("email_password") or ""
+        )
+        nombre = str(cuenta.get("nombre") or "").strip()
+        apellido = str(cuenta.get("apellido") or "").strip()
+        if not (nombre and apellido):
+            nombre, apellido = _resolver_nombres(
+                nombre, apellido, cuenta.get("nombre_mostrado") or ""
+            )
+        if not email or not password:
+            resultado["error"] = "la cuenta no tiene email o contraseña para Change.org"
+            return resultado
+        try:
+            if not self.preparar_driver():
+                resultado["error"] = (
+                    self.ultimo_error or "no se pudo iniciar el navegador"
+                )
+                return resultado
+
+            self._navegar(_URL_LOGIN_CHANGE)
+            if self._cancelado():
+                resultado["error"] = MENSAJE_CANCELADO
+                return resultado
+            self._cerrar_banner_cookies()
+
+            campo = self._asegurar_campo_email()
+            if campo is None:
+                if self._cancelado():
+                    resultado["error"] = MENSAJE_CANCELADO
+                else:
+                    resultado["error"] = (
+                        self.ultimo_error
+                        or "no se encontro el campo de direccion de correo electronico"
+                    )
+                return resultado
+            if not self.escribir_humano(campo, email):
+                resultado["error"] = "no se pudo escribir el correo electronico"
+                return resultado
+            time.sleep(random.uniform(0.15, 0.4))
+            if not self._pulsar_continuar():
+                resultado["error"] = "no se encontro el boton Continuar"
+                return resultado
+
+            vio_password_nueva = False
+            password_enviada = False
+            nombre_enviado = False
+            error = ""
+            confirmado = ""
+            reto_iter = 0
+            for _ in range(60):
+                if self._cancelado():
+                    error = MENSAJE_CANCELADO
+                    break
+                captcha = self._detectar_captcha()
+                if captcha:
+                    if self.esperar_captcha_seg > 0:
+                        # MODO ASISTIDO: un humano lo resuelve y seguimos.
+                        if self._esperar_reto_humano(captcha):
+                            reto_iter = 0
+                            continue
+                        error = self.ultimo_error or f"captcha detectado: {captcha}"
+                        break
+                    error = f"captcha detectado: {captcha}"
+                    break
+                reto = self._detectar_reto_humano()
+                if reto:
+                    if self.esperar_captcha_seg > 0:
+                        # MODO ASISTIDO: espera (visible) y continua al limpiarse.
+                        if self._esperar_reto_humano(reto):
+                            reto_iter = 0
+                            continue
+                        error = self.ultimo_error or (
+                            "verificacion anti-bot de Change.org (Cloudflare): "
+                            f"reto '{reto}' no superado; reintenta con otro "
+                            "proxy o con el navegador visible"
+                        )
+                        break
+                    reto_iter += 1
+                    if reto_iter >= _ITERACIONES_ESPERA_RETO:
+                        error = (
+                            "verificacion anti-bot de Change.org (Cloudflare): "
+                            f"reto '{reto}' no superado; reintenta con otro "
+                            "proxy o con el navegador visible"
+                        )
+                        break
+                else:
+                    reto_iter = 0
+                frase_error = self._detectar_error_sesion()
+                if (
+                    not frase_error
+                    and password_enviada
+                    and self._campo_password() is None
+                ):
+                    # Las señales "tardias" (p. ej. "al menos 10 caracteres")
+                    # solo cuentan cuando la pantalla de contraseña ya no esta
+                    # (en "Crea tu contraseña" son texto de ayuda).
+                    frase_error = self._detectar_error_sesion(tardias=True)
+                if frase_error:
+                    error = self._mensaje_error_sesion(frase_error)
+                    break
+                evidencia = self._evidencia_sesion(email)
+                if evidencia:
+                    confirmado = evidencia
+                    break
+
+                if not password_enviada:
+                    clave = self._campo_password()
+                    if clave is not None:
+                        texto = _normalizar(self._texto_visible())
+                        if any(frase in texto for frase in _FRASES_PANTALLA_NUEVA):
+                            vio_password_nueva = True
+                        if not self.escribir_humano(clave, password):
+                            error = "no se pudo escribir la contrasena"
+                            break
+                        time.sleep(random.uniform(0.15, 0.4))
+                        if not self._pulsar_continuar():
+                            error = "no se encontro el boton Continuar de la contrasena"
+                            break
+                        password_enviada = True
+                        continue
+
+                if not nombre_enviado and (password_enviada or vio_password_nueva):
+                    campo_nombre = self._resolver_campo("nombre")
+                    campo_apellido = self._resolver_campo("apellido")
+                    if campo_nombre is not None and campo_apellido is not None:
+                        texto = _normalizar(self._texto_visible())
+                        es_pantalla_nombre = any(
+                            frase in texto for frase in _FRASES_PANTALLA_NOMBRE
+                        )
+                        if es_pantalla_nombre or vio_password_nueva:
+                            if not self.escribir_humano(campo_nombre, nombre):
+                                error = "no se pudo escribir el nombre"
+                                break
+                            if not self.escribir_humano(campo_apellido, apellido):
+                                error = "no se pudo escribir el apellido"
+                                break
+                            time.sleep(random.uniform(0.15, 0.4))
+                            if not self._pulsar_continuar():
+                                error = (
+                                    "no se encontro el boton Continuar del nombre"
+                                )
+                                break
+                            nombre_enviado = True
+                            continue
+                time.sleep(0.5)
+            else:
+                error = "no se pudo confirmar la sesion de Change.org (timeout)"
+
+            if not error and not confirmado:
+                error = "no se pudo confirmar la sesion de Change.org"
+            if error:
+                resultado["error"] = (
+                    MENSAJE_CANCELADO if self._cancelado() else error
+                )
+                return resultado
+
+            estado = "nueva" if (vio_password_nueva or nombre_enviado) else "existente"
+            resultado["ok"] = True
+            resultado["estado"] = estado
+            resultado["evidencia"] = confirmado
+            self.estado_cuenta = estado
+            return resultado
+        except Exception as e:
+            resultado["error"] = f"error inesperado en el registro: {e}"
+            logger.error(
+                f"Change.org: fallo el registro/login de {email or '(sin email)'}: {e}"
+            )
+            return resultado
+
+    # ------------------------------------------------------------------ #
     # Formulario
     # ------------------------------------------------------------------ #
     def _campo_por_etiqueta(self, etiqueta: str, tipo: str):
@@ -849,10 +1675,11 @@ class ChangeOrgReportBot:
                 return elemento
         return None
 
-    def escribir_humano(self, elemento, texto: str) -> bool:
+    def escribir_humano(self, elemento, texto: str, pausas_rapidas: bool = False) -> bool:
         """Escribe caracter por caracter con send_keys (eventos REALES de teclado).
 
-        Clic tolerante + pausa 0.02-0.12s por caracter, con typo ocasional
+        Clic tolerante + pausa 0.02-0.12s por caracter (0.02-0.04s con
+        `pausas_rapidas`, para quejas largas del modal), con typo ocasional
         (~5%) corregido al instante con BACKSPACE. Devuelve False si no se pudo
         escribir; nunca lanza.
         """
@@ -861,6 +1688,7 @@ class ChangeOrgReportBot:
         texto = str(texto or "")
         if not texto:
             return False
+        pausa_max = 0.04 if pausas_rapidas else 0.12
         try:
             try:
                 elemento.click()
@@ -878,17 +1706,220 @@ class ChangeOrgReportBot:
                     elemento.send_keys(Keys.BACKSPACE)
                     time.sleep(random.uniform(0.02, 0.06))
                 elemento.send_keys(char)
-                time.sleep(random.uniform(0.02, 0.12))
+                time.sleep(random.uniform(0.02, pausa_max))
             return True
         except Exception as e:
             self.ultimo_error = f"error escribiendo en el formulario: {e}"
             logger.warning(f"Change.org: {self.ultimo_error}")
             return False
 
+    # ------------------------------------------------------------------ #
+    # Modal real "Denunciar abuso": radio 3 + pais + textarea
+    # ------------------------------------------------------------------ #
+    def _radios_denuncia(self) -> list:
+        """Radios visibles del modal de denuncia (motive del reporte)."""
+        radios = []
+        for by, selector in (
+            (By.CSS_SELECTOR, "input[type='radio']"),
+            (By.CSS_SELECTOR, "[role='radio']"),
+        ):
+            for elemento in self._buscar_elementos(by, selector):
+                if self._visible(elemento) and elemento not in radios:
+                    radios.append(elemento)
+        return radios
+
+    def _texto_radio(self, radio) -> str:
+        """Texto asociado a un radio: aria-label/value/texto + label[for]/padre."""
+        partes = []
+        partes.append(self._texto_elemento(radio))
+        for attr in ("aria-label", "value", "title"):
+            try:
+                valor = radio.get_attribute(attr)
+            except Exception:
+                valor = ""
+            if valor:
+                partes.append(str(valor))
+        try:
+            radio_id = str(radio.get_attribute("id") or "").strip()
+        except Exception:
+            radio_id = ""
+        if radio_id:
+            for label in self._buscar_elementos(By.TAG_NAME, "label"):
+                try:
+                    if str(label.get_attribute("for") or "").strip() == radio_id:
+                        partes.append(self._texto_elemento(label))
+                except Exception:
+                    continue
+        try:
+            padre = radio.find_element(By.XPATH, "..")
+            partes.append(self._texto_elemento(padre))
+        except Exception:
+            pass
+        return _normalizar(" ".join(str(p) for p in partes if p))
+
+    def _seleccionar_motivo_denuncia(self, radios=None):
+        """Marca el TERCER motivo ("No me gusta esta petición..."). (ok, error)."""
+        radios = list(radios if radios is not None else self._radios_denuncia())
+        if not radios:
+            return False, "no se encontro el grupo de motivos de denuncia en el modal"
+        elegido = None
+        for radio in radios:
+            texto = self._texto_radio(radio)
+            if any(frase in texto for frase in _FRASES_MOTIVO_TERCERO):
+                elegido = radio
+                break
+        if elegido is None:
+            if len(radios) >= 3:
+                elegido = radios[2]
+            else:
+                return False, (
+                    "no se encontro el tercer motivo de denuncia "
+                    "(no me gusta / no estoy de acuerdo) en el modal"
+                )
+        if not self._clic_elemento(elegido):
+            return False, (
+                self.ultimo_error or "no se pudo seleccionar el motivo de la denuncia"
+            )
+        return True, ""
+
+    def _select_ubicacion(self):
+        """Select de "¿Dónde vives?": por etiqueta -> el que tenga Mexico -> 1º."""
+        for label in self._buscar_elementos(By.TAG_NAME, "label"):
+            texto = _normalizar(self._texto_elemento(label))
+            if not texto or not any(f in texto for f in _FRASES_UBICACION):
+                continue
+            for xpath in ("./select", "./following::select[1]"):
+                for elemento in self._buscar_elementos_de(label, By.XPATH, xpath):
+                    if self._visible(elemento):
+                        return elemento
+            try:
+                for_id = str(label.get_attribute("for") or "").strip()
+            except Exception:
+                for_id = ""
+            if for_id:
+                for elemento in self._buscar_elementos(
+                    By.CSS_SELECTOR, f"[id='{for_id}']"
+                ):
+                    if (
+                        getattr(elemento, "tag", "") == "select"
+                        and self._visible(elemento)
+                    ):
+                        return elemento
+        for elemento in self._buscar_elementos(By.TAG_NAME, "select"):
+            if self._visible(elemento) and self._opcion_mexico(elemento) is not None:
+                return elemento
+        for elemento in self._buscar_elementos(By.TAG_NAME, "select"):
+            if self._visible(elemento):
+                return elemento
+        return None
+
+    def _opcion_mexico(self, select):
+        """<option> de Mexico dentro del select (None si no existe)."""
+        for opcion in self._buscar_elementos_de(select, By.TAG_NAME, "option"):
+            try:
+                valor = _normalizar(opcion.get_attribute("value") or "")
+            except Exception:
+                valor = ""
+            texto = _normalizar(self._texto_elemento(opcion))
+            if (
+                "mexico" in texto
+                or "mexico" in valor
+                or valor in ("mx", "mex")
+                or texto in ("mx", "mex")
+            ):
+                return opcion
+        return None
+
+    def _opcion_seleccionada(self, opcion) -> bool:
+        try:
+            if opcion.get_attribute("selected") not in (None, "", False, "false"):
+                return True
+            if str(opcion.get_attribute("aria-selected") or "").lower() == "true":
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _seleccionar_pais_mexico(self) -> str:
+        """Garantiza Mexico en "¿Dónde vives?" si es un <select>.
+
+        Devuelve un detalle ("ya-mexico", "seleccionado", "sin-select", ...);
+        si ya viene Mexico NO toca nada.
+        """
+        select = self._select_ubicacion()
+        if select is None:
+            return "sin-select"
+        try:
+            valor_actual = _normalizar(select.get_attribute("value") or "")
+        except Exception:
+            valor_actual = ""
+        if valor_actual in ("mx", "mex", "mexico"):
+            return "ya-mexico"
+        opcion = self._opcion_mexico(select)
+        if opcion is None:
+            return "sin-opcion-mexico"
+        if self._opcion_seleccionada(opcion):
+            return "ya-mexico"
+        try:
+            opcion.click()
+            return "seleccionado"
+        except Exception:
+            pass
+        try:
+            valor = opcion.get_attribute("value") or "MX"
+            self.driver.execute_script(
+                "arguments[0].value = arguments[1];"
+                "arguments[0].dispatchEvent(new Event('change', {bubbles: true}));",
+                select,
+                valor,
+            )
+            return "seleccionado-js"
+        except Exception as e:
+            logger.debug(f"Change.org: no se pudo marcar Mexico en el select: {e}")
+            return "no-seleccionado"
+
+    def _esperar_textarea_motivo(self, intentos: int = 10):
+        """Espera (~5s) el textarea que aparece tras marcar el tercer motivo."""
+        for _ in range(max(1, intentos)):
+            if self._cancelado():
+                return None
+            elemento = self._resolver_campo("motivo")
+            if elemento is not None:
+                return elemento
+            time.sleep(0.5)
+        return None
+
     def _llenar_formulario(self, identidad: dict, queja: str):
-        """Llena Nombre/Apellido/Correo/Motivo. Devuelve (ok, motivo_error)."""
+        """Llena el modal real (radio 3 + Mexico + textarea). (ok, motivo_error).
+
+        Si el modal no expone radios de motivo, cae al formulario clasico
+        Nombre/Apellido/Correo/Motivo (compatibilidad).
+        """
         if self._cancelado():
             return False, MENSAJE_CANCELADO
+        texto_motivo = str(queja or self.contexto or "")
+        if not texto_motivo:
+            return False, "no hay texto de queja para el formulario"
+
+        radios = self._radios_denuncia()
+        if radios:
+            ok_radio, problema = self._seleccionar_motivo_denuncia(radios)
+            if not ok_radio:
+                return False, problema
+            time.sleep(random.uniform(0.3, 0.8))
+            self._seleccionar_pais_mexico()
+            elemento = self._esperar_textarea_motivo()
+            if elemento is None:
+                return False, "no se encontro el campo de motivo en el formulario"
+            if not self.escribir_humano(
+                elemento, texto_motivo, pausas_rapidas=len(texto_motivo) > 300
+            ):
+                return False, "no se pudo escribir el motivo del reporte"
+            time.sleep(random.uniform(0.15, 0.45))
+            return True, ""
+
+        # Formulario clasico (fallback): Nombre/Apellido/Correo + Motivo.
+        identidad = dict(identidad or {})
         campos = (
             ("nombre", str(identidad.get("nombre") or "")),
             ("apellido", str(identidad.get("apellido") or "")),
@@ -903,9 +1934,6 @@ class ChangeOrgReportBot:
             if not self.escribir_humano(elemento, valor):
                 return False, f"no se pudo escribir el campo de {tipo}"
             time.sleep(random.uniform(0.15, 0.45))
-        texto_motivo = str(queja or self.contexto or "")
-        if not texto_motivo:
-            return False, "no hay texto de queja para el formulario"
         elemento = self._resolver_campo("motivo")
         if elemento is None:
             return False, "no se encontro el campo de motivo en el formulario"
@@ -1003,7 +2031,9 @@ class ChangeOrgReportBot:
 
     def _formulario_presente(self) -> bool:
         return (
-            self._resolver_campo("motivo") is not None
+            bool(self._radios_denuncia())
+            or self._resolver_campo("motivo") is not None
+            or self._resolver_campo("nombre") is not None
             or self._resolver_campo("email") is not None
         )
 
@@ -1060,11 +2090,17 @@ class ChangeOrgReportBot:
     def reportar(self, identidad: dict = None, queja: str = "") -> dict:
         """Corre el flujo completo de UN reporte de violacion de politicas.
 
+        Si el bot trae `cuenta`, PRIMERO ejecuta `registrar_o_entrar()` (tras
+        `preparar_driver()`): si el registro/login falla, devuelve ok=False con
+        ese error y no toca la peticion; si entra bien, sigue con el reporte.
+
         Devuelve ``{"ok","email","nombre","apellido","queja","error","evidencia",
-        "url"}`` (+ ``"cancelado": True`` si se pidio el paro antes de enviar).
-        Nunca lanza.
+        "url"}`` (+ ``"estado_cuenta"`` en modo cuenta; + ``"cancelado": True``
+        si se pidio el paro antes de enviar). Nunca lanza.
         """
         identidad = dict(identidad or {})
+        if not identidad and self.cuenta:
+            identidad = _identidad_desde_cuenta(self.cuenta)
         resultado = {
             "ok": False,
             "email": str(identidad.get("email") or ""),
@@ -1094,6 +2130,23 @@ class ChangeOrgReportBot:
             if not self.preparar_driver():
                 resultado["error"] = self.ultimo_error or "no se pudo iniciar el navegador"
                 return resultado
+
+            if self.cuenta:
+                registro = self.registrar_o_entrar()
+                resultado["estado_cuenta"] = str(
+                    registro.get("estado") or "fallo"
+                )
+                if not registro.get("ok"):
+                    resultado["error"] = str(
+                        registro.get("error")
+                        or "no se pudo registrar o iniciar sesion en Change.org"
+                    )
+                    if self._cancelado():
+                        resultado["cancelado"] = True
+                        resultado["error"] = MENSAJE_CANCELADO
+                    return resultado
+                if _paro():
+                    return resultado
 
             self._navegar(self.url_peticion)
             resultado["url"] = self._url_actual() or resultado["url"]
@@ -1163,17 +2216,14 @@ class ChangeOrgReportBot:
             return resultado
 
     def _esperar_formulario(self, intentos: int = 20) -> bool:
-        """Espera (~10s) a que monte el formulario (modal o pagina nueva)."""
+        """Espera (~10s) a que monte el modal de denuncia (o el formulario nuevo)."""
         for _ in range(max(1, intentos)):
             if self._cancelado():
                 return False
-            if (
-                self._resolver_campo("nombre") is not None
-                or self._resolver_campo("motivo") is not None
-            ):
+            if self._formulario_presente():
                 return True
             time.sleep(0.5)
-        return self._resolver_campo("motivo") is not None
+        return self._formulario_presente()
 
 
 # --------------------------------------------------------------------------- #
@@ -1200,8 +2250,23 @@ def ejecutar_un_reporte(
     evitar=None,
     cancelar=None,
     guardar_identidad: bool = True,
+    cuenta=None,
+    esperar_captcha_seg=None,
+    *,
+    _aviso=None,
 ) -> dict:
     """Genera identidad + queja IA, corre el bot y guarda la identidad si fue OK.
+
+    Modo clasico (sin `cuenta`): genera identidad + queja IA, corre el bot en
+    anonimo y persiste la identidad en la granja si el reporte fue OK.
+    Modo cuenta (`cuenta` = dict con "usuario","email","password"/"email_password",
+    "nombre","apellido","nombre_mostrado"): NO llama a `generar_identidad_change`
+    (usa los datos de la cuenta), NO guarda en la granja
+    (``identidad_guardada=False``) y agrega ``"estado_cuenta"`` y ``"usuario"``
+    al resultado. El bot hace login/registro en Change.org ANTES de reportar.
+    `esperar_captcha_seg` activa el MODO ASISTIDO del bot (None -> env
+    CHANGE_ESPERAR_CAPTCHA_SEG -> 0; ver `ChangeOrgReportBot`). `_aviso` es
+    interno: el callback de aviso de espera que usan las campanas.
 
     Devuelve el dict de `reportar()` + ``{"identidad", "identidad_guardada",
     "guardado", "cancelado"}``. Con `cancelar` ya seteado devuelve
@@ -1219,7 +2284,12 @@ def ejecutar_un_reporte(
         except Exception:
             pass
 
-    identidad = generar_identidad_change()
+    esperar_captcha_seg = _resolver_esperar_captcha_seg(esperar_captcha_seg)
+    cuenta = dict(cuenta or {}) if isinstance(cuenta, dict) else {}
+    if cuenta:
+        identidad = _identidad_desde_cuenta(cuenta)
+    else:
+        identidad = generar_identidad_change()
     queja = ""
     try:
         # Import PEREZOSO: ia.generador_contenido es pesado y el contrato pide
@@ -1242,6 +2312,9 @@ def ejecutar_un_reporte(
             proxy=proxy,
             headless=headless,
             cancelar=cancelar,
+            cuenta=cuenta or None,
+            esperar_captcha_seg=esperar_captcha_seg,
+            aviso=_aviso,
         )
         resultado = bot.reportar(identidad=identidad, queja=queja)
         if not isinstance(resultado, dict):
@@ -1264,6 +2337,13 @@ def ejecutar_un_reporte(
     resultado["identidad"] = identidad
     resultado["cancelado"] = bool(resultado.get("cancelado", False)) or None
 
+    if cuenta:
+        resultado["usuario"] = str(cuenta.get("usuario") or "")
+        resultado.setdefault("estado_cuenta", "fallo")
+        resultado["identidad_guardada"] = False
+        resultado["guardado"] = None
+        return resultado
+
     guardado = None
     identidad_guardada = False
     if resultado.get("ok") and guardar_identidad:
@@ -1280,6 +2360,423 @@ def ejecutar_un_reporte(
     return resultado
 
 
+def registrar_cuenta_change(
+    usuario: str = "",
+    email: str = "",
+    password: str = "",
+    nombre: str = "",
+    apellido: str = "",
+    proxy: str = "",
+    headless: bool = None,
+    cancelar=None,
+    esperar_captcha_seg=None,
+    *,
+    _aviso=None,
+) -> dict:
+    """Registra (o inicia sesion en) UNA cuenta de Change.org.
+
+    Abre Chrome (crear_chrome + stealth + proxy), ejecuta
+    `ChangeOrgReportBot.registrar_o_entrar()` y cierra SIEMPRE. `password` se
+    normaliza con `password_change_para` (si viene corta se deriva). Los nombres
+    vacios se completan con Faker es_MX (`_resolver_nombres`), nunca quedan
+    vacios. NUNCA lanza.
+
+    `esperar_captcha_seg` activa el MODO ASISTIDO dentro del bot (None -> env
+    CHANGE_ESPERAR_CAPTCHA_SEG -> 0; acotado a [0, 900]); `_aviso` es interno:
+    el callback de aviso de espera que usan las campanas.
+
+    Resultado: ``{"ok","usuario","email","estado","nombre","apellido","error",
+    "evidencia","url","cancelado"}`` con ``estado in "nueva"|"existente"|"fallo"``.
+    """
+    resultado = {
+        "ok": False,
+        "usuario": str(usuario or ""),
+        "email": str(email or ""),
+        "estado": "fallo",
+        "nombre": str(nombre or ""),
+        "apellido": str(apellido or ""),
+        "error": "",
+        "evidencia": "",
+        "url": "",
+        "cancelado": False,
+    }
+    if cancelar is not None:
+        try:
+            if cancelar.is_set():
+                resultado["cancelado"] = True
+                resultado["error"] = MENSAJE_CANCELADO
+                return resultado
+        except Exception:
+            pass
+
+    email = str(email or "").strip()
+    clave = password_change_para(password)
+    if not email or not clave:
+        resultado["error"] = "la cuenta no tiene email o contraseña"
+        return resultado
+
+    esperar_captcha_seg = _resolver_esperar_captcha_seg(esperar_captcha_seg)
+    nombre, apellido = _resolver_nombres(nombre, apellido, "")
+    resultado["nombre"] = nombre
+    resultado["apellido"] = apellido
+
+    bot = None
+    try:
+        bot = ChangeOrgReportBot(
+            proxy=proxy,
+            headless=headless,
+            cancelar=cancelar,
+            cuenta={
+                "usuario": resultado["usuario"],
+                "email": email,
+                "password": clave,
+                "nombre": nombre,
+                "apellido": apellido,
+            },
+            esperar_captcha_seg=esperar_captcha_seg,
+            aviso=_aviso,
+        )
+        if not bot.preparar_driver():
+            resultado["error"] = bot.ultimo_error or "no se pudo iniciar el navegador"
+            return resultado
+        registro = bot.registrar_o_entrar()
+        if not isinstance(registro, dict):
+            registro = {}
+        resultado["ok"] = bool(registro.get("ok"))
+        resultado["estado"] = str(registro.get("estado") or "fallo")
+        resultado["error"] = str(registro.get("error") or "")
+        resultado["evidencia"] = str(registro.get("evidencia") or "")
+        resultado["url"] = bot._url_actual()
+        if cancelar is not None:
+            try:
+                if cancelar.is_set():
+                    resultado["cancelado"] = True
+                    if not resultado["error"]:
+                        resultado["error"] = MENSAJE_CANCELADO
+            except Exception:
+                pass
+        return resultado
+    except Exception as e:
+        resultado["error"] = f"error inesperado: {e}"
+        logger.error(
+            f"Change.org: fallo el registro de {email or '(sin email)'}: {e}"
+        )
+        return resultado
+    finally:
+        if bot is not None:
+            bot.cerrar()
+
+
+def ejecutar_campana_registros(
+    cuentas,
+    max_workers: int = 2,
+    usar_proxies: bool = True,
+    pais_proxy: str = "",
+    headless: bool = None,
+    cancelar=None,
+    callback=None,
+    esperar_captcha_seg=None,
+) -> dict:
+    """Registra/entra en Change.org con un lote de cuentas de la BD.
+
+    - `cuentas`: lista de dicts ``{"usuario","email","email_password" (o
+      "password"),"nombre_mostrado" (opcional)}``; cap 500.
+    - Omitidas: cuentas sin email o sin contraseña (no abren navegador); se
+      reportan con ``estado="omitida"`` y se cuentan en ``omitidas``.
+    - Nombres: `nombre_mostrado` partido (>=2 palabras) o Faker es_MX; nunca
+      vacios (via `_resolver_nombres`).
+    - `esperar_captcha_seg`: MODO ASISTIDO (None -> env
+      CHANGE_ESPERAR_CAPTCHA_SEG -> 0; acotado a [0, 900]). Cuando el bot avisa
+      que espera el reto anti-bot, este callback recibe ``{"tipo":
+      "espera_captcha","hechas":i,"total":N,"usuario":str,"email":str,
+      "detalle":"esperando captcha (Ns)"}`` (tambien si el reto aparece al
+      inicio del registro).
+    - `callback`: ``{"tipo":"inicio","total":N}`` y por cuenta terminada
+      ``{"tipo":"registro","hechas":i,"total":N,"ok":bool,"usuario":str,
+      "email":str,"estado":str,"detalle":str}``.
+    - `cancelar` (threading.Event): para de encolar (`shutdown(cancel_futures=
+      True)`) y marca ``cancelada=True``.
+    - Resumen: ``{"total","exitosos","fallidos","nuevas","existentes",
+      "omitidas","cancelada","resultados","proxies_total","sin_proxy","error"}``
+      donde `resultados` trae dicts con al menos ``ok, usuario, email, estado,
+      detalle``. Proxy round-robin por cuenta. NUNCA lanza.
+    """
+    resumen = {
+        "total": 0,
+        "exitosos": 0,
+        "fallidos": 0,
+        "nuevas": 0,
+        "existentes": 0,
+        "omitidas": 0,
+        "cancelada": False,
+        "resultados": [],
+        "proxies_total": 0,
+        "sin_proxy": 0,
+        "error": "",
+    }
+    try:
+        lista = []
+        try:
+            for item in cuentas or []:
+                if isinstance(item, dict):
+                    lista.append(dict(item))
+        except TypeError:
+            lista = []
+        if len(lista) > 500:
+            lista = lista[:500]
+        resumen["total"] = len(lista)
+
+        try:
+            workers = max(1, min(5, int(max_workers)))
+        except (TypeError, ValueError):
+            workers = 2
+
+        esperar_captcha_seg = _resolver_esperar_captcha_seg(esperar_captcha_seg)
+
+        def _evento_cancelado() -> bool:
+            if cancelar is None:
+                return False
+            try:
+                return bool(cancelar.is_set())
+            except Exception:
+                return False
+
+        _notificar(callback, {"tipo": "inicio", "total": len(lista)})
+        if _evento_cancelado():
+            resumen["cancelada"] = True
+            return resumen
+
+        proxies = []
+        if usar_proxies:
+            try:
+                proxies = [p for p in (proxies_disponibles(pais_proxy) or []) if p]
+            except Exception:
+                proxies = []
+        resumen["proxies_total"] = len(proxies)
+
+        lock = threading.Lock()
+        contadores = {
+            "proxy": 0,
+            "sin_proxy": 0,
+            "hechas": 0,
+            "exitosos": 0,
+            "fallidos": 0,
+            "nuevas": 0,
+            "existentes": 0,
+            "omitidas": 0,
+        }
+        total = len(lista)
+
+        def _siguiente_proxy() -> str:
+            with lock:
+                if not proxies:
+                    contadores["sin_proxy"] += 1
+                    return ""
+                proxy = proxies[contadores["proxy"] % len(proxies)]
+                contadores["proxy"] += 1
+                return proxy
+
+        def _procesar(item: dict) -> None:
+            resumen["resultados"].append(item)
+            with lock:
+                contadores["hechas"] += 1
+                if item.get("estado") == "omitida":
+                    contadores["omitidas"] += 1
+                elif item.get("ok"):
+                    contadores["exitosos"] += 1
+                    if item.get("estado") == "nueva":
+                        contadores["nuevas"] += 1
+                    elif item.get("estado") == "existente":
+                        contadores["existentes"] += 1
+                else:
+                    contadores["fallidos"] += 1
+                hechas = contadores["hechas"]
+            _notificar(
+                callback,
+                {
+                    "tipo": "registro",
+                    "hechas": hechas,
+                    "total": total,
+                    "ok": bool(item.get("ok")),
+                    "usuario": str(item.get("usuario") or ""),
+                    "email": str(item.get("email") or ""),
+                    "estado": str(item.get("estado") or ""),
+                    "detalle": str(item.get("detalle") or ""),
+                },
+            )
+
+        def _omitida(cuenta: dict, detalle: str) -> None:
+            _procesar(
+                {
+                    "ok": False,
+                    "usuario": str(cuenta.get("usuario") or ""),
+                    "email": str(cuenta.get("email") or ""),
+                    "estado": "omitida",
+                    "detalle": detalle,
+                }
+            )
+
+        def _trabajo(datos: dict) -> dict:
+            proxy = _siguiente_proxy()
+
+            def _aviso_captcha(info: dict) -> None:
+                """Reenvia a la UI la espera asistida de ESTA cuenta."""
+                info = dict(info or {})
+                with lock:
+                    hechas = contadores["hechas"]
+                _notificar(
+                    callback,
+                    {
+                        "tipo": "espera_captcha",
+                        "hechas": hechas,
+                        "total": total,
+                        "usuario": str(datos.get("usuario") or ""),
+                        "email": str(datos.get("email") or ""),
+                        "detalle": (
+                            f"esperando captcha ({info.get('segundos')}s)"
+                        ),
+                    },
+                )
+
+            try:
+                resultado = registrar_cuenta_change(
+                    usuario=datos["usuario"],
+                    email=datos["email"],
+                    password=datos["password"],
+                    nombre=datos["nombre"],
+                    apellido=datos["apellido"],
+                    proxy=proxy,
+                    headless=headless,
+                    cancelar=cancelar,
+                    esperar_captcha_seg=esperar_captcha_seg,
+                    _aviso=_aviso_captcha,
+                )
+            except Exception as e:
+                resultado = {
+                    "ok": False,
+                    "usuario": datos.get("usuario", ""),
+                    "email": datos.get("email", ""),
+                    "estado": "fallo",
+                    "error": f"{type(e).__name__}: {e}",
+                }
+            if not isinstance(resultado, dict):
+                resultado = {}
+            ok = bool(resultado.get("ok"))
+            estado = str(resultado.get("estado") or ("nueva" if ok else "fallo"))
+            detalle = "éxito" if ok else str(
+                resultado.get("error") or "fallo sin detalle"
+            )
+            return {
+                "ok": ok,
+                "usuario": str(resultado.get("usuario") or datos.get("usuario") or ""),
+                "email": str(resultado.get("email") or datos.get("email") or ""),
+                "estado": estado,
+                "detalle": detalle,
+                "error": str(resultado.get("error") or ""),
+                "evidencia": str(resultado.get("evidencia") or ""),
+            }
+
+        # Omitidas primero (sin navegador), luego las validas en paralelo.
+        validas = []
+        for cuenta in lista:
+            email = str(cuenta.get("email") or "").strip()
+            clave = password_change_para(
+                cuenta.get("email_password") or cuenta.get("password") or ""
+            )
+            if not email or not clave:
+                _omitida(cuenta, "sin email o contraseña")
+                continue
+            nombre, apellido = _resolver_nombres(
+                cuenta.get("nombre"), cuenta.get("apellido"),
+                cuenta.get("nombre_mostrado"),
+            )
+            validas.append(
+                {
+                    "usuario": str(cuenta.get("usuario") or ""),
+                    "email": email,
+                    "password": clave,
+                    "nombre": nombre,
+                    "apellido": apellido,
+                }
+            )
+
+        cancelada = _evento_cancelado()
+        if validas and not cancelada:
+            executor = ThreadPoolExecutor(max_workers=workers)
+            futuros: dict = {}
+            siguiente = 0
+            try:
+                while True:
+                    while (
+                        not _evento_cancelado()
+                        and siguiente < len(validas)
+                        and len(futuros) < max(1, workers * 2)
+                    ):
+                        datos = validas[siguiente]
+                        futuros[executor.submit(_trabajo, datos)] = siguiente
+                        siguiente += 1
+                    if _evento_cancelado():
+                        cancelada = True
+                        break
+                    if not futuros:
+                        break
+                    completado = None
+                    for futuro in as_completed(list(futuros)):
+                        completado = futuro
+                        break
+                    if completado is None:
+                        break
+                    futuros.pop(completado, None)
+                    try:
+                        resultado = completado.result()
+                    except Exception as e:
+                        resultado = {
+                            "ok": False,
+                            "usuario": "",
+                            "email": "",
+                            "estado": "fallo",
+                            "detalle": f"{type(e).__name__}: {e}",
+                        }
+                    if not isinstance(resultado, dict):
+                        resultado = {
+                            "ok": False,
+                            "usuario": "",
+                            "email": "",
+                            "estado": "fallo",
+                            "detalle": "respuesta invalida del registro",
+                        }
+                    _procesar(resultado)
+                    if _evento_cancelado():
+                        cancelada = True
+            finally:
+                if _evento_cancelado():
+                    cancelada = True
+                try:
+                    executor.shutdown(wait=not cancelada, cancel_futures=cancelada)
+                except TypeError:  # pragma: no cover - Python < 3.9
+                    executor.shutdown(wait=not cancelada)
+
+        resumen["exitosos"] = contadores["exitosos"]
+        resumen["fallidos"] = contadores["fallidos"]
+        resumen["nuevas"] = contadores["nuevas"]
+        resumen["existentes"] = contadores["existentes"]
+        resumen["omitidas"] = contadores["omitidas"]
+        resumen["sin_proxy"] = contadores["sin_proxy"]
+        resumen["cancelada"] = bool(cancelada)
+        logger.info(
+            "Change.org: campana de registros terminada "
+            f"({contadores['exitosos']} exitosos, {contadores['fallidos']} fallidos, "
+            f"{contadores['omitidas']} omitidas"
+            + (", cancelada" if cancelada else "")
+            + ")"
+        )
+        return resumen
+    except Exception as e:
+        resumen["error"] = f"{type(e).__name__}: {e}"
+        logger.error(f"Change.org: la campana de registros fallo: {e}")
+        return resumen
+
+
 def ejecutar_campana_reportes(
     url_peticion: str,
     contexto: str = "",
@@ -1291,18 +2788,30 @@ def ejecutar_campana_reportes(
     headless: bool = None,
     cancelar=None,
     callback=None,
+    cuentas=None,
+    esperar_captcha_seg=None,
 ) -> dict:
     """Lanza N reportes en paralelo con proxy round-robin por reporte.
 
     - `cantidad` se acota a [1, 200] y `max_workers` a [1, 5].
+    - `cuentas` (opcional): lista de dicts de cuentas de la BD; con una lista
+      no vacia cada reporte usa la SIGUIENTE cuenta en round-robin
+      (`ejecutar_un_reporte(..., cuenta=...)`: login/registro primero). El
+      evento de esa cuenta agrega ``"usuario"`` y ``"con_cuenta": True`` (sin
+      ``"identidad"``) y el resumen agrega ``"con_cuentas"`` y
+      ``"cuentas_total"``. Sin cuentas: flujo anonimo clasico intacto.
+    - `esperar_captcha_seg`: MODO ASISTIDO (None -> env
+      CHANGE_ESPERAR_CAPTCHA_SEG -> 0). Cuando el bot avisa que espera el reto
+      anti-bot, el callback recibe ``{"tipo":"espera_captcha","hechas":i,
+      "total":N,"usuario":str,"email":str,"detalle":"esperando captcha (Ns)"}``.
     - `callback` recibe ``{"tipo": "inicio", "total": N}`` y luego, por CADA
       reporte terminado, ``{"tipo": "reporte", "hechas": i, "total": N,
       "ok": bool, "email": str, "identidad": {...}, "detalle": str}``.
     - `cancelar` (threading.Event): deja de enviar nuevos reportes
       (``shutdown(cancel_futures=True)``) y marca ``cancelada=True``.
     - Resumen: ``{"total","enviados","fallidos","cancelada",
-      "identidades_guardadas","resultados","proxies_total","sin_proxy","error"}``.
-      NUNCA lanza.
+      "identidades_guardadas","resultados","proxies_total","sin_proxy","error",
+      "con_cuentas","cuentas_total"}``. NUNCA lanza.
     """
     resumen = {
         "total": 0,
@@ -1314,6 +2823,8 @@ def ejecutar_campana_reportes(
         "proxies_total": 0,
         "sin_proxy": 0,
         "error": "",
+        "con_cuentas": False,
+        "cuentas_total": 0,
     }
     try:
         try:
@@ -1325,6 +2836,18 @@ def ejecutar_campana_reportes(
         except (TypeError, ValueError):
             workers = 2
         resumen["total"] = total
+
+        esperar_captcha_seg = _resolver_esperar_captcha_seg(esperar_captcha_seg)
+
+        cuentas_lista = []
+        try:
+            for item in cuentas or []:
+                if isinstance(item, dict):
+                    cuentas_lista.append(dict(item))
+        except TypeError:
+            cuentas_lista = []
+        resumen["con_cuentas"] = bool(cuentas_lista)
+        resumen["cuentas_total"] = len(cuentas_lista)
 
         def _evento_cancelado() -> bool:
             if cancelar is None:
@@ -1357,6 +2880,7 @@ def ejecutar_campana_reportes(
             "enviados": 0,
             "fallidos": 0,
             "guardadas": 0,
+            "cuenta": 0,
         }
 
         def _siguiente_proxy() -> str:
@@ -1368,12 +2892,42 @@ def ejecutar_campana_reportes(
                 contadores["proxy"] += 1
                 return proxy
 
-        def _trabajo() -> dict:
+        def _siguiente_cuenta():
+            """Cuenta de la BD para el siguiente reporte (round-robin)."""
+            with lock:
+                if not cuentas_lista:
+                    return None
+                cuenta = cuentas_lista[contadores["cuenta"] % len(cuentas_lista)]
+                contadores["cuenta"] += 1
+                return dict(cuenta)
+
+        def _trabajo(cuenta_actual=None) -> dict:
             proxy = _siguiente_proxy()
             with lock:
                 evitar_actual = list(evitar)
+
+            def _aviso_captcha(info: dict) -> None:
+                """Reenvia a la UI la espera asistida de ESTE reporte."""
+                info = dict(info or {})
+                with lock:
+                    hechas = contadores["hechas"]
+                cuenta_info = dict(cuenta_actual or {})
+                _notificar(
+                    callback,
+                    {
+                        "tipo": "espera_captcha",
+                        "hechas": hechas,
+                        "total": total,
+                        "usuario": str(cuenta_info.get("usuario") or ""),
+                        "email": str(cuenta_info.get("email") or ""),
+                        "detalle": (
+                            f"esperando captcha ({info.get('segundos')}s)"
+                        ),
+                    },
+                )
+
             try:
-                resultado = ejecutar_un_reporte(
+                kwargs = dict(
                     url_peticion=url_peticion,
                     contexto=contexto,
                     proxy=proxy,
@@ -1381,7 +2935,12 @@ def ejecutar_campana_reportes(
                     evitar=evitar_actual,
                     cancelar=cancelar,
                     guardar_identidad=guardar_identidades,
+                    esperar_captcha_seg=esperar_captcha_seg,
+                    _aviso=_aviso_captcha,
                 )
+                if cuenta_actual is not None:
+                    kwargs["cuenta"] = cuenta_actual
+                resultado = ejecutar_un_reporte(**kwargs)
             except Exception as e:
                 resultado = {
                     "ok": False,
@@ -1416,22 +2975,26 @@ def ejecutar_campana_reportes(
                     contadores["guardadas"] += 1
                 hechas = contadores["hechas"]
             ok = bool(resultado.get("ok"))
-            _notificar(
-                callback,
-                {
-                    "tipo": "reporte",
-                    "hechas": hechas,
-                    "total": total,
-                    "ok": ok,
-                    "email": str(resultado.get("email") or ""),
-                    "identidad": dict(resultado.get("identidad") or {}),
-                    "detalle": (
-                        "éxito"
-                        if ok
-                        else str(resultado.get("error") or "fallo sin detalle")
-                    ),
-                },
-            )
+            info = {
+                "tipo": "reporte",
+                "hechas": hechas,
+                "total": total,
+                "ok": ok,
+                "email": str(resultado.get("email") or ""),
+                "detalle": (
+                    "éxito"
+                    if ok
+                    else str(resultado.get("error") or "fallo sin detalle")
+                ),
+            }
+            if cuentas_lista:
+                # Modo cuenta: el evento identifica la cuenta usada y NO lleva
+                # "identidad" (esa es de la granja anonima).
+                info["usuario"] = str(resultado.get("usuario") or "")
+                info["con_cuenta"] = True
+            else:
+                info["identidad"] = dict(resultado.get("identidad") or {})
+            _notificar(callback, info)
 
         executor = ThreadPoolExecutor(max_workers=workers)
         futuros: dict = {}
@@ -1444,7 +3007,8 @@ def ejecutar_campana_reportes(
                     and siguiente < total
                     and len(futuros) < max(1, workers * 2)
                 ):
-                    futuros[executor.submit(_trabajo)] = siguiente
+                    cuenta_actual = _siguiente_cuenta()
+                    futuros[executor.submit(_trabajo, cuenta_actual)] = siguiente
                     siguiente += 1
                 if _evento_cancelado():
                     # Paro inmediato: no se esperan los futuros en vuelo; el
