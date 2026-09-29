@@ -24,5 +24,10 @@ if [ ! -f "$SEED_MARKER" ]; then
     echo "[entrypoint] Siembra completada."
 fi
 
+# Proxies: Railway no sube los archivos gitignored; si el volumen no tiene
+# proxies por pais, se regeneran desde PROXY_BASE (o data/proxy_base.txt).
+# El `|| true` mantiene sano el `set -e` si python o la regeneracion fallan.
+python -c "from utils.proxies import ProxyManager; ProxyManager().regenerar_si_base()" || true
+
 echo "[entrypoint] Arrancando supervisord ..."
 exec "$@"

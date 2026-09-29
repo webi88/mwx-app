@@ -119,6 +119,10 @@ class ProxyManager:
         self.archivo = archivo or resolver_ruta("data/proxies.txt")
         self.dir_paises = resolver_ruta("data/proxies")
         self.quemados_path = resolver_ruta("data/proxies/quemados.txt")
+        # Proxy base de un solo gateway con el que regenerar data/proxies/*.txt.
+        # Se guarda como atributo para poder apuntarlo a un directorio temporal
+        # en pruebas (nunca a data/ real).
+        self.base_path = resolver_ruta("data/proxy_base.txt")
         self._fwd_proxy = None
         # Gateways ya reportados por logger.error para no repetir el aviso.
         self._gateways_logueados = set()
@@ -523,9 +527,43 @@ class ProxyManager:
             logger.info(f"Proxies {pais}: {len(proxies_pais)} -> {ruta}")
         return resultado
 
+    def _base_configurada(self) -> str:
+        """Resuelve el proxy base para regenerar los proxies por pais.
+
+        Orden de prioridad (sin efectos secundarios, nunca lanza):
+
+          1. La primera linea valida (no vacia y sin `#`) de
+             `data/proxy_base.txt` (reutiliza `_leer_archivo`, que normaliza).
+          2. La variable de entorno `PROXY_BASE`: se ignoran lineas vacias y
+             comentarios (`#`) y se toleran espacios alrededor; se normaliza
+             con `self.normalizar`.
+
+        Devuelve el proxy normalizado (`http://user:pass@host:port`) o `""` si
+        ninguna fuente tiene un proxy valido. Railway NO sube los archivos
+        gitignored, asi que en el contenedor la env es la unica fuente.
+        """
+        if self.base_path and os.path.exists(self.base_path):
+            proxies = self._leer_archivo(self.base_path)
+            if proxies:
+                return proxies[0]
+
+        env = os.environ.get("PROXY_BASE") or ""
+        for linea in env.splitlines():
+            linea = linea.strip()
+            if not linea or linea.startswith("#"):
+                continue
+            proxy = self.normalizar(linea)
+            if proxy:
+                return proxy
+        return ""
+
     def regenerar_si_base(self) -> bool:
-        """Si existe data/proxy_base.txt, regenera los proxies por pais desde
-        la primera linea valida. Devuelve True si regenero.
+        """Si hay un proxy base configurado, regenera los proxies por pais.
+
+        El proxy base se resuelve con `_base_configurada()`: primero la primera
+        linea valida de `data/proxy_base.txt` y, si el archivo no existe o no
+        tiene lineas validas, la variable de entorno `PROXY_BASE`. Devuelve True
+        si regenero (15 paises x 50 sesiones sticky via `regenerar_desde_base`).
 
         SOLO regenera en el PRIMER arranque (cuando los archivos por pais no
         existen o estan vacios). Regenerar en cada arranque crearia sesiones
@@ -534,26 +572,30 @@ class ProxyManager:
         ejecuciones (whack-a-mole). Por eso, si ya hay proxies por pais, se
         conservan tal cual (con sus quemados acumulados).
         """
-        base_path = resolver_ruta("data/proxy_base.txt")
-        if not os.path.exists(base_path):
-            return False
         if self._hay_proxies_por_pais():
             logger.info(
                 "Ya existen proxies por pais; se omite la regeneracion desde "
                 "base para conservar las sesiones quemadas entre ejecuciones."
             )
             return False
+
+        proxy = self._base_configurada()
+        if not proxy:
+            logger.info(
+                "Sin proxy base (data/proxy_base.txt ni PROXY_BASE): no se "
+                "regeneran los proxies por pais."
+            )
+            return False
+
         try:
-            with open(base_path, "r", encoding="utf-8") as f:
-                for linea in f:
-                    linea = linea.strip()
-                    if not linea or linea.startswith("#"):
-                        continue
-                    proxy = self.normalizar(linea)
-                    if proxy:
-                        self.regenerar_desde_base(proxy)
-                        logger.info(f"Proxies por pais actualizados desde {base_path}")
-                        return True
+            resultado = self.regenerar_desde_base(proxy)
+            if resultado:
+                total = sum(resultado.values())
+                logger.info(
+                    f"Proxies por pais actualizados desde proxy base: {total} "
+                    f"proxies en {len(resultado)} paises"
+                )
+                return True
         except Exception as e:
             logger.warning(f"Error regenerando proxies desde base: {e}")
         return False
