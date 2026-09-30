@@ -53,6 +53,15 @@ Cubren, SIN Chrome, SIN red y SIN campanas reales (fakes + monkeypatch):
       se lanza SIN el kwarg y se avisa con `st.warning`; el evento
       `espera_captcha` agrega la linea 🧠 al log del panel sin contar como
       exito/fallo (y respeta el recorte LOG_MAX).
+  (10) Tablas SOLO exitos + capturas: `_filas_resultados` descarta los
+      fallidos (columnas Usuario/Email/Detalle; Usuario cae al email),
+      `_filas_resultados_registros` descarta fallos/omitidas,
+      `_conteos_resultados` arma los totales del caption (contadores del
+      resumen o conteo de la lista) y `_capturas_exitos`/`_resolver_captura`
+      manejan la clave OPCIONAL `captura` (maximo 8, solo archivos
+      existentes; rutas relativas con `resolver_ruta`). En AppTest: filas
+      filtradas, captions de totales, expander "Imagen del éxito (N)" con
+      `st.image` real (PNG temporal) y su ausencia sin capturas / sin exitos.
 
 Los scripts de `AppTest.from_function` son SOLO ASCII (Streamlit escribe el
 script temporal con la codificacion local de Windows; misma regla que
@@ -67,6 +76,7 @@ from __future__ import annotations
 import ast
 import inspect
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -74,6 +84,13 @@ from pathlib import Path
 RAIZ = Path(__file__).resolve().parent.parent
 if str(RAIZ) not in sys.path:
     sys.path.insert(0, str(RAIZ))
+
+# PNG minimo (1x1) para las capturas de exito: archivo REAL y sin red.
+PNG_MINIMO = bytes.fromhex(
+    "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c489"
+    "0000000d4944415478da63fcffff3f030005fe02fea735d5c40000000049454e44"
+    "ae426082"
+)
 
 
 # ===================== FAKES (definidos FUERA de los scripts) =====================
@@ -1034,8 +1051,8 @@ def run(check):
     )
     filas_reg = change._filas_resultados_registros(resumen_reg)
     check(
-        "registro cuentas: _filas_resultados_registros mapea "
-        "Usuario/Email/Estado/Detalle",
+        "registro cuentas: _filas_resultados_registros SOLO muestra los "
+        "exitos (nueva/existente) con Usuario/Email/Estado/Detalle",
         filas_reg
         == [
             {
@@ -1049,18 +1066,6 @@ def run(check):
                 "Email": "bob@example.com",
                 "Estado": "👤 Existente",
                 "Detalle": "",
-            },
-            {
-                "Usuario": "@carla",
-                "Email": "carla@example.com",
-                "Estado": "❌ Fallo",
-                "Detalle": "captcha",
-            },
-            {
-                "Usuario": "@dave",
-                "Email": "dave@example.com",
-                "Estado": "➖ Omitida",
-                "Detalle": "sin correo",
             },
         ],
         ascii(str(filas_reg))[:220],
@@ -1194,6 +1199,164 @@ def run(check):
         ascii(str(snap_cap["log"][-1])) if snap_cap else "sin snapshot",
     )
     change._limpiar_registro()
+
+    # ---------------- 3e) Resultados SOLO exitos + capturas ----------------
+    with tempfile.TemporaryDirectory() as tmp:
+        png = Path(tmp) / "exito.png"
+        png.write_bytes(PNG_MINIMO)
+        ruta_ok = str(png)
+        faltante = str(Path(tmp) / "no-existe.png")
+        resumen_rep = {
+            "enviados": 9,
+            "fallidos": 3,
+            "resultados": [
+                {
+                    "ok": True,
+                    "usuario": "ana",
+                    "email": "ana@example.com",
+                    "detalle": "reportado",
+                    "captura": ruta_ok,
+                },
+                {
+                    "ok": False,
+                    "usuario": "bob",
+                    "email": "bob@example.com",
+                    "detalle": "captcha",
+                    "captura": ruta_ok,
+                },
+                {
+                    "ok": True,
+                    "email": "carla@example.com",
+                    "detalle": "",
+                    "captura": faltante,
+                },
+                "no-dict",
+            ],
+        }
+        filas_rep = change._filas_resultados(resumen_rep)
+        check(
+            "resultados: _filas_resultados SOLO exitos con Usuario/Email/"
+            "Detalle (usuario o email; los fallos no se listan)",
+            filas_rep
+            == [
+                {
+                    "Usuario": "@ana",
+                    "Email": "ana@example.com",
+                    "Detalle": "reportado",
+                },
+                {
+                    "Usuario": "carla@example.com",
+                    "Email": "carla@example.com",
+                    "Detalle": "",
+                },
+            ],
+            ascii(str(filas_rep))[:220],
+        )
+        check(
+            "resultados: sin resultados (o backend viejo) la tabla queda vacia",
+            change._filas_resultados({}) == []
+            and change._filas_resultados({"resultados": []}) == []
+            and change._filas_resultados(
+                {"resultados": [{"ok": False, "email": "x@y.com"}]}
+            )
+            == [],
+        )
+        totales_rep = change._conteos_resultados(resumen_rep)
+        check(
+            "resultados: _conteos_resultados usa los contadores del resumen",
+            totales_rep
+            == {
+                "exitos": 9,
+                "nuevas": 0,
+                "existentes": 0,
+                "fallidos": 3,
+                "omitidas": 0,
+            },
+            ascii(str(totales_rep))[:200],
+        )
+        totales_sin = change._conteos_resultados(
+            {
+                "resultados": [
+                    {"ok": True, "estado": "nueva"},
+                    {"ok": True, "estado": "existente"},
+                    {"ok": False, "estado": "fallo"},
+                    {"ok": False, "estado": "omitida"},
+                ]
+            }
+        )
+        check(
+            "resultados: sin contadores los totales se cuentan de la lista "
+            "(exitos/nuevas/existentes/fallidos/omitidas)",
+            totales_sin
+            == {
+                "exitos": 2,
+                "nuevas": 1,
+                "existentes": 1,
+                "fallidos": 1,
+                "omitidas": 1,
+            },
+            ascii(str(totales_sin))[:200],
+        )
+        capturas = change._capturas_exitos(resumen_rep)
+        check(
+            "capturas: _capturas_exitos solo toma exitos con archivo "
+            "existente (el fallo y la ruta faltante se omiten)",
+            capturas == [(ruta_ok, "ana", "reportado")],
+            ascii(str(capturas))[:220],
+        )
+        capturas_muchas = change._capturas_exitos(
+            {
+                "resultados": [
+                    {"ok": True, "usuario": f"u{i}", "captura": ruta_ok}
+                    for i in range(12)
+                ]
+            }
+        )
+        check(
+            "capturas: maximo 8 capturas en el orden de los resultados",
+            len(capturas_muchas) == 8
+            and [quien for _, quien, _ in capturas_muchas]
+            == [f"u{i}" for i in range(8)],
+            str(len(capturas_muchas)),
+        )
+        check(
+            "capturas: backend viejo (sin clave captura) no produce capturas",
+            change._capturas_exitos(
+                {"resultados": [{"ok": True, "email": "a@b.com"}]}
+            )
+            == []
+            and change._capturas_exitos({}) == [],
+        )
+        check(
+            "capturas: _resolver_captura valida archivos y tolera rutas "
+            "vacias/faltantes",
+            change._resolver_captura(ruta_ok) == ruta_ok
+            and change._resolver_captura("") == ""
+            and change._resolver_captura(None) == ""
+            and change._resolver_captura(faltante) == "",
+        )
+        check(
+            "capturas: _detalle_corto recorta detalles largos en una linea",
+            change._detalle_corto("corto") == "corto"
+            and len(change._detalle_corto("x" * 200)) == 80
+            and change._detalle_corto("x" * 200).endswith("…")
+            and "\n" not in change._detalle_corto("dos\nlineas"),
+        )
+        # Ruta relativa: se resuelve con `core.config.resolver_ruta`.
+        import core.config as core_config
+
+        original_resolver = core_config.resolver_ruta
+        try:
+            core_config.resolver_ruta = lambda ruta: ruta_ok
+            check(
+                "capturas: las rutas relativas se resuelven con resolver_ruta",
+                change._resolver_captura(
+                    "data/reportes/change/exito.png"
+                )
+                == ruta_ok,
+            )
+        finally:
+            core_config.resolver_ruta = original_resolver
 
     # ---------------- 4) Fuente de web/app.py ----------------
     constantes = _leer_constantes_app()
@@ -1861,14 +2024,31 @@ def run(check):
             df.value for df in at_final.dataframe
         ]
         check(
-            "campana AppTest: dataframe de resultados (Email/OK/Detalle)",
+            "campana AppTest: dataframe SOLO con el exito (Usuario/Email/"
+            "Detalle; el fallo no aparece)",
             any(
                 hasattr(tabla, "columns")
-                and {"Email", "OK", "Detalle"} <= set(tabla.columns)
-                and len(tabla) == 2
+                and {"Usuario", "Email", "Detalle"} <= set(tabla.columns)
+                and len(tabla) == 1
                 for tabla in tablas
             ),
             ascii(str([list(t.columns) for t in tablas]))[:220],
+        )
+        check(
+            "campana AppTest: caption con exitos y fallidos (no se muestran)",
+            any(
+                "✅ 1 reportes exitosos" in str(c.value)
+                and "❌ 1 fallidos (no se muestran)" in str(c.value)
+                for c in at_final.caption
+            ),
+            ascii([str(c.value) for c in at_final.caption])[:220],
+        )
+        check(
+            "campana AppTest: sin capturas NO aparece el expander de imagenes",
+            not any(
+                "Imagen del éxito" in str(e.label) for e in at_final.expander
+            ),
+            ascii([str(e.label) for e in at_final.expander])[:220],
         )
         check(
             "campana AppTest: caption con identidades guardadas",
@@ -1882,6 +2062,107 @@ def run(check):
             "campana AppTest: el registro quedo terminado y con resumen",
             (change._snapshot() or {}).get("estado") == "terminada"
             and (change._snapshot() or {}).get("resumen", {}).get("total") == 2,
+        )
+        change._limpiar_registro()
+
+    # ---------------- 9b) Captura del exito en el panel final ----------------
+    fake_img = _BackendReportesFake()
+    with tempfile.TemporaryDirectory() as tmp:
+        png = Path(tmp) / "exito.png"
+        png.write_bytes(PNG_MINIMO)
+        fake_img.resumen["resultados"][0]["usuario"] = "ana"
+        fake_img.resumen["resultados"][0]["detalle"] = "reporte enviado"
+        fake_img.resumen["resultados"][0]["captura"] = str(png)
+        fake_img.resumen["resultados"][1]["captura"] = str(
+            Path(tmp) / "no-existe.png"
+        )
+        with _BackendParcheado(fake_img), _GranjaParcheada(change), (
+            _CuentasChangeParcheadas(change)
+        ):
+            change._limpiar_registro()
+            at_img = AppTest.from_function(
+                _app_change_una_pasada, default_timeout=90
+            )
+            at_img.run()
+            at_img.radio(key="change_rep_modo").set_value(
+                change.MODO_ANONIMO
+            ).run()
+            at_img.text_input(key="change_rep_url").input(
+                "https://www.change.org/p/demo"
+            ).run()
+            at_img.text_area(key="change_rep_contexto").input(
+                "Incumple las normas de la comunidad"
+            ).run()
+            at_img.button(key="btn_change_reportes").click().run()
+            _esperar_campana_libre(change)
+            at_img.run()
+            expanders_img = [str(e.label) for e in at_img.expander]
+            imagenes = at_img.get("imgs")
+            captions_img = [
+                str(getattr(img, "caption", ""))
+                for elemento in imagenes
+                for img in elemento.proto.imgs
+            ]
+            check(
+                "capturas AppTest: expander 'Imagen del éxito (1)' con la "
+                "captura existente y caption @usuario — detalle",
+                not at_img.exception
+                and any(
+                    "Imagen del éxito (1)" in e for e in expanders_img
+                )
+                and len(imagenes) == 1
+                and any(
+                    "@ana" in caption and "reporte enviado" in caption
+                    for caption in captions_img
+                ),
+                ascii(str(expanders_img))[:200] + excepcion_app(at_img),
+            )
+            change._limpiar_registro()
+
+    # Solo fallos: caption "Sin reportes exitosos." y sin tabla ni imagenes.
+    fake_solo_fallos = _BackendReportesFake()
+    fake_solo_fallos.resumen["resultados"] = [
+        resultado
+        for resultado in fake_solo_fallos.resumen["resultados"]
+        if not resultado.get("ok")
+    ]
+    with _BackendParcheado(fake_solo_fallos), _GranjaParcheada(change), (
+        _CuentasChangeParcheadas(change)
+    ):
+        change._limpiar_registro()
+        at_fallo = AppTest.from_function(
+            _app_change_una_pasada, default_timeout=90
+        )
+        at_fallo.run()
+        at_fallo.radio(key="change_rep_modo").set_value(
+            change.MODO_ANONIMO
+        ).run()
+        at_fallo.text_input(key="change_rep_url").input(
+            "https://www.change.org/p/demo"
+        ).run()
+        at_fallo.text_area(key="change_rep_contexto").input(
+            "Incumple las normas de la comunidad"
+        ).run()
+        at_fallo.button(key="btn_change_reportes").click().run()
+        _esperar_campana_libre(change)
+        at_fallo.run()
+        tablas_fallo = [
+            df.value
+            for df in at_fallo.dataframe
+            if hasattr(df.value, "columns")
+            and {"Usuario", "Email", "Detalle"} <= set(df.value.columns)
+        ]
+        check(
+            "capturas AppTest: sin exitos el panel muestra 'Sin reportes "
+            "exitosos.' y no pinta tabla ni imagenes",
+            not at_fallo.exception
+            and "Sin reportes exitosos." in _textos(at_fallo)
+            and tablas_fallo == []
+            and not any(
+                "Imagen del éxito" in str(e.label)
+                for e in at_fallo.expander
+            ),
+            ascii(_textos(at_fallo))[:240] + excepcion_app(at_fallo),
         )
         change._limpiar_registro()
 
@@ -2125,17 +2406,30 @@ def run(check):
             and {"Usuario", "Email", "Estado", "Detalle"} <= set(df.value.columns)
         ]
         check(
-            "registros AppTest: dataframe Usuario/Email/Estado/Detalle con "
-            "Nueva/Existente/Fallo",
+            "registros AppTest: dataframe SOLO con los exitos Nueva/Existente "
+            "(el fallo no aparece)",
             bool(tabla_reg)
-            and len(tabla_reg[0]) == 3
+            and len(tabla_reg[0]) == 2
             and "@ana" in str(tabla_reg[0].iloc[0].to_dict())
             and "🆕 Nueva" in str(tabla_reg[0].iloc[0].to_dict())
             and "👤 Existente" in str(tabla_reg[0].iloc[1].to_dict())
-            and "❌ Fallo" in str(tabla_reg[0].iloc[2].to_dict()),
+            and "carla" not in str(
+                [dict(fila) for fila in tabla_reg[0].to_dict("records")]
+            ),
             ascii(str([dict(fila) for fila in tabla_reg[0].to_dict("records")]))[
                 :240
             ] if tabla_reg else "sin dataframe",
+        )
+        check(
+            "registros AppTest: caption con los totales (ok/nuevas/existentes/"
+            "fallidos/omitidas) y el aviso 'no se muestran'",
+            any(
+                "✅ 2 ok (🆕 1 nuevas · 👤 1 existentes)" in str(c.value)
+                and "❌ 1 fallidos" in str(c.value)
+                and "➖ 0 omitidas (no se muestran)" in str(c.value)
+                for c in at_reg_ok.caption
+            ),
+            ascii([str(c.value) for c in at_reg_ok.caption])[:240],
         )
         check(
             "registros AppTest: el registro quedo terminado tipo 'registros'",

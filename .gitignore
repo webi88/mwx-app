@@ -19,6 +19,7 @@ data/avatars/
 data/portadas/
 data/backups/
 data/campanas/
+data/reportes/change/
 data/clientes/
 data/clientes_bot.json
 *.db-shm

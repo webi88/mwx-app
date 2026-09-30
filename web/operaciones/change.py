@@ -64,6 +64,13 @@ reportes y registros.
 La granja de identidades (`CuentaChange`) se muestra al final en un expander
 con el total de filas y las ultimas 20, SIEMPRE envuelta en try/except: si la
 tabla o la BD no existen, la pagina sigue funcionando con un caption.
+
+Las tablas del panel final muestran SOLO los exitos (reportes y registros):
+los fallidos y las omitidas no se listan, y un caption debajo resume sus
+totales. En el panel final de reportes, un expander
+"🖼️ Imagen del éxito (N)" muestra hasta 8 capturas de los exitos
+(`resultado["captura"]`, clave OPCIONAL: si falta, la ruta no existe o el
+archivo no se puede mostrar, se omite).
 """
 from __future__ import annotations
 
@@ -424,45 +431,100 @@ def _snapshot(id_campana=None) -> dict | None:
         }
 
 
-def _filas_resultados(resumen: dict) -> list:
-    """Filas (Email/OK/Detalle) del `resumen["resultados"]` para `st.dataframe`.
+def _estado_resultado(resultado: dict) -> str:
+    """`estado` normalizado de un resultado de registros ('' si falta)."""
+    return str(resultado.get("estado") or "").strip().lower()
 
-    Es el formato del modo anonimo de reportes."""
+
+def _filas_resultados(resumen: dict) -> list:
+    """Filas (Usuario/Email/Detalle) de SOLO los reportes exitosos.
+
+    Los fallidos NO se muestran (el caption del panel da su total). `Usuario`
+    usa `resultado["usuario"]` y, si no hay, cae al correo. `captura` (nueva,
+    opcional) no forma parte de la tabla: la usa el expander de imagenes."""
     filas = []
     for resultado in (resumen or {}).get("resultados") or []:
-        if not isinstance(resultado, dict):
+        if not isinstance(resultado, dict) or not resultado.get("ok"):
             continue
+        email = str(resultado.get("email") or "").strip()
+        usuario = str(resultado.get("usuario") or "").strip().lstrip("@")
         filas.append(
             {
-                "Email": str(resultado.get("email") or ""),
-                "OK": "✅" if resultado.get("ok") else "❌",
-                "Detalle": str(resultado.get("detalle") or ""),
+                "Usuario": f"@{usuario}" if usuario else (email or "?"),
+                "Email": email,
+                "Detalle": str(resultado.get("detalle") or "").strip(),
             }
         )
     return filas
 
 
-def _filas_resultados_registros(resumen: dict) -> list:
-    """Filas (Usuario/Email/Estado/Detalle) del resumen de registros.
+def _conteos_resultados(resumen: dict) -> dict:
+    """Conteos {exitos, nuevas, existentes, fallidos, omitidas} del resumen.
 
-    `estado` del backend: "nueva" | "existente" | "fallo" | "omitida"
-    (cualquier otro valor se muestra tal cual)."""
+    Prefiere los contadores del backend (`enviados`/`exitosos`, `nuevas`,
+    `existentes`, `fallidos`, `omitidas`) y cae a contar la lista `resultados`
+    cuando el contador falta (backend viejo con lista pero sin totales).
+    Nunca lanza."""
+    resumen = resumen or {}
+    resultados = [
+        resultado
+        for resultado in resumen.get("resultados") or []
+        if isinstance(resultado, dict)
+    ]
+    exitos_filas = sum(1 for resultado in resultados if resultado.get("ok"))
+    nuevas_filas = sum(
+        1
+        for resultado in resultados
+        if resultado.get("ok") and _estado_resultado(resultado) == "nueva"
+    )
+    existentes_filas = sum(
+        1
+        for resultado in resultados
+        if resultado.get("ok")
+        and _estado_resultado(resultado) == "existente"
+    )
+    omitidas_filas = sum(
+        1
+        for resultado in resultados
+        if not resultado.get("ok")
+        and _estado_resultado(resultado) == "omitida"
+    )
+    fallidos_filas = max(0, len(resultados) - exitos_filas - omitidas_filas)
+    enviados = resumen.get("enviados")
+    if enviados is None:
+        enviados = resumen.get("exitosos")
+    return {
+        "exitos": max(_entero(enviados, exitos_filas), exitos_filas),
+        "nuevas": max(_entero(resumen.get("nuevas"), nuevas_filas), nuevas_filas),
+        "existentes": max(
+            _entero(resumen.get("existentes"), existentes_filas),
+            existentes_filas,
+        ),
+        "fallidos": max(
+            _entero(resumen.get("fallidos"), fallidos_filas), fallidos_filas
+        ),
+        "omitidas": max(
+            _entero(resumen.get("omitidas"), omitidas_filas), omitidas_filas
+        ),
+    }
+
+
+def _filas_resultados_registros(resumen: dict) -> list:
+    """Filas (Usuario/Email/Estado/Detalle) de SOLO los registros exitosos.
+
+    Exito = `ok=True` con estado "nueva" | "existente"; los fallos y las
+    omitidas NO se muestran (el caption del panel da sus totales)."""
     filas = []
     for resultado in (resumen or {}).get("resultados") or []:
-        if not isinstance(resultado, dict):
+        if not isinstance(resultado, dict) or not resultado.get("ok"):
             continue
-        ok = bool(resultado.get("ok"))
-        estado = str(resultado.get("estado") or "").strip().lower()
-        if ok and estado == "nueva":
+        estado = _estado_resultado(resultado)
+        if estado == "nueva":
             etiqueta = "🆕 Nueva"
-        elif ok and estado == "existente":
+        elif estado == "existente":
             etiqueta = "👤 Existente"
-        elif estado == "omitida":
-            etiqueta = "➖ Omitida"
-        elif ok:
-            etiqueta = "✅ OK"
         else:
-            etiqueta = "❌ Fallo"
+            continue
         usuario = str(resultado.get("usuario") or "").strip().lstrip("@")
         filas.append(
             {
@@ -473,6 +535,59 @@ def _filas_resultados_registros(resumen: dict) -> list:
             }
         )
     return filas
+
+
+def _resolver_captura(ruta) -> str:
+    """Ruta de archivo existente de una captura ('' si falta o no es archivo).
+
+    Acepta rutas absolutas y relativas a la raiz del proyecto (`resolver_ruta`
+    cuando esta disponible; si no, `os.path.abspath`). Nunca lanza."""
+    candidata = str(ruta or "").strip()
+    if not candidata:
+        return ""
+    if not os.path.isabs(candidata):
+        try:
+            from core.config import resolver_ruta
+
+            candidata = str(resolver_ruta(candidata))
+        except Exception:
+            candidata = os.path.abspath(candidata)
+    return candidata if os.path.isfile(candidata) else ""
+
+
+def _detalle_corto(detalle, limite: int = 80) -> str:
+    """Detalle en una sola linea, recortado a `limite` caracteres (con …)."""
+    texto = " ".join(str(detalle or "").split())
+    if len(texto) <= limite:
+        return texto
+    return texto[: max(1, limite - 1)].rstrip() + "…"
+
+
+def _capturas_exitos(resumen: dict, limite: int = 8) -> list:
+    """[(ruta, quien, detalle)] de los exitos CON captura existente.
+
+    La clave `captura` es OPCIONAL (`resultado.get("captura") or ""`): con un
+    backend viejo no hay capturas y el expander no se pinta. Se conserva el
+    orden de `resultados` y se corta en `limite` (default 8). Nunca lanza."""
+    capturas = []
+    for resultado in (resumen or {}).get("resultados") or []:
+        if not isinstance(resultado, dict) or not resultado.get("ok"):
+            continue
+        ruta = _resolver_captura(resultado.get("captura") or "")
+        if not ruta:
+            continue
+        email = str(resultado.get("email") or "").strip()
+        usuario = str(resultado.get("usuario") or "").strip().lstrip("@")
+        capturas.append(
+            (
+                ruta,
+                usuario or email,
+                str(resultado.get("detalle") or "").strip(),
+            )
+        )
+        if len(capturas) >= limite:
+            break
+    return capturas
 
 
 def _boton_detener(snap: dict) -> None:
@@ -531,8 +646,28 @@ def _pintar_reportes_final(snap: dict) -> None:
             f"{snap['fallidos']} fallidos"
         )
     filas = _filas_resultados(resumen)
+    totales = _conteos_resultados(resumen)
     if filas:
         st.dataframe(filas, use_container_width=True, hide_index=True)
+        st.caption(
+            f"✅ {totales['exitos']} reportes exitosos · "
+            f"❌ {totales['fallidos']} fallidos (no se muestran)"
+        )
+    else:
+        st.caption("Sin reportes exitosos.")
+    capturas = _capturas_exitos(resumen)
+    if capturas:
+        with st.expander(
+            f"🖼️ Imagen del éxito ({len(capturas)})", expanded=False
+        ):
+            for ruta, quien, detalle in capturas:
+                etiqueta = f"@{quien}" if quien else "?"
+                if detalle:
+                    etiqueta += f" — {_detalle_corto(detalle)}"
+                try:
+                    st.image(ruta, caption=etiqueta)
+                except Exception:
+                    continue
     guardadas = _entero(resumen.get("identidades_guardadas"))
     if guardadas > 0:
         st.caption(f"🧾 Identidades guardadas: {guardadas}")
@@ -581,11 +716,15 @@ def _pintar_registros_final(snap: dict) -> None:
     else:
         st.success(f"✅ Registro terminado: {conteos}")
     filas = _filas_resultados_registros(resumen)
+    totales = _conteos_resultados(resumen)
     if filas:
         st.dataframe(filas, use_container_width=True, hide_index=True)
-    omitidas = _entero(resumen.get("omitidas"))
-    if omitidas > 0:
-        st.caption(f"➖ Omitidas: {omitidas}")
+    st.caption(
+        f"✅ {totales['exitos']} ok (🆕 {totales['nuevas']} nuevas · "
+        f"👤 {totales['existentes']} existentes) · "
+        f"❌ {totales['fallidos']} fallidos · "
+        f"➖ {totales['omitidas']} omitidas (no se muestran)"
+    )
 
 
 def _pintar_proceso(snap=None) -> None:

@@ -7,6 +7,24 @@ Cubre el contrato congelado de `cuentas/change_org.py`:
       evita duplicados, campos no vacios y llamadas distintas.
   (2) `proxies_disponibles`: usa `cargar_por_pais` / `cargar_proxies` y nunca
       lanza ([] ante error).
+  (2b) `_error_navegacion_pagina`: detecta las paginas de error de red de Chrome
+      (`Privacy error`, `NET::ERR_*`, `ERR_TUNNEL_*`, `This site can't be
+      reached`, `la conexion no es privada`, ...) por titulo y texto visible y
+      `_navegar`/`registrar_o_entrar`/`reportar` fallan con el mensaje
+      accionable de proxy con TLS/red rota (nunca como captcha ni como "campo
+      no encontrado").
+  (2c) `proxy_change_valido`: con `requests.get` monkeypatcheado (HTTP 200 ->
+       True; SSLError/Timeout/503 -> False), cadena vacia o proxy no analizable
+       -> True, cache por proceso con TTL `PROXY_CHANGE_CACHE_SEG` (segunda
+       llamada sin red; 0 = sin cache) y nunca lanza.
+  (2d) `_pagina_error_servidor`: la pagina de ERROR DE APLICACION de Change.org
+       ("¡Oh no! Error del servidor...") se detecta por TEXTO VISIBLE
+       normalizado con combinaciones anti-falso-positivo ("error del servidor"
+       sola basta; "oh no" aislada NO; frases ambiguas solas NO y dos juntas
+       SI; `page_source` no cuenta con body presente); `reportar` hace UN
+       `driver.refresh()` tras navegar y, si persiste, falla con
+       `_ERROR_SERVIDOR_PETICION` (nunca el generico "no se encontro el
+       enlace"); si el refresh la quita, el flujo continua normal.
   (3) Localizacion y clic del enlace de reporte con FakeDriver: texto ES exacto,
       variante EN, `href` policy_violation, scroll hasta encontrarlo y JS click
       de fallback.
@@ -31,6 +49,16 @@ Cubre el contrato congelado de `cuentas/change_org.py`:
        de proxies, callbacks `inicio` + N `reporte` con `hechas` 1..N, resumen
        consistente, `cancelar` pre-seteado, excepciones contadas como fallo y
        nunca lanza.
+  (10b) Pantalla de CODIGO TEMPORAL por correo (cuenta existente): la deteccion
+       ES/EN (`_pantalla_codigo_temporal`), la opcion "Ingresar con
+       contraseña"/"Sign in with password" (`_pulsar_opcion_password`, texto o
+       `value`, solo visible y especifica primero), el flujo que la pulsa UNA
+       vez y llena la contraseña hasta confirmar sesion ("existente") y el error
+       CLARO exacto cuando la opcion no aparece (nunca el timeout generico).
+  (14b) Campanas con `proxy_change_valido` FAKE: el round-robin SALTA los
+       proxies invalidos y usa el primero valido (sin re-validar en la misma
+       corrida); si ninguno valida corren sin proxy (`sin_proxy`) y el resumen
+       trae `proxies_descartados` (unicos) en registros y reportes.
   (18) MODO ASISTIDO (`esperar_captcha_seg`): resolucion kwarg/env/acotado,
        espera visible hasta que el reto desaparece, timeout con mensaje
        accionable exacto, headless nunca espera (y lo aclara), cancelacion
@@ -38,6 +66,44 @@ Cubre el contrato congelado de `cuentas/change_org.py`:
        integracion con `_asegurar_campo_email`/`registrar_o_entrar` y el evento
        `espera_captcha` reenviado por las campanas (bot -> registrar/reporte ->
        callback, tambien al inicio del registro).
+  (19) SESION PERSISTENTE (`data/cookies/change/{usuario}.json`): ruta saneada,
+       roundtrip `guardar_sesion_change`/`cargar_sesion_change`/`borrar_sesion_change`,
+       archivo corrupto/invalido -> None, `CHANGE_REUTILIZAR_SESION=0` desactiva
+       guardar y restaurar, restauracion por CDP con evidencia (sin escribir el
+       correo ni pedir captcha), fallback al login normal (y guardado de la
+       sesion nueva con cookies rotadas), tolerancia a CDP sin cookies/error de
+       navegacion/reto presente y propagacion de `sesion_restaurada` a
+       `registrar_cuenta_change` y `ejecutar_un_reporte`. Todo con fakes y en un
+       temp dir (monkeypatch de `_DIR_SESIONES_CHANGE`): NUNCA toca `data/` real.
+  (20) CAPTURA DE EVIDENCIA (`_DIR_CAPTURAS_CHANGE`, `_capturar_evidencia`):
+       reporte exitoso -> `captura` con la ruta de un PNG real
+       (`change_{slug}_{YYYYmmdd_HHMMSS}.png`); reporte fallido ->
+       `captura == ""` y UNA captura de DEPURACION
+       (`debug/debug_fallo_{slug}_{YYYYmmdd_HHMMSS}.png`) guardada por
+       `_capturar_fallo` sin romper el flujo; `save_screenshot` que lanza o
+       devuelve False -> `captura == ""` sin romper el flujo; slug saneado con
+       usuarios raros (espacios, `/`, `@`) y sufijo `_1` en repeticiones; clave
+       SIEMPRE presente; propagacion de `captura` por `ejecutar_un_reporte`
+       (anonimo y modo cuenta) y por `ejecutar_campana_reportes`. Todo con
+       `_DIR_CAPTURAS_CHANGE` monkeypatcheado a temp dirs: NUNCA toca
+       `data/reportes/change/` real.
+  (15b) MODAL DE DENUNCIA por TEXTO + estrategias de seleccion: el modal se
+       detecta por el texto de su `[role=dialog]` (aunque `find_elements` de
+       los radios devuelva 0, reportado en vivo); el tercer motivo se marca en
+       cadena radio -> etiqueta visible -> JS puro con verificacion
+       (`checked`/`aria-checked`/textarea que aparece); si nada lo marca el
+       error es el claro de "radios del modal no seleccionables"; flujo
+       completo por JS (radio -> textarea -> Mexico -> Enviar -> gracias).
+  (21) APP DE LA PETICION (hidratacion React) + reintentos del modal:
+       `_esperar_app_peticion` True con spinner->listo/firmado, False con
+       spinner visible/texto sin firma/JS roto/timeout, best-effort (no lanza)
+       y cancelable; `_href_directo_enlace` solo acepta http(s) de change.org
+       (nunca "#"/javascript/mailto/dominios ajenos); en `reportar()`, si el
+       modal no abre: 2º clic tras re-localizar (`_esperar_formulario` x2),
+       UNA recarga completa (`_navegar` x2) y ULTIMO recurso por navegacion
+       directa al href real; nunca abre -> error claro con la URL (2
+       reintentos de clic + recarga); paro a mitad -> cancelado sin
+       reintentos. Todo con fakes y `time.sleep` neutralizado.
 
 Determinista: `time.sleep` se neutraliza y todo Chrome/BD/proxy/IA esta
 monkeypatcheado. No se ejecutan campanas reales.
@@ -52,10 +118,12 @@ import contextlib
 import os
 import re
 import sys
+import tempfile
 import threading
 import time
 import types
 from collections import Counter
+from datetime import datetime
 from pathlib import Path
 from unittest import mock
 
@@ -88,6 +156,10 @@ from cuentas.change_org import (  # noqa: E402
     proxies_disponibles,
     registrar_cuenta_change,
 )
+
+# Valor REAL de la constante capturado ANTES de que `run()` lo monkeypatchee
+# a un temp dir: la suite jamas escribe en `data/reportes/change/`.
+_DIR_CAPTURAS_REAL = change_org._DIR_CAPTURAS_CHANGE
 
 
 @contextlib.contextmanager
@@ -300,6 +372,18 @@ class FakeDriver:
         self.al_navegar = None
         self.elementos = []
         self.switch_to = _FakeSwitchTo(self)
+        # Sesion persistente: cookies del driver + CDP `Network.setCookie`.
+        self.cookies = []
+        self.cdp_calls = []
+        self.cdp_setcookie_falla = False
+        self.cdp_setcookie_success_false = False
+        # Evidencia de exito: `save_screenshot` crea un PNG real en disco.
+        self.screenshots = []
+        self.screenshot_falla = False
+        # Refresh de pagina (pagina de error de APLICACION de Change.org).
+        self.refresh_count = 0
+        self.refresh_falla = False
+        self.al_refrescar = None
 
     def registrar(self, *elementos):
         for elemento in elementos:
@@ -307,11 +391,39 @@ class FakeDriver:
             self.elementos.append(elemento)
         return elementos[0] if len(elementos) == 1 else elementos
 
+    def get_cookies(self):
+        return [dict(cookie) for cookie in self.cookies]
+
+    def save_screenshot(self, ruta):
+        """Escribe un PNG minimo real (para verificar archivo/extension)."""
+        if self.screenshot_falla:
+            raise RuntimeError("save_screenshot fallo")
+        self.screenshots.append(ruta)
+        with open(ruta, "wb") as archivo:
+            archivo.write(b"\x89PNG\r\n\x1a\nfake")
+        return True
+
+    def execute_cdp_cmd(self, cmd, params):
+        self.cdp_calls.append((cmd, params))
+        if self.cdp_setcookie_falla:
+            raise RuntimeError("Network.setCookie fallo")
+        if self.cdp_setcookie_success_false:
+            return {"success": False}
+        return {"success": True}
+
     def get(self, url):
         self.url = url
         self.current_url = url
         if self.al_navegar:
             self.al_navegar(url)
+
+    def refresh(self):
+        """`refresh()` real: `al_refrescar` simula la pagina nueva; tolera fallo."""
+        self.refresh_count += 1
+        if self.refresh_falla:
+            raise RuntimeError("refresh fallo")
+        if self.al_refrescar:
+            self.al_refrescar()
 
     def set_page_load_timeout(self, valor):
         self.timeouts.append(valor)
@@ -390,6 +502,54 @@ class _DriverConScroll(FakeDriver):
 
     def find_elements(self, by, selector):
         if not any("scrollBy" in s for s in self.scripts):
+            return []
+        return super().find_elements(by, selector)
+
+
+class _DriverReadyState(FakeDriver):
+    """Driver que responde a `document.readyState` con una secuencia dada.
+
+    `estados` es la secuencia de respuestas (se agota devolviendo la ultima);
+    `fallar=True` simula un JS roto (siempre lanza).
+    """
+
+    def __init__(self, estados=None, fallar=False):
+        super().__init__()
+        self.estados = list(estados or [])
+        self.fallar = fallar
+        self.ready_llamados = 0
+
+    def execute_script(self, script, *args):
+        if "readyState" in str(script):
+            self.ready_llamados += 1
+            self.scripts.append(script)
+            if self.fallar:
+                raise RuntimeError("JS roto")
+            if self.estados:
+                return self.estados.pop(0)
+            return "loading"
+        return super().execute_script(script, *args)
+
+
+class _DriverEnlaceTrasRefresh(FakeDriver):
+    """Recien 've' los elementos despues del primer refresh (pagina lenta)."""
+
+    def __init__(self):
+        super().__init__()
+        self.visible_tras_refresh = False
+
+    def refresh(self):
+        super().refresh()
+        self.visible_tras_refresh = True
+
+    def execute_script(self, script, *args):
+        if "readyState" in str(script):
+            self.scripts.append(script)
+            return "complete"
+        return super().execute_script(script, *args)
+
+    def find_elements(self, by, selector):
+        if not self.visible_tras_refresh:
             return []
         return super().find_elements(by, selector)
 
@@ -551,6 +711,538 @@ def test_proxies(check):
 
 
 # --------------------------------------------------------------------------- #
+# (2b) Errores de red de Chrome (proxy con TLS/red rota)
+# --------------------------------------------------------------------------- #
+_MENSAJE_RED_CERT = (
+    "la conexion con change.org fallo (ERR_CERT_AUTHORITY_INVALID): "
+    "probable PROXY con TLS/red rota; prueba otro proxy"
+)
+
+
+def _driver_red(codigo="ERR_CERT_AUTHORITY_INVALID", titulo="Privacy error"):
+    """FakeDriver que simula la pagina de error de red de Chrome."""
+    driver = FakeDriver()
+    driver.title = titulo
+    driver.page_source = (
+        "<div id='main-message'><h1>Your connection is not private</h1>"
+        f"<div class='error-code'>{codigo}</div></div>"
+    )
+    return driver
+
+
+def test_error_navegacion_pagina(check):
+    print("(2b) pagina de error de red (Privacy error / NET::ERR_)")
+    driver = _driver_red()
+    check(
+        "red: 'Privacy error' + NET::ERR_CERT_... -> codigo",
+        _bot(driver)._error_navegacion_pagina() == "ERR_CERT_AUTHORITY_INVALID",
+        _bot(driver)._error_navegacion_pagina(),
+    )
+
+    driver = FakeDriver()
+    driver.title = "Your connection is not private"
+    driver.page_source = "<p>Attackers might be trying to steal your information</p>"
+    check(
+        "red: 'your connection is not private' -> etiqueta corta",
+        _bot(driver)._error_navegacion_pagina() == "your connection is not private",
+    )
+
+    driver = FakeDriver()
+    driver.title = "www.change.org"
+    driver.page_source = (
+        "<h1>This site can\u2019t be reached</h1>"
+        "<p>ERR_TUNNEL_CONNECTION_FAILED</p>"
+    )
+    check(
+        "red: 'This site can’t be reached' + ERR_TUNNEL -> codigo",
+        _bot(driver)._error_navegacion_pagina() == "ERR_TUNNEL_CONNECTION_FAILED",
+    )
+
+    driver = FakeDriver()
+    driver.title = ""
+    driver.page_source = "<h1>La conexión no es privada</h1>"
+    check(
+        "red: español 'la conexion no es privada' -> etiqueta",
+        _bot(driver)._error_navegacion_pagina() == "la conexion no es privada",
+    )
+
+    driver = FakeDriver()
+    driver.title = "Change.org"
+    driver.page_source = "<h1>Crea tu contraseña</h1><p>Al menos 10 caracteres</p>"
+    check(
+        "red: pagina normal -> ''",
+        _bot(driver)._error_navegacion_pagina() == "",
+    )
+
+    class _DriverRoto:
+        @property
+        def title(self):
+            raise RuntimeError("sin titulo")
+
+        @property
+        def page_source(self):
+            raise RuntimeError("sin fuente")
+
+        def find_element(self, *args, **kwargs):
+            raise RuntimeError("sin body")
+
+    check(
+        "red: driver que explota -> '' y nunca lanza",
+        _bot(_DriverRoto())._error_navegacion_pagina() == "",
+    )
+
+    # _navegar deja el mensaje accionable y devuelve el codigo.
+    driver = _driver_red()
+    driver.al_navegar = lambda url: None
+    bot = _bot(driver)
+    codigo = bot._navegar("https://www.change.org/login_or_join?user_flow=nav")
+    check(
+        "red: _navegar devuelve el codigo y deja ultimo_error accionable",
+        codigo == "ERR_CERT_AUTHORITY_INVALID"
+        and bot.ultimo_error == _MENSAJE_RED_CERT,
+        bot.ultimo_error,
+    )
+
+    # registrar_o_entrar falla con ESE mensaje (no con "campo no encontrado").
+    driver = _driver_red()
+    driver.al_navegar = lambda url: None
+    bot = _bot(
+        driver,
+        cuenta={
+            "usuario": "u1",
+            "email": "u1@x.com",
+            "password": "claveSegura123",
+        },
+    )
+    with _sin_esperas():
+        registro = bot.registrar_o_entrar()
+    check(
+        "red: registrar_o_entrar falla con el mensaje de red (no 'campo')",
+        registro["ok"] is False
+        and registro["error"] == _MENSAJE_RED_CERT
+        and "no se encontro el campo" not in registro["error"],
+        str(registro["error"]),
+    )
+
+    # reportar tambien falla con el mensaje de red (sin buscar enlaces).
+    driver = _driver_red()
+    driver.al_navegar = lambda url: None
+    bot = _bot(driver, url_peticion="https://www.change.org/p/x")
+    with _sin_esperas():
+        resultado = bot.reportar(identidad={"email": "a@b.com"}, queja="q")
+    check(
+        "red: reportar falla con el mensaje de red (no 'enlace')",
+        resultado["ok"] is False
+        and resultado["error"] == _MENSAJE_RED_CERT
+        and "no se encontro el enlace" not in resultado["error"],
+        str(resultado["error"]),
+    )
+
+
+# --------------------------------------------------------------------------- #
+# (2d) pagina de error de APLICACION de Change.org
+# ("¡Oh no! Error del servidor" -> UN refresh + error claro)
+# --------------------------------------------------------------------------- #
+# Texto REAL de la captura debug_fallo_*_20260929_232936.png.
+_TEXTO_ERROR_SERVIDOR = (
+    "¡Oh no!\n"
+    "Error del servidor\n"
+    "Puede actualizar la página y si aún hay problemas inténtelo más tarde. "
+    "Estamos haciendo nuestro mejor esfuerzo para que las cosas funcionen sin "
+    "problemas.\n"
+    "Volver a inicio"
+)
+
+
+def _body(driver, texto):
+    """Fija el `body` fake del driver (el TEXTO VISIBLE que lee el bot)."""
+    cuerpo = FakeElement(driver, tag="body", texto=texto)
+    driver.body = cuerpo
+    return cuerpo
+
+
+def test_error_servidor(check):
+    print("(2d) pagina de error de APLICACION ('¡Oh no! Error del servidor')")
+    check(
+        "error servidor: constante exacta del mensaje claro",
+        change_org._ERROR_SERVIDOR_PETICION
+        == "Change.org devolvio un error de servidor al abrir la peticion "
+        "(actualiza/reintenta mas tarde o usa otro proxy)",
+        change_org._ERROR_SERVIDOR_PETICION,
+    )
+
+    # --- deteccion por TEXTO VISIBLE normalizado (la pagina real) ---
+    driver = FakeDriver()
+    _body(driver, _TEXTO_ERROR_SERVIDOR)
+    check(
+        "error servidor: '¡Oh no! Error del servidor' visible -> detecta",
+        _bot(driver)._pagina_error_servidor() == "error del servidor",
+        _bot(driver)._pagina_error_servidor(),
+    )
+
+    for texto, esperado in (
+        ("Server error", "server error"),
+        ("Algo salió mal", "algo salio mal"),
+        ("Something went wrong", "something went wrong"),
+    ):
+        driver = FakeDriver()
+        _body(driver, texto)
+        check(
+            f"error servidor: '{texto}' sola -> detecta",
+            _bot(driver)._pagina_error_servidor() == esperado,
+            _bot(driver)._pagina_error_servidor(),
+        )
+
+    # "oh no" sola NO basta (falso positivo en textos normales)...
+    driver = FakeDriver()
+    _body(driver, "Oh no, qué lástima que esta petición no tenga más firmas")
+    check(
+        "error servidor: 'oh no' aislado -> NO detecta",
+        _bot(driver)._pagina_error_servidor() == "",
+        _bot(driver)._pagina_error_servidor(),
+    )
+    # ...pero con "error" o "volver a inicio" SI.
+    for texto in (
+        "Oh no, ocurrió un error inesperado",
+        "Oh no. Volver a inicio",
+    ):
+        driver = FakeDriver()
+        _body(driver, texto)
+        check(
+            f"error servidor: 'oh no' + compania -> detecta ({texto!r})",
+            _bot(driver)._pagina_error_servidor() == "oh no",
+            _bot(driver)._pagina_error_servidor(),
+        )
+
+    # Frases ambiguas solas no bastan; dos juntas si.
+    for texto in (
+        "Puedes actualizar la página cuando quieras",
+        "Vuelve e intenta de nuevo más tarde si te interesa",
+    ):
+        driver = FakeDriver()
+        _body(driver, texto)
+        check(
+            f"error servidor: frase ambigua sola -> NO detecta ({texto!r})",
+            _bot(driver)._pagina_error_servidor() == "",
+            _bot(driver)._pagina_error_servidor(),
+        )
+    driver = FakeDriver()
+    _body(
+        driver,
+        "Puede actualizar la página y si aún hay problemas inténtelo más tarde",
+    )
+    check(
+        "error servidor: 'actualizar la pagina' + 'intentelo mas tarde' -> detecta",
+        _bot(driver)._pagina_error_servidor() == "actualizar la pagina",
+        _bot(driver)._pagina_error_servidor(),
+    )
+
+    # Con body presente NO se mira `page_source` (evita bundles JS).
+    driver = FakeDriver()
+    _body(driver, "Esta petición busca mejorar el parque")
+    driver.page_source = "<script>var msg = 'Error del servidor';</script>"
+    check(
+        "error servidor: page_source con 'error del servidor' + body normal -> ''",
+        _bot(driver)._pagina_error_servidor() == "",
+        _bot(driver)._pagina_error_servidor(),
+    )
+
+    # Sin texto y con driver roto: "" y NUNCA lanza.
+    driver = FakeDriver()
+    _body(driver, "")
+    check(
+        "error servidor: sin texto visible -> ''",
+        _bot(driver)._pagina_error_servidor() == "",
+    )
+
+    class _DriverRoto:
+        @property
+        def page_source(self):
+            raise RuntimeError("sin fuente")
+
+        def find_element(self, *args, **kwargs):
+            raise RuntimeError("sin body")
+
+    check(
+        "error servidor: driver que explota -> '' y nunca lanza",
+        _bot(_DriverRoto())._pagina_error_servidor() == "",
+    )
+
+    identidad = {
+        "nombre": "Ana",
+        "apellido": "Lopez",
+        "email": "ana.lopez12@gmail.com",
+        "codigo_postal": "44100",
+    }
+    queja = "Considero que esta peticion incumple las normas de la comunidad."
+
+    with _sin_esperas():
+        # --- reportar: error persistente -> UN refresh + error claro ---
+        driver = FakeDriver()
+        _body(driver, _TEXTO_ERROR_SERVIDOR)
+        enlace = FakeElement(
+            driver, tag="button", texto="Denunciar una violación de las políticas"
+        )
+        driver.registrar(enlace)
+        bot = _bot(driver, url_peticion="https://www.change.org/p/x")
+        bot.preparar_driver = lambda: True
+        resultado = bot.reportar(identidad=identidad, queja=queja)
+        check(
+            "error servidor: reportar (persiste) -> refresh UNA vez",
+            driver.refresh_count == 1,
+            str(driver.refresh_count),
+        )
+        check(
+            "error servidor: reportar (persiste) -> error claro exacto",
+            resultado["ok"] is False
+            and resultado["error"] == change_org._ERROR_SERVIDOR_PETICION,
+            str(resultado["error"]),
+        )
+        check(
+            "error servidor: reportar (persiste) -> NO es el error de enlace",
+            "no se encontro el enlace" not in resultado["error"],
+            resultado["error"],
+        )
+        check(
+            "error servidor: reportar (persiste) -> NO busca/clica el enlace",
+            enlace.click_count == 0,
+            f"clics={enlace.click_count}",
+        )
+        check(
+            "error servidor: reportar (persiste) -> captura de fallo guardada",
+            bool(driver.screenshots)
+            and os.path.basename(driver.screenshots[0]).startswith("debug_fallo_")
+            and os.path.isfile(driver.screenshots[0]),
+            str(driver.screenshots),
+        )
+        check(
+            "error servidor: reportar (persiste) -> captura de exito vacia",
+            resultado.get("captura") == "",
+            str(resultado.get("captura")),
+        )
+
+        # --- reportar: el refresh la quita -> el flujo sigue y reporta ok ---
+        driver, piezas = _driver_modal()
+        cuerpo = _body(driver, _TEXTO_ERROR_SERVIDOR)
+
+        def _recuperar():
+            cuerpo._texto = "Petición: Denunciar una violación de las políticas"
+
+        driver.al_refrescar = _recuperar
+        bot = _bot(driver, url_peticion="https://www.change.org/p/x")
+        bot.preparar_driver = lambda: True
+        with mock.patch.object(change_org.random, "random", return_value=0.99):
+            resultado = bot.reportar(identidad=identidad, queja=queja)
+        check(
+            "error servidor: refresh que la quita -> reporte ok",
+            resultado["ok"] is True,
+            f"ok={resultado['ok']} error={resultado['error']!r}",
+        )
+        check(
+            "error servidor: refresh que la quita -> UN refresh y enlace clicado",
+            driver.refresh_count == 1 and piezas["enlace"].click_count == 1,
+            f"refresh={driver.refresh_count} clics={piezas['enlace'].click_count}",
+        )
+
+        # --- reportar: refresh que LANZA -> se tolera y el mensaje es claro ---
+        driver = FakeDriver()
+        _body(driver, _TEXTO_ERROR_SERVIDOR)
+        driver.refresh_falla = True
+        bot = _bot(driver, url_peticion="https://www.change.org/p/x")
+        bot.preparar_driver = lambda: True
+        resultado = bot.reportar(identidad=identidad, queja=queja)
+        check(
+            "error servidor: refresh que lanza -> tolerado y error claro",
+            driver.refresh_count == 1
+            and resultado["ok"] is False
+            and resultado["error"] == change_org._ERROR_SERVIDOR_PETICION,
+            f"refresh={driver.refresh_count} error={resultado['error']!r}",
+        )
+
+        # --- red de seguridad: la app falla DESPUES del chequeo inicial ---
+        driver = FakeDriver()
+        cuerpo = _body(driver, "Petición normal sin enlace de reporte")
+        bot = _bot(driver, url_peticion="https://www.change.org/p/x")
+        bot.preparar_driver = lambda: True
+
+        def _cerrar_y_fallar(intentos=8):
+            cuerpo._texto = _TEXTO_ERROR_SERVIDOR
+            return False
+
+        bot._cerrar_banner_cookies = _cerrar_y_fallar
+        resultado = bot.reportar(identidad=identidad, queja=queja)
+        check(
+            "error servidor: falla tras el chequeo inicial -> error claro (no generico)",
+            resultado["ok"] is False
+            and resultado["error"] == change_org._ERROR_SERVIDOR_PETICION
+            and "no se encontro el enlace" not in resultado["error"],
+            str(resultado["error"]),
+        )
+        check(
+            "error servidor: red de seguridad -> refresh de recuperacion del enlace",
+            driver.refresh_count == 1,
+            str(driver.refresh_count),
+        )
+
+
+# --------------------------------------------------------------------------- #
+# (2c) proxy_change_valido (requests monkeypatcheado, SIN red)
+# --------------------------------------------------------------------------- #
+def test_proxy_change_valido(check):
+    print("(2c) proxy_change_valido (requests monkeypatcheado)")
+    import requests
+
+    from cuentas.change_org import proxy_change_valido
+
+    check(
+        "proxy valido: publico en __all__",
+        "proxy_change_valido" in change_org.__all__,
+    )
+
+    with change_org._PROXY_CHANGE_CACHE_LOCK:
+        change_org._PROXY_CHANGE_CACHE.clear()
+
+    llamadas = []
+    siguientes = []
+
+    class _RespuestaFake:
+        def __init__(self, status_code):
+            self.status_code = status_code
+
+    def _get_fake(url, proxies=None, timeout=None, allow_redirects=None):
+        llamadas.append(
+            {
+                "url": url,
+                "proxies": dict(proxies or {}),
+                "timeout": timeout,
+                "allow_redirects": allow_redirects,
+            }
+        )
+        accion = siguientes.pop(0)
+        if isinstance(accion, Exception):
+            raise accion
+        return _RespuestaFake(accion)
+
+    proxy_ok = "http://usuario:secreto@127.0.0.1:8001"
+    with mock.patch.object(requests, "get", side_effect=_get_fake):
+        siguientes[:] = [200]
+        primera = proxy_change_valido(proxy_ok, timeout=7)
+        segunda = proxy_change_valido(proxy_ok, timeout=7)
+    check(
+        "proxy valido: HTTP 200 -> True",
+        primera is True and segunda is True,
+    )
+    check(
+        "proxy valido: cache -> segunda llamada sin red",
+        len(llamadas) == 1,
+        str(llamadas),
+    )
+    check(
+        "proxy valido: URL de change.org, proxies http/https, timeout y redirects",
+        llamadas[0]["url"] == "https://www.change.org/login_or_join?user_flow=nav"
+        and llamadas[0]["proxies"]
+        == {"http": proxy_ok, "https": proxy_ok}
+        and llamadas[0]["timeout"] == 7
+        and llamadas[0]["allow_redirects"] is True,
+        str(llamadas[0]),
+    )
+
+    proxy_cert = "http://usuario:secreto@127.0.0.2:8002"
+    with mock.patch.object(requests, "get", side_effect=_get_fake):
+        siguientes[:] = [requests.exceptions.SSLError("bad record mac")]
+        check(
+            "proxy invalido: SSLError -> False",
+            proxy_change_valido(proxy_cert) is False,
+        )
+
+    proxy_timeout = "http://usuario:secreto@127.0.0.3:8003"
+    with mock.patch.object(requests, "get", side_effect=_get_fake):
+        siguientes[:] = [requests.exceptions.Timeout("timeout")]
+        check(
+            "proxy invalido: timeout -> False",
+            proxy_change_valido(proxy_timeout) is False,
+        )
+
+    proxy_500 = "http://usuario:secreto@127.0.0.4:8004"
+    with mock.patch.object(requests, "get", side_effect=_get_fake):
+        siguientes[:] = [503]
+        check(
+            "proxy invalido: HTTP 503 -> False",
+            proxy_change_valido(proxy_500) is False,
+        )
+
+    check(
+        "proxy: cadena vacia -> True sin tocar requests",
+        proxy_change_valido("") is True
+        and proxy_change_valido(None) is True,
+    )
+
+    proxy_raro = "p1"
+    llamadas.clear()
+    with mock.patch.object(requests, "get", side_effect=_get_fake):
+        check(
+            "proxy no analizable -> True sin descartar por incertidumbre",
+            proxy_change_valido(proxy_raro) is True and llamadas == [],
+            str(llamadas),
+        )
+
+    class _PMRoto:
+        def analizar(self, proxy):
+            raise RuntimeError("analizar roto")
+
+    with mock.patch.object(change_org, "ProxyManager", _PMRoto):
+        check(
+            "proxy: analizar que explota -> True (nunca lanza)",
+            proxy_change_valido("http://u:p@1.2.3.4:80") is True,
+        )
+
+    # TTL 0: sin cache -> dos llamadas reales.
+    proxy_sin_cache = "http://usuario:secreto@127.0.0.5:8005"
+    llamadas.clear()
+    with mock.patch.dict(os.environ, {"PROXY_CHANGE_CACHE_SEG": "0"}), \
+            mock.patch.object(requests, "get", side_effect=_get_fake):
+        siguientes[:] = [200, 200]
+        proxy_change_valido(proxy_sin_cache)
+        proxy_change_valido(proxy_sin_cache)
+    check(
+        "proxy: PROXY_CHANGE_CACHE_SEG=0 -> sin cache (2 llamadas)",
+        len(llamadas) == 2,
+        str(len(llamadas)),
+    )
+
+    with mock.patch.dict(os.environ, {"PROXY_CHANGE_CACHE_SEG": "123"}):
+        check("proxy: TTL lee el env", change_org._proxy_change_cache_seg() == 123)
+    with mock.patch.dict(os.environ, {"PROXY_CHANGE_CACHE_SEG": "no-numero"}):
+        check(
+            "proxy: TTL invalido -> 600 (default)",
+            change_org._proxy_change_cache_seg() == 600,
+        )
+    sin_env = {
+        clave: valor
+        for clave, valor in os.environ.items()
+        if clave != "PROXY_CHANGE_CACHE_SEG"
+    }
+    with mock.patch.dict(os.environ, sin_env, clear=True):
+        check(
+            "proxy: TTL default 600 sin env",
+            change_org._proxy_change_cache_seg() == 600,
+        )
+
+    # Tope de la cache (~1000): al llenarse purga y no crece sin limite.
+    with change_org._PROXY_CHANGE_CACHE_LOCK:
+        change_org._PROXY_CHANGE_CACHE.clear()
+    for i in range(change_org._PROXY_CHANGE_CACHE_MAX + 25):
+        change_org._guardar_cache_proxy(f"cache-{i}", True)
+    check(
+        "proxy: cache con tope 1000 entradas",
+        len(change_org._PROXY_CHANGE_CACHE) == change_org._PROXY_CHANGE_CACHE_MAX,
+        str(len(change_org._PROXY_CHANGE_CACHE)),
+    )
+    with change_org._PROXY_CHANGE_CACHE_LOCK:
+        change_org._PROXY_CHANGE_CACHE.clear()
+
+
+# --------------------------------------------------------------------------- #
 # (3) Localizacion y clic del enlace
 # --------------------------------------------------------------------------- #
 def test_enlace(check):
@@ -663,6 +1355,87 @@ def test_enlace(check):
         check(
             "enlace: None cuando no existe (tras agotar scroll)",
             _bot(driver)._buscar_enlace_reporte(intentos=2) is None,
+        )
+
+
+# --------------------------------------------------------------------------- #
+# (3b) Documento listo (readyState) + segunda pasada del enlace tras refresh
+# --------------------------------------------------------------------------- #
+def test_documento_listo(check):
+    print("(3b) documento listo (readyState) y segunda pasada del enlace")
+    with _sin_esperas():
+        # `complete` de inmediato -> True con UNA sola consulta.
+        driver = _DriverReadyState(estados=["complete"])
+        check(
+            "documento: readyState 'complete' -> True",
+            _bot(driver)._esperar_documento_listo(timeout=5) is True
+            and driver.ready_llamados == 1,
+            f"llamados={driver.ready_llamados}",
+        )
+
+        # `complete` recien al 2o poll -> True (espera ~1s).
+        driver = _DriverReadyState(estados=["loading", "complete"])
+        check(
+            "documento: 'complete' al 2o poll -> True",
+            _bot(driver)._esperar_documento_listo(timeout=5) is True
+            and driver.ready_llamados == 2,
+            f"llamados={driver.ready_llamados}",
+        )
+
+        # Nunca `complete` -> False sin lanzar (agota el timeout).
+        driver = _DriverReadyState(estados=["loading"])
+        check(
+            "documento: nunca 'complete' -> False sin lanzar",
+            _bot(driver)._esperar_documento_listo(timeout=2) is False
+            and driver.ready_llamados == 2,
+            f"llamados={driver.ready_llamados}",
+        )
+
+        # JS que siempre lanza -> False sin lanzar.
+        driver = _DriverReadyState(fallar=True)
+        check(
+            "documento: JS que lanza -> False sin lanzar",
+            _bot(driver)._esperar_documento_listo(timeout=2) is False,
+        )
+
+        # Paro pedido -> False inmediato (ni consulta el DOM).
+        driver = _DriverReadyState(estados=["complete"])
+        bot = _bot(driver)
+        evento = threading.Event()
+        evento.set()
+        bot.cancelar = evento
+        check(
+            "documento: cancelado -> False sin consultar el DOM",
+            bot._esperar_documento_listo(timeout=5) is False
+            and driver.ready_llamados == 0,
+            f"llamados={driver.ready_llamados}",
+        )
+
+        # Enlace que aparece recien tras el refresh: 1a pasada falla y la 2a
+        # (con refresh + espera de readyState) lo encuentra.
+        driver = _DriverEnlaceTrasRefresh()
+        enlace = FakeElement(
+            driver, tag="button", texto="Denunciar una violación de las políticas"
+        )
+        driver.registrar(enlace)
+        encontrado = _bot(driver)._buscar_enlace_reporte(intentos=2)
+        check(
+            "enlace: 2a pasada tras refresh encuentra el enlace",
+            encontrado is enlace and driver.refresh_count == 1,
+            f"refresh={driver.refresh_count} encontrado={encontrado is enlace}",
+        )
+        check(
+            "enlace: la espera de readyState ocurre tras el refresh",
+            any("readyState" in s for s in driver.scripts),
+        )
+
+        # Nunca aparece -> None y UN UNICO refresh (sin bucles).
+        driver = FakeDriver()
+        check(
+            "enlace: nunca aparece -> None y refresh=1",
+            _bot(driver)._buscar_enlace_reporte(intentos=2) is None
+            and driver.refresh_count == 1,
+            f"refresh={driver.refresh_count}",
         )
 
 
@@ -959,6 +1732,51 @@ def test_reportar(check):
             resultado["ok"] is False
             and "no se encontro el enlace" in resultado["error"],
             resultado["error"],
+        )
+
+        # Primer clic "temprano" sin modal -> relocaliza y el 2do clic abre.
+        driver = FakeDriver()
+        enlace = FakeElement(
+            driver, tag="button", texto="Denunciar una violación de las políticas"
+        )
+        nombre = FakeElement(
+            driver, tag="input", attrs={"autocomplete": "given-name"}, visible=False
+        )
+        apellido = FakeElement(
+            driver, tag="input", attrs={"autocomplete": "family-name"}, visible=False
+        )
+        email = FakeElement(driver, tag="input", attrs={"type": "email"}, visible=False)
+        motivo = FakeElement(
+            driver, tag="textarea", attrs={"name": "reason"}, visible=False
+        )
+        enviar = FakeElement(
+            driver, tag="button", attrs={"type": "submit"}, texto="Enviar",
+            visible=False,
+        )
+        driver.registrar(enlace, nombre, apellido, email, motivo, enviar)
+        estado_modal = {"clics": 0}
+
+        def _abrir_al_segundo_clic():
+            estado_modal["clics"] += 1
+            if estado_modal["clics"] >= 2:
+                for campo in (nombre, apellido, email, motivo, enviar):
+                    campo.visible = True
+
+        enlace.al_click = _abrir_al_segundo_clic
+        enviar.al_click = lambda: setattr(
+            driver, "page_source", "Gracias, hemos recibido tu reporte"
+        )
+        bot = _bot(driver, url_peticion="https://www.change.org/p/x")
+        bot.preparar_driver = lambda: True
+        with mock.patch.object(change_org.random, "random", return_value=0.99):
+            resultado = bot.reportar(identidad=identidad, queja=queja)
+        check(
+            "reportar: 1er clic sin modal -> relocaliza, 2do abre y reporta ok",
+            resultado["ok"] is True
+            and enlace.click_count == 2
+            and estado_modal["clics"] == 2,
+            f"ok={resultado['ok']} clics={enlace.click_count} "
+            f"error={resultado['error']!r}",
         )
 
         # Cancelacion al inicio: NO se abre navegador.
@@ -1941,6 +2759,562 @@ def test_registro_flujo(check):
 
 
 # --------------------------------------------------------------------------- #
+# (12c) captcha visible vs restos de scripts + home logueada (evidencia manda)
+# --------------------------------------------------------------------------- #
+def test_captcha_visible_y_home_logueada(check):
+    print("(12c) captcha solo visible + home logueada (evidencia primero)")
+
+    # --- _detectar_captcha: 'recaptcha' en scripts/config NO es captcha ---
+    driver = FakeDriver()
+    cuerpo = FakeElement(
+        driver,
+        tag="body",
+        texto="Inicio  Peticiones  Acciones  Protegido por reCAPTCHA",
+    )
+    driver.body = cuerpo
+    driver.current_url = "https://www.change.org/?met=esnv"
+    driver.page_source = (
+        "<script src='https://www.google.com/recaptcha/api.js'></script>"
+        "<script>window.__recaptcha='recaptcha';"
+        " var hcaptcha=1; var captcha=2;</script>"
+        "<body>Inicio</body>"
+    )
+    bot = _bot(driver)
+    check(
+        "captcha: page_source con 'recaptcha' en scripts -> '' (no captcha)",
+        bot._detectar_captcha() == "",
+        bot._detectar_captcha(),
+    )
+    check(
+        "captcha: page_source NO se consulta con body presente",
+        bot._detectar_captcha() == "" and "recaptcha" in driver.page_source,
+    )
+
+    # --- sin body (paginas parciales): los scripts tampoco cuentan ---
+    driver_sin_body = FakeDriver()
+    driver_sin_body.page_source = (
+        "<script>var recaptcha=1, hcaptcha=2, captcha=3;</script>"
+    )
+    check(
+        "captcha: sin body y solo scripts genericos -> ''",
+        _bot(driver_sin_body)._detectar_captcha() == "",
+        _bot(driver_sin_body)._detectar_captcha(),
+    )
+
+    # --- los terminos genericos TAMPOCO cuentan como TEXTO VISIBLE ---
+    driver_generico = FakeDriver()
+    driver_generico.body = FakeElement(
+        driver_generico,
+        tag="body",
+        texto="Inicio. Este sitio esta protegido por reCAPTCHA.",
+    )
+    check(
+        "captcha: 'protegido por reCAPTCHA' visible no es captcha",
+        _bot(driver_generico)._detectar_captcha() == "",
+    )
+
+    # --- las señales inequivocas SIGUEN detectandose ---
+    driver_texto = FakeDriver()
+    driver_texto.body = FakeElement(
+        driver_texto, tag="body", texto="Demuestra que eres una persona"
+    )
+    check(
+        "captcha: frase visible inequivoca -> detecta",
+        _bot(driver_texto)._detectar_captcha() == "demuestra que eres una persona",
+        _bot(driver_texto)._detectar_captcha(),
+    )
+    driver_iframe = FakeDriver()
+    driver_iframe.registrar(
+        FakeElement(
+            driver_iframe,
+            tag="iframe",
+            attrs={"src": "https://www.google.com/recaptcha/api.js"},
+        )
+    )
+    check(
+        "captcha: iframe recaptcha VISIBLE -> selector",
+        _bot(driver_iframe)._detectar_captcha() == "iframe[src*='recaptcha']",
+        _bot(driver_iframe)._detectar_captcha(),
+    )
+    driver_iframe_oculto = FakeDriver()
+    driver_iframe_oculto.registrar(
+        FakeElement(
+            driver_iframe_oculto,
+            tag="iframe",
+            attrs={"src": "https://www.google.com/recaptcha/api.js"},
+            visible=False,
+        )
+    )
+    check(
+        "captcha: iframe recaptcha OCULTO -> '' (exige visibilidad real)",
+        _bot(driver_iframe_oculto)._detectar_captcha() == "",
+    )
+
+    # --- _evidencia_sesion: home logueada con avatar de cabecera ---
+    driver = FakeDriver()
+    driver.current_url = "https://www.change.org/?met=esnv"
+    driver.body = FakeElement(driver, tag="body", texto="Inicio")
+    cabecera = FakeElement(driver, tag="header")
+    logo = FakeElement(
+        driver, tag="img", attrs={"alt": "Change.org logo", "src": "/logo.svg"}
+    )
+    avatar_cabecera = FakeElement(
+        driver, tag="img", attrs={"alt": "Cuenta de Ana", "class": "header-photo"}
+    )
+    cabecera.hijos = [logo, avatar_cabecera]
+    driver.registrar(cabecera)
+    evidencia = _bot(driver)._evidencia_sesion("ana@x.com")
+    check(
+        "evidencia home: avatar de cabecera (logo descartado) -> texto",
+        bool(evidencia) and "cabecera" in evidencia,
+        evidencia,
+    )
+
+    # --- home con 'Iniciar sesión' visible -> SIN evidencia ---
+    driver = FakeDriver()
+    driver.current_url = "https://www.change.org/?met=esnv"
+    cabecera = FakeElement(driver, tag="header")
+    cabecera.hijos = [FakeElement(driver, tag="img", attrs={"alt": "Cuenta de Ana"})]
+    driver.registrar(
+        cabecera,
+        FakeElement(driver, tag="button", texto="Iniciar sesión"),
+    )
+    check(
+        "evidencia home: 'Iniciar sesión' visible -> '' (sin evidencia)",
+        _bot(driver)._evidencia_sesion("") == "",
+        _bot(driver)._evidencia_sesion(""),
+    )
+
+    # --- sin login + logout oculto en el DOM (dropdown) -> evidencia ---
+    driver = FakeDriver()
+    driver.current_url = "https://www.change.org/?met=esnv"
+    driver.registrar(
+        FakeElement(driver, tag="a", href="https://www.change.org/logout", visible=False)
+    )
+    evidencia = _bot(driver)._evidencia_sesion("")
+    check(
+        "evidencia home: logout oculto en el DOM + sin login -> evidencia",
+        bool(evidencia) and "DOM" in evidencia,
+        evidencia,
+    )
+
+    # --- avatar con aria-label de cuenta (boton de menu) -> evidencia ---
+    driver = FakeDriver()
+    driver.current_url = "https://www.change.org/?met=esnv"
+    driver.registrar(
+        FakeElement(
+            driver, tag="button", attrs={"aria-label": "Menú de cuenta"}
+        )
+    )
+    evidencia = _bot(driver)._evidencia_sesion("")
+    check(
+        "evidencia home: boton aria-label de cuenta -> evidencia",
+        bool(evidencia) and "home logueada" in evidencia,
+        evidencia,
+    )
+
+    # --- URL de login: aunque haya avatar, NO es home logueada ---
+    driver = FakeDriver()
+    driver.current_url = "https://www.change.org/login_or_join?user_flow=nav"
+    cabecera = FakeElement(driver, tag="header")
+    cabecera.hijos = [FakeElement(driver, tag="img", attrs={"alt": "Cuenta de Ana"})]
+    driver.registrar(cabecera)
+    check(
+        "evidencia home: URL de login -> '' (aunque haya avatar)",
+        _bot(driver)._evidencia_sesion("") == "",
+    )
+
+    # --- flujo real: 'recaptcha' residual en page_source + home logueada ---
+    cuenta = {
+        "usuario": "u_home",
+        "email": "home@x.com",
+        "email_password": "claveSegura123",
+    }
+    driver, piezas = _driver_login("existente")
+    avatar = FakeElement(
+        driver, tag="img", attrs={"data-testid": "avatar-home"}, visible=False
+    )
+    driver.registrar(avatar)
+    cuerpo_flujo = FakeElement(driver, tag="body", texto="Ingresa tu contraseña")
+    driver.body = cuerpo_flujo
+
+    def _home_tras_clave():
+        piezas["clave"].visible = False
+        piezas["btn_clave"].visible = False
+        avatar.visible = True
+        cuerpo_flujo._texto = "Inicio  Peticiones  Explora  Acciones"
+        driver.current_url = "https://www.change.org/?met=esnv"
+        driver.page_source = (
+            "<script src='https://www.google.com/recaptcha/api.js'></script>"
+            "<script>window.__recaptcha='recaptcha';</script>"
+        )
+
+    piezas["btn_clave"].al_click = _home_tras_clave
+    avisos = []
+    bot = _bot(
+        driver,
+        cuenta=cuenta,
+        headless=False,
+        esperar_captcha_seg=300,
+        aviso=avisos.append,
+    )
+    with _sin_esperas():
+        registro = bot.registrar_o_entrar()
+    check(
+        "flujo: page_source con recaptcha + home logueada -> ok True",
+        registro["ok"] is True,
+        str(registro),
+    )
+    check(
+        "flujo: estado 'existente' confirmado por evidencia real",
+        registro["estado"] == "existente" and bool(registro["evidencia"]),
+        str(registro),
+    )
+    check(
+        "flujo: NO entro en la espera asistida (avisos [])",
+        avisos == [],
+        str(avisos),
+    )
+    check(
+        "flujo: _detectar_captcha '' en la home logueada final",
+        bot._detectar_captcha() == "",
+        bot._detectar_captcha(),
+    )
+
+    # --- flujo: captcha REAL por selector, pero la sesion ya esta iniciada ---
+    driver, piezas = _driver_login("nueva")
+    recaptcha = FakeElement(
+        driver,
+        tag="iframe",
+        attrs={"src": "https://www.google.com/recaptcha/api.js"},
+        visible=False,
+    )
+    avatar = FakeElement(
+        driver, tag="img", attrs={"data-testid": "avatar-home"}, visible=False
+    )
+    driver.registrar(recaptcha, avatar)
+    cuerpo_flujo = FakeElement(driver, tag="body", texto="Crea tu contraseña")
+    driver.body = cuerpo_flujo
+
+    def _home_con_captcha():
+        piezas["clave"].visible = False
+        piezas["btn_clave"].visible = False
+        recaptcha.visible = True
+        avatar.visible = True
+        cuerpo_flujo._texto = "Inicio"
+        driver.current_url = "https://www.change.org/?met=esnv"
+
+    piezas["btn_clave"].al_click = _home_con_captcha
+    avisos.clear()
+    bot = _bot(
+        driver,
+        cuenta=cuenta,
+        headless=False,
+        esperar_captcha_seg=300,
+        aviso=avisos.append,
+    )
+    with _sin_esperas():
+        registro = bot.registrar_o_entrar()
+    check(
+        "flujo: captcha por selector + home logueada -> evidencia manda (ok True)",
+        registro["ok"] is True and registro["estado"] == "nueva",
+        str(registro),
+    )
+    check(
+        "flujo: captcha real no metio espera asistida si hay sesion",
+        avisos == [],
+        str(avisos),
+    )
+
+    # --- flujo: RETO anti-bot detectado, pero la sesion ya esta iniciada ---
+    driver, piezas = _driver_login("existente")
+    reto_frame = next(el for el in driver.elementos if el.tag == "iframe")
+    avatar = FakeElement(
+        driver, tag="img", attrs={"data-testid": "avatar-home"}, visible=False
+    )
+    driver.registrar(avatar)
+    cuerpo_flujo = FakeElement(driver, tag="body", texto="Ingresa tu contraseña")
+    driver.body = cuerpo_flujo
+
+    def _home_con_reto():
+        piezas["clave"].visible = False
+        piezas["btn_clave"].visible = False
+        reto_frame.visible = True
+        avatar.visible = True
+        cuerpo_flujo._texto = "Inicio"
+        driver.current_url = "https://www.change.org/?met=esnv"
+
+    piezas["btn_clave"].al_click = _home_con_reto
+    avisos.clear()
+    bot = _bot(
+        driver,
+        cuenta=cuenta,
+        headless=False,
+        esperar_captcha_seg=300,
+        aviso=avisos.append,
+    )
+    with _sin_esperas():
+        registro = bot.registrar_o_entrar()
+    check(
+        "flujo: reto anti-bot + home logueada -> evidencia manda (ok True)",
+        registro["ok"] is True and registro["estado"] == "existente",
+        str(registro),
+    )
+    check(
+        "flujo: reto no metio espera asistida si hay sesion",
+        avisos == [],
+        str(avisos),
+    )
+
+
+# --------------------------------------------------------------------------- #
+# (12b) pantalla de codigo temporal por correo (cuenta existente)
+# --------------------------------------------------------------------------- #
+def _driver_codigo_temporal(idioma="es", con_opcion=True):
+    """FakeDriver que simula la pantalla de codigo temporal tras "Continuar".
+
+    Con `con_opcion` el enlace "Ingresar con contraseña" (ES) / "Sign in with
+    password" (EN) queda visible; al pulsarlo revela `input[type=password]` y
+    el "Continuar" de la contraseña confirma la sesion (perfil visible).
+    """
+    driver = FakeDriver()
+    btn_login = FakeElement(driver, tag="button", texto="Iniciar sesión")
+    email = FakeElement(driver, tag="input", attrs={"type": "email"}, visible=False)
+    btn_email = FakeElement(driver, tag="button", texto="Continuar", visible=False)
+    clave = FakeElement(driver, tag="input", attrs={"type": "password"}, visible=False)
+    btn_clave = FakeElement(driver, tag="button", texto="Continuar", visible=False)
+    menu = FakeElement(
+        driver, tag="a", href="https://www.change.org/profile/ana", visible=False
+    )
+    opcion = FakeElement(
+        driver,
+        tag="a",
+        texto=(
+            "Ingresar con contraseña"
+            if idioma == "es"
+            else "Sign in with password"
+        ),
+        visible=False,
+    )
+    driver.registrar(btn_login, email, btn_email, opcion, clave, btn_clave, menu)
+
+    def _abrir_email():
+        btn_login.visible = False
+        email.visible = True
+        btn_email.visible = True
+
+    btn_login.al_click = _abrir_email
+
+    if idioma == "es":
+        texto_codigo = (
+            "<h1>Te enviamos un código temporal</h1>"
+            "<p>Revisa tu correo y usa el código de verificación</p>"
+        )
+    else:
+        texto_codigo = (
+            "<h1>We sent a code to your email</h1>"
+            "<p>Check your email for the temporary code</p>"
+        )
+
+    def _mostrar_codigo():
+        email.visible = False
+        btn_email.visible = False
+        driver.page_source = texto_codigo
+        if con_opcion:
+            opcion.visible = True
+
+    btn_email.al_click = _mostrar_codigo
+
+    def _mostrar_clave():
+        opcion.visible = False
+        clave.visible = True
+        btn_clave.visible = True
+        driver.page_source = "<h1>Ingresa tu contraseña</h1>"
+
+    opcion.al_click = _mostrar_clave
+
+    def _tras_clave():
+        clave.visible = False
+        btn_clave.visible = False
+        menu.visible = True
+        driver.page_source = "<p>Mi cuenta</p>"
+
+    btn_clave.al_click = _tras_clave
+    piezas = {
+        "btn_login": btn_login,
+        "email": email,
+        "btn_email": btn_email,
+        "opcion": opcion,
+        "clave": clave,
+        "btn_clave": btn_clave,
+        "menu": menu,
+    }
+    return driver, piezas
+
+
+def test_registro_codigo_temporal(check):
+    print("(12b) pantalla de codigo temporal (opcion 'Ingresar con contraseña')")
+    cuenta = {
+        "usuario": "u5",
+        "email": "existe2@x.com",
+        "email_password": "claveSegura789",
+    }
+
+    # --- deteccion de la pantalla (ES y EN) ---
+    driver = FakeDriver()
+    driver.page_source = (
+        "<h1>Te enviamos un código temporal</h1><p>Revisa tu correo</p>"
+    )
+    check(
+        "codigo ES: _pantalla_codigo_temporal detecta el texto",
+        _bot(driver)._pantalla_codigo_temporal() is True,
+    )
+    driver_en = FakeDriver()
+    driver_en.page_source = (
+        "<h1>We sent a code to your email</h1>"
+        "<p>Check your email for the temporary code</p>"
+    )
+    check(
+        "codigo EN: _pantalla_codigo_temporal detecta el texto",
+        _bot(driver_en)._pantalla_codigo_temporal() is True,
+    )
+    driver_nueva = FakeDriver()
+    driver_nueva.page_source = (
+        "<h1>Crea tu contraseña</h1><p>Debe tener al menos 10 caracteres</p>"
+    )
+    check(
+        "codigo: la pantalla nueva NO se confunde con la de codigo",
+        _bot(driver_nueva)._pantalla_codigo_temporal() is False,
+    )
+    check(
+        "codigo: sin texto visible -> False (nunca lanza)",
+        _bot(FakeDriver())._pantalla_codigo_temporal() is False,
+    )
+
+    # --- _pulsar_opcion_password: enlace, value, ocultos y sin opcion ---
+    driver = FakeDriver()
+    enlace = FakeElement(driver, tag="a", texto="Ingresar con contraseña")
+    driver.registrar(enlace)
+    check(
+        "pulsar opcion: enlace ES -> True y clic",
+        _bot(driver)._pulsar_opcion_password() is True
+        and enlace.click_count == 1,
+    )
+    driver = FakeDriver()
+    boton = FakeElement(driver, tag="button", attrs={"value": "Use password"})
+    driver.registrar(boton)
+    check(
+        "pulsar opcion: button con value EN -> True y clic",
+        _bot(driver)._pulsar_opcion_password() is True
+        and boton.click_count == 1,
+    )
+    driver = FakeDriver()
+    oculto = FakeElement(
+        driver, tag="a", texto="Sign in with password", visible=False
+    )
+    driver.registrar(oculto)
+    check(
+        "pulsar opcion: enlace oculto -> False sin clic",
+        _bot(driver)._pulsar_opcion_password() is False
+        and oculto.click_count == 0,
+    )
+    driver = FakeDriver()
+    otro = FakeElement(driver, tag="button", texto="Continuar")
+    driver.registrar(otro)
+    check(
+        "pulsar opcion: sin coincidencia -> False",
+        _bot(driver)._pulsar_opcion_password() is False
+        and otro.click_count == 0,
+    )
+    driver = FakeDriver()
+    olvido = FakeElement(driver, tag="a", texto="¿Olvidaste tu contraseña?")
+    correcta = FakeElement(driver, tag="a", texto="Ingresar con contraseña")
+    driver.registrar(olvido, correcta)
+    check(
+        "pulsar opcion: prefiere 'Ingresar con contraseña' sobre '¿Olvidaste...?'",
+        _bot(driver)._pulsar_opcion_password() is True
+        and correcta.click_count == 1
+        and olvido.click_count == 0,
+    )
+
+    with _sin_esperas():
+        # --- ES: el flujo pulsa la opcion, llena la contraseña y entra ---
+        driver, piezas = _driver_codigo_temporal("es")
+        registro = _bot(driver, cuenta=cuenta).registrar_o_entrar()
+        check(
+            "codigo ES: opcion pulsada, contraseña escrita y 'existente'",
+            registro["ok"] is True
+            and registro["estado"] == "existente"
+            and piezas["opcion"].click_count == 1
+            and "".join(piezas["clave"].typed) == "claveSegura789"
+            and piezas["btn_clave"].click_count == 1,
+            str(registro),
+        )
+        check(
+            "codigo ES: evidencia positiva de sesion",
+            bool(registro["evidencia"]),
+            registro["evidencia"],
+        )
+        check(
+            "codigo ES: la opcion se pulsa UNA sola vez",
+            piezas["opcion"].click_count == 1,
+            str(piezas["opcion"].click_count),
+        )
+
+        # --- EN: mismo flujo con la pantalla/opcion en ingles ---
+        driver, piezas = _driver_codigo_temporal("en")
+        registro_en = _bot(driver, cuenta=cuenta).registrar_o_entrar()
+        check(
+            "codigo EN: opcion pulsada, contraseña escrita y 'existente'",
+            registro_en["ok"] is True
+            and registro_en["estado"] == "existente"
+            and piezas["opcion"].click_count == 1
+            and "".join(piezas["clave"].typed) == "claveSegura789",
+            str(registro_en),
+        )
+
+        # --- pantalla de codigo SIN la opcion -> error claro (no timeout) ---
+        driver, piezas = _driver_codigo_temporal("es", con_opcion=False)
+        registro_sin = _bot(driver, cuenta=cuenta).registrar_o_entrar()
+        esperado = (
+            "Change.org pidio un codigo de verificacion por correo y no se "
+            "encontro la opcion 'Ingresar con contrasena'"
+        )
+        check(
+            "codigo sin opcion: error claro exacto (no el timeout generico)",
+            registro_sin["ok"] is False
+            and registro_sin["estado"] == "fallo"
+            and registro_sin["error"] == esperado
+            and "timeout" not in registro_sin["error"],
+            repr(registro_sin["error"]),
+        )
+        check(
+            "codigo sin opcion: la constante del modulo coincide",
+            change_org._ERROR_PANTALLA_CODIGO == esperado,
+        )
+        check(
+            "codigo sin opcion: nunca se abre la pantalla de contraseña",
+            piezas["clave"].typed == [] and piezas["btn_clave"].click_count == 0,
+        )
+
+        # --- cuenta NUEVA intacta: sigue creando contraseña y nombre ---
+        driver, piezas = _driver_login("nueva")
+        registro_nueva = _bot(driver, cuenta={
+            "usuario": "u1",
+            "email": "nueva@x.com",
+            "password": "claveSegura123",
+            "nombre": "Ana",
+            "apellido": "Lopez",
+        }).registrar_o_entrar()
+        check(
+            "codigo: la cuenta NUEVA conserva su flujo (estado 'nueva')",
+            registro_nueva["ok"] is True
+            and registro_nueva["estado"] == "nueva",
+            str(registro_nueva),
+        )
+
+
+# --------------------------------------------------------------------------- #
 # (13) registrar_cuenta_change
 # --------------------------------------------------------------------------- #
 def test_registrar_cuenta_change(check):
@@ -1980,7 +3354,7 @@ def test_registrar_cuenta_change(check):
         set(resultado)
         == {
             "ok", "usuario", "email", "estado", "nombre", "apellido",
-            "error", "evidencia", "url", "cancelado",
+            "error", "evidencia", "url", "cancelado", "sesion_restaurada",
         },
         str(sorted(resultado)),
     )
@@ -2111,7 +3485,7 @@ def test_campana_registros(check):
         == {
             "total", "exitosos", "fallidos", "nuevas", "existentes",
             "omitidas", "cancelada", "resultados", "proxies_total",
-            "sin_proxy", "error",
+            "sin_proxy", "proxies_descartados", "error",
         },
         str(sorted(resumen)),
     )
@@ -2136,8 +3510,10 @@ def test_campana_registros(check):
         ),
     )
     check(
-        "campana registros: proxies_total 2 y sin_proxy 0",
-        resumen["proxies_total"] == 2 and resumen["sin_proxy"] == 0,
+        "campana registros: proxies_total 2, sin_proxy 0 y descartados 0",
+        resumen["proxies_total"] == 2
+        and resumen["sin_proxy"] == 0
+        and resumen["proxies_descartados"] == 0,
     )
     check(
         "campana registros: no cancelada y sin error",
@@ -2251,6 +3627,152 @@ def test_campana_registros(check):
         "campana registros: excepcion -> 1 fallido y sin error global",
         resumen["fallidos"] == 1 and resumen["error"] == "",
         str(resumen["error"]),
+    )
+
+
+# --------------------------------------------------------------------------- #
+# (14b) Las campanas descartan proxies con TLS/red rota (sin red real)
+# --------------------------------------------------------------------------- #
+def test_campana_proxies_rotos(check):
+    print("(14b) campanas: saltan proxies invalidos y usan el siguiente")
+    cuentas = [
+        {"usuario": "u1", "email": "u1@x.com", "email_password": "claveSegura123"},
+        {"usuario": "u2", "email": "u2@x.com", "email_password": "claveSegura123"},
+    ]
+
+    def _registro_fake(**kwargs):
+        return {
+            "ok": True,
+            "usuario": kwargs.get("usuario", ""),
+            "email": kwargs.get("email", ""),
+            "estado": "nueva",
+            "error": "",
+            "evidencia": "ok",
+        }
+
+    # --- registros: 1 invalido + 1 valido -> el roto se salta SIEMPRE ---
+    validaciones = []
+
+    def _valida(proxy, timeout=15):
+        validaciones.append(proxy)
+        return proxy != "malo"
+
+    llamadas = []
+
+    def _registro_espia(**kwargs):
+        llamadas.append(kwargs.get("proxy"))
+        return _registro_fake(**kwargs)
+
+    with mock.patch.object(
+        change_org, "proxies_disponibles", lambda pais="": ["malo", "bueno"]
+    ), mock.patch.object(
+        change_org, "proxy_change_valido", _valida
+    ), mock.patch.object(
+        change_org, "registrar_cuenta_change", _registro_espia
+    ):
+        resumen = ejecutar_campana_registros(cuentas, max_workers=1)
+    check(
+        "campana registros: proxy roto descartado y usa el siguiente valido",
+        llamadas == ["bueno", "bueno"],
+        str(llamadas),
+    )
+    check(
+        "campana registros: proxies_descartados 1 y sin_proxy 0",
+        resumen["proxies_descartados"] == 1 and resumen["sin_proxy"] == 0,
+        f"descartados={resumen['proxies_descartados']} sin_proxy={resumen['sin_proxy']}",
+    )
+    check(
+        "campana registros: no re-valida el mismo proxy en la corrida",
+        validaciones == ["malo", "bueno"],
+        str(validaciones),
+    )
+
+    # --- registros: TODOS invalidos -> "" y contadores coherentes ---
+    validaciones.clear()
+    llamadas.clear()
+    with mock.patch.object(
+        change_org, "proxies_disponibles", lambda pais="": ["m1", "m2"]
+    ), mock.patch.object(
+        change_org,
+        "proxy_change_valido",
+        lambda proxy, timeout=15: validaciones.append(proxy) or False,
+    ), mock.patch.object(
+        change_org, "registrar_cuenta_change", _registro_espia
+    ):
+        resumen = ejecutar_campana_registros(cuentas, max_workers=1)
+    check(
+        "campana registros: todos invalidos -> sin proxy en todas las cuentas",
+        llamadas == ["", ""],
+        str(llamadas),
+    )
+    check(
+        "campana registros: sin_proxy 2 y descartados 2 (unicos)",
+        resumen["sin_proxy"] == 2 and resumen["proxies_descartados"] == 2,
+        f"sin_proxy={resumen['sin_proxy']} descartados={resumen['proxies_descartados']}",
+    )
+    check(
+        "campana registros: validacion unica por proxy (2 llamadas)",
+        validaciones == ["m1", "m2"],
+        str(validaciones),
+    )
+
+    # --- reportes: misma logica de seleccion ---
+    def _reporte_fake(**kwargs):
+        llamadas.append(kwargs.get("proxy"))
+        return {
+            "ok": True,
+            "email": "e@x.com",
+            "queja": "",
+            "identidad": {},
+            "identidad_guardada": False,
+            "error": "",
+        }
+
+    validaciones.clear()
+    llamadas.clear()
+    with mock.patch.object(
+        change_org, "proxies_disponibles", lambda pais="": ["malo", "bueno"]
+    ), mock.patch.object(
+        change_org, "proxy_change_valido", _valida
+    ), mock.patch.object(
+        change_org, "ejecutar_un_reporte", _reporte_fake
+    ):
+        resumen = ejecutar_campana_reportes("u", cantidad=2, max_workers=1)
+    check(
+        "campana reportes: descarta el roto y usa el valido",
+        llamadas == ["bueno", "bueno"],
+        str(llamadas),
+    )
+    check(
+        "campana reportes: proxies_descartados 1, sin_proxy 0 y clave en resumen",
+        resumen["proxies_descartados"] == 1
+        and resumen["sin_proxy"] == 0
+        and "proxies_descartados" in resumen,
+        str({k: resumen.get(k) for k in ("proxies_descartados", "sin_proxy")}),
+    )
+
+    # --- reportes: todos invalidos -> sin proxy y descartados unicos ---
+    validaciones.clear()
+    llamadas.clear()
+    with mock.patch.object(
+        change_org, "proxies_disponibles", lambda pais="": ["m1", "m2"]
+    ), mock.patch.object(
+        change_org,
+        "proxy_change_valido",
+        lambda proxy, timeout=15: validaciones.append(proxy) or False,
+    ), mock.patch.object(
+        change_org, "ejecutar_un_reporte", _reporte_fake
+    ):
+        resumen = ejecutar_campana_reportes("u", cantidad=3, max_workers=1)
+    check(
+        "campana reportes: todos invalidos -> 3 sin proxy",
+        llamadas == ["", "", ""] and resumen["sin_proxy"] == 3,
+        str(llamadas),
+    )
+    check(
+        "campana reportes: descartados unicos 2 con 3 reportes",
+        resumen["proxies_descartados"] == 2 and validaciones == ["m1", "m2"],
+        f"descartados={resumen['proxies_descartados']} validaciones={validaciones}",
     )
 
 
@@ -2428,6 +3950,328 @@ def test_reporte_modal(check):
             "modal: _reporte_exitoso acepta la frase nueva",
             ok is True and "gracias por tomarte el tiempo" in evidencia,
             evidencia,
+        )
+
+
+# --------------------------------------------------------------------------- #
+# (15b) modal: deteccion por TEXTO del dialogo + seleccion por capas (label/JS)
+# --------------------------------------------------------------------------- #
+class _DriverModalJs(FakeDriver):
+    """Modal donde Selenium NO ve los radios: el DOM se simula con un dict.
+
+    `execute_script` responde a los scripts marcados del bot
+    (`change_org:seleccionar_motivo` / `change_org:estado_radios`) como lo
+    haria el DOM real: marca el radio `dislike_content` (o el indice 2) y
+    activa el textarea a traves de `al_seleccionar`.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.dom = {
+            "radios": [
+                {"value": "violates_guidelines", "checked": False},
+                {"value": "illegal_content", "checked": False},
+                {"value": "dislike_content", "checked": False},
+            ],
+            "textarea": False,
+        }
+        self.al_seleccionar = None
+
+    def execute_script(self, script, *args):
+        texto_script = str(script)
+        if "change_org:seleccionar_motivo" in texto_script:
+            self.scripts.append(script)
+            elegido = None
+            for radio in self.dom["radios"]:
+                if radio["value"] == "dislike_content":
+                    elegido = radio
+                    break
+            if elegido is None and len(self.dom["radios"]) > 2:
+                elegido = self.dom["radios"][2]
+            if elegido is not None:
+                elegido["checked"] = True
+            self.dom["textarea"] = True
+            if self.al_seleccionar:
+                self.al_seleccionar()
+            return {"ok": True, "checked": True, "textarea": True}
+        if "change_org:estado_radios" in texto_script:
+            return {
+                "total": len(self.dom["radios"]),
+                "tercero": bool(self.dom["radios"][2]["checked"]),
+                "alguno": any(r["checked"] for r in self.dom["radios"]),
+                "textarea": bool(self.dom["textarea"]),
+            }
+        return super().execute_script(script, *args)
+
+
+def _driver_modal_js(gracias=True):
+    """Modal SOLO-JS: radios invisibles para Selenium + textarea/select/Enviar."""
+    driver = _DriverModalJs()
+    enlace = FakeElement(
+        driver, tag="button", texto="Denunciar una violación de las políticas"
+    )
+    dialogo = FakeElement(
+        driver, tag="div", attrs={"role": "dialog"}, texto="Denunciar un abuso"
+    )
+    label_ubi = FakeElement(driver, tag="label", texto="¿Dónde vives?")
+    op_us = FakeElement(
+        driver, tag="option", texto="Estados Unidos", attrs={"value": "US"}
+    )
+    op_mx = FakeElement(driver, tag="option", texto="México", attrs={"value": "MX"})
+    select = FakeElement(driver, tag="select", attrs={"value": "US"}, hijos=[op_us, op_mx])
+    label_ubi.siguiente = select
+    motivo = FakeElement(driver, tag="textarea", attrs={"name": "reason"}, visible=False)
+    enviar = FakeElement(driver, tag="button", attrs={"type": "submit"}, texto="Enviar")
+    driver.registrar(enlace, dialogo, label_ubi, select, op_us, op_mx, motivo, enviar)
+
+    def _mostrar_textarea():
+        motivo.visible = True
+
+    driver.al_seleccionar = _mostrar_textarea
+    if gracias:
+        enviar.al_click = lambda: setattr(
+            driver,
+            "page_source",
+            "<p>Gracias por tomarte el tiempo de denunciar contenido.</p>",
+        )
+    else:
+        enviar.al_click = lambda: setattr(
+            driver, "page_source", "<p>La denuncia sigue en el formulario</p>"
+        )
+    return driver, {"motivo": motivo, "enviar": enviar, "op_mx": op_mx}
+
+
+def test_modal_deteccion_y_estrategias(check):
+    print("(15b) modal: deteccion por texto y seleccion por capas")
+    identidad = {
+        "nombre": "Ana",
+        "apellido": "Lopez",
+        "email": "ana.lopez12@gmail.com",
+        "codigo_postal": "44100",
+    }
+    queja = "Considero que esta peticion incumple las normas de la comunidad."
+    error_esperado = (
+        "no se pudo seleccionar el motivo de denuncia "
+        "(radios del modal no seleccionables)"
+    )
+
+    with _sin_esperas():
+        # --- (1) el modal se detecta SOLO por el TEXTO del [role=dialog] ---
+        for frase in (
+            "Denunciar un abuso",
+            "Report abuse",
+            "No me gusta esta petición o no estoy de acuerdo con ella",
+            "Viola las Normas de la Comunidad",
+            "El contenido es ilegal",
+        ):
+            driver = FakeDriver()
+            driver.registrar(
+                FakeElement(driver, tag="div", attrs={"role": "dialog"}, texto=frase)
+            )
+            bot = _bot(driver, url_peticion="https://www.change.org/p/x")
+            check(
+                f"modal: _formulario_presente por TEXTO '{frase[:26]}'",
+                bot._formulario_presente() is True,
+            )
+            check(
+                f"modal: _esperar_formulario por TEXTO '{frase[:26]}'",
+                bot._esperar_formulario(intentos=1) is True,
+            )
+
+        driver = FakeDriver()
+        driver.registrar(
+            FakeElement(
+                driver, tag="div", attrs={"role": "dialog"},
+                texto="Comparte esta petición con tus amigos",
+            )
+        )
+        check(
+            "modal: dialogo con OTRO texto no cuenta como formulario",
+            _bot(driver)._formulario_presente() is False,
+        )
+
+        driver = FakeDriver()
+        driver.registrar(
+            FakeElement(
+                driver, tag="div", attrs={"role": "dialog"},
+                texto="Denunciar un abuso", visible=False,
+            )
+        )
+        check(
+            "modal: dialogo con el TEXTO del modal pero OCULTO no cuenta",
+            _bot(driver)._formulario_presente() is False,
+        )
+
+        # --- (2) radio seleccionable SOLO por la ETIQUETA visible ---
+        driver = FakeDriver()
+        motivo = FakeElement(
+            driver, tag="textarea", attrs={"name": "reason"}, visible=False
+        )
+        etiqueta = FakeElement(
+            driver, tag="label",
+            texto="No me gusta esta petición o no estoy de acuerdo con ella",
+            attrs={"class": "relative flex cursor-pointer"},
+        )
+        driver.registrar(motivo, etiqueta)
+        etiqueta.al_click = lambda: setattr(motivo, "visible", True)
+        bot = _bot(driver)
+        ok_radio, error = bot._seleccionar_motivo_denuncia()
+        check(
+            "modal: sin radios para Selenium -> selecciona por ETIQUETA visible",
+            ok_radio is True and error == "" and etiqueta.click_count == 1,
+            str(error),
+        )
+        check(
+            "modal: la etiqueta hace aparecer el textarea (verificacion)",
+            bot._verificar_motivo_seleccionado() is True,
+        )
+
+        # --- (3) radio seleccionable SOLO por JS puro (DOM simulado) ---
+        driver, piezas = _driver_modal_js()
+        bot = _bot(driver)
+        ok_radio, error = bot._seleccionar_motivo_denuncia()
+        check(
+            "modal: radios invisibles para Selenium -> selecciona por JS puro",
+            ok_radio is True
+            and error == ""
+            and driver.dom["radios"][2]["checked"] is True
+            and driver.dom["radios"][0]["checked"] is False
+            and driver.dom["radios"][1]["checked"] is False,
+            str(error),
+        )
+        check(
+            "modal: se ejecuto el JS de seleccion marcado del bot",
+            any("change_org:seleccionar_motivo" in s for s in driver.scripts),
+        )
+
+        # flujo COMPLETO por JS: radio -> textarea -> Mexico -> Enviar -> gracias
+        driver, piezas = _driver_modal_js()
+        bot = _bot(driver, url_peticion="https://www.change.org/p/x")
+        bot.preparar_driver = lambda: True
+        with mock.patch.object(change_org.random, "random", return_value=0.99):
+            resultado = bot.reportar(identidad=identidad, queja=queja)
+        check(
+            "modal JS: flujo completo ok con evidencia de gracias",
+            resultado["ok"] is True
+            and "gracias por tomarte el tiempo" in resultado["evidencia"],
+            f"ok={resultado['ok']} error={resultado['error']!r}",
+        )
+        check(
+            "modal JS: solo el tercer radio quedo marcado",
+            driver.dom["radios"][2]["checked"] is True
+            and driver.dom["radios"][0]["checked"] is False
+            and driver.dom["radios"][1]["checked"] is False,
+        )
+        check(
+            "modal JS: Mexico seleccionado y queja escrita",
+            piezas["op_mx"].click_count == 1
+            and "".join(piezas["motivo"].typed) == queja,
+            f"mx={piezas['op_mx'].click_count}",
+        )
+        check("modal JS: boton Enviar clicado", piezas["enviar"].click_count == 1)
+
+        # --- (4) verificacion fallida -> error claro exacto ---
+        driver = FakeDriver()
+        r3 = FakeElement(
+            driver, tag="input",
+            attrs={"type": "radio", "value": "dislike_content"},
+            texto="No me gusta esta petición o no estoy de acuerdo con ella",
+            click_falla=True, js_click_falla=True,
+        )
+        driver.registrar(
+            FakeElement(
+                driver, tag="input", attrs={"type": "radio", "value": "spam"},
+                texto="Es spam o publicidad engañosa",
+            ),
+            FakeElement(
+                driver, tag="input", attrs={"type": "radio", "value": "falsa"},
+                texto="Contiene información falsa",
+            ),
+            r3,
+        )
+        bot = _bot(driver)
+        ok_radio, error = bot._seleccionar_motivo_denuncia()
+        check(
+            "modal: ninguna estrategia marca -> error claro exacto",
+            ok_radio is False and error == error_esperado,
+            str(error),
+        )
+        check(
+            "modal: con la seleccion fallida no se toca ningun radio ajeno",
+            r3.click_count == 0 and r3.js_click_count == 0,
+        )
+
+        # --- (5) la verificacion acepta checked/aria-checked sin clic ---
+        for atributo, valor in (("checked", "true"), ("aria-checked", "true")):
+            driver = FakeDriver()
+            radio3 = FakeElement(
+                driver, tag="input",
+                attrs={
+                    "type": "radio", "value": "dislike_content", atributo: valor,
+                },
+                texto="No me gusta esta petición",
+            )
+            driver.registrar(
+                FakeElement(driver, tag="input", attrs={"type": "radio"}, texto="Spam"),
+                FakeElement(
+                    driver, tag="input", attrs={"type": "radio"}, texto="Falsa"
+                ),
+                radio3,
+            )
+            bot = _bot(driver)
+            check(
+                f"modal: verificacion acepta {atributo}='true'",
+                bot._verificar_motivo_seleccionado() is True,
+            )
+
+        # --- (6) sin candidatos -> error claro (no el generico viejo) ---
+        driver = FakeDriver()
+        bot = _bot(driver)
+        ok_radio, error = bot._seleccionar_motivo_denuncia()
+        check(
+            "modal: sin radios ni etiquetas -> error claro exacto",
+            ok_radio is False and error == error_esperado,
+            str(error),
+        )
+
+        # --- (7) campo opcional del modal real (input de React Aria) ---
+        driver = FakeDriver()
+        campo = FakeElement(
+            driver, tag="input",
+            attrs={"type": "text", "name": "question1.answer"},
+        )
+        driver.registrar(campo)
+        check(
+            "modal: _resolver_campo('motivo') por selector question1.answer",
+            _bot(driver)._resolver_campo("motivo") is campo,
+        )
+
+        class _DriverCampoMotivoJs(FakeDriver):
+            """Selenium no ve el campo del motivo; el JS del bot SI."""
+
+            def __init__(self):
+                super().__init__()
+                self.campo = FakeElement(
+                    self, tag="input",
+                    attrs={"type": "text", "name": "question1.answer"},
+                )
+
+            def execute_script(self, script, *args):
+                if "change_org:campo_motivo" in str(script):
+                    self.scripts.append(script)
+                    return self.campo
+                return super().execute_script(script, *args)
+
+        driver = _DriverCampoMotivoJs()
+        driver.registrar(
+            FakeElement(
+                driver, tag="div", attrs={"role": "dialog"},
+                texto="Denunciar un abuso",
+            )
+        )
+        check(
+            "modal: _resolver_campo('motivo') por JS (input de React Aria)",
+            _bot(driver)._resolver_campo("motivo") is driver.campo,
         )
 
 
@@ -3281,30 +5125,1315 @@ def test_campana_espera_captcha(check):
 
 
 # --------------------------------------------------------------------------- #
+# (19) Sesion persistente de Change.org (cookies por cuenta, sin BD)
+# --------------------------------------------------------------------------- #
+def test_sesion_persistente(check):
+    print("(19) sesion persistente (guardar/cargar/borrar + restauracion)")
+    with tempfile.TemporaryDirectory(prefix="change_sesion_") as tmp:
+        with mock.patch.object(change_org, "_DIR_SESIONES_CHANGE", tmp), \
+                mock.patch.dict(os.environ):
+            os.environ.pop("CHANGE_REUTILIZAR_SESION", None)
+
+            # --- ruta saneada (dentro del directorio, nunca vacia) ---
+            ruta = change_org._ruta_sesion_change("NereydaBach")
+            check(
+                "sesion: ruta en el directorio y con .json",
+                os.path.dirname(ruta) == tmp
+                and ruta.endswith("NereydaBach.json"),
+                ruta,
+            )
+            ruta_rara = change_org._ruta_sesion_change("../../etc/passwd")
+            check(
+                "sesion: nombre saneado (sin separadores ni path traversal)",
+                os.path.dirname(ruta_rara) == tmp
+                and "/" not in os.path.basename(ruta_rara)
+                and "\\" not in os.path.basename(ruta_rara)
+                and os.path.basename(ruta_rara).rstrip(".json") != "..",
+                ruta_rara,
+            )
+            check(
+                "sesion: usuario vacio -> nombre no vacio",
+                bool(os.path.basename(change_org._ruta_sesion_change(""))),
+            )
+            check(
+                "sesion: env default -> reutilizacion activa",
+                change_org._reutilizar_sesion_activo() is True,
+            )
+
+            # --- roundtrip guardar/cargar ---
+            cookies = [
+                {
+                    "name": "session_id",
+                    "value": "abc123",
+                    "domain": ".change.org",
+                    "path": "/",
+                    "secure": True,
+                    "httpOnly": True,
+                    "expiry": 2000000000,
+                },
+                {
+                    "name": "otra",
+                    "value": "xyz",
+                    "domain": "www.change.org",
+                    "path": "/",
+                },
+            ]
+            driver = FakeDriver()
+            driver.cookies = cookies
+            check(
+                "sesion: guardar True con cookies",
+                change_org.guardar_sesion_change(
+                    "u_guardar", driver, "u_guardar@x.com", "p1"
+                )
+                is True,
+            )
+            datos = change_org.cargar_sesion_change("u_guardar")
+            check(
+                "sesion: JSON con las claves del contrato",
+                isinstance(datos, dict)
+                and set(datos) == {"usuario", "email", "guardada", "proxy", "cookies"},
+                str(sorted(datos)) if isinstance(datos, dict) else repr(datos),
+            )
+            check(
+                "sesion: usuario/email/proxy persistidos",
+                datos["usuario"] == "u_guardar"
+                and datos["email"] == "u_guardar@x.com"
+                and datos["proxy"] == "p1",
+                str({k: datos[k] for k in ("usuario", "email", "proxy")}),
+            )
+            check(
+                "sesion: cookies completas (name/value/domain/path)",
+                datos["cookies"] == cookies,
+                str(len(datos["cookies"])),
+            )
+            check(
+                "sesion: 'guardada' es ISO parseable",
+                isinstance(datos["guardada"], str)
+                and bool(datetime.fromisoformat(datos["guardada"])),
+                str(datos["guardada"]),
+            )
+            check(
+                "sesion: archivo real en disco",
+                os.path.isfile(change_org._ruta_sesion_change("u_guardar")),
+            )
+            if os.name == "posix":
+                modo = (
+                    os.stat(change_org._ruta_sesion_change("u_guardar")).st_mode
+                    & 0o777
+                )
+                check("sesion: permisos 0600 en POSIX", modo == 0o600, oct(modo))
+
+            # sin cookies -> no guarda
+            driver_vacio = FakeDriver()
+            check(
+                "sesion: driver sin cookies -> False",
+                change_org.guardar_sesion_change("u_vacio", driver_vacio) is False,
+            )
+
+            class _DriverSinGetCookies(FakeDriver):
+                def get_cookies(self):
+                    raise RuntimeError("sin API de cookies")
+
+            check(
+                "sesion: get_cookies que lanza -> False sin lanzar",
+                change_org.guardar_sesion_change(
+                    "u_roto", _DriverSinGetCookies()
+                )
+                is False,
+            )
+
+            # --- archivo corrupto / invalido -> None ---
+            with open(
+                change_org._ruta_sesion_change("u_corrupta"), "w", encoding="utf-8"
+            ) as archivo:
+                archivo.write("{esto no es json")
+            check(
+                "sesion: archivo corrupto -> None",
+                change_org.cargar_sesion_change("u_corrupta") is None,
+            )
+            with open(
+                change_org._ruta_sesion_change("u_sin_cookies"), "w", encoding="utf-8"
+            ) as archivo:
+                archivo.write('{"usuario": "u_sin_cookies", "cookies": []}')
+            check(
+                "sesion: JSON sin cookies -> None",
+                change_org.cargar_sesion_change("u_sin_cookies") is None,
+            )
+            with open(
+                change_org._ruta_sesion_change("u_lista"), "w", encoding="utf-8"
+            ) as archivo:
+                archivo.write("[1, 2, 3]")
+            check(
+                "sesion: JSON que no es dict -> None",
+                change_org.cargar_sesion_change("u_lista") is None,
+            )
+            check(
+                "sesion: sesion inexistente -> None",
+                change_org.cargar_sesion_change("no_existe_jamas") is None,
+            )
+
+            # --- env desactivado: no guarda ni restaura ---
+            with mock.patch.dict(os.environ, {"CHANGE_REUTILIZAR_SESION": "0"}):
+                check(
+                    "sesion: env 0 -> reutilizacion desactivada",
+                    change_org._reutilizar_sesion_activo() is False,
+                )
+                check(
+                    "sesion: env 0 -> guardar no escribe",
+                    change_org.guardar_sesion_change(
+                        "u_off", driver, "x@x.com"
+                    )
+                    is False,
+                )
+                check(
+                    "sesion: env 0 -> cargar devuelve None aunque exista",
+                    change_org.cargar_sesion_change("u_guardar") is None,
+                )
+            check(
+                "sesion: al reactivar, la sesion sigue ahi",
+                change_org.cargar_sesion_change("u_guardar") is not None,
+            )
+
+            # --- borrar ---
+            check(
+                "sesion: borrar True",
+                change_org.borrar_sesion_change("u_guardar") is True,
+            )
+            check(
+                "sesion: borrar de nuevo -> False",
+                change_org.borrar_sesion_change("u_guardar") is False,
+            )
+            check(
+                "sesion: ya no carga tras borrar",
+                change_org.cargar_sesion_change("u_guardar") is None,
+            )
+
+            # ============================================================= #
+            # Flujo: sesion guardada + home logueada -> restaurada          #
+            # ============================================================= #
+            driver_persistir = FakeDriver()
+            driver_persistir.cookies = [
+                {"name": "auth", "value": "tok", "domain": ".change.org", "path": "/"}
+            ]
+            check(
+                "sesion flujo: sesion previa guardada",
+                change_org.guardar_sesion_change(
+                    "u_restaura", driver_persistir, "u_restaura@x.com", "proxy-mx"
+                )
+                is True,
+            )
+            cuenta = {
+                "usuario": "u_restaura",
+                "email": "u_restaura@x.com",
+                "email_password": "claveSegura123",
+            }
+            driver, piezas = _driver_login("existente")
+            piezas["btn_login"].visible = False
+            avatar = FakeElement(
+                driver, tag="img", attrs={"data-testid": "avatar-home"}
+            )
+            driver.registrar(avatar)
+
+            def _home_logueada(_url):
+                driver.current_url = "https://www.change.org/?met=esnv"
+
+            driver.al_navegar = _home_logueada
+            with _sin_esperas():
+                registro = _bot(driver, cuenta=cuenta).registrar_o_entrar()
+            check(
+                "sesion flujo: ok True / estado existente / sesion_restaurada",
+                registro["ok"] is True
+                and registro["estado"] == "existente"
+                and registro["sesion_restaurada"] is True,
+                str(registro),
+            )
+            check(
+                "sesion flujo: evidencia 'sesion restaurada (cookies)'",
+                registro["evidencia"] == "sesion restaurada (cookies)",
+                str(registro["evidencia"]),
+            )
+            check(
+                "sesion flujo: NO escribio el email ni pulso 'Iniciar sesión'",
+                piezas["email"].typed == [] and piezas["btn_login"].click_count == 0,
+            )
+            check(
+                "sesion flujo: cookies inyectadas por CDP (enable + setCookie)",
+                any(cmd == "Network.enable" for cmd, _ in driver.cdp_calls)
+                and any(cmd == "Network.setCookie" for cmd, _ in driver.cdp_calls),
+                str([cmd for cmd, _ in driver.cdp_calls]),
+            )
+            payloads = [
+                params
+                for cmd, params in driver.cdp_calls
+                if cmd == "Network.setCookie"
+            ]
+            check(
+                "sesion flujo: payload CDP con name/value/domain/path/secure",
+                bool(payloads)
+                and payloads[0].get("name") == "auth"
+                and payloads[0].get("value") == "tok"
+                and payloads[0].get("domain") == ".change.org"
+                and payloads[0].get("path") == "/"
+                and payloads[0].get("secure") is True,
+                str(payloads),
+            )
+            check(
+                "sesion flujo: NO navego al login (solo a la home)",
+                driver.url == "https://www.change.org/",
+                driver.url,
+            )
+
+            # ============================================================= #
+            # Flujo: sesion guardada pero home NO logueada -> login normal  #
+            # ============================================================= #
+            driver2, piezas2 = _driver_login("existente")
+            driver2.cookies = [
+                {
+                    "name": "post_login",
+                    "value": "v2",
+                    "domain": ".change.org",
+                    "path": "/",
+                }
+            ]
+            with _sin_esperas():
+                registro2 = _bot(driver2, cuenta=cuenta).registrar_o_entrar()
+            check(
+                "sesion flujo fallback: login normal ok y sesion_restaurada False",
+                registro2["ok"] is True
+                and registro2["estado"] == "existente"
+                and registro2["sesion_restaurada"] is False,
+                str(registro2),
+            )
+            check(
+                "sesion flujo fallback: SI escribio el email del login",
+                "".join(piezas2["email"].typed) == "u_restaura@x.com",
+                "".join(piezas2["email"].typed),
+            )
+            datos_nuevos = change_org.cargar_sesion_change("u_restaura")
+            check(
+                "sesion flujo fallback: guardo la sesion nueva (cookies rotadas)",
+                isinstance(datos_nuevos, dict)
+                and bool(datos_nuevos["cookies"])
+                and datos_nuevos["cookies"][0]["name"] == "post_login",
+                str(datos_nuevos)[:140],
+            )
+
+            # env 0: NO restaura aunque el archivo exista (login normal).
+            with mock.patch.dict(os.environ, {"CHANGE_REUTILIZAR_SESION": "0"}):
+                driver3, piezas3 = _driver_login("existente")
+                with _sin_esperas():
+                    registro3 = _bot(driver3, cuenta=cuenta).registrar_o_entrar()
+                check(
+                    "sesion flujo: env 0 -> no restaura (sin CDP) y hace login normal",
+                    registro3["ok"] is True
+                    and registro3["sesion_restaurada"] is False
+                    and "".join(piezas3["email"].typed) == "u_restaura@x.com"
+                    and driver3.cdp_calls == [],
+                    f"{registro3} cdp={driver3.cdp_calls}",
+                )
+
+            # ============================================================= #
+            # _restaurar_sesion_change tolerante a fallos                   #
+            # ============================================================= #
+            bot_sin = _bot(
+                FakeDriver(), cuenta={"usuario": "sin_sesion", "email": "s@x.com"}
+            )
+            check(
+                "restaurar: sin archivo -> False sin lanzar",
+                bot_sin._restaurar_sesion_change() is False,
+            )
+            bot_cdp = _bot(
+                FakeDriver(), cuenta={"usuario": "u_restaura", "email": "r@x.com"}
+            )
+            bot_cdp.driver.cdp_setcookie_falla = True
+            with _sin_esperas():
+                check(
+                    "restaurar: CDP caido -> False sin lanzar",
+                    bot_cdp._restaurar_sesion_change() is False,
+                )
+            bot_cdp2 = _bot(
+                FakeDriver(), cuenta={"usuario": "u_restaura", "email": "r@x.com"}
+            )
+            bot_cdp2.driver.cdp_setcookie_success_false = True
+            with _sin_esperas():
+                check(
+                    "restaurar: CDP success=False -> False",
+                    bot_cdp2._restaurar_sesion_change() is False,
+                )
+            driver_nav = FakeDriver()
+
+            def _explota(_url):
+                raise RuntimeError("red caida")
+
+            driver_nav.al_navegar = _explota
+            bot_nav = _bot(
+                driver_nav, cuenta={"usuario": "u_restaura", "email": "r@x.com"}
+            )
+            with _sin_esperas():
+                check(
+                    "restaurar: error de navegacion -> False sin lanzar",
+                    bot_nav._restaurar_sesion_change() is False,
+                )
+            driver_red = FakeDriver()
+            driver_red.title = "Privacy error"
+            driver_red.page_source = (
+                "<div class='error-code'>ERR_CERT_AUTHORITY_INVALID</div>"
+            )
+            bot_red = _bot(
+                driver_red, cuenta={"usuario": "u_restaura", "email": "r@x.com"}
+            )
+            with _sin_esperas():
+                check(
+                    "restaurar: pagina de error de red -> False",
+                    bot_red._restaurar_sesion_change() is False,
+                )
+            driver_reto = FakeDriver()
+            driver_reto.registrar(
+                FakeElement(
+                    driver_reto,
+                    tag="iframe",
+                    attrs={
+                        "src": "https://challenges.cloudflare.com/turnstile/v0/api.js"
+                    },
+                )
+            )
+            bot_reto = _bot(
+                driver_reto, cuenta={"usuario": "u_restaura", "email": "r@x.com"}
+            )
+            with _sin_esperas():
+                check(
+                    "restaurar: reto anti-bot -> False (el flujo normal decide)",
+                    bot_reto._restaurar_sesion_change() is False,
+                )
+            bot_err = _bot(
+                FakeDriver(), cuenta={"usuario": "u_restaura", "email": "r@x.com"}
+            )
+            bot_err.ultimo_error = ""
+            with _sin_esperas():
+                bot_err._restaurar_sesion_change()
+            check(
+                "restaurar: no deja ultimo_error pegado del intento",
+                bot_err.ultimo_error == "",
+                bot_err.ultimo_error,
+            )
+
+            # ============================================================= #
+            # Propagacion de `sesion_restaurada`                            #
+            # ============================================================= #
+            class _BotRestaurado:
+                def __init__(self, **kwargs):
+                    self.kwargs = kwargs
+                    self.ultimo_error = ""
+
+                def preparar_driver(self):
+                    return True
+
+                def registrar_o_entrar(self):
+                    return {
+                        "ok": True,
+                        "estado": "existente",
+                        "error": "",
+                        "evidencia": "sesion restaurada (cookies)",
+                        "sesion_restaurada": True,
+                    }
+
+                def _url_actual(self):
+                    return "https://www.change.org/"
+
+                def cerrar(self):
+                    pass
+
+            with mock.patch.object(change_org, "ChangeOrgReportBot", _BotRestaurado):
+                resultado_reg = registrar_cuenta_change(
+                    usuario="u_prop",
+                    email="u_prop@x.com",
+                    password="claveSegura123",
+                )
+            check(
+                "propagacion: registrar_cuenta_change trae sesion_restaurada True",
+                resultado_reg["ok"] is True
+                and resultado_reg["estado"] == "existente"
+                and resultado_reg["sesion_restaurada"] is True,
+                str(
+                    {
+                        k: resultado_reg.get(k)
+                        for k in ("ok", "estado", "sesion_restaurada")
+                    }
+                ),
+            )
+
+            class _BotReporteRestaurado(_BotRestaurado):
+                def reportar(self, identidad=None, queja=""):
+                    return {
+                        "ok": True,
+                        "email": "u_prop@x.com",
+                        "usuario": "u_prop",
+                        "queja": queja,
+                        "error": "",
+                        "evidencia": "ok",
+                        "url": "u",
+                        "estado_cuenta": "existente",
+                        "sesion_restaurada": True,
+                    }
+
+            with mock.patch.object(
+                change_org, "ChangeOrgReportBot", _BotReporteRestaurado
+            ), mock.patch.object(
+                gc,
+                "generar_queja_change",
+                lambda *a, **k: {
+                    "ok": True,
+                    "queja": "Q",
+                    "usada_ia": False,
+                    "error": "",
+                },
+            ):
+                resultado_rep = ejecutar_un_reporte(
+                    "u", cuenta={"usuario": "u_prop", "email": "u_prop@x.com"}
+                )
+            check(
+                "propagacion: ejecutar_un_reporte cuenta trae sesion_restaurada True",
+                resultado_rep["sesion_restaurada"] is True,
+                str(resultado_rep.get("sesion_restaurada")),
+            )
+
+            class _BotReporteAnonimo(_BotRestaurado):
+                def reportar(self, identidad=None, queja=""):
+                    return {
+                        "ok": True,
+                        "email": "",
+                        "usuario": "",
+                        "queja": queja,
+                        "error": "",
+                        "evidencia": "ok",
+                        "url": "u",
+                    }
+
+            with mock.patch.object(
+                change_org, "ChangeOrgReportBot", _BotReporteAnonimo
+            ), mock.patch.object(
+                gc,
+                "generar_queja_change",
+                lambda *a, **k: {
+                    "ok": True,
+                    "queja": "Q",
+                    "usada_ia": False,
+                    "error": "",
+                },
+            ), mock.patch.object(
+                change_org,
+                "guardar_identidad_change",
+                lambda *a, **k: {"guardada": True, "id": 1, "motivo": ""},
+            ):
+                resultado_anon = ejecutar_un_reporte("u")
+            check(
+                "propagacion: la clave existe tambien en el flujo anonimo (False)",
+                resultado_anon["sesion_restaurada"] is False,
+                str(resultado_anon.get("sesion_restaurada")),
+            )
+
+
+# --------------------------------------------------------------------------- #
+# (20) Captura de evidencia de los reportes exitosos (screenshot)
+# --------------------------------------------------------------------------- #
+def test_captura_evidencia(check):
+    print("(20) captura de evidencia (_capturar_evidencia + clave captura)")
+    identidad = {
+        "nombre": "Ana",
+        "apellido": "Lopez",
+        "email": "ana.lopez12@gmail.com",
+        "codigo_postal": "44100",
+    }
+    queja = "Considero que esta peticion incumple las normas de la comunidad."
+
+    check(
+        "captura: _DIR_CAPTURAS_CHANGE = data/reportes/change",
+        str(_DIR_CAPTURAS_REAL).replace("\\", "/").endswith("data/reportes/change"),
+        str(_DIR_CAPTURAS_REAL),
+    )
+    check(
+        "captura: la suite corre aislada en temp (no data/reportes/change real)",
+        os.path.basename(
+            os.path.normpath(str(change_org._DIR_CAPTURAS_CHANGE))
+        ).startswith("change_capturas_"),
+        str(change_org._DIR_CAPTURAS_CHANGE),
+    )
+
+    with _sin_esperas():
+        # --- reporte exitoso: PNG real, nombre y ruta en `captura` ---
+        with tempfile.TemporaryDirectory(prefix="change_capturas_ok_") as tmp:
+            with mock.patch.object(change_org, "_DIR_CAPTURAS_CHANGE", tmp):
+                driver, _piezas = _driver_modal()
+                bot = _bot(driver, url_peticion="https://www.change.org/p/x")
+                bot.preparar_driver = lambda: True
+                with mock.patch.object(change_org.random, "random", return_value=0.99):
+                    resultado = bot.reportar(identidad=identidad, queja=queja)
+                ruta = resultado.get("captura")
+                check(
+                    "captura: reporte ok -> captura no vacia",
+                    resultado["ok"] is True
+                    and isinstance(ruta, str)
+                    and bool(ruta),
+                    str(ruta),
+                )
+                check(
+                    "captura: PNG real dentro del temp dir",
+                    bool(ruta)
+                    and os.path.dirname(ruta) == tmp
+                    and ruta.endswith(".png")
+                    and os.path.isfile(ruta),
+                    str(ruta),
+                )
+                check(
+                    "captura: nombre change_{slug}_{YYYYmmdd_HHMMSS}.png",
+                    bool(
+                        re.fullmatch(
+                            r"change_cuenta_\d{8}_\d{6}\.png",
+                            os.path.basename(ruta or ""),
+                        )
+                    ),
+                    os.path.basename(ruta or ""),
+                )
+                check(
+                    "captura: save_screenshot recibio esa misma ruta",
+                    driver.screenshots == [ruta],
+                    str(driver.screenshots),
+                )
+                check(
+                    "captura: exactamente UN archivo por reporte",
+                    os.listdir(tmp) == [os.path.basename(ruta or "")],
+                    str(os.listdir(tmp)),
+                )
+                check(
+                    "debug: reporte ok -> NO se guarda captura de fallo",
+                    not os.path.isdir(os.path.join(tmp, "debug"))
+                    and driver.screenshots == [ruta],
+                    f"dirs={os.listdir(tmp)} screenshots={driver.screenshots}",
+                )
+
+        # --- reporte fallido: captura de exito "" + UNA de debug en debug/ ---
+        with tempfile.TemporaryDirectory(prefix="change_capturas_fail_") as tmp:
+            with mock.patch.object(change_org, "_DIR_CAPTURAS_CHANGE", tmp):
+                driver, _piezas = _driver_modal(gracias=False)
+                bot = _bot(driver, url_peticion="https://www.change.org/p/x")
+                bot.preparar_driver = lambda: True
+                with mock.patch.object(change_org.random, "random", return_value=0.99):
+                    resultado = bot.reportar(identidad=identidad, queja=queja)
+                check(
+                    "captura: reporte fallido -> ok False y captura vacia",
+                    resultado["ok"] is False and resultado.get("captura") == "",
+                    f"ok={resultado['ok']} captura={resultado.get('captura')!r}",
+                )
+                debug_dir = os.path.join(tmp, "debug")
+                debug_files = (
+                    os.listdir(debug_dir) if os.path.isdir(debug_dir) else []
+                )
+                check(
+                    "debug: reporte fallido -> UNA captura en debug/ (no en la raiz)",
+                    len(debug_files) == 1
+                    and re.fullmatch(
+                        r"debug_fallo_cuenta_\d{8}_\d{6}\.png", debug_files[0]
+                    )
+                    is not None
+                    and os.path.isfile(os.path.join(debug_dir, debug_files[0])),
+                    str(debug_files),
+                )
+                check(
+                    "debug: la raiz de capturas queda sin PNG de exito",
+                    [n for n in os.listdir(tmp) if n.endswith(".png")] == [],
+                    str(os.listdir(tmp)),
+                )
+                check(
+                    "debug: save_screenshot solo con la ruta de debug",
+                    bool(debug_files)
+                    and driver.screenshots
+                    == [os.path.join(debug_dir, debug_files[0])],
+                    str(driver.screenshots),
+                )
+
+        # --- debug de fallo que LANZA: el flujo conserva su error ---
+        with tempfile.TemporaryDirectory(prefix="change_capturas_fail_throw_") as tmp:
+            with mock.patch.object(change_org, "_DIR_CAPTURAS_CHANGE", tmp):
+                driver, _piezas = _driver_modal(gracias=False)
+                driver.screenshot_falla = True
+                bot = _bot(driver, url_peticion="https://www.change.org/p/x")
+                bot.preparar_driver = lambda: True
+                with mock.patch.object(change_org.random, "random", return_value=0.99):
+                    resultado = bot.reportar(identidad=identidad, queja=queja)
+                check(
+                    "debug: captura de fallo que lanza -> mismo error y sin romper",
+                    resultado["ok"] is False
+                    and resultado["error"] == "sin evidencia de exito en la pagina"
+                    and resultado.get("captura") == "",
+                    str(resultado.get("error")),
+                )
+
+        # --- save_screenshot que LANZA: el flujo sigue ok y captura "" ---
+        with tempfile.TemporaryDirectory(prefix="change_capturas_throw_") as tmp:
+            with mock.patch.object(change_org, "_DIR_CAPTURAS_CHANGE", tmp):
+                driver, _piezas = _driver_modal()
+                driver.screenshot_falla = True
+                bot = _bot(driver, url_peticion="https://www.change.org/p/x")
+                bot.preparar_driver = lambda: True
+                with mock.patch.object(change_org.random, "random", return_value=0.99):
+                    resultado = bot.reportar(identidad=identidad, queja=queja)
+                check(
+                    "captura: save_screenshot que lanza -> flujo ok y captura ''",
+                    resultado["ok"] is True and resultado.get("captura") == "",
+                    f"ok={resultado['ok']} captura={resultado.get('captura')!r}",
+                )
+                check(
+                    "captura: excepcion sin dejar archivos a medias",
+                    os.listdir(tmp) == [],
+                    str(os.listdir(tmp)),
+                )
+
+        # --- save_screenshot que devuelve False (sin excepcion) ---
+        with tempfile.TemporaryDirectory(prefix="change_capturas_false_") as tmp:
+            with mock.patch.object(change_org, "_DIR_CAPTURAS_CHANGE", tmp):
+                driver = FakeDriver()
+                driver.save_screenshot = lambda ruta: False
+                bot = _bot(driver, cuenta={"usuario": "u_false", "email": "f@x.com"})
+                check(
+                    "captura: save_screenshot False -> '' sin lanzar",
+                    bot._capturar_evidencia() == "",
+                )
+
+        # --- slug saneado + sufijo en repeticiones (reloj fijo) ---
+        class _DatetimeFijo(datetime):
+            """`datetime` con `now()` fijo: dos capturas caen en el mismo segundo."""
+
+            @classmethod
+            def now(cls, tz=None):
+                return datetime(2026, 9, 29, 12, 34, 56)
+
+        with tempfile.TemporaryDirectory(prefix="change_capturas_slug_") as tmp:
+            with mock.patch.object(change_org, "_DIR_CAPTURAS_CHANGE", tmp):
+                driver = FakeDriver()
+                bot = _bot(driver, cuenta={"usuario": "  juan perez/../@x  "})
+                with mock.patch.object(change_org, "datetime", _DatetimeFijo):
+                    ruta1 = bot._capturar_evidencia()
+                    ruta2 = bot._capturar_evidencia()
+                base1 = os.path.basename(ruta1)
+                check(
+                    "captura: slug saneado (sin espacios, / ni @) y marca fija",
+                    base1 == "change_juan_perez_.._x_20260929_123456.png",
+                    base1,
+                )
+                check(
+                    "captura: repeticion -> sufijo _1 y archivos distintos",
+                    os.path.basename(ruta2)
+                    == "change_juan_perez_.._x_20260929_123456_1.png"
+                    and ruta2 != ruta1
+                    and os.path.isfile(ruta1)
+                    and os.path.isfile(ruta2),
+                    os.path.basename(ruta2),
+                )
+                check(
+                    "captura: respaldo 'cuenta' si la cuenta no trae usuario/email",
+                    bool(
+                        re.fullmatch(
+                            r"change_cuenta_\d{8}_\d{6}\.png",
+                            os.path.basename(
+                                _bot(FakeDriver(), cuenta={})._capturar_evidencia()
+                            ),
+                        )
+                    ),
+                )
+
+        # --- _capturar_fallo: tolerante, nombre debug y sufijo _1 ---
+        check(
+            "debug: sin driver -> '' sin lanzar",
+            _bot(None)._capturar_fallo() == "",
+        )
+        with tempfile.TemporaryDirectory(prefix="change_debug_slug_") as tmp:
+            with mock.patch.object(change_org, "_DIR_CAPTURAS_CHANGE", tmp):
+                driver = FakeDriver()
+                driver.save_screenshot = lambda ruta: False
+                bot = _bot(driver, cuenta={"usuario": "u_debug"})
+                check(
+                    "debug: save_screenshot False -> '' sin lanzar",
+                    bot._capturar_fallo() == "",
+                )
+                driver = FakeDriver()
+                bot = _bot(driver, cuenta={"usuario": "  juan perez/../@x  "})
+                with mock.patch.object(change_org, "datetime", _DatetimeFijo):
+                    debug1 = bot._capturar_fallo()
+                    debug2 = bot._capturar_fallo()
+                check(
+                    "debug: nombre debug_fallo_{slug}_{marca}.png en debug/",
+                    os.path.basename(debug1)
+                    == "debug_fallo_juan_perez_.._x_20260929_123456.png"
+                    and os.path.dirname(debug1) == os.path.join(tmp, "debug")
+                    and os.path.isfile(debug1),
+                    str(debug1),
+                )
+                check(
+                    "debug: repeticion -> sufijo _1 y archivo distinto",
+                    os.path.basename(debug2)
+                    == "debug_fallo_juan_perez_.._x_20260929_123456_1.png"
+                    and debug2 != debug1
+                    and os.path.isfile(debug2),
+                    os.path.basename(debug2),
+                )
+
+        # --- early-returns: la clave SIEMPRE esta presente y vacia ---
+        bot = ChangeOrgReportBot(url_peticion="")
+        resultado = bot.reportar(identidad=identidad, queja=queja)
+        check(
+            "captura: sin URL -> clave presente y vacia",
+            "captura" in resultado and resultado["captura"] == "",
+            str(resultado.get("captura")),
+        )
+
+        evento = threading.Event()
+        evento.set()
+        bot = _bot(FakeDriver(), url_peticion="https://www.change.org/p/x")
+        bot.cancelar = evento
+        resultado = bot.reportar(identidad=identidad, queja=queja)
+        check(
+            "captura: cancelado -> clave presente y vacia",
+            resultado.get("cancelado") is True and resultado.get("captura") == "",
+            f"cancelado={resultado.get('cancelado')} captura={resultado.get('captura')!r}",
+        )
+
+        driver = FakeDriver()
+        bot = _bot(
+            driver,
+            url_peticion="https://www.change.org/p/x",
+            cuenta={"usuario": "u1", "email": "u1@x.com"},
+        )
+        bot.preparar_driver = lambda: True
+        bot.registrar_o_entrar = lambda: {
+            "ok": False,
+            "estado": "fallo",
+            "error": "no entro",
+            "evidencia": "",
+        }
+        resultado = bot.reportar(identidad=identidad, queja=queja)
+        check(
+            "captura: login fallido -> clave presente y vacia",
+            resultado["ok"] is False and resultado.get("captura") == "",
+            str(resultado.get("captura")),
+        )
+
+    # --- propagacion de `captura` (anonimo, modo cuenta y campana) ---
+    class _BotReporteCaptura:
+        retorno = {}
+
+        def __init__(self, **kwargs):
+            pass
+
+        def reportar(self, identidad=None, queja=""):
+            return dict(self.retorno)
+
+        def cerrar(self):
+            pass
+
+    def _queja_fake(*args, **kwargs):
+        return {"ok": True, "queja": "Q", "usada_ia": False, "error": ""}
+
+    with mock.patch.object(change_org, "ChangeOrgReportBot", _BotReporteCaptura), \
+            mock.patch.object(gc, "generar_queja_change", _queja_fake), \
+            mock.patch.object(
+                change_org,
+                "guardar_identidad_change",
+                lambda *a, **k: {"guardada": False, "id": None, "motivo": "duplicada"},
+            ):
+        _BotReporteCaptura.retorno = {
+            "ok": True,
+            "email": "a@x.com",
+            "queja": "Q",
+            "error": "",
+            "evidencia": "ok",
+            "url": "u",
+            "captura": "/tmp/fake_evidencia.png",
+        }
+        resultado_anon = ejecutar_un_reporte("u")
+        check(
+            "captura: ejecutar_un_reporte anonimo la propaga tal cual",
+            resultado_anon.get("captura") == "/tmp/fake_evidencia.png",
+            str(resultado_anon.get("captura")),
+        )
+        resultado_cuenta = ejecutar_un_reporte(
+            "u", cuenta={"usuario": "u1", "email": "u1@x.com"}
+        )
+        check(
+            "captura: ejecutar_un_reporte modo cuenta la propaga tal cual",
+            resultado_cuenta.get("captura") == "/tmp/fake_evidencia.png",
+            str(resultado_cuenta.get("captura")),
+        )
+        _BotReporteCaptura.retorno = {
+            "ok": False,
+            "email": "",
+            "queja": "Q",
+            "error": "sin exito",
+            "evidencia": "sin evidencia",
+            "url": "u",
+        }
+        resultado_sin = ejecutar_un_reporte("u")
+        check(
+            "captura: backend sin captura -> clave presente y vacia",
+            "captura" in resultado_sin and resultado_sin["captura"] == "",
+            str(resultado_sin.get("captura")),
+        )
+
+    def _reporte_campana(**kwargs):
+        return {
+            "ok": True,
+            "email": "camp@x.com",
+            "queja": "q",
+            "identidad": {"email": "camp@x.com"},
+            "identidad_guardada": False,
+            "error": "",
+            "captura": "/tmp/campana_evidencia.png",
+        }
+
+    with mock.patch.object(change_org, "ejecutar_un_reporte", _reporte_campana):
+        resumen = ejecutar_campana_reportes("u", cantidad=1, usar_proxies=False)
+    check(
+        "captura: la campana conserva captura en sus resultados",
+        bool(resumen["resultados"])
+        and resumen["resultados"][0].get("captura") == "/tmp/campana_evidencia.png",
+        str(resumen["resultados"][0].get("captura"))
+        if resumen["resultados"]
+        else "sin resultados",
+    )
+
+
+# --------------------------------------------------------------------------- #
+# (21) app de la peticion (hidratacion React) + reintentos del modal
+# --------------------------------------------------------------------------- #
+class _DriverAppPeticion(FakeDriver):
+    """FakeDriver cuyo JS `change_org:app_peticion` responde una secuencia.
+
+    `estados` es la lista de respuestas del poll (dict/None); se agota
+    devolviendo la ULTIMA. `fallar=True` simula un JS roto (siempre lanza).
+    Los demas scripts caen al `FakeDriver` normal.
+    """
+
+    def __init__(self, estados=None, fallar=False):
+        super().__init__()
+        self.estados = list(estados or [])
+        self.fallar = fallar
+        self.app_llamados = 0
+        self.ultima = None
+
+    def execute_script(self, script, *args):
+        if "change_org:app_peticion" in str(script):
+            self.app_llamados += 1
+            self.scripts.append(script)
+            if self.fallar:
+                raise RuntimeError("JS de la app roto")
+            if self.estados:
+                self.ultima = self.estados.pop(0)
+            return self.ultima
+        return super().execute_script(script, *args)
+
+
+class _DriverNavegacion(FakeDriver):
+    """FakeDriver que registra cada `get` (recarga/ultimo recurso incluidos)."""
+
+    def __init__(self):
+        super().__init__()
+        self.gets = []
+
+    def get(self, url):
+        self.gets.append(url)
+        super().get(url)
+
+
+def _campos_modal_ocultos(driver):
+    """Campos del modal ocultos hasta que el fake los haga visibles."""
+    nombre = FakeElement(
+        driver, tag="input", attrs={"autocomplete": "given-name"}, visible=False
+    )
+    apellido = FakeElement(
+        driver, tag="input", attrs={"autocomplete": "family-name"}, visible=False
+    )
+    email = FakeElement(driver, tag="input", attrs={"type": "email"}, visible=False)
+    motivo = FakeElement(driver, tag="textarea", attrs={"name": "reason"}, visible=False)
+    enviar = FakeElement(
+        driver, tag="button", attrs={"type": "submit"}, texto="Enviar", visible=False
+    )
+    return nombre, apellido, email, motivo, enviar
+
+
+def _gracias(driver):
+    """`al_click` del boton Enviar: deja la evidencia positiva de exito."""
+    def _confirmar():
+        driver.page_source = (
+            "<p>Gracias por tomarte el tiempo de denunciar contenido.</p>"
+        )
+    return _confirmar
+
+
+def test_app_peticion_y_reintentos(check):
+    print("(21) app de la peticion (hidratacion) + reintentos del modal")
+    identidad = {
+        "nombre": "Ana",
+        "apellido": "Lopez",
+        "email": "ana.lopez12@gmail.com",
+        "codigo_postal": "44100",
+    }
+    queja = "Considero que esta peticion incumple las normas de la comunidad."
+    url = "https://www.change.org/p/x"
+
+    check(
+        "app peticion: frases de firma/firmado normalizadas presentes",
+        "firma esta peticion" in change_org._FRASES_FIRMA
+        and "firma la peticion" in change_org._FRASES_FIRMA
+        and "firmar" in change_org._FRASES_FIRMA
+        and "has firmado" in change_org._FRASES_FIRMADO,
+    )
+
+    with _sin_esperas():
+        # --- _esperar_app_peticion: spinner -> listo (2 polls) ---
+        driver = _DriverAppPeticion(
+            [
+                {"panel": True, "spinner": True, "texto": "Firma esta petición"},
+                {"panel": True, "spinner": False, "texto": "Firma esta petición"},
+            ]
+        )
+        bot = _bot(driver)
+        check(
+            "app peticion: espera a que el spinner desaparezca -> True",
+            bot._esperar_app_peticion(5) is True and driver.app_llamados == 2,
+            f"llamados={driver.app_llamados}",
+        )
+        check(
+            "app peticion: el poll es el JS marcado del bot",
+            bool(driver.scripts)
+            and all("change_org:app_peticion" in s for s in driver.scripts),
+            str(driver.scripts[:1]),
+        )
+
+        driver = _DriverAppPeticion(
+            [{"panel": True, "spinner": False, "texto": "Firma la petición ahora"}]
+        )
+        check(
+            "app peticion: variante 'firma la peticion' -> True",
+            _bot(driver)._esperar_app_peticion(1) is True,
+        )
+
+        driver = _DriverAppPeticion(
+            [{"panel": True, "spinner": False, "texto": "Has firmado esta petición"}]
+        )
+        check(
+            "app peticion: estado de usuario firmado -> True",
+            _bot(driver)._esperar_app_peticion(1) is True,
+        )
+
+        driver = _DriverAppPeticion(
+            [{"panel": False, "spinner": False, "texto": "Cargando petición"}]
+        )
+        check(
+            "app peticion: texto sin firma -> False",
+            _bot(driver)._esperar_app_peticion(1) is False,
+        )
+
+        driver = _DriverAppPeticion([None])
+        check(
+            "app peticion: timeout tolerante (JS vacio) -> False sin lanzar",
+            _bot(driver)._esperar_app_peticion(3) is False
+            and driver.app_llamados >= 3,
+            f"llamados={driver.app_llamados}",
+        )
+
+        driver = _DriverAppPeticion(fallar=True)
+        check(
+            "app peticion: JS roto -> False sin lanzar",
+            _bot(driver)._esperar_app_peticion(2) is False,
+        )
+
+        evento = threading.Event()
+        evento.set()
+        driver = _DriverAppPeticion(
+            [{"panel": True, "spinner": False, "texto": "Firma esta petición"}]
+        )
+        bot = _bot(driver)
+        bot.cancelar = evento
+        check(
+            "app peticion: cancelado -> False sin ejecutar el JS",
+            bot._esperar_app_peticion(5) is False and driver.app_llamados == 0,
+        )
+
+        # --- _href_directo_enlace: solo http(s) de change.org ---
+        driver = FakeDriver()
+        driver.current_url = "https://www.change.org/p/una-peticion"
+        bot = _bot(driver)
+        check(
+            "href: URL absoluta de change.org -> se devuelve",
+            bot._href_directo_enlace(
+                FakeElement(
+                    driver, tag="a",
+                    href="https://www.change.org/p/x/policy_violation",
+                )
+            )
+            == "https://www.change.org/p/x/policy_violation",
+        )
+        check(
+            "href: relativo -> se resuelve contra la URL actual",
+            bot._href_directo_enlace(
+                FakeElement(driver, tag="a", href="/p/x/policy_violation")
+            )
+            == "https://www.change.org/p/x/policy_violation",
+        )
+        for href in (
+            "#", "javascript:void(0)", "mailto:a@b.com", "tel:+52",
+            "https://evil.com/p/x", "http://notchange.org/x", "",
+        ):
+            check(
+                f"href: {href!r} -> sin navegacion directa",
+                bot._href_directo_enlace(FakeElement(driver, tag="a", href=href))
+                == "",
+            )
+        check(
+            "href: boton sin href -> ''",
+            bot._href_directo_enlace(FakeElement(driver, tag="button")) == "",
+        )
+        check(
+            "href: elemento roto -> '' sin lanzar",
+            bot._href_directo_enlace(object()) == "",
+        )
+
+        # --- app YA lista: un solo poll y el modal abre al primer clic ---
+        driver = _DriverAppPeticion(
+            [{"panel": True, "spinner": False, "texto": "Firma esta petición"}]
+        )
+        enlace = FakeElement(
+            driver, tag="button", texto="Denunciar una violación de las políticas"
+        )
+        nombre, apellido, email, motivo, enviar = _campos_modal_ocultos(driver)
+        for campo in (nombre, apellido, email, motivo, enviar):
+            campo.visible = True
+        enviar.al_click = _gracias(driver)
+        driver.registrar(enlace, nombre, apellido, email, motivo, enviar)
+        bot = _bot(driver, url_peticion=url)
+        bot.preparar_driver = lambda: True
+        with mock.patch.object(change_org.random, "random", return_value=0.99):
+            resultado = bot.reportar(identidad=identidad, queja=queja)
+        check(
+            "reintentos: app lista -> UN poll de app y un solo clic",
+            resultado["ok"] is True
+            and driver.app_llamados == 1
+            and enlace.click_count == 1,
+            f"ok={resultado['ok']} polls={driver.app_llamados} "
+            f"clics={enlace.click_count} error={resultado['error']!r}",
+        )
+
+        # --- el modal abre al 2º clic (re-localiza) ---
+        driver = _DriverNavegacion()
+        enlace = FakeElement(
+            driver, tag="button", texto="Denunciar una violación de las políticas"
+        )
+        nombre, apellido, email, motivo, enviar = _campos_modal_ocultos(driver)
+        enviar.al_click = _gracias(driver)
+        driver.registrar(enlace, nombre, apellido, email, motivo, enviar)
+        estado = {"clics": 0}
+
+        def _abrir_al_segundo():
+            estado["clics"] += 1
+            if estado["clics"] >= 2:
+                for campo in (nombre, apellido, email, motivo, enviar):
+                    campo.visible = True
+
+        enlace.al_click = _abrir_al_segundo
+        bot = _bot(driver, url_peticion=url)
+        bot.preparar_driver = lambda: True
+        llamadas = {"esperas": 0}
+        esperar_real = bot._esperar_formulario
+
+        def _contar_espera(*args, **kwargs):
+            llamadas["esperas"] += 1
+            return esperar_real(*args, **kwargs)
+
+        bot._esperar_formulario = _contar_espera
+        with mock.patch.object(change_org.random, "random", return_value=0.99):
+            resultado = bot.reportar(identidad=identidad, queja=queja)
+        check(
+            "reintentos: 2º clic abre el modal (re-localiza y espera x2)",
+            resultado["ok"] is True
+            and enlace.click_count == 2
+            and llamadas["esperas"] == 2
+            and driver.gets.count(url) == 1,
+            f"ok={resultado['ok']} clics={enlace.click_count} "
+            f"esperas={llamadas['esperas']} error={resultado['error']!r}",
+        )
+
+        # --- el modal solo abre tras la RECARGA completa (intento 3) ---
+        driver = _DriverNavegacion()
+        enlace = FakeElement(
+            driver, tag="button", texto="Denunciar una violación de las políticas"
+        )
+        nombre, apellido, email, motivo, enviar = _campos_modal_ocultos(driver)
+        enviar.al_click = _gracias(driver)
+        driver.registrar(enlace, nombre, apellido, email, motivo, enviar)
+
+        def _revelar_en_la_recarga(url_navegada):
+            if driver.gets.count(url_navegada) >= 2:
+                for campo in (nombre, apellido, email, motivo, enviar):
+                    campo.visible = True
+
+        driver.al_navegar = _revelar_en_la_recarga
+        bot = _bot(driver, url_peticion=url)
+        bot.preparar_driver = lambda: True
+        with mock.patch.object(change_org.random, "random", return_value=0.99):
+            resultado = bot.reportar(identidad=identidad, queja=queja)
+        check(
+            "reintentos: el modal abre solo tras la recarga (_navegar x2)",
+            resultado["ok"] is True
+            and driver.gets.count(url) == 2
+            and enlace.click_count == 3,
+            f"ok={resultado['ok']} gets={driver.gets} "
+            f"clics={enlace.click_count} error={resultado['error']!r}",
+        )
+
+        # --- nunca abre: error claro (1 clic inicial + 2 reintentos + recarga) ---
+        driver = _DriverNavegacion()
+        enlace = FakeElement(
+            driver, tag="button", texto="Denunciar una violación de las políticas"
+        )
+        nombre, apellido, email, motivo, enviar = _campos_modal_ocultos(driver)
+        driver.registrar(enlace, nombre, apellido, email, motivo, enviar)
+        bot = _bot(driver, url_peticion=url)
+        bot.preparar_driver = lambda: True
+        with mock.patch.object(change_org.random, "random", return_value=0.99):
+            resultado = bot.reportar(identidad=identidad, queja=queja)
+        check(
+            "reintentos: nunca abre -> error claro con la URL",
+            resultado["ok"] is False
+            and "el formulario de reporte no aparecio" in resultado["error"]
+            and url in resultado["error"],
+            str(resultado["error"]),
+        )
+        check(
+            "reintentos: nunca abre -> 2 reintentos de clic + 1 recarga",
+            enlace.click_count == 3
+            and driver.gets.count(url) == 2,
+            f"clics={enlace.click_count} gets={driver.gets}",
+        )
+
+        # --- href externo/ajeno: NUNCA se navega directo ---
+        driver = _DriverNavegacion()
+        enlace = FakeElement(
+            driver, tag="a",
+            texto="Denunciar una violación de las políticas",
+            href="https://evil.com/p/x",
+        )
+        nombre, apellido, email, motivo, enviar = _campos_modal_ocultos(driver)
+        driver.registrar(enlace, nombre, apellido, email, motivo, enviar)
+        bot = _bot(driver, url_peticion=url)
+        bot.preparar_driver = lambda: True
+        resultado = bot.reportar(identidad=identidad, queja=queja)
+        check(
+            "href: dominios ajenos -> sin navegacion directa (solo recarga)",
+            "el formulario de reporte no aparecio" in resultado["error"]
+            and driver.gets.count(url) == 2
+            and "evil.com" not in driver.gets,
+            f"gets={driver.gets} error={resultado['error']!r}",
+        )
+
+        # --- ULTIMO recurso: navegacion directa al href real de change.org ---
+        driver = _DriverNavegacion()
+        href = "https://www.change.org/p/x/policy_violation"
+        enlace = FakeElement(
+            driver, tag="a",
+            texto="Denunciar una violación de las políticas",
+            href=href,
+        )
+        nombre, apellido, email, motivo, enviar = _campos_modal_ocultos(driver)
+        enviar.al_click = _gracias(driver)
+        driver.registrar(enlace, nombre, apellido, email, motivo, enviar)
+
+        def _revelar_en_href(url_navegada):
+            if url_navegada == href:
+                for campo in (nombre, apellido, email, motivo, enviar):
+                    campo.visible = True
+
+        driver.al_navegar = _revelar_en_href
+        bot = _bot(driver, url_peticion=url)
+        bot.preparar_driver = lambda: True
+        with mock.patch.object(change_org.random, "random", return_value=0.99):
+            resultado = bot.reportar(identidad=identidad, queja=queja)
+        check(
+            "href: ultimo recurso -> navega al href y el reporte continua",
+            resultado["ok"] is True
+            and href in driver.gets
+            and driver.gets.index(href) == 2
+            and "".join(motivo.typed) == queja,
+            f"ok={resultado['ok']} gets={driver.gets} error={resultado['error']!r}",
+        )
+
+        # --- paro a mitad del modal: cancelado True sin reintentos ---
+        driver = _DriverNavegacion()
+        enlace = FakeElement(
+            driver, tag="button", texto="Denunciar una violación de las políticas"
+        )
+        nombre, apellido, email, motivo, enviar = _campos_modal_ocultos(driver)
+        driver.registrar(enlace, nombre, apellido, email, motivo, enviar)
+        evento = threading.Event()
+        enlace.al_click = lambda: evento.set()
+        bot = _bot(driver, url_peticion=url)
+        bot.preparar_driver = lambda: True
+        bot.cancelar = evento
+        resultado = bot.reportar(identidad=identidad, queja=queja)
+        check(
+            "reintentos: paro a mitad del modal -> cancelado y sin reintentos",
+            resultado.get("cancelado") is True
+            and resultado["error"] == MENSAJE_CANCELADO
+            and enlace.click_count == 1
+            and driver.gets.count(url) == 1,
+            f"cancelado={resultado.get('cancelado')} clics={enlace.click_count} "
+            f"gets={driver.gets} error={resultado['error']!r}",
+        )
+
+
+# --------------------------------------------------------------------------- #
 # Runner
 # --------------------------------------------------------------------------- #
 def run(check):
-    """Ejecuta los checks con el `check` del runner (o del marco local)."""
-    test_generar_identidad(check)
-    test_proxies(check)
-    test_enlace(check)
-    test_formulario(check)
-    test_resultado(check)
-    test_reportar(check)
-    test_preparar_driver(check)
-    test_guardar_identidad(check)
-    test_ejecutar_un_reporte(check)
-    test_campana(check)
-    test_password_change(check)
-    test_registro_flujo(check)
-    test_registrar_cuenta_change(check)
-    test_campana_registros(check)
-    test_reporte_modal(check)
-    test_reporte_con_cuenta(check)
-    test_un_reporte_con_cuenta(check)
-    test_campana_cuentas(check)
-    test_modo_asistido(check)
-    test_campana_espera_captcha(check)
+    """Ejecuta los checks con el `check` del runner (o del marco local).
+
+    TODO el archivo corre con `_DIR_SESIONES_CHANGE` y `_DIR_CAPTURAS_CHANGE`
+    apuntando a directorios temporales: la suite NUNCA escribe en
+    `data/cookies/change/` ni en `data/reportes/change/` reales.
+    """
+    with tempfile.TemporaryDirectory(prefix="change_sesiones_") as sesiones_tmp, \
+            tempfile.TemporaryDirectory(prefix="change_capturas_") as capturas_tmp, \
+            mock.patch.object(change_org, "_DIR_SESIONES_CHANGE", sesiones_tmp), \
+            mock.patch.object(change_org, "_DIR_CAPTURAS_CHANGE", capturas_tmp):
+            test_generar_identidad(check)
+            test_proxies(check)
+            test_error_navegacion_pagina(check)
+            test_error_servidor(check)
+            test_proxy_change_valido(check)
+            test_enlace(check)
+            test_documento_listo(check)
+            test_formulario(check)
+            test_resultado(check)
+            test_reportar(check)
+            test_preparar_driver(check)
+            test_guardar_identidad(check)
+            test_ejecutar_un_reporte(check)
+            test_campana(check)
+            test_password_change(check)
+            test_registro_flujo(check)
+            test_captcha_visible_y_home_logueada(check)
+            test_registro_codigo_temporal(check)
+            test_registrar_cuenta_change(check)
+            test_campana_registros(check)
+            test_campana_proxies_rotos(check)
+            test_reporte_modal(check)
+            test_modal_deteccion_y_estrategias(check)
+            test_reporte_con_cuenta(check)
+            test_un_reporte_con_cuenta(check)
+            test_campana_cuentas(check)
+            test_modo_asistido(check)
+            test_campana_espera_captcha(check)
+            test_sesion_persistente(check)
+            test_captura_evidencia(check)
+            test_app_peticion_y_reintentos(check)
 
 
 if __name__ == "__main__":

@@ -11,15 +11,32 @@ tres misiones:
    generada por IA en el textarea que aparece y pulsa "Enviar". Marca exito SOLO
    con evidencia positiva ("Gracias por tomarte el tiempo de denunciar
    contenido...", URL de confirmacion o desaparicion del formulario sin error).
-   Detecta captcha y errores de la pagina.
+   Detecta captcha y errores de la pagina. Si al abrir la peticion Change.org
+   responde con su pagina de ERROR DE APLICACION ("¡Oh no! Error del
+   servidor..."), `_pagina_error_servidor()` la detecta por texto visible,
+   hace UN `driver.refresh()` y, si persiste, falla con
+   `_ERROR_SERVIDOR_PETICION` en vez del engañoso "no se encontro el enlace"
+   (nunca busca el enlace ni el modal en esa pantalla). Timing/hidratacion
+   (best-effort): antes de pulsar el enlace espera a que el panel de firma ya
+   no tenga spinner y muestre texto/boton de firma (`_esperar_app_peticion`,
+   `_JS_ESTADO_APP_PETICION`); si el modal no abre, `reportar()` reintenta con
+   re-localizacion del enlace tras 3s, UNA recarga completa de la peticion y,
+   como ULTIMO recurso, navega directo al `href` real del enlace (solo
+   http(s) de change.org; nunca "#"/javascript). Si nada lo abre: "el
+   formulario de reporte no aparecio (url=...)".
 
 2. **Registro/Login**: `ChangeOrgReportBot.registrar_o_entrar()` crea la cuenta
    en Change.org (o entra a una existente) con el email/email_password de una
    cuenta de la BD via `https://www.change.org/login_or_join?user_flow=nav`:
    "Iniciar sesión" -> correo -> "Continuar" -> contraseña -> "Continuar" ->
-   (solo cuentas nuevas) "Nombres"/"Apellidos" -> "Continuar". Estado "nueva"
-   si vio "Crea tu contraseña", "existente" si entro por login y "fallo" si no
-   se pudo confirmar la sesion. `registrar_cuenta_change()` y
+   (solo cuentas nuevas) "Nombres"/"Apellidos" -> "Continuar". Si para una
+   cuenta EXISTENTE Change muestra la pantalla que envio un codigo temporal al
+   correo (sin campo de contraseña), se pulsa UNA vez la opcion "Ingresar con
+   contraseña"/"Sign in with password" (`_pulsar_opcion_password`) y el bucle
+   sigue con el campo de contraseña; si esa opcion no aparece en ~5 intentos,
+   falla con `_ERROR_PANTALLA_CODIGO` (nunca con el timeout generico). Estado
+   "nueva" si vio "Crea tu contraseña", "existente" si entro por login y "fallo"
+   si no se pudo confirmar la sesion. `registrar_cuenta_change()` y
    `ejecutar_campana_registros()` orquestan el lote.
    Si Cloudflare interpone su reto anti-bot (widget Turnstile en sombra/iframe
    "protegida"), se detecta (`_detectar_reto_humano`/`_detectar_captcha`) y se
@@ -31,10 +48,51 @@ tres misiones:
    el reto y sigue solo cuando desaparece; en headless nunca espera (no hay
    quien lo resuelva) y el error lo aclara.
 
+   **Falsos positivos de captcha**: `_detectar_captcha` mira SOLO el texto
+   VISIBLE (nunca `page_source`/scripts, donde la palabra "recaptcha" aparece
+   por config del sitio) y los terminos GENERICOS no cuentan como frase. Ante
+   captcha/reto, el bucle de `registrar_o_entrar` comprueba PRIMERO
+   `_evidencia_sesion(email)`: si la pagina ya muestra la sesion iniciada (home
+   con avatar de cabecera y sin "Iniciar sesión"), confirma el login/registro y
+   no bloquea con la espera asistida (caso real: cuenta YA REGISTRADA que se
+   quedo 600s esperando por un `recaptcha` residual).
+
+   **Errores de red/TLS (proxies rotos)**: tras navegar (y al inicio del
+   registro) `_error_navegacion_pagina()` detecta las paginas de error de Chrome
+   (`Privacy error`, `Your connection is not private`, `NET::ERR_CERT_*`,
+   `ERR_TUNNEL_*`, `ERR_PROXY_*`, `This site can't be reached`, ...) por titulo
+   y texto visible normalizados y falla con
+   `"la conexion con change.org fallo (<codigo>): probable PROXY con TLS/red
+   rota; prueba otro proxy"` en vez del engañoso "no se encontro el campo de
+   direccion de correo electronico". Las campanas ademas validan cada proxy
+   antes de usarlo (`proxy_change_valido`) y lo descartan si el nodo no da TLS.
+   NADA de esto se confunde con captcha ni con campos faltantes.
+
 3. **Granja de identidades**: `generar_identidad_change()` produce
    Nombre/Apellido/Correo/CP creibles (Faker es_MX) y
    `guardar_identidad_change()` las persiste en la tabla `cuenta_change` para
    las futuras firmas masivas (la columna `usada_firma` queda reservada).
+
+4. **Sesiones persistentes (best-effort)**: una vez que un humano resolvio el
+   captcha la primera vez, las siguientes corridas reutilizan la sesion y NO
+   vuelven a pedir captcha. Sin columnas nuevas en la BD: las cookies viven en
+   `data/cookies/change/{usuario}.json` (carpeta gitignored) via
+   `guardar_sesion_change` / `cargar_sesion_change` / `borrar_sesion_change`.
+   `ChangeOrgReportBot._restaurar_sesion_change()` inyecta las cookies por CDP
+   (`Network.setCookie`), navega a la home y exige evidencia real de sesion
+   (`_evidencia_sesion` / `_evidencia_home_logueada`, hasta ~8s). Con
+   `CHANGE_REUTILIZAR_SESION=0` se desactiva guardar y restaurar (flujo
+   clasico). Cloudflare ata la sesion a IP+UA: si la IP cambia puede volver a
+   pedir el reto y el bot hara el login normal.
+
+5. **Evidencia visual de los exitos**: cada reporte con `ok=True` guarda un
+   screenshot de la pantalla de confirmacion en `_DIR_CAPTURAS_CHANGE`
+   (`data/reportes/change/`, carpeta gitignored) como
+   `change_{slug}_{YYYYmmdd_HHMMSS}.png` (slug saneado de `usuario` o `email`
+   de la cuenta; con sufijo `_1`, `_2`... si el nombre se repite) y expone la
+   ruta en la clave `captura` del resultado. En fallos, cancelaciones o
+   early-returns `captura` queda `""`; `_capturar_evidencia()` nunca lanza y
+   jamas loguea datos de la cuenta (solo la ruta del PNG).
 
 Contrato congelado (el frontend y los tests dependen de el; no romper):
 
@@ -53,6 +111,18 @@ Contrato congelado (el frontend y los tests dependen de el; no romper):
         ProxyManager: cargar_por_pais(pais) si hay pais, si no cargar_proxies();
         nunca lanza -> [] si falla.
 
+    proxy_change_valido(proxy, timeout=15) -> bool
+        Comprueba que la salida del proxy abre
+        "https://www.change.org/login_or_join?user_flow=nav" con `requests.get`
+        (proxies http/https = la URL reconstruida desde
+        `ProxyManager().analizar(proxy)`, `allow_redirects=True`). True si
+        `status_code < 500`; False en SSLError/ConnectionError/timeout/errores.
+        Cadena vacia -> True (sin proxy no se valida); `requests` ausente o
+        proxy no analizable -> True (NO descartar por incertidumbre). NUNCA
+        lanza. Cache por proceso {proxy: (bool, timestamp)} con TTL
+        `PROXY_CHANGE_CACHE_SEG` (env, default 600; 0 = sin cache) y tope ~1000
+        entradas (purga expirados y luego el mas viejo).
+
     guardar_identidad_change(identidad, url_peticion="", contexto="", queja="",
                              origen="reporte") -> dict
         {"guardada": bool, "id": int|None, "motivo": str}
@@ -61,6 +131,21 @@ Contrato congelado (el frontend y los tests dependen de el; no romper):
         - fallo real -> {"guardada": False, "motivo": "error", "error": str}
         - si la tabla no existe (OperationalError) llama UNA vez a
           core.database.init_db() y reintenta. NUNCA lanza.
+
+    guardar_sesion_change(usuario, driver, email="", proxy="") -> bool
+        Escribe `data/cookies/change/{usuario}.json` con
+        ``{"usuario","email","guardada"(ISO),"proxy","cookies":[...]}`` de
+        forma atomica (temp + os.replace; 0600 en POSIX). NUNCA lanza y NO
+        loguea valores de cookies; False sin cookies o con
+        `CHANGE_REUTILIZAR_SESION` desactivado.
+
+    cargar_sesion_change(usuario) -> dict | None
+        Carga y valida el JSON (dict con "cookies" lista no vacia); None si no
+        existe/es corrupto/invalido o si la reutilizacion esta desactivada.
+        NUNCA lanza.
+
+    borrar_sesion_change(usuario) -> bool
+        Borra el archivo de sesion; True si lo elimino. NUNCA lanza.
 
     ChangeOrgReportBot(url_peticion="", contexto="", proxy="", headless=None,
                        timeout=45, cancelar=None, cuenta=None,
@@ -78,12 +163,29 @@ Contrato congelado (el frontend y los tests dependen de el; no romper):
             resuelvelo a mano". Con 0 (default) se conserva el fallo clasico y
             en headless NUNCA espera (no hay humano).
         .preparar_driver() -> bool
-        .registrar_o_entrar() -> {"ok","estado","error","evidencia"}
-            estado in "nueva"|"existente"|"fallo"; nunca lanza.
+        .registrar_o_entrar() -> {"ok","estado","error","evidencia",
+                                  "sesion_restaurada"}
+            estado in "nueva"|"existente"|"fallo"; nunca lanza. Con sesion
+            persistida y evidencia real retorna de inmediato ok=True,
+            estado="existente", evidencia="sesion restaurada (cookies)" y
+            sesion_restaurada=True (sin escribir el correo ni pedir captcha).
         .reportar(identidad=None, queja="") -> dict
             Con `cuenta`: ejecuta registrar_o_entrar() tras preparar_driver();
             si el registro/login falla devuelve ok=False con ese error; si
             entra bien, sigue con el flujo de reporte (estado_cuenta incluido).
+            Clave `captura`: ruta del PNG de evidencia cuando ok=True ("" en
+            fallo, cancelado o early-returns); la clave SIEMPRE esta presente.
+        ._error_navegacion_pagina() -> str
+            Codigo (`ERR_CERT_AUTHORITY_INVALID`, ...) o etiqueta corta de la
+            pagina de error de red de Chrome; "" si la pagina esta bien. Nunca
+            lanza. `_navegar` y `registrar_o_entrar` lo usan: al detectarlo
+            dejan en `ultimo_error` el mensaje accionable de proxy con TLS/red
+            rota y fallan con el.
+        ._pagina_error_servidor() -> str
+            Frase detectada de la pagina de error de APLICACION de Change.org
+            ("¡Oh no! Error del servidor...": "error del servidor", "algo salio
+            mal", "oh no" con compania, ...); "" si la pagina esta bien. Mira
+            SOLO el texto visible y NUNCA lanza.
         .cerrar() -> None   (driver.quit con fallbacks + cerrar SIEMPRE el fwd)
 
     registrar_cuenta_change(usuario="", email="", password="", nombre="",
@@ -91,7 +193,8 @@ Contrato congelado (el frontend y los tests dependen de el; no romper):
                             cancelar=None, esperar_captcha_seg=None) -> dict
         Abre Chrome (crear_chrome + stealth + proxy), registra/entra y cierra
         SIEMPRE. NUNCA lanza. Resultado: {"ok","usuario","email","estado",
-        "nombre","apellido","error","evidencia","url","cancelado"}.
+        "nombre","apellido","error","evidencia","url","cancelado",
+        "sesion_restaurada"}.
         `esperar_captcha_seg` activa el MODO ASISTIDO dentro del bot.
 
     ejecutar_campana_registros(cuentas, max_workers=2, usar_proxies=True,
@@ -99,7 +202,9 @@ Contrato congelado (el frontend y los tests dependen de el; no romper):
                                callback=None, esperar_captcha_seg=None) -> dict
         `cuentas`: lista de dicts {"usuario","email","email_password" (o
         "password"),"nombre_mostrado" (opcional)}; lista cap 500 y workers
-        acotados a [1,5]; proxy round-robin por cuenta. Callback:
+        acotados a [1,5]; proxy round-robin por cuenta: al elegir se valida con
+        `proxy_change_valido` y los nodos con TLS/red rota se SALTAN (una sola
+        validacion por proxy y corrida). Callback:
         {"tipo":"inicio","total":N}, por cuenta terminada {"tipo":"registro",
         "hechas":i,"total":N,"ok":bool,"usuario":str,"email":str,
         "estado":str,"detalle":str} (las omitidas, sin email/contraseña,
@@ -108,7 +213,9 @@ Contrato congelado (el frontend y los tests dependen de el; no romper):
         "total":N,"usuario":str,"email":str,"detalle":"esperando captcha (Ns)"}.
         Resumen: {"total","exitosos","fallidos","nuevas","existentes",
         "omitidas","cancelada","resultados","proxies_total","sin_proxy",
-        "error"}; NUNCA lanza.
+        "proxies_descartados","error"}; `proxies_descartados` cuenta los
+        proxies unicos descartados y `sin_proxy` las cuentas que corrieron sin
+        proxy (porque ninguno valido o no habia). NUNCA lanza.
 
     ejecutar_un_reporte(url_peticion, contexto="", proxy="", headless=None,
                         evitar=None, cancelar=None, guardar_identidad=True,
@@ -117,8 +224,11 @@ Contrato congelado (el frontend y los tests dependen de el; no romper):
         identidad en la granja si el reporte fue OK (comportamiento clasico).
         Con `cuenta`: NO llama a generar_identidad_change (usa los datos de la
         cuenta), NO guarda en la granja (identidad_guardada=False) y agrega
-        "estado_cuenta" y "usuario" al resultado. `esperar_captcha_seg` activa
-        el MODO ASISTIDO del bot. Cierra SIEMPRE (finally).
+        "estado_cuenta", "usuario" y "sesion_restaurada" (True si el bot
+        reutilizo las cookies persistidas) al resultado. La clave `captura`
+        (ruta del PNG de evidencia o "") viaja tal cual desde `reportar()` en
+        ambos modos. `esperar_captcha_seg`
+        activa el MODO ASISTIDO del bot. Cierra SIEMPRE (finally).
 
     ejecutar_campana_reportes(url_peticion, contexto="", cantidad=5,
                               max_workers=2, usar_proxies=True, pais_proxy="",
@@ -129,9 +239,11 @@ Contrato congelado (el frontend y los tests dependen de el; no romper):
         round-robin (login/registro primero); el evento "reporte" agrega
         "usuario" y "con_cuenta": True (sin "identidad") y el resumen agrega
         "con_cuentas" y "cuentas_total". Sin cuentas: flujo anonimo clasico.
-        Con el modo asistido activo tambien emite {"tipo":"espera_captcha",
-        "hechas":i,"total":N,"usuario":str,"email":str,
-        "detalle":"esperando captcha (Ns)"}.
+        Los proxies se validan con `proxy_change_valido` al elegirlos (round-
+        robin): los nodos con TLS/red rota se saltan y el resumen agrega
+        `proxies_descartados` (unicos). Con el modo asistido activo tambien
+        emite {"tipo":"espera_captcha","hechas":i,"total":N,"usuario":str,
+        "email":str,"detalle":"esperando captcha (Ns)"}.
 
     _resolver_esperar_captcha_seg(valor=None) -> int
         `valor` None -> env CHANGE_ESPERAR_CAPTCHA_SEG -> 0; acota a [0, 900];
@@ -147,13 +259,17 @@ Reglas de oro del flujo Selenium:
 """
 from __future__ import annotations
 
+import json
 import os
 import random
 import re
+import tempfile
 import threading
 import time
 import unicodedata
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
+from urllib.parse import quote, urljoin, urlparse
 
 from faker import Faker
 from loguru import logger
@@ -161,7 +277,7 @@ from selenium.common.exceptions import TimeoutException
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 
-from core.config import detectar_chrome_version, settings
+from core.config import detectar_chrome_version, resolver_ruta, settings
 from core.database import obtener_sesion
 from core.models import CuentaChange
 from plataformas.chrome_driver import crear_chrome
@@ -179,7 +295,11 @@ __all__ = [
     "ChangeOrgReportBot",
     "generar_identidad_change",
     "proxies_disponibles",
+    "proxy_change_valido",
     "guardar_identidad_change",
+    "guardar_sesion_change",
+    "cargar_sesion_change",
+    "borrar_sesion_change",
     "registrar_cuenta_change",
     "ejecutar_un_reporte",
     "ejecutar_campana_reportes",
@@ -190,6 +310,20 @@ __all__ = [
 MENSAJE_CANCELADO = "⛔ Ataque de reportes detenido por el usuario"
 
 _URL_LOGIN_CHANGE = "https://www.change.org/login_or_join?user_flow=nav"
+
+# Home de Change.org: destino de la restauracion de sesion por cookies.
+_URL_HOME_CHANGE = "https://www.change.org/"
+
+# Sesiones persistidas por cuenta (cookies con sesion iniciada). La carpeta ya
+# esta en .gitignore; se guarda un archivo por cuenta y NO se agregan columnas
+# a la BD. `_DIR_SESIONES_CHANGE` es modulo-global para poder monkeypatchearlo
+# en los tests a un directorio temporal.
+_DIR_SESIONES_CHANGE = resolver_ruta("data/cookies/change")
+
+# Capturas (screenshots) de evidencia de los reportes EXITOSOS. La carpeta
+# esta en .gitignore; `_DIR_CAPTURAS_CHANGE` es modulo-global para poder
+# monkeypatchearlo en los tests a un directorio temporal.
+_DIR_CAPTURAS_CHANGE = resolver_ruta("data/reportes/change")
 
 _SUFIJO_PASSWORD_CORTA = "Change.org"
 
@@ -212,6 +346,96 @@ _FRASES_ENLACE = (
     "report policy violation",
     "report a violation",
 )
+# Señales (ya normalizadas) de que la app React de la peticion TERMINO de
+# hidratar: el panel de firma muestra texto/boton de firma o el estado de
+# usuario que YA firmo. Son best-effort para `_esperar_app_peticion` (el flujo
+# NUNCA depende de ellas).
+_FRASES_FIRMA = (
+    "firma esta peticion",
+    "firma la peticion",
+    "firmar esta peticion",
+    "firmar la peticion",
+    "firmar ahora",
+    "firmar",
+    "sign this petition",
+    "sign the petition",
+    "sign now",
+    "sign petition",
+)
+_FRASES_FIRMADO = (
+    "has firmado",
+    "ya firmaste",
+    "firmaste esta peticion",
+    "gracias por firmar",
+    "has apoyado esta peticion",
+    "you signed",
+    "already signed",
+    "thank you for signing",
+)
+# Poll JS del panel de firma de la peticion: devuelve
+# {"panel": bool, "spinner": bool, "texto": str} o null. El marcador
+# "change_org:app_peticion" permite a los tests (fakes) interceptarlo.
+# La señal fuerte es un BOTON/ENLACE visible con "firm" en su texto (la app
+# cliente-react ya monto el CTA); desde el se sube por ancestros hasta el panel
+# (>=250x250) y ahi se busca un spinner/loading REAL. OJO: `[role=progressbar]`
+# NO cuenta (la peticion tiene la barra "¡Alcancemos 200 firmas!" siempre
+# visible y no es un spinner de carga).
+_JS_ESTADO_APP_PETICION = """
+try {
+  /* change_org:app_peticion */
+  var visible = function (el) {
+    try {
+      if (!el) { return false; }
+      var estilo = window.getComputedStyle(el);
+      if (!estilo || estilo.display === 'none' || estilo.visibility === 'hidden'
+          || parseFloat(estilo.opacity || '1') === 0) { return false; }
+      var rect = el.getBoundingClientRect();
+      return rect.width > 2 && rect.height > 2;
+    } catch (e) { return false; }
+  };
+  var firma = null;
+  var candidatos = document.querySelectorAll("button, a, [role='button']");
+  for (var i = 0; i < candidatos.length; i++) {
+    var texto = String(candidatos[i].innerText || "").toLowerCase();
+    if (texto.indexOf("firm") !== -1 && visible(candidatos[i])) {
+      firma = candidatos[i];
+      break;
+    }
+  }
+  var panel = null;
+  if (firma) {
+    var nodo = firma;
+    for (var sube = 0; sube < 8 && nodo; sube++) {
+      nodo = nodo.parentElement;
+      if (!nodo || nodo === document.body || nodo === document.documentElement) {
+        break;
+      }
+      panel = nodo;
+      var rect = nodo.getBoundingClientRect();
+      if (rect.width >= 250 && rect.height >= 250) { break; }
+    }
+  }
+  var alcance = panel || document.body || document.documentElement;
+  var spinner = false;
+  if (panel) {
+    var posibles = panel.querySelectorAll(
+      "[class*='spinner'], [class*='Spinner'], [class*='loading'], " +
+      "[class*='Loading'], [class*='skeleton'], [class*='Skeleton'], " +
+      "[class*='animate-spin'], svg[class*='spin']"
+    );
+    for (var k = 0; k < posibles.length; k++) {
+      if (visible(posibles[k])) { spinner = true; break; }
+    }
+  }
+  return {
+    panel: !!panel,
+    spinner: spinner,
+    texto: String((alcance && alcance.innerText) || "")
+  };
+} catch (e) {
+  return null;
+}
+"""
 # Botones del banner de cookies.
 _FRASES_BANNER = (
     "aceptar", "accept", "acepto", "got it", "entendido", "de acuerdo",
@@ -279,6 +503,75 @@ _FRASES_CAPTCHA = (
     "hcaptcha",
     "captcha",
 )
+# Terminos GENERICOS de captcha que NO cuentan como frase de TEXTO visible: los
+# scripts/config/analytics del sitio mencionan "recaptcha"/"hcaptcha"/"captcha"
+# aunque no haya captcha real (falso positivo reportado en la home logueada de
+# Change.org, que dejaba el registro esperando 600s tras un login exitoso).
+_FRASES_CAPTCHA_GENERICAS = ("captcha", "recaptcha", "hcaptcha")
+
+# Paginas de error de red/TLS de Chrome (titulo y texto visible normalizados;
+# los apostrofes se eliminan antes de comparar). NUNCA se confunden con
+# captcha ni con "campo no encontrado".
+_FRASES_ERROR_RED = (
+    "privacy error",
+    "your connection is not private",
+    "this site cant be reached",
+    "this site cannot be reached",
+    "this site is not available",
+    "the connection was reset",
+    "la conexion no es privada",
+    "este sitio no puede ser alcanzado",
+    "no se puede acceder a este sitio",
+    "err_cert",
+    "err_tunnel",
+    "err_proxy",
+    "err_connection",
+    "net::err_",
+)
+# Codigo especifico de Chrome/Chromium (p. ej. ERR_CERT_AUTHORITY_INVALID).
+_PATRON_CODIGO_RED = re.compile(r"(?:net::)?(err_[a-z0-9_]+)")
+
+# Pagina de error de APLICACION de Change.org ("¡Oh no! Error del servidor —
+# Puede actualizar la pagina y si aun hay problemas inténtelo mas tarde...
+# Volver a inicio"). Es una pantalla del sitio, NO la peticion: al buscar el
+# enlace de reporte el bot daria el error generico engañoso "no se encontro el
+# enlace". Se detecta SOLO por TEXTO VISIBLE (nunca `page_source` cuando hay
+# body) y con combinaciones razonables para no marcar paginas normales:
+# las frases FUERTES bastan solas; "oh no" y demas frases ambiguas exigen
+# compania de otra señal de error en la MISMA pagina.
+_FRASES_ERROR_SERVIDOR_FUERTES = (
+    "error del servidor",
+    "server error",
+    "algo salio mal",
+    "something went wrong",
+)
+_FRASES_ERROR_SERVIDOR_DEBILES = (
+    "oh no",
+    "actualiza la pagina",
+    "actualizar la pagina",
+    "intenta de nuevo mas tarde",
+    "intentelo mas tarde",
+    "try again later",
+    "please try again later",
+    "refresh the page",
+)
+# Companias que validan una frase DEBIL: "oh no" + "error"/"volver a inicio".
+_FRASES_ERROR_SERVIDOR_CONTEXTO = (
+    "error",
+    "servidor",
+    "volver a inicio",
+    "volver al inicio",
+    "pagina de inicio",
+    "back to home",
+    "home page",
+    "no disponible",
+)
+# Mensaje claro cuando la app de Change.org falla al abrir la peticion (nunca
+# el generico "no se encontro el enlace": la pagina jamas fue la peticion).
+_ERROR_SERVIDOR_PETICION = (
+    "Change.org devolvio un error de servidor al abrir la peticion "
+    "(actualiza/reintenta mas tarde o usa otro proxy)"
+)
 
 # --------------------------------------------------------------------------- #
 # Textos del flujo de registro/login (todos normalizados: sin acentos)
@@ -310,6 +603,38 @@ _FRASES_PANTALLA_NOMBRE = (
     "what's your name",
     "cual es tu nombre",
     "como te llamas",
+)
+# Pantalla de CUENTA EXISTENTE que pide un codigo temporal por correo (el
+# formulario OCULTA la contraseña); abajo suele estar la opcion para volver a
+# "Ingresar con contraseña". Todas normalizadas (sin acentos ni mayusculas).
+_FRASES_PANTALLA_CODIGO = (
+    "enviamos un codigo",
+    "te enviamos un codigo",
+    "hemos enviado un codigo",
+    "enviamos un codigo temporal",
+    "codigo temporal",
+    "codigo de verificacion",
+    "revisa tu correo",
+    "revisa tu bandeja",
+    "we sent a code",
+    "sent you a code",
+    "sent a temporary code",
+    "temporary code",
+    "verification code",
+    "check your email",
+)
+# Opcion/enlace de esa pantalla para volver al login con contraseña
+# (mas especifica primero: "contraseña" pelada queda al final).
+_FRASES_OPCION_PASSWORD = (
+    "ingresar con contrasena",
+    "iniciar sesion con contrasena",
+    "entrar con contrasena",
+    "usar contrasena",
+    "sign in with password",
+    "log in with password",
+    "use password",
+    "enter password",
+    "contrasena",
 )
 # Errores de login (normalizados) con mensaje claro para el UI.
 _FRASES_ERROR_SESION = (
@@ -350,6 +675,89 @@ _FRASES_MOTIVO_TERCERO = (
     "i disagree",
     "don't like",
 )
+# Frases que confirman que el modal "Denunciar abuso" esta ABIERTO segun el
+# TEXTO de su dialogo. La deteccion por texto es OBLIGATORIA: en vivo
+# `driver.find_elements(By.CSS_SELECTOR, "input[type='radio']")` devolvio 0
+# radios con el modal abierto (mientras `execute_script` +
+# `document.querySelectorAll` si veia los 3), por lo que la presencia del
+# formulario NO puede depender de `find_elements` / `is_displayed`.
+_FRASES_MODAL_DENUNCIA = (
+    "denunciar un abuso",
+    "report abuse",
+    "no me gusta esta peticion",
+    "viola las normas de la comunidad",
+    "contenido es ilegal",
+)
+# Valor real del tercer radio ("No me gusta esta petición...") en la UI de
+# Change.org y su indice de respaldo cuando `value` no esta disponible.
+_VALOR_MOTIVO_TERCERO = "dislike_content"
+_INDICE_MOTIVO_TERCERO = 2
+# Error claro cuando NINGUNA estrategia (Selenium -> etiqueta -> JS) logro
+# marcar el motivo.
+_ERROR_MOTIVO_NO_SELECCIONABLE = (
+    "no se pudo seleccionar el motivo de denuncia "
+    "(radios del modal no seleccionables)"
+)
+# JS puro (sin `find_elements`) para el modal: leer los radios del DOM,
+# seleccionar el motivo 3 y devolver evidencia serializable. Se usa como
+# respaldo cuando Selenium no "ve" los radios nativos del modal.
+_JS_ESTADO_RADIOS = """
+/* change_org:estado_radios */
+var valor = %r;
+var radios = Array.prototype.slice.call(
+    document.querySelectorAll("input[type='radio']"));
+var objetivo = null;
+for (var i = 0; i < radios.length; i++) {
+    if (String(radios[i].value || '') === valor) { objetivo = radios[i]; break; }
+}
+if (!objetivo && radios.length > %d) { objetivo = radios[%d]; }
+function marcado(r) {
+    if (!r) { return false; }
+    if (r.checked) { return true; }
+    return String(r.getAttribute('aria-checked') || '').toLowerCase() === 'true';
+}
+var alguno = false;
+for (var j = 0; j < radios.length; j++) { if (marcado(radios[j])) { alguno = true; } }
+return {
+    total: radios.length,
+    tercero: marcado(objetivo),
+    alguno: alguno,
+    textarea: !!document.querySelector('textarea, [contenteditable="true"]')
+};
+""" % (
+    _VALOR_MOTIVO_TERCERO,
+    _INDICE_MOTIVO_TERCERO,
+    _INDICE_MOTIVO_TERCERO,
+)
+_JS_SELECCIONAR_MOTIVO = """
+/* change_org:seleccionar_motivo */
+var valor = %r;
+var radios = Array.prototype.slice.call(
+    document.querySelectorAll("input[type='radio']"));
+var elegido = null;
+for (var i = 0; i < radios.length; i++) {
+    if (String(radios[i].value || '') === valor) { elegido = radios[i]; break; }
+}
+if (!elegido && radios.length > %d) { elegido = radios[%d]; }
+if (!elegido) { return {ok: false, motivo: 'sin-radios'}; }
+try {
+    elegido.click();
+    elegido.dispatchEvent(new MouseEvent('click', {
+        bubbles: true, cancelable: true, view: window
+    }));
+} catch (e) {}
+var marcado = !!elegido.checked
+    || String(elegido.getAttribute('aria-checked') || '').toLowerCase() === 'true';
+return {
+    ok: true,
+    checked: marcado,
+    textarea: !!document.querySelector('textarea, [contenteditable="true"]')
+};
+""" % (
+    _VALOR_MOTIVO_TERCERO,
+    _INDICE_MOTIVO_TERCERO,
+    _INDICE_MOTIVO_TERCERO,
+)
 # Etiqueta del campo "¿Dónde vives?" (select de ubicacion).
 _FRASES_UBICACION = ("donde vives", "where do you live")
 # Reto anti-bot de Cloudflare/Turnstile (normalizado). El widget vive en una
@@ -368,6 +776,15 @@ _FRASES_RETO_HUMANO = (
 )
 # Iteraciones (~10s) que se tolera el reto antes de fallar con error claro.
 _ITERACIONES_ESPERA_RETO = 20
+# Intentos (~5) que se tolera la pantalla de codigo sin la opcion de contraseña
+# antes de fallar con el error claro del codigo de verificacion.
+_INTENTOS_OPCION_PASSWORD = 5
+# Error claro cuando Change.org pidio el codigo por correo y no aparece la
+# opcion para volver a la contraseña (NUNCA el generico de timeout).
+_ERROR_PANTALLA_CODIGO = (
+    "Change.org pidio un codigo de verificacion por correo y no se encontro "
+    "la opcion 'Ingresar con contrasena'"
+)
 
 # Etiquetas (normalizadas) que identifican cada campo del formulario.
 _ETIQUETAS_CAMPOS = {
@@ -419,6 +836,12 @@ _SELECTORES_CAMPOS = {
         (By.CSS_SELECTOR, "textarea[id*='reason']"),
         (By.CSS_SELECTOR, "textarea"),
         (By.CSS_SELECTOR, "[contenteditable='true']"),
+        # Modal real de Change.org: el campo opcional "Seleccionaste: ..." es
+        # un input de React Aria (`name="question1.answer"`), NO un textarea.
+        (By.CSS_SELECTOR, "[role='dialog'] input[name*='answer']"),
+        (By.CSS_SELECTOR, "input[name*='question'][name*='answer']"),
+        (By.CSS_SELECTOR, "input[name*='answer']"),
+        (By.CSS_SELECTOR, "[role='dialog'] input[type='text']"),
     ),
 }
 
@@ -439,6 +862,23 @@ def _normalizar(texto) -> str:
 def _slug_email(texto) -> str:
     """Fragmento valido para un email: solo [a-z0-9] (sin acentos ni espacios)."""
     return re.sub(r"[^a-z0-9]+", "", _normalizar(texto))
+
+
+def _slug_captura(cuenta) -> str:
+    """Fragmento saneado para el nombre del screenshot de un reporte.
+
+    Prefiere "usuario" y cae a "email" del dict de la cuenta; deja solo
+    ``[A-Za-z0-9_.-]`` (espacios, ``/`` y ``@`` pasan a ``_``), recorta
+    separadores de los extremos y nunca queda vacio (respaldo "cuenta").
+    Nunca lanza.
+    """
+    try:
+        datos = dict(cuenta) if isinstance(cuenta, dict) else {}
+        origen = str(datos.get("usuario") or datos.get("email") or "")
+        limpio = re.sub(r"[^A-Za-z0-9_.-]+", "_", origen).strip("_.-")
+    except Exception:
+        limpio = ""
+    return limpio or "cuenta"
 
 
 def _dato_faker(fake, metodo: str, respaldo: tuple) -> str:
@@ -494,6 +934,156 @@ def _resolver_esperar_captcha_seg(valor=None) -> int:
     except (TypeError, ValueError):
         segundos = 0
     return max(0, min(900, segundos))
+
+
+# --------------------------------------------------------------------------- #
+# Sesiones persistentes de Change.org (cookies por cuenta, sin columnas en BD)
+# --------------------------------------------------------------------------- #
+def _reutilizar_sesion_activo() -> bool:
+    """True si se guardan/restauran sesiones (env CHANGE_REUTILIZAR_SESION).
+
+    Default "1" (activo). Con "0"/"false"/"no"/"off" se desactiva TODO:
+    `guardar_sesion_change`, `cargar_sesion_change` y la restauracion en
+    `ChangeOrgReportBot`. Nunca lanza.
+    """
+    try:
+        valor = os.environ.get("CHANGE_REUTILIZAR_SESION")
+        if valor is None:
+            return True
+        return str(valor).strip().lower() not in ("0", "false", "no", "off")
+    except Exception:
+        return True
+
+
+def _ruta_sesion_change(usuario: str) -> str:
+    """Ruta del JSON de sesion de UNA cuenta (nombre saneado, nunca vacio).
+
+    El archivo vive en `_DIR_SESIONES_CHANGE` (`data/cookies/change/`), se
+    lee el modulo-global en cada llamada (testeable con monkeypatch) y solo
+    usa `[A-Za-z0-9_.-]` en el nombre: sin separadores de ruta, sin escapar
+    del directorio y nunca vacio (respaldo "cuenta"). Nunca lanza.
+    """
+    try:
+        limpio = re.sub(r"[^A-Za-z0-9_.-]", "_", str(usuario or ""))
+    except Exception:
+        limpio = ""
+    if not limpio:
+        limpio = "cuenta"
+    try:
+        carpeta = _DIR_SESIONES_CHANGE
+    except Exception:  # pragma: no cover - defensa extrema
+        carpeta = ""
+    return os.path.join(str(carpeta or ""), f"{limpio}.json")
+
+
+def _escribir_json_atomico(ruta: str, datos: dict) -> bool:
+    """Escribe `datos` como JSON en `ruta` de forma ATÓMICA (temp + replace).
+
+    Crea la carpeta si falta; en POSIX deja el archivo con permisos 0600.
+    Nunca lanza ni deja archivos temporales huerfanos.
+    """
+    temporal = None
+    try:
+        carpeta = os.path.dirname(ruta) or "."
+        os.makedirs(carpeta, exist_ok=True)
+        fd, temporal = tempfile.mkstemp(
+            prefix=".sesion-change-", suffix=".tmp", dir=carpeta
+        )
+        with os.fdopen(fd, "w", encoding="utf-8") as archivo:
+            json.dump(datos, archivo, ensure_ascii=False)
+        if os.name == "posix":
+            try:
+                os.chmod(temporal, 0o600)
+            except OSError:
+                pass
+        os.replace(temporal, ruta)
+        temporal = None
+        return True
+    except Exception as e:
+        logger.debug(
+            f"Change.org: no se pudo escribir la sesion ({type(e).__name__}): {e}"
+        )
+        return False
+    finally:
+        if temporal:
+            try:
+                os.remove(temporal)
+            except OSError:
+                pass
+
+
+def guardar_sesion_change(
+    usuario: str, driver, email: str = "", proxy: str = ""
+) -> bool:
+    """Guarda las cookies de la sesion actual en `data/cookies/change/`.
+
+    Lee `driver.get_cookies()` y escribe el JSON
+    ``{"usuario","email","guardada" (ISO),"proxy","cookies":[...]}`` con
+    escritura atomica (temp + `os.replace`; permisos 0600 en POSIX). NO
+    loguea valores de cookies. Con `CHANGE_REUTILIZAR_SESION` desactivado no
+    escribe nada. NUNCA lanza; devuelve True/False.
+    """
+    if not _reutilizar_sesion_activo():
+        return False
+    try:
+        cookies = list(driver.get_cookies() or [])
+    except Exception:
+        return False
+    if not cookies:
+        return False
+    try:
+        datos = {
+            "usuario": str(usuario or ""),
+            "email": str(email or ""),
+            "guardada": datetime.now().isoformat(timespec="seconds"),
+            "proxy": str(proxy or ""),
+            "cookies": cookies,
+        }
+        ruta = _ruta_sesion_change(usuario)
+        ok = _escribir_json_atomico(ruta, datos)
+    except Exception:  # pragma: no cover - defensa extrema
+        return False
+    if ok:
+        # Solo el conteo: jamas los valores de las cookies.
+        logger.debug(
+            f"Change.org: sesion guardada para {usuario or '(sin usuario)'} "
+            f"({len(cookies)} cookies)"
+        )
+    return ok
+
+
+def cargar_sesion_change(usuario: str) -> dict | None:
+    """Carga la sesion persistida de `usuario` (None si no hay o es invalida).
+
+    Valida que el JSON sea un dict con ``"cookies"`` como lista no vacia. Con
+    `CHANGE_REUTILIZAR_SESION` desactivado devuelve None aunque el archivo
+    exista. NUNCA lanza.
+    """
+    if not _reutilizar_sesion_activo():
+        return None
+    try:
+        with open(_ruta_sesion_change(usuario), "r", encoding="utf-8") as archivo:
+            datos = json.load(archivo)
+    except Exception:
+        return None
+    if not isinstance(datos, dict):
+        return None
+    cookies = datos.get("cookies")
+    if not isinstance(cookies, list) or not cookies:
+        return None
+    return datos
+
+
+def borrar_sesion_change(usuario: str) -> bool:
+    """Borra la sesion persistida de `usuario`; True si elimino el archivo.
+
+    False si no existe o si no se pudo borrar. NUNCA lanza.
+    """
+    try:
+        os.remove(_ruta_sesion_change(usuario))
+        return True
+    except Exception:
+        return False
 
 
 # --------------------------------------------------------------------------- #
@@ -652,6 +1242,131 @@ def proxies_disponibles(pais: str = "") -> list:
         return []
 
 
+# --------------------------------------------------------------------------- #
+# Validacion de proxies contra change.org (los nodos residenciales se rompen)
+# --------------------------------------------------------------------------- #
+_URL_VALIDACION_PROXY = _URL_LOGIN_CHANGE
+_PROXY_CHANGE_CACHE: dict = {}          # proxy -> (bool, timestamp)
+_PROXY_CHANGE_CACHE_LOCK = threading.Lock()
+_PROXY_CHANGE_CACHE_MAX = 1000
+_PROXY_CHANGE_CACHE_TTL_DEFAULT = 600   # PROXY_CHANGE_CACHE_SEG (10 min)
+
+
+def _proxy_change_cache_seg() -> int:
+    """TTL de la cache de validacion: env `PROXY_CHANGE_CACHE_SEG` -> 600.
+
+    `0` (o negativo -> 0) desactiva la cache; valores no numericos o vacios
+    devuelven el default (600). Nunca lanza.
+    """
+    try:
+        valor = int(float(str(os.environ.get("PROXY_CHANGE_CACHE_SEG", "")).strip()))
+    except (TypeError, ValueError):
+        return _PROXY_CHANGE_CACHE_TTL_DEFAULT
+    return max(0, valor)
+
+
+def _url_proxy_para_requests(info: dict) -> str:
+    """URL `scheme://user:pass@host:port` desde `ProxyManager().analizar()`."""
+    scheme = str(info.get("scheme") or "http").strip() or "http"
+    host = str(info.get("host") or "").strip()
+    port = info.get("port")
+    user = str(info.get("user") or "")
+    password = str(info.get("password") or "")
+    credenciales = ""
+    if user:
+        credenciales = quote(user, safe="")
+        if password:
+            credenciales += ":" + quote(password, safe="")
+        credenciales += "@"
+    return f"{scheme}://{credenciales}{host}:{port}"
+
+
+def _guardar_cache_proxy(proxy: str, valido: bool) -> None:
+    """Guarda el resultado en la cache del proceso (tope ~1000). Nunca lanza."""
+    try:
+        with _PROXY_CHANGE_CACHE_LOCK:
+            if len(_PROXY_CHANGE_CACHE) >= _PROXY_CHANGE_CACHE_MAX:
+                ahora = time.time()
+                ttl = _proxy_change_cache_seg()
+                expirados = [
+                    clave
+                    for clave, (_, marca) in list(_PROXY_CHANGE_CACHE.items())
+                    if ttl <= 0 or (ahora - marca) >= ttl
+                ]
+                for clave in expirados:
+                    _PROXY_CHANGE_CACHE.pop(clave, None)
+                while len(_PROXY_CHANGE_CACHE) >= _PROXY_CHANGE_CACHE_MAX:
+                    mas_viejo = min(
+                        _PROXY_CHANGE_CACHE,
+                        key=lambda clave: _PROXY_CHANGE_CACHE[clave][1],
+                    )
+                    _PROXY_CHANGE_CACHE.pop(mas_viejo, None)
+            _PROXY_CHANGE_CACHE[proxy] = (bool(valido), time.time())
+    except Exception:
+        pass
+
+
+def proxy_change_valido(proxy: str, timeout: int = 15) -> bool:
+    """Comprueba si un proxy abre change.org sin errores de TLS/red.
+
+    Hace ``requests.get("https://www.change.org/login_or_join?user_flow=nav",
+    proxies={"http": url, "https": url}, timeout=timeout,
+    allow_redirects=True)`` con la URL del proxy reconstruida desde
+    ``ProxyManager().analizar(proxy)`` (soporta credenciales con caracteres
+    especiales). Devuelve True si ``status_code < 500``; False en
+    SSLError/ConnectionError/timeout/cualquier error.
+
+    - Cadena vacia (o None) -> True: sin proxy no se valida.
+    - `requests` no disponible o proxy no analizable -> True (NO descartar por
+      incertidumbre).
+    - Cache por proceso ``{proxy: (bool, timestamp)}`` con TTL
+      `PROXY_CHANGE_CACHE_SEG` (env, default 600; 0 = sin cache) y tope ~1000
+      entradas (purga primero los expirados y luego el mas viejo).
+    NUNCA lanza.
+    """
+    proxy = str(proxy or "").strip()
+    if not proxy:
+        return True
+    ttl = _proxy_change_cache_seg()
+    ahora = time.time()
+    if ttl > 0:
+        try:
+            with _PROXY_CHANGE_CACHE_LOCK:
+                entrada = _PROXY_CHANGE_CACHE.get(proxy)
+            if entrada is not None and (ahora - entrada[1]) < ttl:
+                return bool(entrada[0])
+        except Exception:
+            pass
+
+    try:
+        info = ProxyManager().analizar(proxy)
+    except Exception:
+        info = None
+    if not info:
+        # Formato desconocido: NO se descarta por incertidumbre (el forward
+        # proxy local puede interpretarlo igual).
+        return True
+    try:
+        import requests
+    except Exception:
+        return True
+
+    url_proxy = _url_proxy_para_requests(info)
+    try:
+        respuesta = requests.get(
+            _URL_VALIDACION_PROXY,
+            proxies={"http": url_proxy, "https": url_proxy},
+            timeout=timeout,
+            allow_redirects=True,
+        )
+        valido = int(getattr(respuesta, "status_code", 0) or 0) < 500
+    except Exception:
+        valido = False
+    if ttl > 0:
+        _guardar_cache_proxy(proxy, valido)
+    return bool(valido)
+
+
 def guardar_identidad_change(
     identidad: dict,
     url_peticion: str = "",
@@ -771,6 +1486,8 @@ class ChangeOrgReportBot:
       - `_resolver_campo` / `escribir_humano` / `_llenar_formulario`
       - `_buscar_boton_enviar` / `_esperar_confirmacion`
       - `_reporte_exitoso` / `_detectar_captcha` / `_detectar_error_envio`
+      - `_capturar_evidencia` (screenshot de los reportes EXITOSOS)
+      - `_capturar_fallo` (screenshot de DEPURACION de los fallidos)
     """
 
     def __init__(
@@ -978,8 +1695,94 @@ class ChangeOrgReportBot:
             pass
         return False
 
-    def _navegar(self, url: str) -> None:
-        """Abre la URL tolerando TimeoutException (sigue con esperas explicitas)."""
+    def _error_navegacion_pagina(self) -> str:
+        """Detecta la pagina de error de red de Chrome ("" si esta bien).
+
+        Revisa titulo y texto visible normalizados (`Privacy error`,
+        `Your connection is not private`, `This site can't be reached`,
+        `NET::ERR_...`, `ERR_CERT_*`, `ERR_TUNNEL_*`, `ERR_PROXY_*`,
+        `la conexion no es privada`, ...) y devuelve el codigo especifico
+        (`ERR_CERT_AUTHORITY_INVALID`, ...) o la etiqueta corta detectada.
+        Sirve para no confundir un proxy con TLS/red rota con un captcha o
+        con un campo faltante. NUNCA lanza.
+        """
+        try:
+            titulo = ""
+            try:
+                titulo = str(self.driver.title or "")
+            except Exception:
+                titulo = ""
+            bruto = f"{titulo}\n{self._texto_visible()}"
+            normalizado = _normalizar(bruto)
+            # "can't"/"can’t"/"`" se comparan sin apostrofes.
+            compacto = (
+                normalizado.replace("'", "").replace("\u2019", "").replace("`", "")
+            )
+            coincide = _PATRON_CODIGO_RED.search(compacto)
+            if coincide:
+                return coincide.group(1).upper()
+            for frase in _FRASES_ERROR_RED:
+                if frase in compacto:
+                    return frase
+            return ""
+        except Exception:
+            return ""
+
+    def _pagina_error_servidor(self) -> str:
+        """Detecta la pagina de error de APLICACION de Change.org ("" si no).
+
+        La pantalla real ("¡Oh no! Error del servidor — Puede actualizar la
+        pagina y si aun hay problemas inténtelo mas tarde...") es una respuesta
+        del propio sitio, no la peticion: buscarla por el enlace de reporte
+        daria el engañoso "no se encontro el enlace de violacion de politicas".
+
+        Se detecta por TEXTO VISIBLE normalizado (`_texto_visible` +
+        `_normalizar`), con reglas anti-falso-positivo: "error del servidor",
+        "server error", "algo salio mal" y "something went wrong" bastan SOLAS;
+        "oh no" y las frases ambiguas ("actualiza la pagina", "intenta de nuevo
+        mas tarde", "intentelo mas tarde", ...) solo cuentan acompanadas de
+        otra señal de error en la MISMA pagina ("error", "volver a inicio",
+        ...) o de una segunda frase ambigua.
+
+        Devuelve la frase detectada (ya normalizada) o "". NUNCA lanza.
+        """
+        try:
+            texto = _normalizar(self._texto_visible())
+            if not texto:
+                return ""
+            for frase in _FRASES_ERROR_SERVIDOR_FUERTES:
+                if frase in texto:
+                    return frase
+            presentes = [
+                frase
+                for frase in _FRASES_ERROR_SERVIDOR_DEBILES
+                if frase in texto
+            ]
+            if not presentes:
+                return ""
+            companias = (
+                _FRASES_ERROR_SERVIDOR_FUERTES
+                + _FRASES_ERROR_SERVIDOR_CONTEXTO
+            )
+            for frase in presentes:
+                if any(compania in texto for compania in companias):
+                    return frase
+                if any(otra != frase for otra in presentes):
+                    # Dos frases ambiguas juntas (p. ej. "actualiza la pagina"
+                    # + "intentelo mas tarde") ya son señal suficiente.
+                    return frase
+            return ""
+        except Exception:
+            return ""
+
+    def _navegar(self, url: str) -> str:
+        """Abre la URL tolerando TimeoutException (sigue con esperas explicitas).
+
+        Tras navegar revisa `_error_navegacion_pagina()`: si Chrome mostro una
+        pagina de error de red/TLS (p. ej. un proxy con TLS roto), deja en
+        `self.ultimo_error` el mensaje accionable y devuelve el codigo
+        detectado; si la pagina cargo bien devuelve "".
+        """
         try:
             self.driver.get(url)
         except TimeoutException as e:
@@ -988,6 +1791,94 @@ class ChangeOrgReportBot:
             )
         except Exception as e:
             raise RuntimeError(f"no se pudo abrir {url}: {e}")
+
+        codigo = self._error_navegacion_pagina()
+        if codigo:
+            self.ultimo_error = (
+                f"la conexion con change.org fallo ({codigo}): probable PROXY "
+                "con TLS/red rota; prueba otro proxy"
+            )
+            logger.warning(f"Change.org: {self.ultimo_error} (url={url})")
+        return codigo
+
+    def _esperar_documento_listo(self, timeout: int = 30) -> bool:
+        """Espera (polling de 1s) a que `document.readyState` sea 'complete'.
+
+        Con un proxy lento la pagina puede quedar a medio cargar (imagenes
+        rotas, paneles con spinner) cuando `driver.get()` ya retorno: sin el
+        DOM completo el enlace de reporte todavia no existe y la busqueda
+        fallaria en falso.
+
+        Devuelve True si el documento quedo listo y False si se agoto `timeout`
+        o se pidio el paro. Tolerante: si el JS falla (driver muerto, target
+        cambiado) se cuenta como NO listo y se reintenta. NUNCA lanza.
+        """
+        intentos = max(1, int(timeout or 0))
+        for intento in range(intentos):
+            if self._cancelado():
+                return False
+            try:
+                estado = self.driver.execute_script("return document.readyState;")
+                if estado is True or str(estado or "").strip().lower() == "complete":
+                    return True
+            except Exception:
+                pass
+            if intento + 1 < intentos:
+                time.sleep(1)
+        return False
+
+    def _app_peticion_lista(self) -> bool:
+        """UN poll del estado de la app de la peticion (uso interno). NUNCA lanza.
+
+        True si el JS `_JS_ESTADO_APP_PETICION` reporta en el panel de firma
+        texto/boton de firma visible (o el estado de usuario firmado) y, cuando
+        el panel se pudo aislar, NINGUN spinner visible dentro de el. Cualquier
+        fallo del JS (driver muerto, respuesta inesperada) cuenta como False.
+        """
+        try:
+            estado = self.driver.execute_script(_JS_ESTADO_APP_PETICION)
+        except Exception:
+            return False
+        if not isinstance(estado, dict):
+            return False
+        texto = _normalizar(str(estado.get("texto") or ""))
+        if not texto:
+            return False
+        tiene_firma = any(frase in texto for frase in _FRASES_FIRMA)
+        firmado = any(frase in texto for frase in _FRASES_FIRMADO)
+        if not (tiene_firma or firmado):
+            return False
+        if bool(estado.get("panel")) and bool(estado.get("spinner")):
+            return False
+        return True
+
+    def _esperar_app_peticion(self, timeout: int = 30) -> bool:
+        """Espera (BEST-EFFORT) a que la app React de la peticion este lista.
+
+        Con proxy lento la peticion carga (imagen/hero OK) pero la app sigue
+        hidratando: el panel "Firma esta petición" queda con spinner y los
+        clics del enlace de reporte NO abren el modal. Este poll (1s) espera
+        hasta `timeout` segundos a ver en el panel de firma el texto/boton de
+        firma ("firma esta peticion"/"firma la peticion"/"firmar") o el estado
+        de usuario firmado, y SIN spinner visible dentro del panel; la señal
+        real la aporta el JS `_JS_ESTADO_APP_PETICION`.
+
+        BEST-EFFORT: si se agota `timeout` devuelve False y el flujo CONTINUA
+        igual (jamas bloquea el reporte; los reintentos de `reportar()` cubren
+        el timing). Tolerante a JS roto/driver muerto (False) y cancelable
+        (`_cancelado`). NUNCA lanza.
+        """
+        intentos = max(1, int(timeout or 0))
+        for intento in range(intentos):
+            if self._cancelado():
+                return False
+            if self._app_peticion_lista():
+                return True
+            if intento + 1 < intentos:
+                time.sleep(1)
+        if self._cancelado():
+            return False
+        return self._app_peticion_lista()
 
     def _scroll_humano(self) -> None:
         """Scroll incremental 250-550px con pausa aleatoria y retroceso ocasional."""
@@ -1099,8 +1990,40 @@ class ChangeOrgReportBot:
                 return elemento
         return None
 
-    def _buscar_enlace_reporte(self, intentos: int = 12):
-        """Busca el enlace con scroll humano incremental hasta encontrarlo."""
+    def _href_directo_enlace(self, elemento) -> str:
+        """Href REAL (http(s) de change.org) del enlace, o "".
+
+        Solo sirve como ULTIMO recurso de `reportar()`: se ignora todo lo que
+        no sea una URL http(s) del mismo dominio (nunca "#", "javascript:",
+        "mailto:", "tel:", href vacio ni dominios externos). Los hrefs
+        relativos (`/p/.../policy_violation`) se resuelven contra la URL
+        actual o la raiz de change.org. NUNCA lanza.
+        """
+        try:
+            href = str(elemento.get_attribute("href") or "").strip()
+        except Exception:
+            return ""
+        if not href:
+            return ""
+        bajo = href.lower()
+        if bajo.startswith(("#", "javascript:", "mailto:", "tel:")):
+            return ""
+        try:
+            completa = urljoin(
+                self._url_actual() or "https://www.change.org/", href
+            )
+            partes = urlparse(completa)
+        except Exception:
+            return ""
+        if (partes.scheme or "").lower() not in ("http", "https"):
+            return ""
+        host = (partes.netloc or "").lower().split("@")[-1].split(":")[0]
+        if host != "change.org" and not host.endswith(".change.org"):
+            return ""
+        return completa
+
+    def _buscar_enlace_reporte_una_pasada(self, intentos: int = 12):
+        """Una pasada: sin scroll -> scroll humano incremental hasta encontrarlo."""
         if self._cancelado():
             return None
         elemento = self._localizar_enlace_reporte()
@@ -1114,6 +2037,34 @@ class ChangeOrgReportBot:
             if elemento is not None:
                 return elemento
         return None
+
+    def _buscar_enlace_reporte(self, intentos: int = 12):
+        """Busca el enlace con scroll humano y una segunda pasada tras refresh.
+
+        Si la primera pasada no lo encuentra (pagina a medio cargar por un
+        proxy lento), hace UN `driver.refresh()` (try/except) +
+        `_esperar_documento_listo(25)` + otra pasada completa. Si aun asi no
+        aparece, deja un WARNING con la URL y devuelve None. NUNCA lanza.
+        """
+        elemento = self._buscar_enlace_reporte_una_pasada(intentos)
+        if elemento is not None or self._cancelado():
+            return elemento
+        logger.debug(
+            "Change.org: enlace de reporte no encontrado en la primera pasada; "
+            f"refresco y reintento (url={self._url_actual() or self.url_peticion})"
+        )
+        try:
+            self.driver.refresh()
+        except Exception as e:
+            logger.debug(f"Change.org: el refresh de recuperacion fallo: {e}")
+        self._esperar_documento_listo(25)
+        elemento = self._buscar_enlace_reporte_una_pasada(intentos)
+        if elemento is None:
+            logger.warning(
+                "Change.org: no se encontro el enlace de reporte de violacion "
+                f"de politicas (url={self._url_actual() or self.url_peticion})"
+            )
+        return elemento
 
     # ------------------------------------------------------------------ #
     # Registro / Login en Change.org
@@ -1186,6 +2137,47 @@ class ChangeOrgReportBot:
                 if self._visible(elemento) and self._interactuable(elemento):
                     return elemento
         return None
+
+    def _pantalla_codigo_temporal(self) -> bool:
+        """True si el texto visible pide un codigo temporal/verificacion.
+
+        Change.org la muestra al correo de una cuenta EXISTENTE en vez del
+        formulario de contraseña; `_pulsar_opcion_password` es la salida.
+        """
+        try:
+            texto = _normalizar(self._texto_visible())
+        except Exception:
+            return False
+        if not texto:
+            return False
+        return any(frase in texto for frase in _FRASES_PANTALLA_CODIGO)
+
+    def _pulsar_opcion_password(self) -> bool:
+        """Pulsa la opcion 'Ingresar con contraseña' de la pantalla de codigo.
+
+        Busca `a`/`button`/`[role='button']`/`[role='link']` visibles e
+        interactuables cuyo texto (o `value`) coincida con
+        `_FRASES_OPCION_PASSWORD` (las frases mas especificas primero) y los
+        pulsa con `_clic_elemento`. Devuelve True si logro pulsar alguno.
+        """
+        for frase in _FRASES_OPCION_PASSWORD:
+            for by, selector in (
+                (By.TAG_NAME, "a"),
+                (By.TAG_NAME, "button"),
+                (By.CSS_SELECTOR, "[role='button']"),
+                (By.CSS_SELECTOR, "[role='link']"),
+            ):
+                for elemento in self._buscar_elementos(by, selector):
+                    if not (
+                        self._visible(elemento) and self._interactuable(elemento)
+                    ):
+                        continue
+                    texto = self._texto_boton_candidato(elemento)
+                    if not texto or frase not in texto:
+                        continue
+                    if self._clic_elemento(elemento):
+                        return True
+        return False
 
     def _campo_email_login(self):
         """Input de correo del acceso: prioriza el modal (`role='dialog']`)."""
@@ -1400,8 +2392,111 @@ class ChangeOrgReportBot:
             return f"Change.org no encontro una cuenta con ese correo (señal: '{frase}')"
         return f"error de Change.org: '{frase}'"
 
+    def _hay_login_visible(self) -> bool:
+        """True si hay un enlace/boton VISIBLE de 'Iniciar sesión'/'Log in'.
+
+        Contra-señal de la home logueada: con sesion iniciada Change.org NO
+        muestra ese boton. Acepta `aria-label` ademas de texto/`value`.
+        """
+        for by, selector in (
+            (By.TAG_NAME, "button"),
+            (By.CSS_SELECTOR, "[role='button']"),
+            (By.TAG_NAME, "a"),
+            (By.CSS_SELECTOR, "input[type='submit']"),
+        ):
+            for elemento in self._buscar_elementos(by, selector):
+                if not self._visible(elemento):
+                    continue
+                texto = self._texto_boton_candidato(elemento)
+                if not texto:
+                    try:
+                        texto = _normalizar(
+                            elemento.get_attribute("aria-label") or ""
+                        )
+                    except Exception:
+                        texto = ""
+                if not texto:
+                    continue
+                if any(
+                    texto == frase or texto.startswith(frase)
+                    for frase in _FRASES_LOGIN
+                ):
+                    return True
+        return False
+
+    def _evidencia_home_logueada(self) -> str:
+        """Home logueada real: avatar/menu de cuenta y SIN 'Iniciar sesión'.
+
+        Change.org sirve la home con sesion (`https://www.change.org/?met=esnv`)
+        con el avatar/menu de cuenta en la cabecera y sin el enlace visible de
+        "Iniciar sesión". Para no confundir el logo con un avatar se exige:
+        (1) la URL NO es de login, (2) NO hay login visible y (3) al menos una
+        señal de sesion: imagen de la cabecera (`header > img`, descartando
+        logo/brand), avatar por `data-testid`/clase, boton con `aria-label` de
+        cuenta, o un enlace de cerrar sesion presente en el DOM (puede estar
+        oculto dentro de un dropdown). Nunca marca exito por un clic: solo
+        señales reales del DOM.
+        """
+        url_norm = _normalizar(self._url_actual())
+        if "login_or_join" in url_norm or "/login" in url_norm:
+            return ""
+        if self._hay_login_visible():
+            return ""
+        # (1) Imagen de la cabecera que no sea el logo/marca.
+        for cabecera in self._buscar_elementos(By.TAG_NAME, "header"):
+            if not self._visible(cabecera):
+                continue
+            for imagen in self._buscar_elementos_de(cabecera, By.TAG_NAME, "img"):
+                if not self._visible(imagen):
+                    continue
+                pistas = _normalizar(
+                    " ".join(
+                        str(imagen.get_attribute(nombre) or "")
+                        for nombre in ("alt", "src", "class", "data-testid")
+                    )
+                )
+                if any(pista in pistas for pista in ("logo", "brand")):
+                    continue
+                return (
+                    "home logueada (avatar de la cabecera y sin "
+                    "'Iniciar sesión')"
+                )
+        # (2) Avatar/menu de cuenta por selector (testid, clase, aria-label).
+        for by, selector in (
+            (By.CSS_SELECTOR, "[data-testid*='avatar']"),
+            (By.CSS_SELECTOR, "[class*='avatar']"),
+            (By.CSS_SELECTOR, "[aria-label*='cuenta' i]"),
+            (By.CSS_SELECTOR, "[aria-label*='account' i]"),
+            (By.CSS_SELECTOR, "[aria-label*='usuario' i]"),
+            (By.CSS_SELECTOR, "[aria-label*='user' i]"),
+            (By.CSS_SELECTOR, "img[alt*='perfil' i]"),
+            (By.CSS_SELECTOR, "img[alt*='profile' i]"),
+        ):
+            for elemento in self._buscar_elementos(by, selector):
+                if self._visible(elemento):
+                    return (
+                        f"home logueada ({selector} visible y sin "
+                        "'Iniciar sesión')"
+                    )
+        # (3) Menu de cuenta en el DOM (puede estar oculto en un dropdown).
+        for by, selector in (
+            (By.CSS_SELECTOR, "a[href*='/logout']"),
+            (By.CSS_SELECTOR, "[href*='sign_out']"),
+            (By.CSS_SELECTOR, "[href*='sign-out']"),
+        ):
+            if self._buscar_elementos(by, selector):
+                return "home logueada (menu de cuenta/cerrar sesion en el DOM)"
+        return ""
+
     def _evidencia_sesion(self, email: str = "") -> str:
-        """Evidencia POSITIVA de sesion iniciada; "" si aun no se confirma."""
+        """Evidencia POSITIVA de sesion iniciada; "" si aun no se confirma.
+
+        Prioridad: selectores fuertes (logout/perfil/ajustes/avatar) -> textos
+        de cuenta en pantalla -> correo de la cuenta -> URL de cuenta -> home
+        logueada real (avatar de cabecera o menu de cuenta sin el enlace
+        "Iniciar sesión"). NUNCA marca exito por "hacer clic", solo con señales
+        reales del DOM/pantalla.
+        """
         selectores = (
             (By.CSS_SELECTOR, "a[href*='/logout']"),
             (By.CSS_SELECTOR, "a[href*='/profile']"),
@@ -1436,7 +2531,136 @@ class ChangeOrgReportBot:
             for fragmento in ("/profile", "/dashboard", "/account", "/settings", "/user"):
                 if fragmento in url_norm:
                     return f"URL de cuenta: {self._url_actual()}"
-        return ""
+        return self._evidencia_home_logueada()
+
+    # ------------------------------------------------------------------ #
+    # Sesion persistente por cookies (anti-captcha en corridas siguientes)
+    # ------------------------------------------------------------------ #
+    def _payload_cookie_cdp(self, cookie) -> dict:
+        """Payload de `Network.setCookie` para una cookie guardada (o {}).
+
+        Mapea `name,value,domain,path,secure,httpOnly` y `expires` ->
+        `expirationDate` (acepta tambien `expiry`/`expirationDate`). Devuelve
+        ``{}`` si la cookie no tiene name/value utilizables.
+        """
+        if not isinstance(cookie, dict):
+            return {}
+        nombre = cookie.get("name")
+        valor = cookie.get("value")
+        if not nombre or valor is None or str(valor) == "":
+            return {}
+        payload = {
+            "name": str(nombre),
+            "value": valor if isinstance(valor, str) else str(valor),
+            "domain": str(cookie.get("domain") or ".change.org"),
+            "path": str(cookie.get("path") or "/"),
+            "secure": bool(cookie.get("secure", True)),
+            "httpOnly": bool(cookie.get("httpOnly", False)),
+        }
+        expira = cookie.get("expires", cookie.get("expiry", cookie.get("expirationDate")))
+        if expira:
+            try:
+                payload["expirationDate"] = float(expira)
+            except (TypeError, ValueError):
+                pass
+        return payload
+
+    def _set_cookie_cdp(self, payload: dict) -> bool:
+        """Inyecta UNA cookie con `Network.setCookie`; False si falla.
+
+        Trata como fallo las excepciones y la respuesta `{"success": False}`.
+        Nunca lanza.
+        """
+        try:
+            respuesta = self.driver.execute_cdp_cmd("Network.setCookie", payload)
+        except Exception:
+            return False
+        if isinstance(respuesta, dict) and respuesta.get("success") is False:
+            return False
+        return True
+
+    def _inyectar_cookies_cdp(self, cookies) -> int:
+        """Inyecta TODAS las cookies guardadas por CDP sin navegar.
+
+        Habilita `Network.enable` (best-effort) y hace un
+        `Network.setCookie` por cookie; las cookies individuales que fallan
+        se IGNORAN. Devuelve cuantas se inyectaron. Nunca lanza.
+        """
+        inyectadas = 0
+        try:
+            self.driver.execute_cdp_cmd("Network.enable", {})
+        except Exception:
+            pass
+        for cookie in cookies or ():
+            payload = self._payload_cookie_cdp(cookie)
+            if not payload:
+                continue
+            if self._set_cookie_cdp(payload):
+                inyectadas += 1
+            else:
+                logger.debug(
+                    f"Change.org: cookie {payload.get('name')} no inyectada por CDP"
+                )
+        return inyectadas
+
+    def _restaurar_sesion_change(self) -> bool:
+        """Restaura la sesion persistida (cookies) de `self.cuenta["usuario"]`.
+
+        Carga `data/cookies/change/{usuario}.json`, inyecta las cookies por
+        CDP (`Network.setCookie`) y navega a la home con `self._navegar`
+        (tolerante); reintenta la evidencia (`_evidencia_sesion` /
+        `_evidencia_home_logueada`) hasta ~8s. Devuelve True SOLO con
+        evidencia real de sesion. Si hay error de red o aparece un reto/captcha
+        devuelve False sin bloquear (el flujo normal de login/registro decidi-
+        ra). NUNCA lanza.
+        """
+        if not _reutilizar_sesion_activo():
+            return False
+        cuenta = dict(self.cuenta or {})
+        usuario = str(cuenta.get("usuario") or "")
+        email = str(cuenta.get("email") or "")
+        if self.driver is None:
+            return False
+        datos = cargar_sesion_change(usuario)
+        if not datos:
+            return False
+        error_previo = self.ultimo_error
+        try:
+            inyectadas = self._inyectar_cookies_cdp(datos.get("cookies") or [])
+            if inyectadas <= 0:
+                return False
+            try:
+                codigo_red = self._navegar(_URL_HOME_CHANGE)
+            except Exception:
+                return False
+            if codigo_red:
+                return False
+            for _ in range(16):  # ~8s de reintentos
+                if self._cancelado():
+                    return False
+                evidencia = (
+                    self._evidencia_sesion(email) or self._evidencia_home_logueada()
+                )
+                if evidencia:
+                    logger.debug(
+                        f"Change.org: sesion restaurada de {usuario or '(sin usuario)'} "
+                        f"({inyectadas} cookies): {evidencia}"
+                    )
+                    return True
+                if self._detectar_reto_humano() or self._detectar_captcha():
+                    return False
+                time.sleep(0.5)
+            return False
+        except Exception as e:
+            logger.debug(
+                f"Change.org: no se pudo restaurar la sesion de "
+                f"{usuario or '(sin usuario)'}: {type(e).__name__}: {e}"
+            )
+            return False
+        finally:
+            # La restauracion no debe dejar un error "pegado" del intento:
+            # si falla, el flujo normal de login/registro decide y reporta.
+            self.ultimo_error = error_previo
 
     def registrar_o_entrar(self) -> dict:
         """Registra (cuenta NUEVA) o inicia sesion en Change.org.
@@ -1446,11 +2670,33 @@ class ChangeOrgReportBot:
         de login) -> "Continuar" -> (solo nuevas) "Nombres"/"Apellidos" ->
         "Continuar". La contraseña sale de `password_change_para`.
 
-        Devuelve ``{"ok","estado","error","evidencia"}`` con estado "nueva" si
-        vio "Crea tu contraseña" (o la pantalla de nombre), "existente" si entro
-        por login y "fallo" si no se pudo confirmar la sesion. NUNCA lanza.
+        Si Change responde con la pantalla de codigo temporal por correo para
+        una cuenta existente (sin campo de contraseña), se pulsa UNA vez la
+        opcion "Ingresar con contraseña"/"Sign in with password" y el flujo
+        continua; si no aparece en ~5 intentos falla con
+        `_ERROR_PANTALLA_CODIGO` (no con el timeout generico).
+
+        SESION PERSISTENTE: si hay cookies guardadas de la cuenta
+        (`data/cookies/change/{usuario}.json`) y `CHANGE_REUTILIZAR_SESION`
+        esta activo, primero intenta `_restaurar_sesion_change()`: con
+        evidencia de sesion retorna de inmediato
+        ``{"ok": True, "estado": "existente", "evidencia": "sesion restaurada
+        (cookies)", "error": "", "sesion_restaurada": True}`` sin escribir el
+        correo ni pedir captcha. En el exito normal (login/registro) guarda la
+        sesion nueva (las cookies pueden rotar).
+
+        Devuelve ``{"ok","estado","error","evidencia","sesion_restaurada"}``
+        con estado "nueva" si vio "Crea tu contraseña" (o la pantalla de
+        nombre), "existente" si entro por login (o restauro la sesion) y
+        "fallo" si no se pudo confirmar la sesion. NUNCA lanza.
         """
-        resultado = {"ok": False, "estado": "fallo", "error": "", "evidencia": ""}
+        resultado = {
+            "ok": False,
+            "estado": "fallo",
+            "error": "",
+            "evidencia": "",
+            "sesion_restaurada": False,
+        }
         cuenta = dict(self.cuenta or {})
         email = str(cuenta.get("email") or "").strip()
         password = password_change_para(
@@ -1472,10 +2718,27 @@ class ChangeOrgReportBot:
                 )
                 return resultado
 
-            self._navegar(_URL_LOGIN_CHANGE)
+            # SESION PERSISTENTE: con cookies guardadas y evidencia real de
+            # sesion NO se escribe el correo ni se pide captcha (se retorna ya).
+            if _reutilizar_sesion_activo() and self._restaurar_sesion_change():
+                resultado["ok"] = True
+                resultado["estado"] = "existente"
+                resultado["evidencia"] = "sesion restaurada (cookies)"
+                resultado["sesion_restaurada"] = True
+                self.estado_cuenta = "existente"
+                return resultado
+
+            codigo_red = self._navegar(_URL_LOGIN_CHANGE)
             if self._cancelado():
                 resultado["error"] = MENSAJE_CANCELADO
                 return resultado
+            if codigo_red:
+                # Proxy con TLS/red rota: NO es captcha ni "campo no encontrado".
+                resultado["error"] = self.ultimo_error
+                return resultado
+            # El home de login tambien puede quedar a medio cargar con proxies
+            # lentos: espera tolerante a que el DOM este listo (sin refrescos).
+            self._esperar_documento_listo(20)
             self._cerrar_banner_cookies()
 
             campo = self._asegurar_campo_email()
@@ -1499,6 +2762,8 @@ class ChangeOrgReportBot:
             vio_password_nueva = False
             password_enviada = False
             nombre_enviado = False
+            opcion_password_pulsada = False
+            intentos_opcion_password = 0
             error = ""
             confirmado = ""
             reto_iter = 0
@@ -1508,6 +2773,13 @@ class ChangeOrgReportBot:
                     break
                 captcha = self._detectar_captcha()
                 if captcha:
+                    # La sesion manda: si la pagina ya muestra evidencia real
+                    # de login (p. ej. avatar en la home), un resto de captcha
+                    # no debe bloquear con la espera asistida.
+                    evidencia = self._evidencia_sesion(email)
+                    if evidencia:
+                        confirmado = evidencia
+                        break
                     if self.esperar_captcha_seg > 0:
                         # MODO ASISTIDO: un humano lo resuelve y seguimos.
                         if self._esperar_reto_humano(captcha):
@@ -1519,6 +2791,11 @@ class ChangeOrgReportBot:
                     break
                 reto = self._detectar_reto_humano()
                 if reto:
+                    # Igual que con el captcha: evidencia de sesion primero.
+                    evidencia = self._evidencia_sesion(email)
+                    if evidencia:
+                        confirmado = evidencia
+                        break
                     if self.esperar_captcha_seg > 0:
                         # MODO ASISTIDO: espera (visible) y continua al limpiarse.
                         if self._esperar_reto_humano(reto):
@@ -1560,6 +2837,30 @@ class ChangeOrgReportBot:
 
                 if not password_enviada:
                     clave = self._campo_password()
+                    if clave is None and self._pantalla_codigo_temporal():
+                        # Cuenta existente: Change mando un codigo temporal al
+                        # correo y escondio la contraseña tras la opcion
+                        # "Ingresar con contraseña". Se pulsa UNA vez por
+                        # pantalla y se sigue el flujo normal (la proxima vuelta
+                        # encuentra el campo de contraseña y lo llena). Si la
+                        # opcion no aparece en varios intentos, se falla con el
+                        # error claro en vez del timeout generico.
+                        if (
+                            not opcion_password_pulsada
+                            and self._pulsar_opcion_password()
+                        ):
+                            opcion_password_pulsada = True
+                            continue
+                        if not opcion_password_pulsada:
+                            intentos_opcion_password += 1
+                            if (
+                                intentos_opcion_password
+                                >= _INTENTOS_OPCION_PASSWORD
+                            ):
+                                error = _ERROR_PANTALLA_CODIGO
+                                break
+                        time.sleep(0.5)
+                        continue
                     if clave is not None:
                         texto = _normalizar(self._texto_visible())
                         if any(frase in texto for frase in _FRASES_PANTALLA_NUEVA):
@@ -1614,6 +2915,18 @@ class ChangeOrgReportBot:
             resultado["estado"] = estado
             resultado["evidencia"] = confirmado
             self.estado_cuenta = estado
+            # Las cookies pueden rotar: actualizar SIEMPRE la sesion guardada
+            # (best-effort; `guardar_sesion_change` nunca lanza ni hace nada si
+            # `CHANGE_REUTILIZAR_SESION` esta desactivado).
+            try:
+                guardar_sesion_change(
+                    str(cuenta.get("usuario") or ""),
+                    self.driver,
+                    email,
+                    self.proxy,
+                )
+            except Exception:  # pragma: no cover - defensa extrema
+                pass
             return resultado
         except Exception as e:
             resultado["error"] = f"error inesperado en el registro: {e}"
@@ -1664,13 +2977,23 @@ class ChangeOrgReportBot:
         return None
 
     def _resolver_campo(self, tipo: str):
-        """Devuelve el elemento del campo pedido (selectores -> etiquetas)."""
+        """Devuelve el elemento del campo pedido (selectores -> etiquetas).
+
+        Para `motivo` agrega un respaldo JS (solo con el modal de denuncia
+        abierto): si Selenium no "ve" los campos del modal (radios invisibles
+        para `find_elements`, reportado en vivo) tampoco vera el textarea
+        recien montado por React.
+        """
         for by, selector in _SELECTORES_CAMPOS.get(tipo, ()):
             for elemento in self._buscar_elementos(by, selector):
                 if self._visible(elemento) and self._interactuable(elemento):
                     return elemento
         for etiqueta in _ETIQUETAS_CAMPOS.get(tipo, ()):
             elemento = self._campo_por_etiqueta(etiqueta, tipo)
+            if elemento is not None:
+                return elemento
+        if tipo == "motivo" and self._modal_denuncia_presente():
+            elemento = self._campo_motivo_js()
             if elemento is not None:
                 return elemento
         return None
@@ -1717,7 +3040,14 @@ class ChangeOrgReportBot:
     # Modal real "Denunciar abuso": radio 3 + pais + textarea
     # ------------------------------------------------------------------ #
     def _radios_denuncia(self) -> list:
-        """Radios visibles del modal de denuncia (motive del reporte)."""
+        """Radios visibles del modal de denuncia (motive del reporte).
+
+        Si Selenium no los encuentra (reportado en vivo: `find_elements`
+        devolvia 0 con el modal abierto), cae a un respaldo JS con
+        `execute_script` que SI los ve; los radios del respaldo NO se filtran
+        por `is_displayed` (la UI real los reporta con `display:inline-block`,
+        pero un falso negativo de Selenium no debe ocultarlos).
+        """
         radios = []
         for by, selector in (
             (By.CSS_SELECTOR, "input[type='radio']"),
@@ -1726,7 +3056,25 @@ class ChangeOrgReportBot:
             for elemento in self._buscar_elementos(by, selector):
                 if self._visible(elemento) and elemento not in radios:
                     radios.append(elemento)
+        if not radios:
+            radios = self._radios_denuncia_js()
         return radios
+
+    def _radios_denuncia_js(self) -> list:
+        """Radios del DOM via JS puro (`execute_script`), sin `find_elements`."""
+        try:
+            encontrados = self.driver.execute_script(
+                "return Array.prototype.slice.call("
+                "document.querySelectorAll(\"input[type='radio'], [role='radio']\"));"
+            )
+        except Exception:
+            return []
+        if not encontrados:
+            return []
+        try:
+            return list(encontrados)
+        except Exception:
+            return []
 
     def _texto_radio(self, radio) -> str:
         """Texto asociado a un radio: aria-label/value/texto + label[for]/padre."""
@@ -1757,30 +3105,216 @@ class ChangeOrgReportBot:
             pass
         return _normalizar(" ".join(str(p) for p in partes if p))
 
+    def _texto_modal_denuncia(self) -> str:
+        """Texto normalizado de los dialogos VISIBLES del modal ("" si no hay).
+
+        Si `element.text` viene vacio se lee `innerText`/`textContent` por JS
+        (tolerante): en vivo la evidencia del modal es el TEXTO del
+        `[role=dialog]`, no la visibilidad de los radios.
+        """
+        partes = []
+        for by, selector in (
+            (By.CSS_SELECTOR, "[role='dialog']"),
+            (By.CSS_SELECTOR, "[aria-modal='true']"),
+            (By.TAG_NAME, "dialog"),
+        ):
+            for elemento in self._buscar_elementos(by, selector):
+                if not self._visible(elemento):
+                    continue
+                texto = self._texto_elemento(elemento)
+                if not texto:
+                    try:
+                        texto = str(
+                            self.driver.execute_script(
+                                "return (arguments[0].innerText || "
+                                "arguments[0].textContent || '');",
+                                elemento,
+                            )
+                            or ""
+                        )
+                    except Exception:
+                        texto = ""
+                if texto:
+                    partes.append(texto)
+        return _normalizar(" ".join(partes))
+
+    def _modal_denuncia_presente(self) -> bool:
+        """True si un `[role=dialog]` VISIBLE trae el texto del modal.
+
+        `find_elements` de los radios puede devolver 0 con el modal abierto
+        (reportado en vivo); el texto del dialogo SI es fiable.
+        """
+        texto = self._texto_modal_denuncia()
+        if not texto:
+            return False
+        return any(frase in texto for frase in _FRASES_MODAL_DENUNCIA)
+
+    def _campo_motivo_js(self):
+        """Campo del motivo via JS puro (o None).
+
+        Respaldo para cuando Selenium no "ve" los campos del modal: busca
+        `textarea`/contenteditable y, si no, el input de React Aria del modal
+        real (`name="question1.answer"`, el texto opcional que aparece al
+        marcar el tercer motivo). El input generico solo se acepta DENTRO del
+        `[role=dialog]` para no tomar un campo ajeno de la pagina.
+        """
+        try:
+            return self.driver.execute_script(
+                "/* change_org:campo_motivo */"
+                "var dialogo = document.querySelector(\"[role='dialog']\");"
+                "var raiz = dialogo || document;"
+                "var e = raiz.querySelector(\"textarea, [contenteditable='true']\");"
+                "if (e) { return e; }"
+                "if (!dialogo) { return null; }"
+                "var campos = dialogo.querySelectorAll("
+                "\"input[type='text'], input:not([type])\");"
+                "var generico = null;"
+                "for (var i = 0; i < campos.length; i++) {"
+                "  var n = String(campos[i].name || '');"
+                "  if (n.indexOf('question') === 0 || n.indexOf('answer') >= 0) {"
+                "    return campos[i];"
+                "  }"
+                "  if (generico === null) { generico = campos[i]; }"
+                "}"
+                "return generico;"
+            )
+        except Exception:
+            return None
+
+    def _radio_marcado(self, radio) -> bool:
+        """True si el radio esta marcado (`checked`/`aria-checked`)."""
+        for atributo in ("checked", "aria-checked", "aria-selected"):
+            try:
+                valor = radio.get_attribute(atributo)
+            except Exception:
+                valor = None
+            if valor in (True, 1, "1", "true", "True", "checked"):
+                return True
+        return False
+
+    def _estado_radios_js(self) -> dict:
+        """Estado de los radios leido por JS puro ({} si no se puede)."""
+        try:
+            estado = self.driver.execute_script(_JS_ESTADO_RADIOS)
+        except Exception:
+            return {}
+        return estado if isinstance(estado, dict) else {}
+
+    def _seleccionar_motivo_js(self) -> bool:
+        """Marca el tercer motivo con JS puro (radios que Selenium no 've')."""
+        try:
+            estado = self.driver.execute_script(_JS_SELECCIONAR_MOTIVO)
+        except Exception as e:
+            logger.debug(f"Change.org: el JS para marcar el motivo fallo: {e}")
+            return False
+        return isinstance(estado, dict) and bool(
+            estado.get("checked") or estado.get("textarea")
+        )
+
+    def _verificar_motivo_seleccionado(self, habia_textarea: bool = False) -> bool:
+        """True si el motivo quedo marcado (evidencia de seleccion real).
+
+        Evidencia: `checked`/`aria-checked="true"` en el tercer radio (o en
+        cualquier radio: la UI real solo tiene 3), estado leido por JS puro
+        (radios que Selenium no "ve") o que APAREZCA el textarea del motivo
+        (`_esperar_textarea_motivo`). Si el textarea ya existia ANTES de la
+        estrategia no cuenta como evidencia.
+        """
+        radios = self._radios_denuncia()
+        if radios:
+            tercero = (
+                radios[_INDICE_MOTIVO_TERCERO]
+                if len(radios) > _INDICE_MOTIVO_TERCERO
+                else radios[-1]
+            )
+            if self._radio_marcado(tercero):
+                return True
+            if any(self._radio_marcado(radio) for radio in radios):
+                return True
+        estado = self._estado_radios_js()
+        if estado and (estado.get("tercero") or estado.get("alguno")):
+            return True
+        if not habia_textarea:
+            if self._esperar_textarea_motivo(intentos=3) is not None:
+                return True
+        return False
+
+    def _etiqueta_motivo_tercero(self, radios=None):
+        """Elemento clickable VISIBLE con el texto del tercer motivo (o None).
+
+        Busca `label`, `div.cursor-pointer` y roles clickables; como respaldo
+        sube desde el radio del tercer motivo a su `label`/padre.
+        """
+        for by, selector in (
+            (By.CSS_SELECTOR, "label"),
+            (By.CSS_SELECTOR, "div[class*='cursor-pointer']"),
+            (By.CSS_SELECTOR, "[role='radio']"),
+            (By.CSS_SELECTOR, "[role='button']"),
+            (By.CSS_SELECTOR, "[role='option']"),
+        ):
+            for elemento in self._buscar_elementos(by, selector):
+                if not (self._visible(elemento) and self._interactuable(elemento)):
+                    continue
+                texto = _normalizar(self._texto_elemento(elemento))
+                if texto and any(frase in texto for frase in _FRASES_MOTIVO_TERCERO):
+                    return elemento
+        for radio in list(radios) if radios else self._radios_denuncia():
+            texto = self._texto_radio(radio)
+            if not any(frase in texto for frase in _FRASES_MOTIVO_TERCERO):
+                continue
+            for xpath in ("./ancestor::label[1]", ".."):
+                for padre in self._buscar_elementos_de(radio, By.XPATH, xpath):
+                    if self._visible(padre):
+                        return padre
+        return None
+
     def _seleccionar_motivo_denuncia(self, radios=None):
-        """Marca el TERCER motivo ("No me gusta esta petición..."). (ok, error)."""
-        radios = list(radios if radios is not None else self._radios_denuncia())
+        """Marca el TERCER motivo ("No me gusta esta petición..."). (ok, error).
+
+        Estrategias EN CADENA, cada una VERIFICADA antes de pasar a la
+        siguiente (los radios nativos del modal no siempre son visibles para
+        `find_elements`; en vivo devolvia 0 con el modal abierto):
+          1. radios de Selenium (`_radios_denuncia`, con respaldo JS) + clic
+             normal/JS de `_clic_elemento`.
+          2. etiqueta visible clickable con el texto del motivo
+             (`_etiqueta_motivo_tercero`: label/div.cursor-pointer/padre).
+          3. JS puro: `input[type=radio]` por `value` (`dislike_content`) o
+             indice 2 con `.click()` + `dispatchEvent(MouseEvent)`.
+        Verificacion: `checked`/`aria-checked="true"` en el tercero, estado
+        por JS o que aparezca el textarea del motivo. Si NADA selecciona:
+        `_ERROR_MOTIVO_NO_SELECCIONABLE`.
+        """
+        radios = list(radios) if radios else []
         if not radios:
-            return False, "no se encontro el grupo de motivos de denuncia en el modal"
+            radios = self._radios_denuncia()
+        habia_textarea = self._resolver_campo("motivo") is not None
+
+        # (a) Radios de Selenium (o de su respaldo JS): clic normal.
         elegido = None
         for radio in radios:
             texto = self._texto_radio(radio)
             if any(frase in texto for frase in _FRASES_MOTIVO_TERCERO):
                 elegido = radio
                 break
-        if elegido is None:
-            if len(radios) >= 3:
-                elegido = radios[2]
-            else:
-                return False, (
-                    "no se encontro el tercer motivo de denuncia "
-                    "(no me gusta / no estoy de acuerdo) en el modal"
-                )
-        if not self._clic_elemento(elegido):
-            return False, (
-                self.ultimo_error or "no se pudo seleccionar el motivo de la denuncia"
-            )
-        return True, ""
+        if elegido is None and len(radios) > _INDICE_MOTIVO_TERCERO:
+            elegido = radios[_INDICE_MOTIVO_TERCERO]
+        if elegido is not None and self._clic_elemento(elegido):
+            if self._verificar_motivo_seleccionado(habia_textarea):
+                return True, ""
+
+        # (b) Etiqueta visible con el texto del tercer motivo (o el padre/label
+        #     del radio), tambien con fallback JS dentro de `_clic_elemento`.
+        etiqueta = self._etiqueta_motivo_tercero(radios)
+        if etiqueta is not None and self._clic_elemento(etiqueta):
+            if self._verificar_motivo_seleccionado(habia_textarea):
+                return True, ""
+
+        # (c) JS puro sobre los radios del DOM.
+        self._seleccionar_motivo_js()
+        if self._verificar_motivo_seleccionado(habia_textarea):
+            return True, ""
+
+        return False, _ERROR_MOTIVO_NO_SELECCIONABLE
 
     def _select_ubicacion(self):
         """Select de "¿Dónde vives?": por etiqueta -> el que tenga Mexico -> 1º."""
@@ -1902,7 +3436,7 @@ class ChangeOrgReportBot:
             return False, "no hay texto de queja para el formulario"
 
         radios = self._radios_denuncia()
-        if radios:
+        if radios or self._modal_denuncia_presente():
             ok_radio, problema = self._seleccionar_motivo_denuncia(radios)
             if not ok_radio:
                 return False, problema
@@ -2003,6 +3537,17 @@ class ChangeOrgReportBot:
         return "\n".join(partes)
 
     def _detectar_captcha(self) -> str:
+        """Detecta un captcha VISIBLE ("" si no hay).
+
+        Los SELECTORES exigen visibilidad real (`self._visible`). La
+        comprobacion por TEXTO usa SOLO el texto visible (`_texto_visible`),
+        NUNCA `page_source`: los scripts/config del sitio mencionan
+        "recaptcha"/"hcaptcha"/"captcha" aunque no haya captcha (falso positivo
+        reportado en la home logueada de Change.org). Por lo mismo, los
+        terminos GENERICOS (`_FRASES_CAPTCHA_GENERICAS`) no cuentan como frase
+        de texto: solo las señales inequivocas ("no soy un robot", "verifica
+        que eres humano", ...).
+        """
         selectores = (
             (By.CSS_SELECTOR, "iframe[src*='recaptcha']"),
             (By.CSS_SELECTOR, "iframe[src*='hcaptcha']"),
@@ -2014,8 +3559,10 @@ class ChangeOrgReportBot:
             for elemento in self._buscar_elementos(by, selector):
                 if self._visible(elemento):
                     return selector
-        texto = _normalizar(self._texto_pagina())
+        texto = _normalizar(self._texto_visible())
         for frase in _FRASES_CAPTCHA:
+            if frase in _FRASES_CAPTCHA_GENERICAS:
+                continue
             if frase in texto:
                 return frase
         return ""
@@ -2030,8 +3577,15 @@ class ChangeOrgReportBot:
         return ""
 
     def _formulario_presente(self) -> bool:
+        """True si el formulario de denuncia esta montado.
+
+        El modal de denuncia se detecta por el TEXTO de su `[role=dialog]`
+        (en vivo `find_elements` de los radios devolvia 0 con el modal
+        abierto); ademas se conservan los checks por campos/radios/clasico.
+        """
         return (
-            bool(self._radios_denuncia())
+            self._modal_denuncia_presente()
+            or bool(self._radios_denuncia())
             or self._resolver_campo("motivo") is not None
             or self._resolver_campo("nombre") is not None
             or self._resolver_campo("email") is not None
@@ -2084,6 +3638,76 @@ class ChangeOrgReportBot:
             return True, evidencia
         return False, evidencia or ultima
 
+    def _capturar_evidencia(self) -> str:
+        """Guarda un screenshot de la pantalla actual como evidencia del exito.
+
+        Crea `_DIR_CAPTURAS_CHANGE` (`data/reportes/change/`) si falta y guarda
+        ``change_{slug}_{YYYYmmdd_HHMMSS}.png``; el slug se sanea desde
+        "usuario"/"email" de `self.cuenta` (`_slug_captura`) y, si el nombre se
+        repite, agrega sufijo ``_1``, ``_2``... Devuelve la ruta del PNG o ""
+        si falla; NUNCA lanza y solo loguea la ruta (nunca datos de la cuenta).
+        """
+        try:
+            driver = getattr(self, "driver", None)
+            if driver is None:
+                return ""
+            carpeta = _DIR_CAPTURAS_CHANGE
+            os.makedirs(carpeta, exist_ok=True)
+            marca = datetime.now().strftime("%Y%m%d_%H%M%S")
+            base = f"change_{_slug_captura(self.cuenta)}_{marca}"
+            ruta = os.path.join(carpeta, f"{base}.png")
+            sufijo = 1
+            while os.path.exists(ruta) and sufijo <= 999:
+                ruta = os.path.join(carpeta, f"{base}_{sufijo}.png")
+                sufijo += 1
+            if driver.save_screenshot(ruta) is False:
+                logger.warning(
+                    "Change.org: save_screenshot devolvio False; sin evidencia"
+                )
+                return ""
+            logger.info(f"Change.org: evidencia del reporte guardada en {ruta}")
+            return ruta
+        except Exception as e:
+            logger.warning(
+                f"Change.org: no se pudo guardar la evidencia del reporte: {e}"
+            )
+            return ""
+
+    def _capturar_fallo(self) -> str:
+        """Captura de DEPURACION de un reporte fallido (solo diagnostico).
+
+        Guarda ``debug_fallo_{slug}_{YYYYmmdd_HHMMSS}.png`` en
+        `_DIR_CAPTURAS_CHANGE/debug/` (subcarpeta, para no mezclarla con las
+        evidencias de exito). Nunca lanza, no altera el flujo y solo loguea la
+        ruta; devuelve la ruta del PNG o "" si no se pudo.
+        """
+        try:
+            driver = getattr(self, "driver", None)
+            if driver is None:
+                return ""
+            carpeta = os.path.join(_DIR_CAPTURAS_CHANGE, "debug")
+            os.makedirs(carpeta, exist_ok=True)
+            marca = datetime.now().strftime("%Y%m%d_%H%M%S")
+            base = f"debug_fallo_{_slug_captura(self.cuenta)}_{marca}"
+            ruta = os.path.join(carpeta, f"{base}.png")
+            sufijo = 1
+            while os.path.exists(ruta) and sufijo <= 999:
+                ruta = os.path.join(carpeta, f"{base}_{sufijo}.png")
+                sufijo += 1
+            if driver.save_screenshot(ruta) is False:
+                logger.warning(
+                    "Change.org: save_screenshot devolvio False; sin captura "
+                    "de fallo"
+                )
+                return ""
+            logger.info(f"Change.org: captura de fallo guardada en {ruta}")
+            return ruta
+        except Exception as e:
+            logger.warning(
+                f"Change.org: no se pudo guardar la captura de fallo: {e}"
+            )
+            return ""
+
     # ------------------------------------------------------------------ #
     # Flujo principal
     # ------------------------------------------------------------------ #
@@ -2095,8 +3719,34 @@ class ChangeOrgReportBot:
         ese error y no toca la peticion; si entra bien, sigue con el reporte.
 
         Devuelve ``{"ok","email","nombre","apellido","queja","error","evidencia",
-        "url"}`` (+ ``"estado_cuenta"`` en modo cuenta; + ``"cancelado": True``
-        si se pidio el paro antes de enviar). Nunca lanza.
+        "url","captura"}`` (+ ``"estado_cuenta"`` en modo cuenta; + ``"cancelado":
+        True`` si se pidio el paro antes de enviar). `captura` es la ruta del
+        screenshot de evidencia cuando ok=True y "" en cualquier otro caso
+        (clave SIEMPRE presente); si el reporte FALLA con el navegador vivo se
+        guarda ademas UNA captura de depuracion en
+        `_DIR_CAPTURAS_CHANGE/debug/` (solo se loguea, no cambia el flujo).
+        Si tras navegar `_pagina_error_servidor()` detecta la pagina de error de
+        APLICACION de Change.org hace UN `driver.refresh()` + espera corta (~6s)
+        y re-chequea; si persiste devuelve ``error = _ERROR_SERVIDOR_PETICION``
+        SIN buscar el enlace (la captura de depuracion del finally se guarda
+        igual). Con proxy lento, tras navegar (y tras el `refresh` del error de
+        servidor) espera a que `document.readyState` sea 'complete' (~30s
+        maximo, `_esperar_documento_listo`) antes de buscar el enlace; si el
+        enlace no aparece, `_buscar_enlace_reporte` hace UNA segunda pasada con
+        `refresh` + espera antes de rendirse.
+
+        Timing/hidratacion: tras `_cerrar_banner_cookies()` espera BEST-EFFORT
+        a la app (`_esperar_app_peticion(30)`) y luego busca el enlace. Si el
+        modal de denuncia no aparece, hace una CADENA de intentos (log INFO por
+        intento): (1) clic + `_esperar_formulario(30)`; (2) 3s + re-localizar el
+        enlace + clic + `_esperar_formulario(25)`; (3) UNA recarga completa
+        (`_navegar(url_peticion)` + `_esperar_documento_listo(30)` +
+        `_esperar_app_peticion(30)` + re-localizar + clic + `_esperar_formulario(25)`);
+        (4) ULTIMO recurso: si el enlace trae un `href` http(s) de change.org
+        (nunca "#"/javascript), navega directo a el + `_esperar_formulario(25)`.
+        Si aun asi no aparece: ``"el formulario de reporte no aparecio
+        (url=...)"``. La cancelacion (`_cancelado`) y el error de red/servidor
+        se siguen respetando en todos los pasos. Nunca lanza.
         """
         identidad = dict(identidad or {})
         if not identidad and self.cuenta:
@@ -2110,6 +3760,7 @@ class ChangeOrgReportBot:
             "error": "",
             "evidencia": "",
             "url": self.url_peticion,
+            "captura": "",
         }
         if self._cancelado():
             resultado["cancelado"] = True
@@ -2136,6 +3787,9 @@ class ChangeOrgReportBot:
                 resultado["estado_cuenta"] = str(
                     registro.get("estado") or "fallo"
                 )
+                resultado["sesion_restaurada"] = bool(
+                    registro.get("sesion_restaurada")
+                )
                 if not registro.get("ok"):
                     resultado["error"] = str(
                         registro.get("error")
@@ -2148,34 +3802,147 @@ class ChangeOrgReportBot:
                 if _paro():
                     return resultado
 
-            self._navegar(self.url_peticion)
+            codigo_red = self._navegar(self.url_peticion)
             resultado["url"] = self._url_actual() or resultado["url"]
             if _paro():
                 return resultado
+            if codigo_red:
+                # Proxy con TLS/red rota: fallar YA (no buscar enlaces en una
+                # pagina de error ni reportar "no se encontro el enlace").
+                resultado["error"] = self.ultimo_error
+                return resultado
+
+            # Proxy lento: `get()` puede retornar con la pagina a medio cargar
+            # (imagenes rotas, paneles con spinner). Se espera a que el DOM
+            # quede listo ANTES de detectar errores y buscar el enlace.
+            documento_listo = self._esperar_documento_listo(30)
+            if documento_listo:
+                logger.debug(
+                    "Change.org: documento listo tras navegar a la peticion"
+                )
+            else:
+                logger.info(
+                    "Change.org: el documento no quedo listo en 30s; sigo con "
+                    "la busqueda del enlace"
+                )
+            if _paro():
+                return resultado
+
+            # Error de APLICACION de Change.org ("¡Oh no! Error del servidor"):
+            # la pantalla no es la peticion. UN refresh suele recuperarla; si
+            # persiste, fallar con el mensaje claro y NO buscar el enlace.
+            error_servidor = self._pagina_error_servidor()
+            if error_servidor:
+                logger.warning(
+                    "Change.org: la peticion respondio con la pagina de error "
+                    f"de servidor ('{error_servidor}'); refresco UNA vez"
+                )
+                try:
+                    self.driver.refresh()
+                except Exception as e:
+                    logger.debug(f"Change.org: el refresh fallo: {e}")
+                time.sleep(6)
+                # El refresh tambien puede tardar con proxy lento: se espera de
+                # nuevo a que el DOM quede listo antes de re-chequear.
+                listo_refresh = self._esperar_documento_listo(30)
+                logger.debug(
+                    "Change.org: documento tras el refresh: "
+                    + ("listo" if listo_refresh else "no listo")
+                )
+                if _paro():
+                    return resultado
+                if self._pagina_error_servidor():
+                    resultado["error"] = _ERROR_SERVIDOR_PETICION
+                    return resultado
 
             self._cerrar_banner_cookies()
+            if _paro():
+                return resultado
+
+            # La app React puede tardar en hidratar (el panel "Firma esta
+            # peticion" se queda con spinner y el clic NO abre el modal). La
+            # espera es BEST-EFFORT: no bloquea el flujo si no confirma.
+            self._esperar_app_peticion(30)
             if _paro():
                 return resultado
 
             enlace = self._buscar_enlace_reporte()
             if enlace is None:
                 if not self._cancelado():
-                    resultado["error"] = (
-                        "no se encontro el enlace de reporte de violacion de politicas"
-                    )
+                    if self._pagina_error_servidor():
+                        # Red de seguridad: la app fallo despues del chequeo
+                        # inicial y seguir buscando el enlace solo daria el
+                        # error generico engañoso.
+                        resultado["error"] = _ERROR_SERVIDOR_PETICION
+                    else:
+                        resultado["error"] = (
+                            "no se encontro el enlace de reporte de violacion de politicas"
+                        )
                 return resultado
-            if not self._clic_elemento(enlace):
-                resultado["error"] = (
-                    self.ultimo_error
-                    or "no se pudo abrir el formulario de reporte de politicas"
-                )
-                return resultado
-            if _paro():
-                return resultado
+            # Href http(s) del mismo dominio: ULTIMO recurso por navegacion
+            # directa si ningun clic logra abrir el modal (nunca "#").
+            href_directo = self._href_directo_enlace(enlace)
 
-            if not self._esperar_formulario():
-                if not self._cancelado():
-                    resultado["error"] = "el formulario de reporte no aparecio"
+            # Intento 1: clic normal + espera del modal (30s).
+            logger.info(
+                "Change.org: intento 1: clic en el enlace de reporte y espera "
+                f"del modal (url={self._url_actual() or self.url_peticion})"
+            )
+            abierto = self._clic_elemento(enlace) and self._esperar_formulario(30)
+            if not abierto and not self._cancelado():
+                # Intento 2: React quiza hidrato despues del primer clic; se
+                # espera 3s, se RE-LOCALIZA el enlace y se reintenta el clic
+                # (nativo + fallback JS dentro de `_clic_elemento`).
+                logger.info(
+                    "Change.org: el modal no aparecio al primer clic; espero 3s, "
+                    "re-localizo el enlace y reintento"
+                )
+                time.sleep(3)
+                if _paro():
+                    return resultado
+                enlace = self._buscar_enlace_reporte(intentos=3)
+                if enlace is not None:
+                    abierto = self._clic_elemento(enlace) and self._esperar_formulario(25)
+                if _paro():
+                    return resultado
+            if not abierto and not self._cancelado():
+                # Intento 3: UNA recarga COMPLETA del flujo (navegar la
+                # peticion de nuevo + esperas + re-localizar + clic).
+                logger.info(
+                    "Change.org: el modal sigue sin aparecer; recargo la peticion "
+                    "UNA vez y repito el flujo"
+                )
+                codigo_red = self._navegar(self.url_peticion)
+                if not codigo_red:
+                    self._esperar_documento_listo(30)
+                    self._esperar_app_peticion(30)
+                if _paro():
+                    return resultado
+                enlace = self._buscar_enlace_reporte(intentos=3)
+                if enlace is not None:
+                    abierto = self._clic_elemento(enlace) and self._esperar_formulario(25)
+                if _paro():
+                    return resultado
+            if not abierto and not self._cancelado() and href_directo:
+                # ULTIMO recurso: el enlace trae un href real de change.org;
+                # navegar directo a el y esperar el modal/formulario.
+                logger.info(
+                    "Change.org: el modal no aparece; ultimo recurso, navego "
+                    f"directo al href del enlace ({href_directo})"
+                )
+                self._navegar(href_directo)
+                abierto = self._esperar_formulario(25)
+                if _paro():
+                    return resultado
+            if not abierto:
+                if self._cancelado():
+                    resultado["cancelado"] = True
+                    resultado["error"] = MENSAJE_CANCELADO
+                else:
+                    resultado["error"] = (
+                        "el formulario de reporte no aparecio "
+                        f"(url={self._url_actual() or self.url_peticion})"
+                    )
                 return resultado
 
             ok_formulario, problema = self._llenar_formulario(identidad, queja)
@@ -2202,6 +3969,9 @@ class ChangeOrgReportBot:
             resultado["ok"] = bool(ok)
             resultado["evidencia"] = evidencia
             resultado["url"] = self._url_actual() or resultado["url"]
+            if ok:
+                # Evidencia visual SOLO del exito, con el driver aun vivo.
+                resultado["captura"] = self._capturar_evidencia()
             if not ok and not self._cancelado():
                 resultado["error"] = evidencia or "el envio no se pudo confirmar"
             if self._cancelado():
@@ -2214,6 +3984,14 @@ class ChangeOrgReportBot:
                 f"Change.org: error reportando {resultado['email'] or '(sin email)'}: {e}"
             )
             return resultado
+        finally:
+            # Diagnostico: UNA captura de depuracion si el reporte fallo y el
+            # navegador sigue vivo (tolerante: nunca cambia el resultado).
+            try:
+                if not resultado["ok"] and not resultado.get("cancelado"):
+                    self._capturar_fallo()
+            except Exception:
+                pass
 
     def _esperar_formulario(self, intentos: int = 20) -> bool:
         """Espera (~10s) a que monte el modal de denuncia (o el formulario nuevo)."""
@@ -2240,6 +4018,63 @@ def _queja_minima(contexto: str = "") -> str:
     if contexto:
         base += f" Motivo del reporte: {contexto[:200]}."
     return base + " Pido que la plataforma la revise y actue conforme a sus reglas."
+
+
+class _SelectorProxy:
+    """Elige el siguiente proxy VALIDO en round-robin (thread-safe).
+
+    - Antes de usar un candidato lo valida UNA vez con `proxy_change_valido`
+      (una validacion por proxy y corrida; no se re-valida en la misma corrida).
+    - Los candidatos que no validan (TLS/red rota) se SALTAN y se prueba el
+      siguiente, hasta ``len(proxies)`` candidatos.
+    - Si ninguno valida -> ``""`` (sin proxy) y suma ``sin_proxy``.
+    - ``descartados``: proxies UNICOS descartados por la validacion.
+    Nunca lanza.
+    """
+
+    def __init__(self, proxies):
+        self._proxies = [str(p) for p in (proxies or []) if p]
+        self._lock = threading.Lock()
+        self._validando_lock = threading.Lock()
+        self._estado: dict = {}   # proxy -> bool (validado en esta corrida)
+        self._indice = 0
+        self.sin_proxy = 0
+        self.descartados = 0
+
+    def siguiente(self) -> str:
+        """Devuelve el proximo proxy valido o "" si no hay/no valida ninguno."""
+        intentos = 0
+        total = len(self._proxies)
+        while intentos < total:
+            with self._lock:
+                indice = self._indice % total
+                self._indice += 1
+                proxy = self._proxies[indice]
+                estado = self._estado.get(proxy)
+            intentos += 1
+            if estado is True:
+                return proxy
+            if estado is False:
+                continue
+            # Validacion serializada con re-chequeo: UNA por proxy y corrida,
+            # aunque varios workers pidan proxy a la vez.
+            try:
+                with self._validando_lock:
+                    with self._lock:
+                        estado = self._estado.get(proxy)
+                    if estado is None:
+                        estado = bool(proxy_change_valido(proxy))
+                        with self._lock:
+                            self._estado[proxy] = estado
+                            if not estado:
+                                self.descartados += 1
+            except Exception:
+                estado = True  # nunca descartar por incertidumbre
+            if estado:
+                return proxy
+        with self._lock:
+            self.sin_proxy += 1
+        return ""
 
 
 def ejecutar_un_reporte(
@@ -2334,6 +4169,11 @@ def ejecutar_un_reporte(
     resultado.setdefault("error", "")
     resultado.setdefault("evidencia", "")
     resultado.setdefault("url", str(url_peticion or ""))
+    # Evidencia visual del reporte ("" si el backend no la capturo).
+    resultado.setdefault("captura", "")
+    # Clave adicional: True si el bot restauro la sesion persistida (cookies)
+    # en vez de hacer login/registro (aplica sobre todo al modo cuenta).
+    resultado.setdefault("sesion_restaurada", False)
     resultado["identidad"] = identidad
     resultado["cancelado"] = bool(resultado.get("cancelado", False)) or None
 
@@ -2386,7 +4226,9 @@ def registrar_cuenta_change(
     el callback de aviso de espera que usan las campanas.
 
     Resultado: ``{"ok","usuario","email","estado","nombre","apellido","error",
-    "evidencia","url","cancelado"}`` con ``estado in "nueva"|"existente"|"fallo"``.
+    "evidencia","url","cancelado","sesion_restaurada"}`` con ``estado in
+    "nueva"|"existente"|"fallo"``; ``sesion_restaurada=True`` cuando entro con
+    las cookies persistidas (sin captcha).
     """
     resultado = {
         "ok": False,
@@ -2399,6 +4241,7 @@ def registrar_cuenta_change(
         "evidencia": "",
         "url": "",
         "cancelado": False,
+        "sesion_restaurada": False,
     }
     if cancelar is not None:
         try:
@@ -2446,6 +4289,7 @@ def registrar_cuenta_change(
         resultado["estado"] = str(registro.get("estado") or "fallo")
         resultado["error"] = str(registro.get("error") or "")
         resultado["evidencia"] = str(registro.get("evidencia") or "")
+        resultado["sesion_restaurada"] = bool(registro.get("sesion_restaurada"))
         resultado["url"] = bot._url_actual()
         if cancelar is not None:
             try:
@@ -2512,6 +4356,7 @@ def ejecutar_campana_registros(
         "resultados": [],
         "proxies_total": 0,
         "sin_proxy": 0,
+        "proxies_descartados": 0,
         "error": "",
     }
     try:
@@ -2556,8 +4401,6 @@ def ejecutar_campana_registros(
 
         lock = threading.Lock()
         contadores = {
-            "proxy": 0,
-            "sin_proxy": 0,
             "hechas": 0,
             "exitosos": 0,
             "fallidos": 0,
@@ -2566,15 +4409,12 @@ def ejecutar_campana_registros(
             "omitidas": 0,
         }
         total = len(lista)
+        # Proxy round-robin SOLO con nodos validos (los de TLS/red rota se
+        # descartan y se prueba el siguiente; una validacion por corrida).
+        selector_proxy = _SelectorProxy(proxies)
 
         def _siguiente_proxy() -> str:
-            with lock:
-                if not proxies:
-                    contadores["sin_proxy"] += 1
-                    return ""
-                proxy = proxies[contadores["proxy"] % len(proxies)]
-                contadores["proxy"] += 1
-                return proxy
+            return selector_proxy.siguiente()
 
         def _procesar(item: dict) -> None:
             resumen["resultados"].append(item)
@@ -2761,12 +4601,14 @@ def ejecutar_campana_registros(
         resumen["nuevas"] = contadores["nuevas"]
         resumen["existentes"] = contadores["existentes"]
         resumen["omitidas"] = contadores["omitidas"]
-        resumen["sin_proxy"] = contadores["sin_proxy"]
+        resumen["sin_proxy"] = selector_proxy.sin_proxy
+        resumen["proxies_descartados"] = selector_proxy.descartados
         resumen["cancelada"] = bool(cancelada)
         logger.info(
             "Change.org: campana de registros terminada "
             f"({contadores['exitosos']} exitosos, {contadores['fallidos']} fallidos, "
-            f"{contadores['omitidas']} omitidas"
+            f"{contadores['omitidas']} omitidas, "
+            f"{selector_proxy.descartados} proxies descartados"
             + (", cancelada" if cancelada else "")
             + ")"
         )
@@ -2810,8 +4652,8 @@ def ejecutar_campana_reportes(
     - `cancelar` (threading.Event): deja de enviar nuevos reportes
       (``shutdown(cancel_futures=True)``) y marca ``cancelada=True``.
     - Resumen: ``{"total","enviados","fallidos","cancelada",
-      "identidades_guardadas","resultados","proxies_total","sin_proxy","error",
-      "con_cuentas","cuentas_total"}``. NUNCA lanza.
+      "identidades_guardadas","resultados","proxies_total","sin_proxy",
+      "proxies_descartados","error","con_cuentas","cuentas_total"}``. NUNCA lanza.
     """
     resumen = {
         "total": 0,
@@ -2822,6 +4664,7 @@ def ejecutar_campana_reportes(
         "resultados": [],
         "proxies_total": 0,
         "sin_proxy": 0,
+        "proxies_descartados": 0,
         "error": "",
         "con_cuentas": False,
         "cuentas_total": 0,
@@ -2874,23 +4717,18 @@ def ejecutar_campana_reportes(
         lock = threading.Lock()
         evitar: list = []
         contadores = {
-            "proxy": 0,
-            "sin_proxy": 0,
             "hechas": 0,
             "enviados": 0,
             "fallidos": 0,
             "guardadas": 0,
             "cuenta": 0,
         }
+        # Proxy round-robin SOLO con nodos validos (los de TLS/red rota se
+        # descartan y se prueba el siguiente; una validacion por corrida).
+        selector_proxy = _SelectorProxy(proxies)
 
         def _siguiente_proxy() -> str:
-            with lock:
-                if not proxies:
-                    contadores["sin_proxy"] += 1
-                    return ""
-                proxy = proxies[contadores["proxy"] % len(proxies)]
-                contadores["proxy"] += 1
-                return proxy
+            return selector_proxy.siguiente()
 
         def _siguiente_cuenta():
             """Cuenta de la BD para el siguiente reporte (round-robin)."""
@@ -3054,12 +4892,14 @@ def ejecutar_campana_reportes(
         resumen["enviados"] = contadores["enviados"]
         resumen["fallidos"] = contadores["fallidos"]
         resumen["identidades_guardadas"] = contadores["guardadas"]
-        resumen["sin_proxy"] = contadores["sin_proxy"]
+        resumen["sin_proxy"] = selector_proxy.sin_proxy
+        resumen["proxies_descartados"] = selector_proxy.descartados
         resumen["cancelada"] = bool(cancelada)
         logger.info(
             "Change.org: campana terminada "
             f"({contadores['enviados']} enviados, {contadores['fallidos']} fallidos, "
-            f"{contadores['guardadas']} identidades guardadas"
+            f"{contadores['guardadas']} identidades guardadas, "
+            f"{selector_proxy.descartados} proxies descartados"
             + (", cancelada" if cancelada else "")
             + ")"
         )

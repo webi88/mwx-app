@@ -7,16 +7,21 @@ Comandos registrados: /start /help /ayuda /status /cuentas
 /codigo.
 Callbacks: menu_*, cuentas_verificar, brandeo:*, perfil_*, foto_*.
 Fotos: MessageHandler(filters.PHOTO) -> foto_recibida.
+Handler de errores global (`_manejar_error`): el 409 Conflict del solape de
+deploy se loguea en UNA linea (sin traceback); el resto de errores con su
+tipo y mensaje.
 """
 
 import logging
 import os
 
 from dotenv import load_dotenv
+from telegram.error import Conflict
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
     CommandHandler,
+    ContextTypes,
     MessageHandler,
     filters,
 )
@@ -64,9 +69,37 @@ def obtener_token() -> str:
         return ""
 
 
+async def _manejar_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Error handler global (PTB v21): el 409 Conflict no ensucia el log.
+
+    Durante el solape del deploy viejo/nuevo, Telegram responde 409 a
+    `getUpdates` (`Conflict: terminated by other getUpdates request`); es
+    TRANSITORIO y PTB reintenta solo. Se registra en UNA linea (sin traceback)
+    con la accion a tomar si persistiera. Cualquier otro error se registra con
+    su tipo y mensaje (equivalente al default de PTB, sin el aviso "No error
+    handlers are registered").
+    """
+    error = getattr(context, "error", None)
+    if isinstance(error, Conflict):
+        log.warning(
+            "Conflicto de polling (409): hay otra instancia con este token "
+            "(normal durante un deploy). PTB reintentará solo; si persiste más "
+            "de ~5 min, busca un proceso/servicio duplicado. Detalle: %s",
+            error,
+        )
+        return
+    log.error(
+        "Error no controlado en el bot: %s: %s",
+        type(error).__name__,
+        error,
+        exc_info=error,
+    )
+
+
 def construir_app(token: str) -> Application:
     """Crea la Application y registra handlers (PTB v21)."""
     app = Application.builder().token(token).build()
+    app.add_error_handler(_manejar_error)
 
     # Comandos base / menu
     app.add_handler(CommandHandler("start", start))

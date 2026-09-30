@@ -19,6 +19,10 @@ Cubre:
     correcto -> sigue. Flujos con fakes PTB (codigo, nombre, foto, grupo,
     aislamiento por usuario) y admin `/nombre` (BD fake).
   - `import bot_clientes.main` no arranca nada y `main()` exige token.
+  - Handler de errores de PTB (`_manejar_error`) de AMBOS bots: un `Conflict`
+    (409) no lanza y loguea UN warning accionable sin traceback; un error comun
+    loguea ERROR con su tipo y mensaje. En `bot/main.py` ademas se verifica que
+    `construir_app` lo registre con `add_error_handler`.
 
 Uso:
     .venv/Scripts/python.exe tests/run_tests.py
@@ -1444,6 +1448,95 @@ def run(check) -> None:  # noqa: C901 - seccionado por bloques tematicos
         and any("falta TELEGRAM_CLIENTES_BOT_TOKEN" in m for m in resultado[3]),
     )
 
+    # ------------------------ ERROR HANDLER (409 CONFLICT, CLIENTES) ------
+    from telegram.error import Conflict
+
+    check(
+        "error handler (clientes): _manejar_error existe y es async",
+        asyncio.iscoroutinefunction(mod._manejar_error),
+    )
+    app_con_handler = mod.construir_app("123456:FAKE-TOKEN")
+    check(
+        "error handler (clientes): construir_app lo registra con add_error_handler",
+        list(app_con_handler.error_handlers) == [mod._manejar_error],
+    )
+    conflicto = Conflict(
+        "Conflict: terminated by other getUpdates request; make sure that only "
+        "one bot instance is running"
+    )
+    lanzado, registros = _ejecutar_error_handler(
+        mod._manejar_error, "bot_clientes.main", conflicto
+    )
+    mensaje = registros[0].getMessage() if registros else ""
+    check(
+        "error handler (clientes): Conflict no lanza y loguea UN warning "
+        "accionable sin traceback",
+        lanzado is None
+        and len(registros) == 1
+        and registros[0].levelno == logging.WARNING
+        and registros[0].exc_info is None
+        and "Conflicto de polling (409)" in mensaje
+        and "otra instancia con este token" in mensaje
+        and "PTB reintentará solo" in mensaje
+        and "proceso/servicio duplicado" in mensaje
+        and "terminated by other getUpdates request" in mensaje,
+    )
+    lanzado, registros = _ejecutar_error_handler(
+        mod._manejar_error, "bot_clientes.main", RuntimeError("boom inesperado")
+    )
+    mensaje = registros[0].getMessage() if registros else ""
+    check(
+        "error handler (clientes): error comun no lanza y loguea ERROR con tipo "
+        "y mensaje",
+        lanzado is None
+        and len(registros) == 1
+        and registros[0].levelno == logging.ERROR
+        and "RuntimeError" in mensaje
+        and "boom inesperado" in mensaje,
+    )
+
+    # ------------------------ ERROR HANDLER (409 CONFLICT, BOT INTERNO) ---
+    from bot import main as mod_interno
+
+    check(
+        "error handler (bot interno): _manejar_error existe y es async",
+        asyncio.iscoroutinefunction(mod_interno._manejar_error),
+    )
+    app_interno = mod_interno.construir_app("123456:FAKE-TOKEN")
+    check(
+        "error handler (bot interno): construir_app lo registra con "
+        "add_error_handler",
+        list(app_interno.error_handlers) == [mod_interno._manejar_error],
+    )
+    lanzado, registros = _ejecutar_error_handler(
+        mod_interno._manejar_error, "bot.main", conflicto
+    )
+    mensaje = registros[0].getMessage() if registros else ""
+    check(
+        "error handler (bot interno): Conflict no lanza y loguea UN warning "
+        "accionable sin traceback",
+        lanzado is None
+        and len(registros) == 1
+        and registros[0].levelno == logging.WARNING
+        and registros[0].exc_info is None
+        and "Conflicto de polling (409)" in mensaje
+        and "PTB reintentará solo" in mensaje
+        and "proceso/servicio duplicado" in mensaje,
+    )
+    lanzado, registros = _ejecutar_error_handler(
+        mod_interno._manejar_error, "bot.main", RuntimeError("boom inesperado")
+    )
+    mensaje = registros[0].getMessage() if registros else ""
+    check(
+        "error handler (bot interno): error comun no lanza y loguea ERROR con "
+        "tipo y mensaje",
+        lanzado is None
+        and len(registros) == 1
+        and registros[0].levelno == logging.ERROR
+        and "RuntimeError" in mensaje
+        and "boom inesperado" in mensaje,
+    )
+
 
 # --------------------------------------------------------------------------- #
 # Helpers de los checks de entrypoint (definidos abajo para no ensuciar)
@@ -1512,6 +1605,38 @@ class _CapturaLog(logging.Handler):
 
     def emit(self, record):
         self.mensajes.append(record.getMessage())
+
+
+class _CapturaRegistros(logging.Handler):
+    """Handler que guarda los `LogRecord` completos (nivel y exc_info)."""
+
+    def __init__(self):
+        super().__init__()
+        self.registros = []
+
+    def emit(self, record):
+        self.registros.append(record)
+
+
+def _ejecutar_error_handler(handler, nombre_logger, error):
+    """Corre `handler(None, context)` con `context.error` y captura el log.
+
+    Devuelve `(excepcion, registros)`: `excepcion` es lo que lanzo el handler
+    (None si no lanzo) y `registros` son los `LogRecord` emitidos.
+    """
+    contexto = types.SimpleNamespace(error=error)
+    captura = _CapturaRegistros()
+    logger = logging.getLogger(nombre_logger)
+    logger.addHandler(captura)
+    try:
+        try:
+            asyncio.run(handler(None, contexto))
+            lanzado = None
+        except Exception as e:  # el handler JAMAS debe lanzar
+            lanzado = e
+    finally:
+        logger.removeHandler(captura)
+    return lanzado, captura.registros
 
 
 class _FinPolling(Exception):
