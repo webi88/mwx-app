@@ -899,7 +899,7 @@ def test_firma_y_helpers(check):
         "self", "usuarios", "hashtags", "posts_min", "posts_max",
         "pausa_entre_posts_seg", "texto_base", "contexto", "narrativa",
         "menciones", "max_browsers", "permitir_pausadas", "duracion_max_min",
-        "cancelar", "callback",
+        "cancelar", "callback", "imagenes", "probabilidad_imagen",
     ]
     check(
         "orden y nombres de parametros congelados",
@@ -907,17 +907,22 @@ def test_firma_y_helpers(check):
         f"({nombres})",
     )
     check(
-        "defaults congelados (3..4, (60,240), 120, False)",
+        "defaults congelados (3..4, (60,240), 120, False, imagenes=None)",
         params["posts_min"].default == 3
         and params["posts_max"].default == 4
         and params["pausa_entre_posts_seg"].default == (60, 240)
         and params["permitir_pausadas"].default is False
         and params["duracion_max_min"].default == 120
-        and params["max_browsers"].default is None,
+        and params["max_browsers"].default is None
+        and params["imagenes"].default is None
+        and params["probabilidad_imagen"].default == 30,
     )
     check(
-        "kwargs al FINAL (duracion_max_min, cancelar, callback)",
-        nombres[-3:] == ["duracion_max_min", "cancelar", "callback"],
+        "kwargs al FINAL (duracion_max_min, cancelar, callback, imagenes, prob)",
+        nombres[-5:] == [
+            "duracion_max_min", "cancelar", "callback", "imagenes",
+            "probabilidad_imagen",
+        ],
     )
     check(
         "browsers: default <=3, tope 3 y minimo 1",

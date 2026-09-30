@@ -1378,6 +1378,11 @@ class MotorActivacion:
         self._cancelar = None
         # Evita repetir el INFO del paro mas de una vez por evento.
         self._paro_logueado = False
+        # Imagenes OPCIONALES para los posts del rol "hashtags": lista de
+        # rutas normalizadas y probabilidad (0-100) que se sortea POR POST.
+        # Sin imagenes configuradas todo se comporta igual que siempre.
+        self._imagenes_activacion: list = []
+        self._prob_imagen_activacion: float = 0.0
 
     _VENTANA_RECURSOS_SEG = 30.0
 
@@ -4015,8 +4020,122 @@ class MotorActivacion:
         except Exception:
             return True
 
+    # ------------------------------------------------------------------ #
+    # IMAGENES OPCIONALES DE LOS POSTS (rol "hashtags")
+    # ------------------------------------------------------------------ #
+    def _normalizar_imagenes_activacion(self, imagenes) -> list[str]:
+        """Normaliza las imagenes de una campana a una lista de rutas.
+
+        Acepta `None`, un texto con rutas separadas por saltos de linea, ';'
+        o '|', o una lista/tupla/set de rutas. Hace strip, descarta vacios y
+        deduplica preservando el orden (tope 100). Nunca lanza.
+        """
+        try:
+            if imagenes is None:
+                return []
+            if isinstance(imagenes, str):
+                crudo = re.split(r"[\r\n;|]+", imagenes)
+            elif isinstance(imagenes, (list, tuple, set)):
+                crudo = list(imagenes)
+            else:
+                crudo = [imagenes]
+            rutas, vistas = [], set()
+            for entrada in crudo:
+                ruta = str(entrada or "").strip()
+                if not ruta or ruta in vistas:
+                    continue
+                vistas.add(ruta)
+                rutas.append(ruta)
+                if len(rutas) >= 100:
+                    break
+            return rutas
+        except Exception:
+            return []
+
+    def _configurar_imagenes_activacion(self, imagenes,
+                                        probabilidad_imagen) -> int:
+        """Configura las imagenes/probabilidad de la campana en curso.
+
+        Normaliza `imagenes` con `_normalizar_imagenes_activacion`, clampa
+        `probabilidad_imagen` a [0,100] (acepta None/str/float; basura = 30) y
+        guarda AMBOS atributos SIEMPRE (si `imagenes` es None la lista queda
+        vacia: resetea entre campanas del mismo motor). Devuelve cuantas rutas
+        EXISTEN en disco. Nunca lanza.
+        """
+        try:
+            rutas = self._normalizar_imagenes_activacion(imagenes)
+        except Exception:
+            rutas = []
+        prob = None
+        try:
+            if probabilidad_imagen is not None:
+                texto_prob = str(probabilidad_imagen).strip()
+                if texto_prob:
+                    prob = float(texto_prob)
+        except (TypeError, ValueError):
+            prob = None
+        if prob is None or prob != prob:  # NaN tambien es basura
+            prob = 30.0
+        prob = max(0.0, min(100.0, prob))
+        self._imagenes_activacion = list(rutas)
+        self._prob_imagen_activacion = float(prob)
+        existentes = 0
+        for ruta in self._imagenes_activacion:
+            try:
+                if os.path.isfile(ruta):
+                    existentes += 1
+            except Exception:
+                continue
+        if self._imagenes_activacion:
+            prob_txt = (
+                str(int(prob)) if float(prob).is_integer() else str(prob)
+            )
+            logger.info(
+                f"Activaciones: {len(self._imagenes_activacion)} imagenes "
+                f"configuradas para los posts (probabilidad {prob_txt}%)"
+            )
+        else:
+            logger.info("Activaciones: sin imagenes para los posts")
+        return existentes
+
+    def _elegir_imagen_post(self) -> str:
+        """Ruta de una imagen al azar para el post, o "" (nunca lanza).
+
+        Sin imagenes configuradas o con probabilidad <= 0 devuelve "". Si la
+        probabilidad se cumple (`random.random() * 100 < prob`), elige al azar
+        SOLO entre las rutas que EXISTEN en disco; si ninguna existe devuelve
+        "" con un DEBUG.
+        """
+        try:
+            rutas = list(getattr(self, "_imagenes_activacion", None) or [])
+            if not rutas:
+                return ""
+            prob = float(
+                getattr(self, "_prob_imagen_activacion", 0.0) or 0.0
+            )
+            if prob <= 0:
+                return ""
+            if random.random() * 100.0 >= prob:
+                return ""
+            disponibles = []
+            for ruta in rutas:
+                try:
+                    if os.path.isfile(ruta):
+                        disponibles.append(ruta)
+                except Exception:
+                    continue
+            if not disponibles:
+                logger.debug(
+                    "Activaciones: ninguna imagen configurada existe en disco"
+                )
+                return ""
+            return random.choice(disponibles)
+        except Exception:
+            return ""
+
     def _accion_en_bot(self, bot, cuenta, rol: str, texto: str,
-                       dar_like: bool, url_objetivo: str) -> tuple:
+                       dar_like: bool, url_objetivo: str,
+                       imagen_path: str = "") -> tuple:
         """Ejecuta la accion del rol en un bot con la sesion ya lista.
 
         Replica EXACTAMENTE los metodos y detalles del flujo clasico
@@ -4111,9 +4230,22 @@ class MotorActivacion:
                 return (cuenta.usuario, rol, ok, detalle[:120], url_publicada)
 
             # rol == "hashtags"
-            res = bot.publicar_tweet(
-                texto, buscar_url=self._capturar_url_post()
-            )
+            if imagen_path:
+                try:
+                    res = bot.publicar_tweet(
+                        texto, imagen_path=imagen_path,
+                        buscar_url=self._capturar_url_post(),
+                    )
+                except TypeError:
+                    # Bot/fake viejo que no acepta `imagen_path`: se publica
+                    # el texto sin imagen (retrocompatible).
+                    res = bot.publicar_tweet(
+                        texto, buscar_url=self._capturar_url_post()
+                    )
+            else:
+                res = bot.publicar_tweet(
+                    texto, buscar_url=self._capturar_url_post()
+                )
             ok = bool(res)
             if isinstance(res, str):
                 url_publicada = _url_publicada_valida(res, cuenta.usuario)
@@ -4125,7 +4257,10 @@ class MotorActivacion:
             else:
                 url_publicada = ""
             if ok:
-                detalle = "hashtags publicados"
+                detalle = (
+                    "hashtags publicados (con imagen)" if imagen_path
+                    else "hashtags publicados"
+                )
             else:
                 motivo = getattr(bot, "ultimo_error", "") or "sin exito"
                 detalle = _detalle_con_sesion(f"hashtags: {motivo}")
@@ -4226,7 +4361,8 @@ class MotorActivacion:
 
     def _ejecutar_accion_en_pestana(self, pestana, cuenta, rol: str,
                                     texto: str, dar_like: bool,
-                                    url_objetivo: str) -> tuple:
+                                    url_objetivo: str,
+                                    imagen_path: str = "") -> tuple:
         """Ejecuta la accion del rol en una pestaña prestada del pool.
 
         Usa `_accion_en_bot` (mismo dispatch del camino clasico) y en el
@@ -4237,7 +4373,8 @@ class MotorActivacion:
         resultado = (cuenta.usuario, rol, False, "sin exito", url_objetivo)
         try:
             resultado = self._accion_en_bot(
-                bot, cuenta, rol, texto, dar_like, url_objetivo
+                bot, cuenta, rol, texto, dar_like, url_objetivo,
+                imagen_path=imagen_path,
             )
         except Exception as e:
             logger.error(
@@ -4612,6 +4749,11 @@ class MotorActivacion:
         """
         if rol == "post":
             rol = "hashtags"
+        # Imagen opcional SOLO para el rol "hashtags" (los posts de Tier 1):
+        # con imagen elegida la API GraphQL (solo texto) no sirve y la accion
+        # va directo a Selenium; sin imagenes configuradas esto es "" y nada
+        # cambia. El reintento interno puede volver a sortear otra imagen.
+        imagen_post = self._elegir_imagen_post() if rol == "hashtags" else ""
 
         # Paro total: ok=None (omitida) sin API, cuota ni navegador.
         if self._cancelado():
@@ -4645,9 +4787,13 @@ class MotorActivacion:
                     )
 
             # --- API PRIMERO (sin navegador ni gate). ---
-            resultado_api = self._probar_api_rol(
-                cuenta, rol, url_objetivo, texto, dar_like
-            )
+            # Con imagen en el post, la API GraphQL (solo texto) no sube
+            # media: se salta directo a Selenium.
+            resultado_api = None
+            if not imagen_post:
+                resultado_api = self._probar_api_rol(
+                    cuenta, rol, url_objetivo, texto, dar_like
+                )
             if resultado_api is not None:
                 return resultado_api
             if rol == "like":
@@ -4668,7 +4814,8 @@ class MotorActivacion:
                 pestana, cuenta
             ):
                 return self._ejecutar_accion_en_pestana(
-                    pestana, cuenta, rol, texto, dar_like, url_objetivo
+                    pestana, cuenta, rol, texto, dar_like, url_objetivo,
+                    imagen_path=imagen_post,
                 )
 
             # --- Selenium (fallback clasico): gate de navegadores. ---
@@ -4693,7 +4840,8 @@ class MotorActivacion:
                         detalle_sesion[:120], "",
                     )
                 resultado_accion = self._accion_en_bot(
-                    bot, cuenta, rol, texto, dar_like, url_objetivo
+                    bot, cuenta, rol, texto, dar_like, url_objetivo,
+                    imagen_path=imagen_post,
                 )
                 try:
                     if (
@@ -5474,6 +5622,8 @@ class MotorActivacion:
         curva_aceleracion: bool = False,
         curva_fase1_min=None,
         cancelar=None,
+        imagenes=None,
+        probabilidad_imagen=30,
     ) -> dict:
         """Campaña masiva dividida en subcuentas por rol (wrapper del flujo).
 
@@ -5487,6 +5637,8 @@ class MotorActivacion:
         hashtags). `curva_aceleracion`/`curva_fase1_min`: modo explosion
         (fase 1 solo Tier 1). `cancelar`: `threading.Event` (basta `is_set()`)
         para el PARO TOTAL; `None` = comportamiento actual exacto.
+        `imagenes`/`probabilidad_imagen`: imagenes OPCIONALES para los posts
+        del rol "hashtags" (una al azar por post segun la probabilidad 0-100).
         """
         inicio = time.monotonic()
         try:
@@ -5497,7 +5649,7 @@ class MotorActivacion:
                 cooldown_min, secciones, porcentaje_min_ronda,
                 porcentaje_max_ronda, pausa_comentario_url_seg,
                 reserva_usuarios, curva_aceleracion, curva_fase1_min,
-                cancelar,
+                cancelar, imagenes, probabilidad_imagen,
             )
         finally:
             self._cerrar_pestanas()
@@ -5531,6 +5683,8 @@ class MotorActivacion:
         curva_aceleracion: bool = False,
         curva_fase1_min=None,
         cancelar=None,
+        imagenes=None,
+        probabilidad_imagen=30,
     ) -> dict:
         """Campaña masiva dividida en subcuentas por rol.
 
@@ -5597,11 +5751,18 @@ class MotorActivacion:
           a mitad = los workers salen en segundos y lo pendiente queda
           OMITIDO (`ok=None` + `MENSAJE_CANCELADO`). `None` = comportamiento
           actual exacto (o el evento interno de `solicitar_paro()`).
+        - `imagenes`/`probabilidad_imagen`: imagenes OPCIONALES para los
+          posts del rol "hashtags" (una al azar por post con probabilidad
+          0-100; 0 = nunca). Con imagen la API de texto se omite y el post va
+          por Selenium. Sin imagenes (`None`) todo se comporta como siempre.
         - Nunca lanza: cada cuenta fallida se reporta en `detalles`.
         """
         # Cuotas horarias: cada campana arranca limpia y las prepara con las
         # cuentas ejecutables (mas abajo).
         self._cuotas = None
+        # Imagenes opcionales de los posts del rol "hashtags" (reset entre
+        # campanas del mismo motor; sin imagenes no cambia nada).
+        self._configurar_imagenes_activacion(imagenes, probabilidad_imagen)
         self._reset_curva_campana()
         urls = [str(u).strip() for u in (urls or []) if str(u).strip()]
         try:
@@ -6822,6 +6983,8 @@ class MotorActivacion:
         duracion_max_min=120,
         cancelar=None,
         callback=None,
+        imagenes=None,
+        probabilidad_imagen=30,
     ) -> dict:
         """Modo ACTIVIDAD: publicaciones suaves de 3-4 tweets por cuenta.
 
@@ -6843,6 +7006,9 @@ class MotorActivacion:
           deadline se cuentan en `omitidas_por_tiempo` sin abrir navegador.
         - `cancelar`: `threading.Event` para el PARO TOTAL; los posts no
           intentados se cuentan en `omitidas_por_cancelacion`.
+        - `imagenes`/`probabilidad_imagen`: imagenes OPCIONALES adjuntas a los
+          posts (una al azar por post segun la probabilidad 0-100; 0 = nunca).
+          Sin imagenes (`None`) el comportamiento es el actual exacto.
         - Tier: el rol efectivo es "hashtags", asi que Tier 2 y Tier 3 se
           omiten con el blindaje existente (`tier_omitidas`).
 
@@ -6869,6 +7035,8 @@ class MotorActivacion:
                 duracion_max_min=duracion_max_min,
                 cancelar=cancelar,
                 callback=callback,
+                imagenes=imagenes,
+                probabilidad_imagen=probabilidad_imagen,
             )
         except Exception as e:  # noqa: BLE001
             logger.error(
@@ -6894,9 +7062,13 @@ class MotorActivacion:
         self, usuarios, hashtags, posts_min, posts_max, pausa_entre_posts_seg,
         texto_base, contexto, narrativa, menciones, max_browsers,
         permitir_pausadas, duracion_max_min, cancelar, callback,
+        imagenes=None, probabilidad_imagen=30,
     ) -> dict:
         """Implementacion del modo ACTIVIDAD (reutiliza la maquinaria)."""
         self._cuotas = None
+        # Imagenes opcionales de los posts (una al azar por post segun la
+        # probabilidad 0-100; reset entre campanas del mismo motor).
+        self._configurar_imagenes_activacion(imagenes, probabilidad_imagen)
         self._reset_curva_campana()
         self._guardar_cancelar(cancelar)
 

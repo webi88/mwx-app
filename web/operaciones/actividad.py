@@ -43,6 +43,7 @@ from web.operaciones.activacion_masiva import (
     _lanzar_con_opciones_velocidad,
     _lanzar_motor,
     _panel_contexto_noticias,
+    _parametros_imagenes,
     _render_proceso_activo,
 )
 
@@ -301,6 +302,56 @@ def _formulario() -> None:
         help="Se agregan a los textos generados cuando la IA las acepte.",
     )
 
+    st.markdown("#### 🖼️ Imágenes para los posts (opcional)")
+    archivos_imagenes = st.file_uploader(
+        "Imágenes para los posts (puedes subir varias)",
+        type=["png", "jpg", "jpeg", "gif", "webp"],
+        accept_multiple_files=True,
+        key="actividad_imagenes",
+        help=(
+            "Los tweets de la actividad usan el rol Hashtags (posts "
+            "originales, típicamente Tier 1): se elige UNA imagen al azar por "
+            "tweet y solo en parte de ellos (según la probabilidad). Otros "
+            "roles/acciones no llevan imagen."
+        ),
+    )
+    prob_imagen = st.number_input(
+        "Probabilidad de publicar con imagen (%)",
+        min_value=0,
+        max_value=100,
+        value=30,
+        step=5,
+        key="actividad_prob_imagen",
+        help=(
+            "Porcentaje de tweets que se publican con una imagen al azar de "
+            "las subidas (0 = ninguno; 100 = todos)."
+        ),
+    )
+    rutas_imagenes: list = []
+    if archivos_imagenes:
+        from web.operaciones._helpers import guardar_imagen_subida
+
+        rutas_imagenes = [
+            ruta
+            for ruta in (
+                guardar_imagen_subida(archivo, prefijo=f"act_img_{i}")
+                for i, archivo in enumerate(archivos_imagenes)
+            )
+            if ruta
+        ]
+        if rutas_imagenes:
+            st.caption(
+                f"🖼️ {len(rutas_imagenes)} imagen(es) lista(s) para los "
+                f"posts (~{int(prob_imagen or 0)}% de los posts llevarán una "
+                "al azar)."
+            )
+        fallidas_imagenes = len(archivos_imagenes) - len(rutas_imagenes)
+        if fallidas_imagenes > 0:
+            st.warning(
+                f"⚠️ {fallidas_imagenes} imagen(es) no se pudieron guardar y "
+                "se ignorarán."
+            )
+
     with st.expander("🎯 Contexto del tema (opcional)", expanded=False):
         contexto = st.text_area(
             "Tema sobre el que deben hablar los tweets",
@@ -423,18 +474,25 @@ def _formulario() -> None:
             menciones=menciones,
             incluir_pausadas=bool(incluir_pausadas),
             limpiar_contexto=bool(limpiar_contexto),
+            imagenes=rutas_imagenes,
+            probabilidad_imagen=prob_imagen,
         )
 
 
 def _lanzar(tags, usuarios_sel, posts_min, posts_max, pausa_min, pausa_max,
             navegadores, duracion, contexto, narrativa, menciones,
-            incluir_pausadas, limpiar_contexto) -> None:
+            incluir_pausadas, limpiar_contexto, imagenes=None,
+            probabilidad_imagen=30) -> None:
     """Valida y lanza `MotorActivacion.ejecutar_actividad` (nunca lanza).
 
     Validaciones bloqueantes: hashtags 1-6, rango de tweets, rango de pausas y
     al menos una cuenta. Si el motor es viejo (sin `ejecutar_actividad`) avisa
     claramente y NO lanza. El lanzamiento real se delega en
     `_lanzar_con_opciones_velocidad` (panel persistente + paro + guard unico).
+
+    `imagenes`/`probabilidad_imagen`: imagenes opcionales de los posts. Se
+    pasan al motor SOLO si hay rutas Y el motor soporta el kwarg `imagenes`
+    (`_parametros_imagenes`); si no, aviso y la actividad sigue sin imagenes.
     """
     if not tags:
         st.error(
@@ -474,6 +532,11 @@ def _lanzar(tags, usuarios_sel, posts_min, posts_max, pausa_min, pausa_max,
         return
 
     motor = MotorActivacion(max_concurrente=int(navegadores))
+    # Imagenes de los posts: SOLO si hay rutas Y el motor soporta el kwarg
+    # `imagenes`; si no, aviso y la actividad sigue sin imagenes.
+    imagen_kwargs = _parametros_imagenes(
+        motor.ejecutar_actividad, imagenes, probabilidad_imagen
+    )
     lanzar = _lanzar_motor(
         motor.ejecutar_actividad,
         {
@@ -489,6 +552,7 @@ def _lanzar(tags, usuarios_sel, posts_min, posts_max, pausa_min, pausa_max,
             "max_browsers": int(navegadores),
             "permitir_pausadas": bool(incluir_pausadas),
             "duracion_max_min": _entero(duracion, 120),
+            **imagen_kwargs,
         },
     )
     _lanzar_con_opciones_velocidad(

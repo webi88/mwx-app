@@ -1747,6 +1747,43 @@ def _parametros_curva_reserva(func, curva: bool, curva_fase1, reserva_activa: bo
     return parametros
 
 
+def _parametros_imagenes(func, rutas, probabilidad) -> dict:
+    """Kwargs de imagenes para los posts SOLO si `func` (el motor) los acepta.
+
+    Reglas (peticion del dueño): las imagenes solo aplican al rol "hashtags"
+    (posts originales, tipicamente Tier 1); el motor elige UNA al azar por post
+    y solo en parte de los posts (segun la probabilidad). Devuelve:
+      - `{}` si no hay rutas (comportamiento clasico exacto).
+      - `{"imagenes": [...], "probabilidad_imagen": N}` si hay rutas Y el motor
+        soporta el kwarg (`_soporta_kwarg`).
+      - `{}` + `st.warning` si el motor es viejo (la campaña sigue SIN imagenes,
+        nunca se rompe el lanzamiento).
+    Nunca lanza.
+    """
+    try:
+        candidatas = [
+            str(r) for r in (rutas or []) if str(r or "").strip()
+        ]
+    except Exception:
+        candidatas = []
+    if not candidatas:
+        return {}
+    if _soporta_kwarg(func, "imagenes"):
+        try:
+            probabilidad_int = max(0, min(100, int(probabilidad)))
+        except (TypeError, ValueError):
+            probabilidad_int = 30
+        return {
+            "imagenes": candidatas,
+            "probabilidad_imagen": probabilidad_int,
+        }
+    st.warning(
+        "🖼️ Este motor todavía no soporta imágenes en los posts; la campaña "
+        "irá sin imágenes."
+    )
+    return {}
+
+
 def _lanzar_con_progreso_o_limpiar(lanzar, motor, duracion_min: int, repetir: bool,
                                    prefix: str, limpiar: bool,
                                    tipo: str = "citas",
@@ -3127,6 +3164,56 @@ def _por_roles():
             key="act_roles_menciones",
         )
 
+    st.markdown("#### 🖼️ Imágenes para los posts (opcional)")
+    archivos_imagenes = st.file_uploader(
+        "Imágenes para los posts (puedes subir varias)",
+        type=["png", "jpg", "jpeg", "gif", "webp"],
+        accept_multiple_files=True,
+        key="act_roles_imagenes",
+        help=(
+            "Solo aplica al rol Hashtags (posts originales, típicamente "
+            "Tier 1): se elige UNA imagen al azar por post y solo en parte de "
+            "los posts (según la probabilidad). Las citas, RT, comentarios y "
+            "likes NO llevan imagen."
+        ),
+    )
+    prob_imagen = st.number_input(
+        "Probabilidad de publicar con imagen (%)",
+        min_value=0,
+        max_value=100,
+        value=30,
+        step=5,
+        key="act_roles_prob_imagen",
+        help=(
+            "Porcentaje de posts con hashtag que se publican con una imagen "
+            "al azar de las subidas (0 = ninguno; 100 = todos)."
+        ),
+    )
+    rutas_imagenes: list = []
+    if archivos_imagenes:
+        from web.operaciones._helpers import guardar_imagen_subida
+
+        rutas_imagenes = [
+            ruta
+            for ruta in (
+                guardar_imagen_subida(archivo, prefijo=f"act_img_{i}")
+                for i, archivo in enumerate(archivos_imagenes)
+            )
+            if ruta
+        ]
+        if rutas_imagenes:
+            st.caption(
+                f"🖼️ {len(rutas_imagenes)} imagen(es) lista(s) para los "
+                f"posts (~{int(prob_imagen or 0)}% de los posts llevarán una "
+                "al azar)."
+            )
+        fallidas_imagenes = len(archivos_imagenes) - len(rutas_imagenes)
+        if fallidas_imagenes > 0:
+            st.warning(
+                f"⚠️ {fallidas_imagenes} imagen(es) no se pudieron guardar y "
+                "se ignorarán."
+            )
+
     with st.expander(
         "📰 Contexto desde noticias (opcional, solo trasfondo)", expanded=False
     ):
@@ -3568,6 +3655,11 @@ def _por_roles():
         pausa_kwargs = {}
         if _soporta_kwarg(motor.ejecutar_por_roles, "pausa_comentario_url_seg"):
             pausa_kwargs["pausa_comentario_url_seg"] = int(pausa_comentario)
+        # Imagenes de los posts: SOLO si hay archivos Y el motor soporta el
+        # kwarg (`imagenes`); si no, aviso y la campana sigue sin imagenes.
+        imagen_kwargs = _parametros_imagenes(
+            motor.ejecutar_por_roles, rutas_imagenes, prob_imagen
+        )
         parametros_extra = _parametros_curva_reserva(
             motor.ejecutar_por_roles,
             curva,
@@ -3600,6 +3692,7 @@ def _por_roles():
                 "porcentaje_min_ronda": int(pct_min),
                 "porcentaje_max_ronda": int(pct_max),
                 **pausa_kwargs,
+                **imagen_kwargs,
                 **parametros_extra,
             },
         )

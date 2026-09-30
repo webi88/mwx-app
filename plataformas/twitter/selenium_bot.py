@@ -5038,13 +5038,141 @@ try {
             f"({restante} chars)"
         )
     
-    def _subir_imagen(self, imagen_path: str):
+    # Selector historico del input de archivo de imagen de X (compatibilidad).
+    _INPUT_IMAGEN_SELECTOR = "input[type='file'][accept*='image']"
+    # Selectores de la vista previa del adjunto, en orden de preferencia.
+    # `solo_dialogo=True` limita la busqueda al `div[role='dialog']`: fuera de
+    # ahi la foto de perfil de la cuenta tambien usa `img[src^='blob:']`.
+    _SELECTORES_VISTA_PREVIA_IMAGEN = (
+        ("[data-testid='attachments']", False),
+        ("[data-testid='tweetPhoto']", False),
+        ("img[src^='blob:']", True),
+        ("[aria-label*='Media']", False),
+        ("[aria-label*='multimedia']", False),
+        ("[aria-label*='Imagen']", False),
+        ("[aria-label*='Image']", False),
+    )
+
+    def _buscar_input_imagen(self):
+        """Devuelve el `input[type='file']` de imagen del compositor (o None).
+
+        Busca PRIMERO dentro de un `div[role='dialog']` VISIBLE (el modal de
+        respuesta/cita monta ahi su propio input; el composer inline puede
+        estar tapado por el mask) y cae al selector global historico para no
+        romper los flujos donde no hay dialogo. Nunca lanza.
+        """
         try:
-            input_file = self.driver.find_element(By.CSS_SELECTOR, "input[type='file'][accept*='image']")
+            for dlg in self.driver.find_elements(By.CSS_SELECTOR, "div[role='dialog']"):
+                try:
+                    if not dlg.is_displayed():
+                        continue
+                except Exception:
+                    pass
+                try:
+                    for input_file in dlg.find_elements(
+                        By.CSS_SELECTOR, self._INPUT_IMAGEN_SELECTOR
+                    ):
+                        return input_file
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        try:
+            return self.driver.find_element(
+                By.CSS_SELECTOR, self._INPUT_IMAGEN_SELECTOR
+            )
+        except Exception:
+            return None
+
+    def _vista_previa_imagen(self) -> bool:
+        """True si el compositor ya muestra la vista previa del adjunto.
+
+        Recorre los selectores conocidos primero DENTRO de los dialogos
+        visibles (modal de respuesta/cita) y luego en toda la pagina; los
+        `img[src^='blob:']` solo cuentan dentro del dialogo (fuera, la foto de
+        perfil de la cuenta tambien es `blob:` y daria un falso positivo).
+        Nunca lanza: ante cualquier error devuelve False.
+        """
+        def _visible(elemento) -> bool:
+            try:
+                return bool(elemento.is_displayed())
+            except Exception:
+                # Sin API de visibilidad (fakes/variantes): cuenta la presencia.
+                return True
+
+        dialogos = []
+        try:
+            for dlg in self.driver.find_elements(By.CSS_SELECTOR, "div[role='dialog']"):
+                if _visible(dlg):
+                    dialogos.append(dlg)
+        except Exception:
+            dialogos = []
+
+        for selector, solo_dialogo in self._SELECTORES_VISTA_PREVIA_IMAGEN:
+            alcances = list(dialogos)
+            if not solo_dialogo:
+                alcances.append(self.driver)
+            for alcance in alcances:
+                try:
+                    for elemento in alcance.find_elements(By.CSS_SELECTOR, selector):
+                        if _visible(elemento):
+                            return True
+                except Exception:
+                    continue
+        return False
+
+    def _esperar_vista_previa_imagen(
+        self, timeout: float = 15.0, intervalo: float = 0.3
+    ) -> bool:
+        """Espera ACTIVA a que aparezca la vista previa del adjunto.
+
+        Una imagen real puede tardar mas que el `sleep(1.5)` fijo de antes:
+        si se sigue antes de que X monte la vista previa, el boton "Post"
+        queda deshabilitado y el post falla. Sondea cada `intervalo` segundos
+        (0.3) hasta `timeout` (configurable; los tests usan valores pequenos)
+        y devuelve True en cuanto la detecta. `timeout <= 0` hace UNA
+        comprobacion inmediata. Nunca lanza.
+        """
+        fin = time.time() + max(0.0, float(timeout or 0.0))
+        while True:
+            if self._vista_previa_imagen():
+                return True
+            if time.time() >= fin:
+                return False
+            time.sleep(max(0.05, float(intervalo)))
+
+    def _subir_imagen(self, imagen_path: str, timeout: float = 15.0):
+        """Adjunta una imagen al compositor y espera su vista previa.
+
+        Localiza el `input[type='file']` (dentro del dialogo del compositor y,
+        si no, en la pagina), envia la ruta absoluta y espera ACTIVAMENTE
+        (poll ~0.3s, `timeout` configurable) a que X muestre la vista previa:
+        con una imagen real la subida/procesado puede tardar mas que el
+        `sleep(1.5)` fijo anterior y el boton "Post" seguia deshabilitado
+        ("boton Post deshabilitado"). NUNCA lanza: si la vista previa no
+        aparece en el plazo, deja constancia y CONTINUA (la espera del boton
+        Post absorbe el resto de la carga).
+        """
+        if timeout is None:
+            timeout = 15.0
+        try:
+            input_file = self._buscar_input_imagen()
+            if input_file is None:
+                logger.warning(
+                    "No se encontro el input de imagen del compositor de X; "
+                    f"no se adjunta {os.path.basename(imagen_path)}"
+                )
+                return
             input_file.send_keys(os.path.abspath(imagen_path))
-            # La espera del boton Post habilitado (o la verificacion real)
-            # absorbe el tiempo de subida; 3s fijos eran de mas.
-            time.sleep(1.5)
+            if self._esperar_vista_previa_imagen(timeout):
+                # Cortesia: un instante para que X termine de montar el
+                # adjunto antes del boton Post (antes eran 1.5s fijos).
+                time.sleep(0.2)
+                return
+            logger.warning(
+                f"La vista previa de la imagen no aparecio en {float(timeout):.1f}s; "
+                "se continua (la espera del boton Post puede absorber la carga)"
+            )
         except Exception as e:
             logger.error(f"Error subiendo imagen: {e}")
     
