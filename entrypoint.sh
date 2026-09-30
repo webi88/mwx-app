@@ -38,5 +38,9 @@ if [ "${VNC_ACTIVO:-0}" = "1" ]; then
     fi
 fi
 
+# Diagnostico de puertos: en Railway el Target port del dominio publico debe
+# ser 8501 (el dashboard escucha SIEMPRE en 8501; ver supervisord.conf).
+echo "[entrypoint] PORT plataforma=${PORT:-<no definida>} | dashboard escuchara en 8501 (Target port del dominio: 8501)"
+
 echo "[entrypoint] Arrancando supervisord ..."
 exec "$@"
