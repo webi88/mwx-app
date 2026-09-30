@@ -143,7 +143,7 @@ import core.database as database  # noqa: E402
 import cuentas.change_org as change_org  # noqa: E402
 import ia.generador_contenido as gc  # noqa: E402
 from core.database import Base  # noqa: E402
-from core.models import CuentaChange  # noqa: E402
+from core.models import CuentaChange, SesionChange  # noqa: E402
 from cuentas.change_org import (  # noqa: E402
     MENSAJE_CANCELADO,
     ChangeOrgReportBot,
@@ -5634,6 +5634,251 @@ def test_sesion_persistente(check):
 
 
 # --------------------------------------------------------------------------- #
+# (19b) Sesion persistente en BD (tabla `sesion_change`) + cache en archivo
+# --------------------------------------------------------------------------- #
+def test_sesion_persistente_bd(check):
+    """Cubre la persistencia de sesiones en la BD (sqlite en memoria).
+
+    La tabla `sesion_change` se prueba SIEMPRE contra un engine EN MEMORIA:
+    aqui NUNCA se toca `data/gestor_redes.db` ni Supabase, y el archivo de
+    sesion vive en un temp dir (monkeypatch de `_DIR_SESIONES_CHANGE`).
+    """
+    print("(19b) sesion persistente en BD (archivo + tabla sesion_change)")
+    engine = _engine_memoria()
+    Base.metadata.create_all(engine)
+    fabrica = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
+    engine_vacio = None
+
+    def _fila(usuario):
+        db = fabrica()
+        try:
+            return (
+                db.query(SesionChange)
+                .filter(SesionChange.usuario == usuario)
+                .first()
+            )
+        finally:
+            db.close()
+
+    def _contar(usuario):
+        db = fabrica()
+        try:
+            return (
+                db.query(SesionChange)
+                .filter(SesionChange.usuario == usuario)
+                .count()
+            )
+        finally:
+            db.close()
+
+    try:
+        # --- guardar: archivo + UPSERT en BD ---
+        with tempfile.TemporaryDirectory(prefix="change_sesion_bd_") as tmp, \
+                mock.patch.object(change_org, "_DIR_SESIONES_CHANGE", tmp), \
+                mock.patch.object(database, "SessionLocal", fabrica), \
+                mock.patch.dict(os.environ):
+            os.environ.pop("CHANGE_REUTILIZAR_SESION", None)
+            cookies = [
+                {
+                    "name": "session_id",
+                    "value": "abc123",
+                    "domain": ".change.org",
+                    "path": "/",
+                }
+            ]
+            driver = FakeDriver()
+            driver.cookies = cookies
+            check(
+                "sesion bd: guardar escribe archivo Y fila en sesion_change",
+                change_org.guardar_sesion_change(
+                    "bd_user_1", driver, "bd1@x.com", "p-bd"
+                )
+                is True
+                and os.path.isfile(change_org._ruta_sesion_change("bd_user_1"))
+                and _contar("bd_user_1") == 1,
+                f"filas={_contar('bd_user_1')}",
+            )
+            fila = _fila("bd_user_1")
+            check(
+                "sesion bd: fila con usuario/cookies/email/proxy/actualizada",
+                fila is not None
+                and fila.usuario == "bd_user_1"
+                and isinstance(fila.cookies_json, dict)
+                and fila.cookies_json.get("cookies") == cookies
+                and fila.cookies_json.get("email") == "bd1@x.com"
+                and fila.cookies_json.get("proxy") == "p-bd"
+                and fila.actualizada is not None,
+                str(getattr(fila, "cookies_json", None))[:120],
+            )
+
+            # --- UPSERT: una segunda vez no duplica y actualiza ---
+            cookies2 = [
+                {"name": "session_id", "value": "NUEVA", "domain": ".change.org"}
+            ]
+            driver2 = FakeDriver()
+            driver2.cookies = cookies2
+            change_org.guardar_sesion_change("bd_user_1", driver2, "bd1@x.com")
+            check(
+                "sesion bd: UPSERT no duplica y actualiza las cookies",
+                _contar("bd_user_1") == 1
+                and _fila("bd_user_1").cookies_json.get("cookies") == cookies2,
+                f"filas={_contar('bd_user_1')}",
+            )
+
+            # --- cargar cae a BD sin archivo (mismo contrato) y cachea ---
+            os.remove(change_org._ruta_sesion_change("bd_user_1"))
+            datos = change_org.cargar_sesion_change("bd_user_1")
+            check(
+                "sesion bd: cargar cae a BD con el mismo contrato de dict",
+                isinstance(datos, dict)
+                and set(datos) == {"usuario", "email", "guardada", "proxy", "cookies"}
+                and datos["cookies"] == cookies2
+                and datos["usuario"] == "bd_user_1",
+                str(sorted(datos)) if isinstance(datos, dict) else repr(datos),
+            )
+            check(
+                "sesion bd: al recuperar de BD deja copia en el archivo (cache)",
+                os.path.isfile(change_org._ruta_sesion_change("bd_user_1")),
+            )
+
+            # --- el archivo valido manda sobre la BD ---
+            archivo_datos = {
+                "usuario": "bd_user_1",
+                "email": "archivo@x.com",
+                "guardada": "2026-01-01T00:00:00",
+                "proxy": "p-archivo",
+                "cookies": [{"name": "del_archivo", "value": "1"}],
+            }
+            change_org._escribir_json_atomico(
+                change_org._ruta_sesion_change("bd_user_1"), archivo_datos
+            )
+            check(
+                "sesion bd: un archivo valido manda sobre la BD",
+                change_org.cargar_sesion_change("bd_user_1") == archivo_datos,
+            )
+
+            # --- archivo corrupto -> fallback a la BD ---
+            with open(
+                change_org._ruta_sesion_change("bd_user_1"), "w", encoding="utf-8"
+            ) as archivo:
+                archivo.write("{corrupto")
+            check(
+                "sesion bd: archivo corrupto -> cae a la BD (y re-cachea)",
+                (change_org.cargar_sesion_change("bd_user_1") or {}).get("cookies")
+                == cookies2
+                and os.path.isfile(change_org._ruta_sesion_change("bd_user_1")),
+            )
+
+            # --- borrar: archivo + fila ---
+            check(
+                "sesion bd: borrar limpia archivo Y fila de BD",
+                change_org.borrar_sesion_change("bd_user_1") is True
+                and not os.path.isfile(change_org._ruta_sesion_change("bd_user_1"))
+                and _contar("bd_user_1") == 0,
+                f"filas={_contar('bd_user_1')}",
+            )
+            check(
+                "sesion bd: borrar de nuevo -> False, sin lanzar",
+                change_org.borrar_sesion_change("bd_user_1") is False,
+            )
+            check(
+                "sesion bd: cargar tras borrar -> None",
+                change_org.cargar_sesion_change("bd_user_1") is None,
+            )
+
+            # --- otros usuarios / sin fila / env desactivado ---
+            change_org.guardar_sesion_change("bd_user_2", driver2, "bd2@x.com")
+            os.remove(change_org._ruta_sesion_change("bd_user_2"))
+            check(
+                "sesion bd: usuario sin archivo ni fila -> None",
+                change_org.cargar_sesion_change("bd_sin_fila") is None,
+            )
+            check(
+                "sesion bd: cargar de BD un segundo usuario",
+                (change_org.cargar_sesion_change("bd_user_2") or {}).get("cookies")
+                == cookies2,
+            )
+            with mock.patch.dict(os.environ, {"CHANGE_REUTILIZAR_SESION": "0"}):
+                check(
+                    "sesion bd: env off -> no guarda ni carga (aunque haya fila)",
+                    change_org.guardar_sesion_change("bd_user_2", driver2) is False
+                    and change_org.cargar_sesion_change("bd_user_2") is None,
+                )
+
+        # --- BD caida: guardar/cargar/borrar NUNCA lanzan ---
+        with tempfile.TemporaryDirectory(prefix="change_sesion_bd_rota_") as tmp, \
+                mock.patch.object(change_org, "_DIR_SESIONES_CHANGE", tmp), \
+                mock.patch.dict(os.environ):
+            os.environ.pop("CHANGE_REUTILIZAR_SESION", None)
+            driver = FakeDriver()
+            driver.cookies = [{"name": "auth", "value": "tok"}]
+
+            def _sesion_rota():
+                raise RuntimeError("bd caida")
+
+            with mock.patch.object(database, "SessionLocal", _sesion_rota):
+                lanzado = False
+                try:
+                    guardado = change_org.guardar_sesion_change("bd_roto", driver)
+                except Exception:
+                    lanzado = True
+                    guardado = None
+                check(
+                    "sesion bd caida: guardar escribe archivo y NO lanza",
+                    lanzado is False
+                    and guardado is True
+                    and os.path.isfile(change_org._ruta_sesion_change("bd_roto")),
+                    f"guardado={guardado} lanzado={lanzado}",
+                )
+                check(
+                    "sesion bd caida: cargar usa el archivo sin lanzar",
+                    (change_org.cargar_sesion_change("bd_roto") or {}).get("cookies")
+                    == [{"name": "auth", "value": "tok"}],
+                )
+                os.remove(change_org._ruta_sesion_change("bd_roto"))
+                check(
+                    "sesion bd caida: cargar sin archivo -> None sin lanzar",
+                    change_org.cargar_sesion_change("bd_roto") is None,
+                )
+                check(
+                    "sesion bd caida: borrar -> False sin lanzar",
+                    change_org.borrar_sesion_change("bd_roto") is False,
+                )
+
+        # --- tabla faltante: init_db UNA vez y reintento (guardar) ---
+        engine_vacio = _engine_memoria()
+        fabrica_vacia = sessionmaker(
+            bind=engine_vacio, autoflush=False, expire_on_commit=False
+        )
+        llamadas_init = []
+
+        def _init_fake():
+            llamadas_init.append(1)
+            Base.metadata.create_all(engine_vacio)
+
+        with tempfile.TemporaryDirectory(prefix="change_sesion_bd_init_") as tmp, \
+                mock.patch.object(change_org, "_DIR_SESIONES_CHANGE", tmp), \
+                mock.patch.dict(os.environ), \
+                mock.patch.object(database, "SessionLocal", fabrica_vacia), \
+                mock.patch.object(database, "init_db", _init_fake):
+            os.environ.pop("CHANGE_REUTILIZAR_SESION", None)
+            driver = FakeDriver()
+            driver.cookies = [{"name": "auth", "value": "tok"}]
+            guardado = change_org.guardar_sesion_change("bd_init", driver)
+            with fabrica_vacia() as db:
+                filas = db.query(SesionChange).filter_by(usuario="bd_init").count()
+            check(
+                "sesion bd: tabla faltante -> init_db UNA vez y reintenta",
+                guardado is True and llamadas_init == [1] and filas == 1,
+                f"init={llamadas_init} filas={filas}",
+            )
+    finally:
+        if engine_vacio is not None:
+            engine_vacio.dispose()
+        engine.dispose()
+
+
+# --------------------------------------------------------------------------- #
 # (20) Captura de evidencia de los reportes exitosos (screenshot)
 # --------------------------------------------------------------------------- #
 def test_captura_evidencia(check):
@@ -6397,12 +6642,24 @@ def run(check):
 
     TODO el archivo corre con `_DIR_SESIONES_CHANGE` y `_DIR_CAPTURAS_CHANGE`
     apuntando a directorios temporales: la suite NUNCA escribe en
-    `data/cookies/change/` ni en `data/reportes/change/` reales.
+    `data/cookies/change/` ni en `data/reportes/change/` reales. Ademas el
+    solucionador CapSolver se desactiva (`CHANGE_CAPTCHA_SOLVER=off`) para que
+    un `CAPSOLVER_API_KEY` real en `.env` no cambie los flujos CLASICOS que
+    este archivo verifica (el captcha automatico se cubre en
+    `tests/test_change_captcha_api.py`). La tabla `sesion_change` (BD) se
+    prueba SIEMPRE contra un sqlite EN MEMORIA (`database.SessionLocal`
+    parcheado): la suite NUNCA toca la BD real ni Supabase.
     """
-    with tempfile.TemporaryDirectory(prefix="change_sesiones_") as sesiones_tmp, \
-            tempfile.TemporaryDirectory(prefix="change_capturas_") as capturas_tmp, \
-            mock.patch.object(change_org, "_DIR_SESIONES_CHANGE", sesiones_tmp), \
-            mock.patch.object(change_org, "_DIR_CAPTURAS_CHANGE", capturas_tmp):
+    engine_bd = _engine_memoria()
+    Base.metadata.create_all(engine_bd)
+    fabrica_bd = sessionmaker(bind=engine_bd, autoflush=False, expire_on_commit=False)
+    try:
+        with tempfile.TemporaryDirectory(prefix="change_sesiones_") as sesiones_tmp, \
+                tempfile.TemporaryDirectory(prefix="change_capturas_") as capturas_tmp, \
+                mock.patch.object(change_org, "_DIR_SESIONES_CHANGE", sesiones_tmp), \
+                mock.patch.object(change_org, "_DIR_CAPTURAS_CHANGE", capturas_tmp), \
+                mock.patch.object(database, "SessionLocal", fabrica_bd), \
+                mock.patch.dict(os.environ, {"CHANGE_CAPTCHA_SOLVER": "off"}):
             test_generar_identidad(check)
             test_proxies(check)
             test_error_navegacion_pagina(check)
@@ -6432,8 +6689,11 @@ def run(check):
             test_modo_asistido(check)
             test_campana_espera_captcha(check)
             test_sesion_persistente(check)
+            test_sesion_persistente_bd(check)
             test_captura_evidencia(check)
             test_app_peticion_y_reintentos(check)
+    finally:
+        engine_bd.dispose()
 
 
 if __name__ == "__main__":

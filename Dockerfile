@@ -13,6 +13,7 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends \
     wget curl gnupg unzip ca-certificates \
     xclip xsel xvfb supervisor fonts-liberation \
+    x11vnc novnc websockify \
     libnss3 libasound2 libgbm1 libx11-6 libx11-xcb1 libxcb1 \
     libxcomposite1 libxdamage1 libxrandr2 libxss1 libxtst6 \
     libatk-bridge2.0-0 libatk1.0-0 libcups2 libdrm2 libxshmfence1 \
@@ -46,9 +47,9 @@ RUN mkdir -p /app/seed \
     && cp /app/data/web_users.json /app/seed/web_users.json 2>/dev/null || true \
     && cp -r /app/config /app/seed/config 2>/dev/null || true
 
-# Script de arranque (siembra el volumen y lanza supervisord).
+# Script de arranque (siembra el volumen y lanza supervisord) + VNC opt-in.
 COPY entrypoint.sh /app/entrypoint.sh
-RUN chmod +x /app/entrypoint.sh
+RUN chmod +x /app/entrypoint.sh /app/vnc.sh
 
 ENV PYTHONUNBUFFERED=1 \
     TZ=America/Mexico_City \

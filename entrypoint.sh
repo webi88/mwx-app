@@ -29,5 +29,14 @@ fi
 # El `|| true` mantiene sano el `set -e` si python o la regeneracion fallan.
 python -c "from utils.proxies import ProxyManager; ProxyManager().regenerar_si_base()" || true
 
+# VNC opt-in (ver vnc.sh): solo informa; no arranca nada por si mismo.
+if [ "${VNC_ACTIVO:-0}" = "1" ]; then
+    if [ -n "${VNC_PASSWORD:-}" ]; then
+        echo "[entrypoint] VNC activo (noVNC en :${NOVNC_PORT:-6080})"
+    else
+        echo "[entrypoint] Aviso: VNC_ACTIVO=1 sin VNC_PASSWORD: VNC no arrancara (define VNC_PASSWORD)"
+    fi
+fi
+
 echo "[entrypoint] Arrancando supervisord ..."
 exec "$@"

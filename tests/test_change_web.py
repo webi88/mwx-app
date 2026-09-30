@@ -62,6 +62,16 @@ Cubren, SIN Chrome, SIN red y SIN campanas reales (fakes + monkeypatch):
       existentes; rutas relativas con `resolver_ruta`). En AppTest: filas
       filtradas, captions de totales, expander "Imagen del éxito (N)" con
       `st.image` real (PNG temporal) y su ausencia sin capturas / sin exitos.
+  (11) Captcha automatico (CapSolver): `_estado_solver_captcha` (import
+      perezoso/defensivo), `_texto_estado_solver` y
+      `_controles_solver_captcha`; checkbox `change_rep_solver` /
+      `change_reg_solver` (default True SOLO con el solucionador activo;
+      deshabilitado y "off" sin `CAPSOLVER_API_KEY`), captions de estado
+      visible en ambas pestanas, kwarg `resolver_captcha` pasado a las
+      campanas SOLO si la firma lo acepta (`_acepta_kwarg`; backend viejo sin
+      el kwarg), `parametros["resolver_captcha"]` en el registro y las lineas
+      del feed `captcha_api` ("iniciando"/"resuelto"/"fallo", incluido el
+      sufijo del modo asistido en fallo y el panel en vivo).
 
 Los scripts de `AppTest.from_function` son SOLO ASCII (Streamlit escribe el
 script temporal con la codificacion local de Windows; misma regla que
@@ -479,6 +489,38 @@ class _CuentasChangeParcheadas:
 
     def __exit__(self, *exc):
         self.change._cargar_cuentas_change = self.original
+        return False
+
+
+class _SolverEstadoParcheado:
+    """Monkeypatch temporal de `change._estado_solver_captcha`.
+
+    Simula el solucionador CapSolver activo (API key configurada) o inactivo
+    sin tocar el entorno ni el `.env` real."""
+
+    def __init__(self, change_mod, activo: bool, motivo: str = ""):
+        self.change = change_mod
+        self.estado = {
+            "activo": bool(activo),
+            "proveedor": "capsolver",
+            "motivo": motivo
+            or (
+                "API key configurada (CAPSOLVER_API_KEY)"
+                if activo
+                else "sin CAPSOLVER_API_KEY: define la variable para resolver "
+                "captchas automaticamente"
+            ),
+        }
+        self.original = None
+
+    def __enter__(self):
+        self.original = self.change._estado_solver_captcha
+        estado = dict(self.estado)
+        self.change._estado_solver_captcha = lambda: dict(estado)
+        return self
+
+    def __exit__(self, *exc):
+        self.change._estado_solver_captcha = self.original
         return False
 
 
@@ -2438,6 +2480,445 @@ def run(check):
             and (change._snapshot() or {}).get("enviados") == 2,
         )
         change._limpiar_registro()
+
+    # ---------------- 12) Captcha automatico (CapSolver) ----------------
+    # 12a) Helpers de estado/caption (sin Streamlit).
+    check(
+        "solver: _acepta_kwarg reconoce resolver_captcha explicito y **kwargs",
+        change._acepta_kwarg(
+            lambda resolver_captcha=None: None, "resolver_captcha"
+        )
+        is True
+        and change._acepta_kwarg(lambda x=1: None, "resolver_captcha") is False,
+    )
+    import utils.captcha_solver as captcha_solver
+
+    original_estado_modulo = captcha_solver.estado
+    try:
+        captcha_solver.estado = lambda: {
+            "activo": True,
+            "proveedor": "capsolver",
+            "motivo": "API key configurada (CAPSOLVER_API_KEY)",
+        }
+        estado_activo = change._estado_solver_captcha()
+        check(
+            "solver: _estado_solver_captcha normaliza el estado activo",
+            estado_activo
+            == {
+                "activo": True,
+                "proveedor": "capsolver",
+                "motivo": "API key configurada (CAPSOLVER_API_KEY)",
+            },
+            ascii(str(estado_activo)),
+        )
+        check(
+            "solver: con CapSolver activo el caption lo anuncia y el modo "
+            "asistido queda como respaldo",
+            change._texto_estado_solver() == change.CAPTCHA_SOLVER_ACTIVO
+            and "CapSolver activo" in change.CAPTCHA_SOLVER_ACTIVO
+            and "respaldo" in change.CAPTCHA_SOLVER_ACTIVO,
+            ascii(change._texto_estado_solver()),
+        )
+        captcha_solver.estado = lambda: (_ for _ in ()).throw(
+            RuntimeError("modulo roto")
+        )
+        estado_roto = change._estado_solver_captcha()
+        check(
+            "solver: si el modulo del solucionador falla el estado es "
+            "inactivo con motivo (nunca lanza)",
+            estado_roto["activo"] is False
+            and "no disponible" in estado_roto["motivo"],
+            ascii(str(estado_roto)),
+        )
+    finally:
+        captcha_solver.estado = original_estado_modulo
+    check(
+        "solver: el caption inactivo pide CAPSOLVER_API_KEY y ofrece el modo "
+        "asistido a mano",
+        change._texto_estado_solver(
+            {
+                "activo": False,
+                "proveedor": "capsolver",
+                "motivo": "sin CAPSOLVER_API_KEY: define la variable para "
+                "resolver captchas automaticamente",
+            }
+        )
+        == change.CAPTCHA_SOLVER_INACTIVO
+        and "CapSolver no configurado" in change.CAPTCHA_SOLVER_INACTIVO
+        and "modo asistido" in change.CAPTCHA_SOLVER_INACTIVO,
+        ascii(change.CAPTCHA_SOLVER_INACTIVO),
+    )
+    check(
+        "solver: un motivo distinto se agrega al caption inactivo",
+        change._texto_estado_solver(
+            {
+                "activo": False,
+                "proveedor": "capsolver",
+                "motivo": "modulo ausente",
+            }
+        ).endswith("(modulo ausente)"),
+        ascii(
+            change._texto_estado_solver(
+                {
+                    "activo": False,
+                    "proveedor": "capsolver",
+                    "motivo": "modulo ausente",
+                }
+            )
+        ),
+    )
+    check(
+        "solver: constantes con los textos exactos del captcha automatico y "
+        "del respaldo asistido",
+        change.CAPTCHA_SOLVER_LABEL
+        == "🤖 Resolver captcha automáticamente (CapSolver)"
+        and "respaldo" in change.CAPTCHA_LABEL
+        and "CapSolver" in change.CAPTCHA_LABEL,
+        ascii(f"({change.CAPTCHA_SOLVER_LABEL!r})"),
+    )
+    check(
+        "solver fuente: estado + checkbox por pestana y el kwarg comprobado "
+        "con _acepta_kwarg en ambas campanas",
+        "change_rep_solver" in fuente
+        and "change_reg_solver" in fuente
+        and "_acepta_kwarg(\n        ejecutar_campana_reportes, "
+        '"resolver_captcha"\n    )' in fuente
+        and '_acepta_kwarg(funcion, "resolver_captcha")' in fuente
+        and 'kwargs["resolver_captcha"] = str(resolver_captcha or "auto")'
+        in fuente,
+    )
+    check(
+        "solver fuente: evento captcha_api, kwarg resolver_captcha y "
+        "constantes documentados",
+        '"captcha_api"' in fuente
+        and 'resolver_captcha="auto"' in fuente
+        and "CAPTCHA_SOLVER" in fuente
+        and "_controles_solver_captcha" in fuente,
+    )
+
+    # 12b) Feed `captcha_api` del registro de campanas (puro).
+    id_api = change._registrar_campana()
+    change._anotar_evento(
+        id_api,
+        {
+            "tipo": "captcha_api",
+            "estado": "iniciando",
+            "metodo": "capsolver",
+            "usuario": "ana",
+            "email": "ana@example.com",
+            "segundos": 0,
+            "detalle": "reto detectado: captcha",
+        },
+    )
+    check(
+        "solver registro: 'iniciando' loggea la linea del feed",
+        change._CAMPANAS[id_api]["log"][-1]
+        == "🤖 ana@example.com — resolviendo captcha automáticamente "
+        "con CapSolver...",
+        ascii(str(change._CAMPANAS[id_api]["log"][-1])),
+    )
+    change._anotar_evento(
+        id_api,
+        {
+            "tipo": "captcha_api",
+            "estado": "resuelto",
+            "metodo": "capsolver",
+            "usuario": "bob",
+            "segundos": 7,
+            "detalle": "resuelto",
+        },
+    )
+    check(
+        "solver registro: 'resuelto' loggea con los segundos (~Ns) y cae a "
+        "@usuario sin email",
+        change._CAMPANAS[id_api]["log"][-1]
+        == "✅ @bob — captcha resuelto automáticamente (~7s)",
+        ascii(str(change._CAMPANAS[id_api]["log"][-1])),
+    )
+    change._anotar_evento(
+        id_api,
+        {
+            "tipo": "captcha_api",
+            "estado": "fallo",
+            "metodo": "capsolver",
+            "usuario": "ana",
+            "email": "ana@example.com",
+            "segundos": 3,
+            "detalle": "sin sitekey ni interstitial",
+        },
+    )
+    entrada_api = change._CAMPANAS[id_api]
+    check(
+        "solver registro: 'fallo' loggea con el detalle, SIN el recordatorio "
+        "del asistido (campana sin esperar_captcha_seg) y no toca contadores",
+        entrada_api["log"][-1]
+        == "⚠️ ana@example.com — CapSolver no pudo resolver el captcha "
+        "· sin sitekey ni interstitial"
+        and entrada_api["hechas"] == 0
+        and entrada_api["enviados"] == 0
+        and entrada_api["fallidos"] == 0
+        and entrada_api["identidades"] == 0,
+        ascii(str(entrada_api["log"][-1])),
+    )
+    log_antes = len(entrada_api["log"])
+    change._anotar_evento(
+        id_api,
+        {"tipo": "captcha_api", "estado": "desconocido", "usuario": "ana"},
+    )
+    check(
+        "solver registro: un estado desconocido no agrega linea",
+        len(change._CAMPANAS[id_api]["log"]) == log_antes,
+    )
+    id_api_asistido = change._registrar_campana(
+        parametros={"esperar_captcha_seg": 180}
+    )
+    change._anotar_evento(
+        id_api_asistido,
+        {
+            "tipo": "captcha_api",
+            "estado": "fallo",
+            "metodo": "capsolver",
+            "usuario": "ana",
+            "email": "ana@example.com",
+            "segundos": 5,
+            "detalle": "",
+        },
+    )
+    check(
+        "solver registro: con el modo asistido activo el fallo recuerda que "
+        "se esperará a que lo resuelvas a mano",
+        change._CAMPANAS[id_api_asistido]["log"][-1]
+        == "⚠️ ana@example.com — CapSolver no pudo resolver el captcha"
+        "; se esperará a que lo resuelvas a mano",
+        ascii(str(change._CAMPANAS[id_api_asistido]["log"][-1])),
+    )
+    change._limpiar_registro()
+
+    # 12c) AppTest con el solucionador ACTIVO.
+    fake_solver = _BackendReportesFake()
+    with _SolverEstadoParcheado(change, activo=True), _BackendParcheado(
+        fake_solver
+    ), _GranjaParcheada(change), _CuentasChangeParcheadas(change):
+        change._limpiar_registro()
+        at_solver = AppTest.from_function(
+            _app_change_una_pasada, default_timeout=90
+        )
+        at_solver.run()
+        textos_solver = _textos(at_solver)
+        caja_rep_solver = _widget_por_key(
+            at_solver, "checkbox", "change_rep_solver"
+        )
+        caja_reg_solver = _widget_por_key(
+            at_solver, "checkbox", "change_reg_solver"
+        )
+        check(
+            "solver AppTest: con CapSolver activo el caption y los 2 "
+            "checkboxes aparecen marcados y habilitados",
+            not at_solver.exception
+            and "CapSolver activo — el reto se resuelve solo" in textos_solver
+            and caja_rep_solver is not None
+            and bool(caja_rep_solver.value) is True
+            and bool(getattr(caja_rep_solver.proto, "disabled", False))
+            is False
+            and caja_reg_solver is not None
+            and bool(caja_reg_solver.value) is True
+            and bool(getattr(caja_reg_solver.proto, "disabled", False))
+            is False,
+            ascii(textos_solver)[:240] + excepcion_app(at_solver),
+        )
+        at_solver.text_input(key="change_rep_url").input(
+            "https://www.change.org/p/demo"
+        ).run()
+        at_solver.text_area(key="change_rep_contexto").input(
+            "Incumple las normas de la comunidad"
+        ).run()
+        at_solver.button(key="btn_change_reportes").click().run()
+        _esperar_campana_libre(change)
+        check(
+            "solver AppTest: con CapSolver activo la campana pasa "
+            "resolver_captcha='auto' y los parametros lo guardan",
+            not at_solver.exception
+            and _llamada(fake_solver).get("resolver_captcha") == "auto"
+            and (
+                (change._campana_actual() or {}).get("parametros") or {}
+            ).get("resolver_captcha")
+            == "auto",
+            ascii(str(_llamada(fake_solver).get("resolver_captcha")))
+            + excepcion_app(at_solver),
+        )
+        at_solver.checkbox(key="change_rep_solver").set_value(False).run()
+        at_solver.button(key="btn_change_reportes").click().run()
+        _esperar_campana_libre(change)
+        check(
+            "solver AppTest: desmarcar el checkbox emite 'off' a la campana",
+            not at_solver.exception
+            and len(fake_solver.llamadas) == 2
+            and _llamada(fake_solver).get("resolver_captcha") == "off",
+            ascii(str(_llamada(fake_solver).get("resolver_captcha")))
+            + excepcion_app(at_solver),
+        )
+        change._limpiar_registro()
+
+    # 12d) AppTest con el solucionador INACTIVO (regresion: pagina viva).
+    fake_inactivo = _BackendReportesFake()
+    with _SolverEstadoParcheado(change, activo=False), _BackendParcheado(
+        fake_inactivo
+    ), _GranjaParcheada(change), _CuentasChangeParcheadas(change):
+        change._limpiar_registro()
+        at_inactivo = AppTest.from_function(
+            _app_change_una_pasada, default_timeout=90
+        )
+        at_inactivo.run()
+        textos_inactivo = _textos(at_inactivo)
+        caja_inactiva = _widget_por_key(
+            at_inactivo, "checkbox", "change_rep_solver"
+        )
+        check(
+            "solver AppTest: sin CapSolver configurado el estado avisa y el "
+            "checkbox queda deshabilitado y sin marcar",
+            not at_inactivo.exception
+            and "CapSolver no configurado" in textos_inactivo
+            and "CAPSOLVER_API_KEY" in textos_inactivo
+            and caja_inactiva is not None
+            and bool(caja_inactiva.value) is False
+            and bool(getattr(caja_inactiva.proto, "disabled", False)) is True,
+            ascii(textos_inactivo)[:240] + excepcion_app(at_inactivo),
+        )
+        at_inactivo.radio(key="change_rep_modo").set_value(
+            change.MODO_ANONIMO
+        ).run()
+        at_inactivo.text_input(key="change_rep_url").input(
+            "https://www.change.org/p/demo"
+        ).run()
+        at_inactivo.text_area(key="change_rep_contexto").input(
+            "Incumple las normas de la comunidad"
+        ).run()
+        at_inactivo.button(key="btn_change_reportes").click().run()
+        _esperar_campana_libre(change)
+        check(
+            "solver AppTest: con el solucionador inactivo la campana pasa "
+            "resolver_captcha='off' (nunca 'auto')",
+            not at_inactivo.exception
+            and _llamada(fake_inactivo).get("resolver_captcha") == "off",
+            ascii(str(_llamada(fake_inactivo).get("resolver_captcha")))
+            + excepcion_app(at_inactivo),
+        )
+        change._limpiar_registro()
+
+    # 12e) Compatibilidad: backend VIEJO sin `resolver_captcha`.
+    viejo_solver = _BackendReportesViejo()
+    with _SolverEstadoParcheado(change, activo=True), _BackendParcheado(
+        viejo_solver
+    ), _GranjaParcheada(change), _CuentasChangeParcheadas(change):
+        change._limpiar_registro()
+        at_viejo_solver = AppTest.from_function(
+            _app_change_una_pasada, default_timeout=90
+        )
+        at_viejo_solver.run()
+        at_viejo_solver.radio(key="change_rep_modo").set_value(
+            change.MODO_ANONIMO
+        ).run()
+        at_viejo_solver.text_input(key="change_rep_url").input(
+            "https://www.change.org/p/demo"
+        ).run()
+        at_viejo_solver.text_area(key="change_rep_contexto").input(
+            "Incumple las normas de la comunidad"
+        ).run()
+        at_viejo_solver.button(key="btn_change_reportes").click().run()
+        _esperar_campana_libre(change)
+        check(
+            "solver compat: backend viejo sin `resolver_captcha` -> lanza SIN "
+            "el kwarg",
+            not at_viejo_solver.exception
+            and len(viejo_solver.llamadas) == 1
+            and "resolver_captcha" not in viejo_solver.llamadas[0],
+            ascii(sorted(viejo_solver.llamadas[0]))[:220]
+            + excepcion_app(at_viejo_solver),
+        )
+        change._limpiar_registro()
+
+    # 12f) Registros: checkbox inactivo + kwarg moderno y backend viejo.
+    fake_solver_reg = _BackendRegistrosFake()
+    with _SolverEstadoParcheado(change, activo=False), _BackendParcheado(
+        fake_solver_reg, nombre="ejecutar_campana_registros"
+    ), _GranjaParcheada(change), _CuentasChangeParcheadas(change):
+        change._limpiar_registro()
+        at_solver_reg = AppTest.from_function(
+            _app_change_una_pasada, default_timeout=90
+        )
+        at_solver_reg.run()
+        caja_reg_inactiva = _widget_por_key(
+            at_solver_reg, "checkbox", "change_reg_solver"
+        )
+        at_solver_reg.button(key="btn_change_registros").click().run()
+        _esperar_campana_libre(change)
+        check(
+            "solver AppTest registros: checkbox deshabilitado sin CapSolver y "
+            "la campana pasa resolver_captcha='off'",
+            not at_solver_reg.exception
+            and caja_reg_inactiva is not None
+            and bool(caja_reg_inactiva.value) is False
+            and bool(getattr(caja_reg_inactiva.proto, "disabled", False))
+            is True
+            and _llamada(fake_solver_reg).get("resolver_captcha") == "off",
+            ascii(str(_llamada(fake_solver_reg).get("resolver_captcha")))
+            + excepcion_app(at_solver_reg),
+        )
+        change._limpiar_registro()
+
+    viejo_solver_reg = _BackendRegistrosViejo()
+    with _BackendParcheado(
+        viejo_solver_reg, nombre="ejecutar_campana_registros"
+    ), _GranjaParcheada(change), _CuentasChangeParcheadas(change):
+        change._limpiar_registro()
+        at_viejo_solver_reg = AppTest.from_function(
+            _app_change_una_pasada, default_timeout=90
+        )
+        at_viejo_solver_reg.run()
+        at_viejo_solver_reg.button(key="btn_change_registros").click().run()
+        _esperar_campana_libre(change)
+        check(
+            "solver compat registros: backend viejo -> lanza SIN el kwarg",
+            not at_viejo_solver_reg.exception
+            and len(viejo_solver_reg.llamadas) == 1
+            and "resolver_captcha" not in viejo_solver_reg.llamadas[0],
+            ascii(sorted(viejo_solver_reg.llamadas[0]))[:220]
+            + excepcion_app(at_viejo_solver_reg),
+        )
+        change._limpiar_registro()
+
+    # 12g) Linea del captcha automatico en el panel en vivo.
+    id_api_panel = change._registrar_campana()
+    change._anotar_evento(id_api_panel, {"tipo": "inicio", "total": 2})
+    change._anotar_evento(
+        id_api_panel,
+        {
+            "tipo": "captcha_api",
+            "estado": "resuelto",
+            "metodo": "capsolver",
+            "usuario": "ana",
+            "email": "ana@example.com",
+            "segundos": 7,
+            "detalle": "resuelto",
+        },
+    )
+    with _SolverEstadoParcheado(change, activo=False), _BackendParcheado(
+        _BackendReportesFake()
+    ), _GranjaParcheada(change), _CuentasChangeParcheadas(change):
+        at_api_panel = AppTest.from_function(
+            _app_change_una_pasada, default_timeout=90
+        )
+        at_api_panel.run()
+        textos_api_panel = _textos(at_api_panel)
+        check(
+            "solver AppTest: la linea del captcha automatico se ve en el "
+            "panel en vivo",
+            not at_api_panel.exception
+            and "✅ ana@example.com — captcha resuelto automáticamente (~7s)"
+            in textos_api_panel,
+            ascii(textos_api_panel)[:240] + excepcion_app(at_api_panel),
+        )
+    change._limpiar_registro()
 
 
 def entry_fin(entrada: dict) -> bool:

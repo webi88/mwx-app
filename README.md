@@ -39,6 +39,27 @@ python -m bot.main
 docker-compose up -d
 ```
 
+## Modo asistido remoto (VNC en Railway)
+
+El modo asistido de Change.org abre un Chrome **visible** en la pantalla virtual
+`:99` del contenedor para resolver el captcha a mano. Con VNC puedes ver y usar
+esa pantalla desde tu navegador, sin depender de una maquina local:
+
+1. En las variables del servicio de Railway define `VNC_ACTIVO=1` y una
+   `VNC_PASSWORD` fuerte (opcional: `VNC_PORT` y `NOVNC_PORT`, por defecto
+   5900 y 6080).
+2. Crea un **TCP Proxy** al puerto `NOVNC_PORT` (6080) y abre
+   `http://<host>:<puerto>/vnc.html`, donde te pedira la password. Para un
+   cliente VNC nativo, crea otro TCP Proxy al `VNC_PORT` (5900).
+3. En el dashboard de Change.org marca el **modo asistido** y la opcion
+   **Chrome visible**: el Chrome del contenedor aparecera en la pantalla
+   compartida y podras resolver el reto ahi mismo.
+4. Al terminar, apaga `VNC_ACTIVO=0` (y retira el TCP Proxy).
+
+⚠️ **Seguridad**: cualquiera con la URL y la password puede ver y pulsar esa
+pantalla (incluido el Chrome con sesiones abiertas). Usa una password fuerte,
+no la compartas y deja `VNC_ACTIVO=0` cuando no lo uses.
+
 ## Bot para clientes (`bot_clientes/`)
 
 Bot de Telegram **independiente** del bot interno. Tiene dos modos de uso:

@@ -22,13 +22,15 @@ del handler del boton para que la pagina cargue sin Chrome:
         usar_proxies=..., pais_proxy=..., guardar_identidades=...,
         headless=..., cancelar=<threading.Event>, callback=cb,
         cuentas=[{usuario,email,email_password,nombre_mostrado}] | None,
-        esperar_captcha_seg=None,   # modo asistido (solo si la firma lo acepta)
+        esperar_captcha_seg=None,   # modo ASISTIDO (respaldo; solo si la firma lo acepta)
+        resolver_captcha="auto",    # CapSolver (solo si la firma lo acepta)
     )
 
     ejecutar_campana_registros(
         cuentas=[...], max_workers=..., usar_proxies=..., pais_proxy=...,
         headless=..., cancelar=<threading.Event>, callback=cb,
-        esperar_captcha_seg=None,   # modo asistido (solo si la firma lo acepta)
+        esperar_captcha_seg=None,   # modo ASISTIDO (respaldo; solo si la firma lo acepta)
+        resolver_captcha="auto",    # CapSolver (solo si la firma lo acepta)
     )
 
 Callbacks (llegan en los hilos worker del backend):
@@ -43,15 +45,29 @@ Callbacks (llegan en los hilos worker del backend):
     "usuario":str,"email":str,"detalle":"esperando captcha (Ns)"}``: el modo
     asistido espera a que el humano resuelva el reto de Cloudflare; solo
     agrega una linea al log (NO cuenta como exito/fallo).
+  - "captcha_api": ``{"tipo":"captcha_api","estado":"iniciando"|"resuelto"|
+    "fallo","metodo":"capsolver","usuario":str,"email":str,"segundos":N,
+    "detalle":str}``: avisos del solucionador AUTOMATICO CapSolver (kwarg
+    `resolver_captcha`); solo agregan una linea al log (NO cuentan como
+    exito/fallo). En "fallo", si el modo asistido esta activo
+    (`esperar_captcha_seg` > 0 en los parametros de la campana), la linea
+    recuerda que se esperara a que el humano lo resuelva.
 
-Modo asistido anti-bot (Cloudflare): en "⚙️ Opciones avanzadas" de AMBAS
-pestanas esta el checkbox "🧠 Esperar a que resuelvas el captcha a mano
-(requiere Chrome visible)". Con el marcado, la pagina fuerza Chrome visible
-(el checkbox de visible queda deshabilitado), muestra los segundos maximos de
-espera y pasa `esperar_captcha_seg=N` al backend SOLO si su firma lo acepta
-(`_acepta_kwarg`, retrocompatible): con un backend viejo se lanza sin el kwarg
-y se avisa con `st.warning`. El backend espera N segundos a que un humano
-resuelva el reto y luego continua solo.
+Captcha automatico (CapSolver) + modo asistido de RESPALDO: en
+"⚙️ Opciones avanzadas" de AMBAS pestanas estan el estado del solucionador
+(caption) y el checkbox "🤖 Resolver captcha automáticamente (CapSolver)"
+(default True SOLO si hay `CAPSOLVER_API_KEY`; con el solucionador inactivo
+queda deshabilitado y la campana no puede pasar `"auto"`). El checkbox emite
+`"auto"` marcado u `"off"` desmarcado y se pasa como `resolver_captcha` al
+backend SOLO si su firma lo acepta (`_acepta_kwarg`, retrocompatible).
+Cuando CapSolver no esta disponible o falla, el modo asistido sigue siendo el
+respaldo: el checkbox "🧠 Esperar a que resuelvas el captcha a mano (respaldo
+si CapSolver no está disponible o falla)". Con el marcado, la pagina fuerza
+Chrome visible (el checkbox de visible queda deshabilitado), muestra los
+segundos maximos de espera y pasa `esperar_captcha_seg=N` al backend SOLO si
+su firma lo acepta: con un backend viejo se lanza sin el kwarg y se avisa con
+`st.warning`. El backend espera N segundos a que un humano resuelva el reto y
+luego continua solo.
 
 El callback SOLO muta el registro de campanas a nivel modulo (`_CAMPANAS` +
 `_CAMPANAS_LOCK`): jamas toca `st.*`. El panel `_render_proceso_activo()` se
@@ -115,7 +131,8 @@ PAIS_TODAS = "Todas"
 
 # Modo asistido anti-bot (Cloudflare): textos compartidos por ambas pestanas.
 CAPTCHA_LABEL = (
-    "🧠 Esperar a que resuelvas el captcha a mano (requiere Chrome visible)"
+    "🧠 Esperar a que resuelvas el captcha a mano "
+    "(respaldo si CapSolver no está disponible o falla)"
 )
 CAPTCHA_CAPTION = (
     "Se abrirá una ventana de Chrome: resuelve el reto de Cloudflare cuando "
@@ -125,6 +142,20 @@ CAPTCHA_AVISO_BACKEND = (
     "⚠️ El modo asistido no está disponible en este backend "
     "(`esperar_captcha_seg`): la campaña se lanzó sin esperar a que resuelvas "
     "el captcha."
+)
+
+# Captcha automatico (CapSolver): estado visible y checkbox por pestana. Con
+# el solucionador activo (env `CAPSOLVER_API_KEY`) el backend resuelve el reto
+# de Cloudflare sin humano; el modo asistido queda como RESPALDO.
+CAPTCHA_SOLVER_LABEL = "🤖 Resolver captcha automáticamente (CapSolver)"
+CAPTCHA_SOLVER_ACTIVO = (
+    "🤖 Captcha automático: CapSolver activo — el reto se resuelve solo; "
+    "el modo asistido queda como respaldo."
+)
+CAPTCHA_SOLVER_INACTIVO = (
+    "⚠️ Captcha automático: CapSolver no configurado (falta "
+    "CAPSOLVER_API_KEY en el .env). El reto se resolverá a mano si activas "
+    "el modo asistido."
 )
 
 
@@ -222,6 +253,11 @@ def _anotar_evento(id_campana, evento) -> None:
     - `{"tipo":"espera_captcha",...}`: modo asistido; agrega al log
       `🧠 {email|@usuario} — esperando a que resuelvas el captcha en Chrome
       (Ns)…` y NO toca ningun contador (no es exito ni fallo).
+    - `{"tipo":"captcha_api",...}`: solucionador automatico CapSolver; agrega
+      al log la linea de "iniciando"/"resuelto"/"fallo" y NO toca ningun
+      contador (no es exito ni fallo). En "fallo", si la campana se lanzo con
+      el modo asistido (`parametros["esperar_captcha_seg"]` > 0), la linea
+      termina con "; se esperará a que lo resuelvas a mano".
     """
     if not isinstance(evento, dict) or not id_campana:
         return
@@ -289,6 +325,39 @@ def _anotar_evento(id_campana, evento) -> None:
                 f"🧠 {identificador} — esperando a que resuelvas el captcha "
                 f"en Chrome{sufijo}…",
             )
+            return
+        if tipo == "captcha_api":
+            # Solucionador AUTOMATICO CapSolver: solo informa en el feed (no
+            # es exito ni fallo). En "fallo" recuerda el respaldo humano si el
+            # modo asistido esta activo en esta campana.
+            email = str(evento.get("email") or "").strip()
+            usuario = str(evento.get("usuario") or "").strip().lstrip("@")
+            identificador = email or (f"@{usuario}" if usuario else "?")
+            estado = str(evento.get("estado") or "").strip().lower()
+            detalle = str(evento.get("detalle") or "").strip()
+            if estado == "iniciando":
+                linea = (
+                    f"🤖 {identificador} — resolviendo captcha automáticamente "
+                    "con CapSolver..."
+                )
+            elif estado == "resuelto":
+                segundos = _entero(evento.get("segundos"))
+                linea = (
+                    f"✅ {identificador} — captcha resuelto automáticamente "
+                    f"(~{segundos}s)"
+                )
+            elif estado == "fallo":
+                linea = (
+                    f"⚠️ {identificador} — CapSolver no pudo resolver el captcha"
+                )
+                if detalle:
+                    linea += f" · {detalle}"
+                parametros = entrada.get("parametros") or {}
+                if _entero(parametros.get("esperar_captcha_seg")):
+                    linea += "; se esperará a que lo resuelvas a mano"
+            else:
+                return
+            _agregar_linea(entrada, linea)
             return
         if tipo != "reporte":
             return
@@ -1042,14 +1111,16 @@ def _iniciar_hilo(id_campana, runner, nombre: str) -> bool:
 
 def _lanzar_ataque(url, contexto, cantidad, workers, usar_proxies, pais_proxy,
                    guardar_identidades, headless, cuentas=None,
-                   esperar_captcha_seg=0) -> None:
+                   esperar_captcha_seg=0, resolver_captcha="auto") -> None:
     """Valida y lanza el ataque de reportes en un hilo daemon (nunca lanza).
 
     `cuentas` (opcional) = filas seleccionadas del selector; None/[] = modo
     anonimo con identidades IA. `esperar_captcha_seg` > 0 pide el modo asistido
     anti-bot: se pasa al backend SOLO si su firma lo acepta (`_acepta_kwarg`);
     con un backend viejo se lanza sin el kwarg y se deja un `st.warning` para
-    el siguiente render. El backend se importa AQUI (perezoso): la pagina
+    el siguiente render. `resolver_captcha` ("auto"|"off") activa/desactiva el
+    captcha automatico CapSolver y se pasa tambien SOLO si la firma lo acepta
+    (retrocompatible). El backend se importa AQUI (perezoso): la pagina
     carga sin Chrome. El callback solo muta `_CAMPANAS` bajo lock."""
     direccion = str(url or "").strip()
     if not direccion or "change.org" not in direccion.lower():
@@ -1108,6 +1179,10 @@ def _lanzar_ataque(url, contexto, cantidad, workers, usar_proxies, pais_proxy,
         if _en_contexto_streamlit():
             st.session_state["change_rep_aviso_asistido"] = CAPTCHA_AVISO_BACKEND
         st.warning(CAPTCHA_AVISO_BACKEND)
+    # Captcha automatico (CapSolver): mismo patron retrocompatible.
+    soporta_solver = _acepta_kwarg(
+        ejecutar_campana_reportes, "resolver_captcha"
+    )
 
     evento = threading.Event()
     id_campana = _registrar_campana(
@@ -1122,6 +1197,7 @@ def _lanzar_ataque(url, contexto, cantidad, workers, usar_proxies, pais_proxy,
             "guardar_identidades": bool(guardar_identidades),
             "headless": bool(headless),
             "esperar_captcha_seg": _entero(esperar_captcha_seg),
+            "resolver_captcha": str(resolver_captcha or "auto"),
             "modo": MODO_CON_CUENTAS if cuentas_envio else MODO_ANONIMO,
             "cuentas_total": len(cuentas_envio),
         },
@@ -1153,6 +1229,9 @@ def _lanzar_ataque(url, contexto, cantidad, workers, usar_proxies, pais_proxy,
             if soporta_captcha:
                 # 0 = sin modo asistido (falla rapido como siempre).
                 kwargs["esperar_captcha_seg"] = _entero(esperar_captcha_seg)
+            if soporta_solver:
+                # "auto" = CapSolver si hay API key; "off" lo desactiva.
+                kwargs["resolver_captcha"] = str(resolver_captcha or "auto")
             resumen = ejecutar_campana_reportes(**kwargs)
 
         except BaseException as e:  # noqa: BLE001
@@ -1168,14 +1247,16 @@ def _lanzar_ataque(url, contexto, cantidad, workers, usar_proxies, pais_proxy,
 
 
 def _lanzar_registros(cuentas, workers, usar_proxies, pais_proxy,
-                      headless, esperar_captcha_seg=0) -> None:
+                      headless, esperar_captcha_seg=0,
+                      resolver_captcha="auto") -> None:
     """Valida y lanza el registro de cuentas en Change.org (nunca lanza).
 
     Importa `ejecutar_campana_registros` PEREZOSAMENTE; si el backend aun no
     la tiene, muestra un `st.error` legible y no rompe la pagina. Con
     `esperar_captcha_seg` > 0 (modo asistido) se pasa el kwarg SOLO si la
     firma del backend lo acepta y, si no, se avisa para el siguiente render.
-    El callback solo muta `_CAMPANAS` bajo lock."""
+    `resolver_captcha` ("auto"|"off") se pasa con el mismo criterio
+    retrocompatible. El callback solo muta `_CAMPANAS` bajo lock."""
     cuentas_envio = _cuentas_para_backend(cuentas)
     if not cuentas_envio:
         st.warning(
@@ -1214,6 +1295,8 @@ def _lanzar_registros(cuentas, workers, usar_proxies, pais_proxy,
         if _en_contexto_streamlit():
             st.session_state["change_reg_aviso_asistido"] = CAPTCHA_AVISO_BACKEND
         st.warning(CAPTCHA_AVISO_BACKEND)
+    # Captcha automatico (CapSolver): mismo patron retrocompatible.
+    soporta_solver = _acepta_kwarg(funcion, "resolver_captcha")
 
     evento = threading.Event()
     id_campana = _registrar_campana(
@@ -1225,6 +1308,7 @@ def _lanzar_registros(cuentas, workers, usar_proxies, pais_proxy,
             "pais_proxy": str(pais_proxy or ""),
             "headless": bool(headless),
             "esperar_captcha_seg": _entero(esperar_captcha_seg),
+            "resolver_captcha": str(resolver_captcha or "auto"),
             "cuentas_total": len(cuentas_envio),
         },
     )
@@ -1249,6 +1333,9 @@ def _lanzar_registros(cuentas, workers, usar_proxies, pais_proxy,
             if soporta_captcha:
                 # 0 = sin modo asistido (falla rapido como siempre).
                 kwargs["esperar_captcha_seg"] = _entero(esperar_captcha_seg)
+            if soporta_solver:
+                # "auto" = CapSolver si hay API key; "off" lo desactiva.
+                kwargs["resolver_captcha"] = str(resolver_captcha or "auto")
             resumen = funcion(**kwargs)
         except BaseException as e:  # noqa: BLE001
             error = e
@@ -1263,6 +1350,69 @@ def _lanzar_registros(cuentas, workers, usar_proxies, pais_proxy,
 
 
 # ============================ FORMULARIOS ============================
+
+def _estado_solver_captcha() -> dict:
+    """Estado del solucionador automatico CapSolver (import perezoso).
+
+    Importa `utils.captcha_solver.estado` dentro de try/except: si el modulo
+    no existe o falla, devuelve el estado inactivo con el motivo y la pagina
+    sigue funcionando. NUNCA lanza."""
+    try:
+        from utils.captcha_solver import estado as captcha_solver_estado
+
+        estado = captcha_solver_estado()
+        if isinstance(estado, dict):
+            return {
+                "activo": bool(estado.get("activo")),
+                "proveedor": str(estado.get("proveedor") or "capsolver"),
+                "motivo": str(estado.get("motivo") or ""),
+            }
+    except Exception:
+        pass
+    return {
+        "activo": False,
+        "proveedor": "capsolver",
+        "motivo": "solucionador no disponible (utils.captcha_solver)",
+    }
+
+
+def _texto_estado_solver(estado=None) -> str:
+    """Caption del estado del solucionador (activo o no configurado).
+
+    Con el solucionador inactivo se agrega el `motivo` cuando aporta detalle
+    (el motivo estandar ya describe la falta de `CAPSOLVER_API_KEY`)."""
+    estado = estado if isinstance(estado, dict) else _estado_solver_captcha()
+    if bool(estado.get("activo")):
+        return CAPTCHA_SOLVER_ACTIVO
+    motivo = str(estado.get("motivo") or "").strip()
+    texto = CAPTCHA_SOLVER_INACTIVO
+    if motivo and "CAPSOLVER_API_KEY" not in motivo.upper():
+        texto += f" ({motivo})"
+    return texto
+
+
+def _controles_solver_captcha(clave: str) -> str:
+    """Estado + checkbox del captcha automatico de UNA pestana.
+
+    Devuelve "auto" si el backend debe intentar CapSolver o "off" si no. El
+    checkbox queda deshabilitado (y sin marcar) cuando CapSolver no esta
+    configurado, asi que con el solucionador inactivo JAMAS se emite "auto"."""
+    estado = _estado_solver_captcha()
+    activo = bool(estado.get("activo"))
+    st.caption(_texto_estado_solver(estado))
+    marcado = st.checkbox(
+        CAPTCHA_SOLVER_LABEL,
+        value=activo,
+        key=clave,
+        disabled=not activo,
+        help=(
+            "Define `CAPSOLVER_API_KEY` en el .env para activarlo. Con el "
+            "solucionador activo el reto de Cloudflare se resuelve solo; el "
+            "modo asistido de abajo queda como respaldo si falla."
+        ),
+    )
+    return "auto" if (activo and marcado) else "off"
+
 
 def _controles_modo_asistido(clave_captcha: str, clave_segundos: str,
                              clave_visible: str) -> tuple:
@@ -1441,6 +1591,7 @@ def _formulario_reportes(cuentas: list) -> None:
                     "(`CuentaChange`) para reutilizarlas más adelante."
                 ),
             )
+        resolver_captcha = _controles_solver_captcha("change_rep_solver")
         esperar_captcha_seg, chrome_visible = _controles_modo_asistido(
             "change_rep_captcha", "change_rep_captcha_seg", "change_rep_visible"
         )
@@ -1468,6 +1619,7 @@ def _formulario_reportes(cuentas: list) -> None:
             headless=headless,
             cuentas=seleccion if es_cuentas else None,
             esperar_captcha_seg=int(esperar_captcha_seg),
+            resolver_captcha=resolver_captcha,
         )
 
 
@@ -1532,6 +1684,7 @@ def _formulario_registros(cuentas: list) -> None:
         pais_proxy = "" if pais_sel == PAIS_TODAS else str(pais_sel)
         if rotar_proxies:
             _aviso_proxies(pais_proxy, pais_sel)
+        resolver_captcha = _controles_solver_captcha("change_reg_solver")
         esperar_captcha_seg, chrome_visible = _controles_modo_asistido(
             "change_reg_captcha", "change_reg_captcha_seg", "change_reg_visible"
         )
@@ -1553,6 +1706,7 @@ def _formulario_registros(cuentas: list) -> None:
             pais_proxy=pais_proxy,
             headless=headless,
             esperar_captcha_seg=int(esperar_captcha_seg),
+            resolver_captcha=resolver_captcha,
         )
 
 

@@ -217,3 +217,25 @@ class CuentaChange(Base):
     origen = Column(String(30), default="reporte")  # "reporte" ahora; futuro "firma"/"manual"
     usada_firma = Column(Boolean, default=False)    # flag para el futuro modulo de firmas masivas
     fecha_creacion = Column(DateTime, default=datetime.utcnow)
+
+
+class SesionChange(Base):
+    """Sesion persistida (cookies) de una cuenta de Change.org en la BD.
+
+    Una fila por cuenta (`usuario` UNIQUE): `cookies_json` guarda el MISMO dict
+    que el archivo `data/cookies/change/{usuario}.json`
+    (``{"usuario","email","guardada","proxy","cookies":[...]}``). Sirve para que
+    la sesion sobreviva a los deploys cuando el volumen no es persistente
+    (Railway/Supabase): si el archivo no existe o esta corrupto,
+    `cargar_sesion_change` la recupera de aqui y la vuelve a cachear en disco.
+    `actualizada` se refresca en cada UPSERT.
+
+    Nota: la tabla se crea sola con `Base.metadata.create_all` (via `init_db`),
+    por lo que no requiere migracion ALTER en core/database.py."""
+
+    __tablename__ = "sesion_change"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    usuario = Column(String(100), unique=True, index=True, nullable=False)
+    cookies_json = Column(JSON, nullable=True)
+    actualizada = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)

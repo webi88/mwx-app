@@ -75,9 +75,13 @@ tres misiones:
 
 4. **Sesiones persistentes (best-effort)**: una vez que un humano resolvio el
    captcha la primera vez, las siguientes corridas reutilizan la sesion y NO
-   vuelven a pedir captcha. Sin columnas nuevas en la BD: las cookies viven en
-   `data/cookies/change/{usuario}.json` (carpeta gitignored) via
-   `guardar_sesion_change` / `cargar_sesion_change` / `borrar_sesion_change`.
+   vuelven a pedir captcha. Las cookies viven en
+   `data/cookies/change/{usuario}.json` (carpeta gitignored) Y, ademas, en la
+   tabla `sesion_change` de la BD (`core.models.SesionChange`), para que
+   sobrevivan a los deploys sin volumen (Railway/Supabase): al guardar se hace
+   UPSERT best-effort y, si el archivo no existe o esta corrupto,
+   `cargar_sesion_change` la recupera de la BD y la vuelve a cachear en disco.
+   Si la BD falla o no existe, el archivo manda (nunca rompe).
    `ChangeOrgReportBot._restaurar_sesion_change()` inyecta las cookies por CDP
    (`Network.setCookie`), navega a la home y exige evidencia real de sesion
    (`_evidencia_sesion` / `_evidencia_home_logueada`, hasta ~8s). Con
@@ -93,6 +97,29 @@ tres misiones:
    ruta en la clave `captura` del resultado. En fallos, cancelaciones o
    early-returns `captura` queda `""`; `_capturar_evidencia()` nunca lanza y
    jamas loguea datos de la cuenta (solo la ruta del PNG).
+
+6. **Captcha automatico (CapSolver, opcional)**: si `CAPSOLVER_API_KEY` esta
+   definida (ver `utils.captcha_solver`), el bot intenta resolver el reto
+   anti-bot de Cloudflare/Turnstile SIN humano ANTES de caer al MODO ASISTIDO:
+   extrae el sitekey del widget (`_extraer_config_turnstile`), resuelve un
+   token con CapSolver (`resolver_turnstile`) y lo inyecta en el formulario
+   (`_inyectar_token_turnstile`); si el reto es el interstitial de Cloudflare
+   (sin sitekey) resuelve `AntiCloudflareTask` e inyecta las cookies
+   (`cf_clearance`) por CDP + `aplicar_user_agent` cuando CapSolver devuelve
+   `userAgent`. Se controla con el kwarg `resolver_captcha` del bot y de las 4
+   funciones publicas (AL FINAL de sus firmas) o con la env
+   `CHANGE_CAPTCHA_SOLVER` ("auto" default: usa CapSolver si hay API key;
+   "off" no intenta). Emite avisos
+   `{"tipo":"captcha_api","estado":"iniciando"|"resuelto"|"fallo",
+   "metodo":"capsolver","usuario":str,"email":str,"segundos":N,"detalle":str}`
+   sin romper jamas el flujo. Si CapSolver falla o no esta disponible, el flujo
+   clasico y el MODO ASISTIDO quedan INTACTOS (los mensajes de error clasicos
+   se conservan byte a byte; el solucionador jamas deja `ultimo_error`
+   envenenado). OJO: Change.org tambien puede servir un reto PROPIO de
+   **PerimeterX/HUMAN Security** ("no eres un bot", `#px-captcha`) que CapSolver
+   NO cubre: `_detectar_perimeterx()` lo reconoce y `_resolver_reto_captcha_api`
+   emite UN aviso `captcha_api` "fallo" con detalle accionable y pasa de
+   inmediato al MODO ASISTIDO/clasico (sin llamar a la API).
 
 Contrato congelado (el frontend y los tests dependen de el; no romper):
 
@@ -135,21 +162,29 @@ Contrato congelado (el frontend y los tests dependen de el; no romper):
     guardar_sesion_change(usuario, driver, email="", proxy="") -> bool
         Escribe `data/cookies/change/{usuario}.json` con
         ``{"usuario","email","guardada"(ISO),"proxy","cookies":[...]}`` de
-        forma atomica (temp + os.replace; 0600 en POSIX). NUNCA lanza y NO
-        loguea valores de cookies; False sin cookies o con
-        `CHANGE_REUTILIZAR_SESION` desactivado.
+        forma atomica (temp + os.replace; 0600 en POSIX) y, ADEMAS, hace UPSERT
+        best-effort de esa sesion en la tabla `sesion_change` de la BD
+        (Supabase/Railway; se crea sola con init_db si falta). Un fallo de BD
+        nunca rompe: el archivo manda. NUNCA lanza y NO loguea valores de
+        cookies; False sin cookies o con `CHANGE_REUTILIZAR_SESION` desactivado.
 
     cargar_sesion_change(usuario) -> dict | None
-        Carga y valida el JSON (dict con "cookies" lista no vacia); None si no
-        existe/es corrupto/invalido o si la reutilizacion esta desactivada.
-        NUNCA lanza.
+        Carga y valida la sesion (dict con "cookies" lista no vacia). Orden:
+        archivo si existe y es valido; si no, la tabla `sesion_change` de la BD
+        y, cuando viene de la BD, deja ademas una copia en el archivo (cache
+        best-effort, silenciosa). None si no existe/es corrupta/invalida o si
+        la reutilizacion esta desactivada. Mismo contrato de dict que el
+        archivo. NUNCA lanza.
 
     borrar_sesion_change(usuario) -> bool
-        Borra el archivo de sesion; True si lo elimino. NUNCA lanza.
+        Borra el archivo de sesion Y la fila de `sesion_change` (la BD en
+        best-effort: si falla, se ignora). True si elimino el archivo. NUNCA
+        lanza.
 
     ChangeOrgReportBot(url_peticion="", contexto="", proxy="", headless=None,
                        timeout=45, cancelar=None, cuenta=None,
-                       esperar_captcha_seg=None, aviso=None)
+                       esperar_captcha_seg=None, aviso=None,
+                       resolver_captcha=None)
         `cuenta` = dict {"usuario","email","password" o "email_password",
                          "nombre","apellido","nombre_mostrado" (opcional)}.
         `esperar_captcha_seg`: segundos del MODO ASISTIDO; None -> env
@@ -162,6 +197,9 @@ Contrato congelado (el frontend y los tests dependen de el; no romper):
             resolvio en Ns; usa el modo asistido con Chrome visible y
             resuelvelo a mano". Con 0 (default) se conserva el fallo clasico y
             en headless NUNCA espera (no hay humano).
+        `resolver_captcha` (AL FINAL): "auto" (default) intenta resolver el
+            reto con CapSolver si hay `CAPSOLVER_API_KEY`; "off" lo desactiva;
+            None -> env `CHANGE_CAPTCHA_SOLVER`. Ver la seccion 6 del modulo.
         .preparar_driver() -> bool
         .registrar_o_entrar() -> {"ok","estado","error","evidencia",
                                   "sesion_restaurada"}
@@ -190,16 +228,19 @@ Contrato congelado (el frontend y los tests dependen de el; no romper):
 
     registrar_cuenta_change(usuario="", email="", password="", nombre="",
                             apellido="", proxy="", headless=None,
-                            cancelar=None, esperar_captcha_seg=None) -> dict
+                            cancelar=None, esperar_captcha_seg=None,
+                            *, resolver_captcha=None) -> dict
         Abre Chrome (crear_chrome + stealth + proxy), registra/entra y cierra
         SIEMPRE. NUNCA lanza. Resultado: {"ok","usuario","email","estado",
         "nombre","apellido","error","evidencia","url","cancelado",
         "sesion_restaurada"}.
         `esperar_captcha_seg` activa el MODO ASISTIDO dentro del bot.
+        `resolver_captcha` activa/desactiva el solucionador CapSolver.
 
     ejecutar_campana_registros(cuentas, max_workers=2, usar_proxies=True,
                                pais_proxy="", headless=None, cancelar=None,
-                               callback=None, esperar_captcha_seg=None) -> dict
+                               callback=None, esperar_captcha_seg=None,
+                               resolver_captcha=None) -> dict
         `cuentas`: lista de dicts {"usuario","email","email_password" (o
         "password"),"nombre_mostrado" (opcional)}; lista cap 500 y workers
         acotados a [1,5]; proxy round-robin por cuenta: al elegir se valida con
@@ -219,7 +260,8 @@ Contrato congelado (el frontend y los tests dependen de el; no romper):
 
     ejecutar_un_reporte(url_peticion, contexto="", proxy="", headless=None,
                         evitar=None, cancelar=None, guardar_identidad=True,
-                        cuenta=None, esperar_captcha_seg=None) -> dict
+                        cuenta=None, esperar_captcha_seg=None, *,
+                        resolver_captcha=None) -> dict
         Sin `cuenta`: genera identidad + queja IA, corre el bot y persiste la
         identidad en la granja si el reporte fue OK (comportamiento clasico).
         Con `cuenta`: NO llama a generar_identidad_change (usa los datos de la
@@ -234,7 +276,8 @@ Contrato congelado (el frontend y los tests dependen de el; no romper):
                               max_workers=2, usar_proxies=True, pais_proxy="",
                               guardar_identidades=True, headless=None,
                               cancelar=None, callback=None, cuentas=None,
-                              esperar_captcha_seg=None) -> dict
+                              esperar_captcha_seg=None,
+                              resolver_captcha=None) -> dict
         Con `cuentas` no vacias: cada reporte usa la siguiente cuenta en
         round-robin (login/registro primero); el evento "reporte" agrega
         "usuario" y "con_cuenta": True (sin "identidad") y el resumen agrega
@@ -248,6 +291,14 @@ Contrato congelado (el frontend y los tests dependen de el; no romper):
     _resolver_esperar_captcha_seg(valor=None) -> int
         `valor` None -> env CHANGE_ESPERAR_CAPTCHA_SEG -> 0; acota a [0, 900];
         valores invalidos -> 0.
+
+    _resolver_captcha_modo(valor=None) -> str
+        `valor` None -> env CHANGE_CAPTCHA_SOLVER -> "auto"; "off" (y alias
+        0/false/no) desactiva el solucionador; cualquier otro -> "auto".
+
+    _resolver_reto_captcha_api(reto="") -> bool
+        Intento automatico con CapSolver (ver seccion 6): True SOLO si el reto
+        desaparecio. Best-effort y jamas lanza.
 
 Reglas de oro del flujo Selenium:
     - `driver.get` tolera `TimeoutException` (sigue con esperas explicitas).
@@ -279,7 +330,7 @@ from selenium.webdriver.common.keys import Keys
 
 from core.config import detectar_chrome_version, resolver_ruta, settings
 from core.database import obtener_sesion
-from core.models import CuentaChange
+from core.models import CuentaChange, SesionChange
 from plataformas.chrome_driver import crear_chrome
 from utils.proxies import ProxyManager
 
@@ -287,6 +338,11 @@ try:  # opcional: el bot funciona aunque el modulo no exista o falle el import
     from utils.anti_detection import aplicar_stealth
 except ImportError:  # pragma: no cover - entorno sin anti_detection
     aplicar_stealth = None
+
+try:  # opcional: UA del interstitial resuelto por CapSolver (AntiCloudflareTask)
+    from utils.anti_detection import aplicar_user_agent
+except ImportError:  # pragma: no cover - entorno sin anti_detection
+    aplicar_user_agent = None
 
 
 __all__ = [
@@ -786,6 +842,17 @@ _ERROR_PANTALLA_CODIGO = (
     "la opcion 'Ingresar con contrasena'"
 )
 
+# PerimeterX/HUMAN Security: Change.org puede servir su reto propio "no eres un
+# bot" (`#px-captcha`, `_pxAppId`, `px-cloud.net`) que CapSolver NO cubre. El
+# solucionador automatico lo reconoce (`_detectar_perimeterx`) y falla rapido
+# con este mensaje accionable, para que el flujo caiga al MODO ASISTIDO/clasico
+# sin gastar timeouts ni llamadas a la API.
+_ERROR_PERIMETERX_API = (
+    "reto PerimeterX (px-captcha) de Change.org: CapSolver no cubre este reto; "
+    "usa el MODO ASISTIDO con Chrome visible (1 vez por cuenta) o reutiliza la "
+    "sesion guardada"
+)
+
 # Etiquetas (normalizadas) que identifican cada campo del formulario.
 _ETIQUETAS_CAMPOS = {
     "nombre": ("nombre", "first name", "given name", "name"),
@@ -936,8 +1003,37 @@ def _resolver_esperar_captcha_seg(valor=None) -> int:
     return max(0, min(900, segundos))
 
 
+def _resolver_captcha_modo(valor=None) -> str:
+    """Resuelve el modo del solucionador CapSolver: "auto" u "off".
+
+    `None`/vacio -> env `CHANGE_CAPTCHA_SOLVER` -> "auto". Solo "off" (y sus
+    alias 0/false/no) desactiva cualquier intento automatico; cualquier otro
+    valor es "auto" (intenta CapSolver si `utils.captcha_solver.disponible()`).
+    Determinista y nunca lanza.
+    """
+    try:
+        texto = str(valor).strip().lower() if valor is not None else ""
+    except Exception:
+        texto = ""
+    if not texto:
+        try:
+            texto = str(os.environ.get("CHANGE_CAPTCHA_SOLVER", "") or "").strip().lower()
+        except Exception:
+            texto = ""
+    if not texto:
+        # Fallback al `.env` (el dashboard local no carga dotenv): mismo
+        # criterio que `utils.captcha_solver.api_key()`.
+        try:
+            from utils.captcha_solver import _leer_env_archivo
+
+            texto = str(_leer_env_archivo("CHANGE_CAPTCHA_SOLVER") or "").strip().lower()
+        except Exception:
+            texto = ""
+    return "off" if texto in ("off", "0", "false", "no", "disabled") else "auto"
+
+
 # --------------------------------------------------------------------------- #
-# Sesiones persistentes de Change.org (cookies por cuenta, sin columnas en BD)
+# Sesiones persistentes de Change.org (archivo JSON + tabla `sesion_change`)
 # --------------------------------------------------------------------------- #
 def _reutilizar_sesion_activo() -> bool:
     """True si se guardan/restauran sesiones (env CHANGE_REUTILIZAR_SESION).
@@ -1012,16 +1108,129 @@ def _escribir_json_atomico(ruta: str, datos: dict) -> bool:
                 pass
 
 
+def _en_bd_sesion_change(accion):
+    """Ejecuta `accion(db)` contra la BD con `init_db()` + UN reintento.
+
+    Best-effort para la tabla `sesion_change`: si la BD no esta disponible
+    (excepcion o tabla faltante en un deploy a medias) devuelve None y solo deja
+    un log DEBUG. NUNCA lanza.
+    """
+    try:
+        with obtener_sesion() as db:
+            return accion(db)
+    except Exception as e:
+        try:
+            from sqlalchemy.exc import OperationalError
+
+            if not isinstance(e, OperationalError):
+                raise
+            from core.database import init_db
+
+            init_db()
+            with obtener_sesion() as db:
+                return accion(db)
+        except Exception as e2:
+            logger.debug(
+                f"Change.org: BD de sesiones no disponible "
+                f"({type(e2).__name__}): {e2}"
+            )
+            return None
+
+
+def _sesion_change_normalizada(usuario: str, contenido) -> dict | None:
+    """Normaliza `cookies_json` de la BD al dict del contrato (None si invalido).
+
+    Acepta el dict completo (lo que guarda `guardar_sesion_change`) o, por
+    compatibilidad, una lista pelada de cookies. Exige `cookies` lista no vacia.
+    Nunca lanza.
+    """
+    try:
+        if isinstance(contenido, dict):
+            datos = dict(contenido)
+        elif isinstance(contenido, list):
+            datos = {"usuario": str(usuario or ""), "cookies": list(contenido)}
+        else:
+            return None
+        cookies = datos.get("cookies")
+        if not isinstance(cookies, list) or not cookies:
+            return None
+        datos["usuario"] = str(datos.get("usuario") or usuario or "")
+        datos.setdefault("email", "")
+        datos.setdefault("guardada", "")
+        datos.setdefault("proxy", "")
+        return datos
+    except Exception:
+        return None
+
+
+def _guardar_sesion_change_bd(usuario: str, datos: dict) -> bool:
+    """UPSERT de la sesion en `sesion_change` (best-effort; nunca lanza)."""
+
+    def _accion(db):
+        fila = (
+            db.query(SesionChange)
+            .filter(SesionChange.usuario == str(usuario or ""))
+            .first()
+        )
+        if fila is None:
+            db.add(
+                SesionChange(
+                    usuario=str(usuario or ""),
+                    cookies_json=dict(datos or {}),
+                )
+            )
+        else:
+            fila.cookies_json = dict(datos or {})
+            fila.actualizada = datetime.utcnow()
+        db.flush()
+        return True
+
+    return bool(_en_bd_sesion_change(_accion))
+
+
+def _cargar_sesion_change_bd(usuario: str) -> dict | None:
+    """Sesion de `sesion_change` normalizada (None si no hay/invalida)."""
+
+    def _accion(db):
+        fila = (
+            db.query(SesionChange)
+            .filter(SesionChange.usuario == str(usuario or ""))
+            .first()
+        )
+        if fila is None:
+            return None
+        return _sesion_change_normalizada(str(usuario or ""), fila.cookies_json)
+
+    resultado = _en_bd_sesion_change(_accion)
+    return resultado if isinstance(resultado, dict) else None
+
+
+def _borrar_sesion_change_bd(usuario: str) -> bool:
+    """Borra la fila de `sesion_change` (best-effort; nunca lanza)."""
+
+    def _accion(db):
+        return bool(
+            db.query(SesionChange)
+            .filter(SesionChange.usuario == str(usuario or ""))
+            .delete()
+        )
+
+    return bool(_en_bd_sesion_change(_accion))
+
+
 def guardar_sesion_change(
     usuario: str, driver, email: str = "", proxy: str = ""
 ) -> bool:
-    """Guarda las cookies de la sesion actual en `data/cookies/change/`.
+    """Guarda las cookies de la sesion actual (archivo + BD best-effort).
 
     Lee `driver.get_cookies()` y escribe el JSON
     ``{"usuario","email","guardada" (ISO),"proxy","cookies":[...]}`` con
-    escritura atomica (temp + `os.replace`; permisos 0600 en POSIX). NO
-    loguea valores de cookies. Con `CHANGE_REUTILIZAR_SESION` desactivado no
-    escribe nada. NUNCA lanza; devuelve True/False.
+    escritura atomica (temp + `os.replace`; permisos 0600 en POSIX); despues
+    hace UPSERT de ese mismo dict en la tabla `sesion_change` (BD), para que la
+    sesion sobreviva a los deploys sin volumen. NO loguea valores de cookies.
+    Con `CHANGE_REUTILIZAR_SESION` desactivado no escribe nada. La BD es
+    best-effort: si falla, el archivo manda. NUNCA lanza; devuelve True/False
+    (resultado del archivo).
     """
     if not _reutilizar_sesion_activo():
         return False
@@ -1049,41 +1258,65 @@ def guardar_sesion_change(
             f"Change.org: sesion guardada para {usuario or '(sin usuario)'} "
             f"({len(cookies)} cookies)"
         )
+    # BD (Supabase/Railway): UPSERT best-effort que sobrevive a los deploys.
+    if _guardar_sesion_change_bd(usuario, datos):
+        logger.debug(
+            f"Change.org: sesion de {usuario or '(sin usuario)'} sincronizada en BD"
+        )
     return ok
 
 
 def cargar_sesion_change(usuario: str) -> dict | None:
     """Carga la sesion persistida de `usuario` (None si no hay o es invalida).
 
-    Valida que el JSON sea un dict con ``"cookies"`` como lista no vacia. Con
-    `CHANGE_REUTILIZAR_SESION` desactivado devuelve None aunque el archivo
-    exista. NUNCA lanza.
+    Valida que el JSON sea un dict con ``"cookies"`` como lista no vacia. Orden:
+    archivo si existe y es valido; si no, la tabla `sesion_change` de la BD y,
+    cuando la sesion viene de la BD, se deja ademas una copia en el archivo
+    (cache best-effort, silenciosa). Con `CHANGE_REUTILIZAR_SESION` desactivado
+    devuelve None aunque exista. NUNCA lanza.
     """
     if not _reutilizar_sesion_activo():
         return None
+    datos = None
     try:
         with open(_ruta_sesion_change(usuario), "r", encoding="utf-8") as archivo:
             datos = json.load(archivo)
     except Exception:
+        datos = None
+    if isinstance(datos, dict):
+        cookies = datos.get("cookies")
+        if isinstance(cookies, list) and cookies:
+            return datos
+
+    # Sin archivo valido: la BD es la fuente que sobrevive a los deploys.
+    datos_bd = _cargar_sesion_change_bd(usuario)
+    if not isinstance(datos_bd, dict):
         return None
-    if not isinstance(datos, dict):
-        return None
-    cookies = datos.get("cookies")
-    if not isinstance(cookies, list) or not cookies:
-        return None
-    return datos
+    try:
+        _escribir_json_atomico(_ruta_sesion_change(usuario), datos_bd)
+    except Exception:  # pragma: no cover - `_escribir_json_atomico` nunca lanza
+        pass
+    logger.debug(
+        f"Change.org: sesion de {usuario or '(sin usuario)'} recuperada de la BD"
+    )
+    return datos_bd
 
 
 def borrar_sesion_change(usuario: str) -> bool:
-    """Borra la sesion persistida de `usuario`; True si elimino el archivo.
+    """Borra la sesion persistida de `usuario` (archivo + fila de BD).
 
-    False si no existe o si no se pudo borrar. NUNCA lanza.
+    Devuelve True si elimino el archivo (contrato clasico); la fila de
+    `sesion_change` se borra SIEMPRE en best-effort y un fallo de BD no afecta
+    el resultado. NUNCA lanza.
     """
+    eliminado = False
     try:
         os.remove(_ruta_sesion_change(usuario))
-        return True
+        eliminado = True
     except Exception:
-        return False
+        eliminado = False
+    _borrar_sesion_change_bd(usuario)
+    return eliminado
 
 
 # --------------------------------------------------------------------------- #
@@ -1501,6 +1734,7 @@ class ChangeOrgReportBot:
         cuenta: dict = None,
         esperar_captcha_seg=None,
         aviso=None,
+        resolver_captcha=None,
     ):
         self.url_peticion = str(url_peticion or "")
         self.contexto = str(contexto or "")
@@ -1511,6 +1745,8 @@ class ChangeOrgReportBot:
         self.cuenta = dict(cuenta or {})
         self.esperar_captcha_seg = _resolver_esperar_captcha_seg(esperar_captcha_seg)
         self.aviso = aviso if callable(aviso) else None
+        self.resolver_captcha = _resolver_captcha_modo(resolver_captcha)
+        self._captcha_api_fallidos = set()
         self.driver = None
         self._fwd_proxy = None
         self.ultimo_error = ""
@@ -2197,11 +2433,16 @@ class ChangeOrgReportBot:
         En MODO ASISTIDO (`esperar_captcha_seg > 0`) el reto anti-bot puede
         aparecer ANTES del campo de correo: se espera a que un humano lo
         resuelva y se sigue buscando el campo (deja el motivo en
-        `self.ultimo_error` si no se pudo).
+        `self.ultimo_error` si no se pudo). Si el solucionador CapSolver esta
+        activo (`resolver_captcha`) se intenta primero SIN humano.
         """
         for _ in range(max(1, intentos)):
             if self._cancelado():
                 return None
+            if self._resolver_captcha_activo():
+                reto_api = self._detectar_reto_humano() or self._detectar_captcha()
+                if reto_api and self._resolver_reto_captcha_api(reto_api):
+                    continue
             if self.esperar_captcha_seg > 0 and not self._esperar_reto_humano():
                 return None
             boton = self._buscar_boton_login()
@@ -2370,6 +2611,503 @@ class ChangeOrgReportBot:
             "y resuelvelo a mano"
         )
         return False
+
+    # ------------------------------------------------------------------ #
+    # CAPTCHA AUTOMATICO (CapSolver): resuelve el reto SIN humano
+    # ------------------------------------------------------------------ #
+    def _resolver_captcha_activo(self) -> bool:
+        """True si el solucionador CapSolver puede intentarse.
+
+        Requiere `resolver_captcha != "off"` y que `utils.captcha_solver`
+        este disponible (API key configurada). Import PEREZOSO: si el modulo
+        no existe o falla, devuelve False sin lanzar jamas.
+        """
+        try:
+            if str(getattr(self, "resolver_captcha", "auto") or "auto").strip().lower() == "off":
+                return False
+            from utils.captcha_solver import disponible
+
+            return bool(disponible())
+        except Exception:
+            return False
+
+    def _detectar_perimeterx(self) -> str:
+        """Detecta el reto PerimeterX/HUMAN Security de Change.org ("" si no).
+
+        Change.org puede servir su check propio "no eres un bot" con
+        PerimeterX (`window._pxAppId`, `#px-captcha`,
+        `[data-qa="px-captcha-modal"]`, `px-cloud.net`, "press and hold"),
+        que CapSolver NO cubre. Devuelve una etiqueta corta (JS, selector o
+        frase de texto) o "". Best-effort y NUNCA lanza.
+        """
+        driver = getattr(self, "driver", None)
+        if driver is None:
+            return ""
+        try:
+            resultado = driver.execute_script(
+                "try {"
+                "  if (window._pxAppId) return 'perimeterx';"
+                "  const nodo = document.querySelector("
+                "    '#px-captcha, [data-qa=\"px-captcha-modal\"],"
+                "     [id*=px-captcha], iframe[src*=px-cloud],"
+                "     iframe[src*=perimeterx]');"
+                "  if (nodo) return 'px-captcha';"
+                "  const recursos ="
+                "    document.querySelectorAll('script[src], link[href]');"
+                "  for (const r of recursos) {"
+                "    const url = r.src || r.href || '';"
+                "    if (/px-cloud\\.net|perimeterx/i.test(url)) return 'px-cloud';"
+                "  }"
+                "} catch (e) {}"
+                "return '';"
+            )
+            if resultado:
+                return str(resultado)
+        except Exception:
+            pass
+        for by, selector in (
+            (By.CSS_SELECTOR, "#px-captcha"),
+            (By.CSS_SELECTOR, "[data-qa='px-captcha-modal']"),
+            (By.CSS_SELECTOR, "[id*='px-captcha']"),
+            (By.CSS_SELECTOR, "iframe[src*='px-cloud']"),
+            (By.CSS_SELECTOR, "iframe[src*='perimeterx']"),
+        ):
+            for elemento in self._buscar_elementos(by, selector):
+                if self._visible(elemento):
+                    return selector
+        texto = _normalizar(self._texto_visible())
+        for frase in (
+            "no eres un bot",
+            "press and hold",
+            "manten presionado",
+            "manten presionada",
+            "haz clic a continuacion para demostrar que eres una persona",
+        ):
+            if frase in texto:
+                return frase
+        return ""
+
+    def _proxy_crudo_change(self) -> str:
+        """Proxy sticky de la cuenta como URL cruda para CapSolver ("" si no).
+
+        Usa `ProxyManager().normalizar` + `analizar` +
+        `_url_proxy_para_requests` (el proxy REAL host:port:user:pass), no el
+        forward local de Chrome: acepta tanto `http://user:pass@host:port` como
+        el formato crudo `host:port:user:pass`. Nunca lanza.
+        """
+        proxy = str(getattr(self, "proxy", "") or "").strip()
+        if not proxy:
+            return ""
+        try:
+            pm = ProxyManager()
+            normalizado = pm.normalizar(proxy) or proxy
+            info = pm.analizar(normalizado)
+            if not info:
+                return ""
+            return _url_proxy_para_requests(info)
+        except Exception:
+            return ""
+
+    def _extraer_config_turnstile(self) -> dict:
+        """Extrae la config del widget Turnstile del DOM (best-effort).
+
+        Devuelve SIEMPRE ``{"sitekey","callback","action","cdata",
+        "chl_page_data"}`` con "" donde no encontro nada: div
+        `.cf-turnstile[data-sitekey]`, cualquier `[data-sitekey]`, scripts
+        inline (`sitekey`/`render(`/`action`/`cData`) e iframes de
+        `challenges.cloudflare.com` (`?k=` del src) como ultimo recurso.
+        Nunca lanza.
+        """
+        vacio = {
+            "sitekey": "",
+            "callback": "",
+            "action": "",
+            "cdata": "",
+            "chl_page_data": "",
+        }
+        driver = getattr(self, "driver", None)
+        if driver is None:
+            return vacio
+        try:
+            datos = driver.execute_script(
+                "try {"
+                "  const salida = {sitekey: '', callback: '', action: '',"
+                "    cdata: '', chl_page_data: ''};"
+                "  const tomar = (el) => {"
+                "    if (!el) return;"
+                "    if (!salida.sitekey)"
+                "      salida.sitekey = el.getAttribute('data-sitekey') || '';"
+                "    if (!salida.callback)"
+                "      salida.callback = el.getAttribute('data-callback') || '';"
+                "    if (!salida.action)"
+                "      salida.action = el.getAttribute('data-action') || '';"
+                "    if (!salida.cdata)"
+                "      salida.cdata = el.getAttribute('data-cdata') || '';"
+                "    if (!salida.chl_page_data)"
+                "      salida.chl_page_data ="
+                "        el.getAttribute('data-chl-page-data') || '';"
+                "  };"
+                "  tomar(document.querySelector('.cf-turnstile[data-sitekey]'));"
+                "  if (!salida.sitekey) {"
+                "    const nodos = document.querySelectorAll('[data-sitekey]');"
+                "    for (const el of nodos) { tomar(el);"
+                "      if (salida.sitekey) break; }"
+                "  }"
+                "  if (!salida.sitekey) {"
+                "    const scripts = document.querySelectorAll('script:not([src])');"
+                "    for (const s of scripts) {"
+                "      const t = s.textContent || '';"
+                "      const m = t.match(/sitekey\\s*[:=]\\s*[\"']([^\"']+)[\"']/i)"
+                "        || t.match(/render\\s*\\(\\s*[\"']([^\"']+)[\"']/i);"
+                "      if (m && !salida.sitekey) salida.sitekey = m[1];"
+                "      const ma = t.match(/action\\s*[:=]\\s*[\"']([^\"']+)[\"']/i);"
+                "      if (ma && !salida.action) salida.action = ma[1];"
+                "      const mc = t.match(/cData\\s*[:=]\\s*[\"']([^\"']+)[\"']/i);"
+                "      if (mc && !salida.cdata) salida.cdata = mc[1];"
+                "      if (salida.sitekey) break;"
+                "    }"
+                "  }"
+                "  if (!salida.sitekey) {"
+                "    const frames ="
+                "      document.querySelectorAll('iframe[src*=\"challenges.cloudflare.com\"]');"
+                "    for (const f of frames) {"
+                "      const src = f.getAttribute('src') || '';"
+                "      const m = src.match(/[?&]k=([^&]+)/);"
+                "      if (m) { salida.sitekey = decodeURIComponent(m[1]); break; }"
+                "    }"
+                "  }"
+                "  return salida;"
+                "} catch (e) {"
+                "  return {sitekey: '', callback: '', action: '', cdata: '',"
+                "    chl_page_data: ''};"
+                "}"
+            )
+        except Exception as e:
+            logger.debug(f"Change.org: no se pudo extraer la config Turnstile: {e}")
+            return vacio
+        if not isinstance(datos, dict):
+            return vacio
+        return {
+            "sitekey": str(datos.get("sitekey") or ""),
+            "callback": str(datos.get("callback") or ""),
+            "action": str(datos.get("action") or ""),
+            "cdata": str(datos.get("cdata") or ""),
+            "chl_page_data": str(datos.get("chl_page_data") or ""),
+        }
+
+    def _inyectar_token_turnstile(self, token) -> bool:
+        """Inyecta el token de Turnstile en el formulario (True si lo aplico).
+
+        Setea `input/textarea[name="cf-turnstile-response"]` (o
+        `#cf-turnstile-response`, o cualquier input dentro de `.cf-turnstile`),
+        dispara `input`/`change` (bubbles) y llama `window[callback](token)` si
+        el widget declara `data-callback` y la funcion global existe. Devuelve
+        True si encontro al menos un input; nunca lanza.
+        """
+        token = str(token or "")
+        if not token:
+            return False
+        driver = getattr(self, "driver", None)
+        if driver is None:
+            return False
+        try:
+            aplicado = driver.execute_script(
+                "const token = arguments[0];"
+                "let inputs = [];"
+                "try {"
+                "  inputs = Array.from(document.querySelectorAll("
+                "    'input[name=\"cf-turnstile-response\"],"
+                "     textarea[name=\"cf-turnstile-response\"],"
+                "     #cf-turnstile-response'));"
+                "} catch (e) { inputs = []; }"
+                "if (!inputs.length) {"
+                "  const widgets = document.querySelectorAll('.cf-turnstile, [data-sitekey]');"
+                "  for (const w of widgets) {"
+                "    for (const i of w.querySelectorAll('input, textarea'))"
+                "      inputs.push(i);"
+                "  }"
+                "}"
+                "if (!inputs.length) return false;"
+                "for (const el of inputs) {"
+                "  try {"
+                "    el.value = token;"
+                "    el.setAttribute('value', token);"
+                "    el.dispatchEvent(new Event('input', {bubbles: true}));"
+                "    el.dispatchEvent(new Event('change', {bubbles: true}));"
+                "  } catch (e) {}"
+                "}"
+                "try {"
+                "  const widget = document.querySelector("
+                "    '.cf-turnstile[data-callback], [data-sitekey][data-callback]');"
+                "  if (widget) {"
+                "    const cb = widget.getAttribute('data-callback');"
+                "    if (cb) {"
+                "      const f = window[cb];"
+                "      if (typeof f === 'function') f(token);"
+                "    }"
+                "  }"
+                "} catch (e) {}"
+                "return true;",
+                token,
+            )
+            return bool(aplicado)
+        except Exception as e:
+            logger.debug(f"Change.org: no se pudo inyectar el token Turnstile: {e}")
+            return False
+
+    def _avisar_captcha_api(self, estado: str, **extra) -> None:
+        """Emite el aviso `captcha_api` del solucionador (jamas rompe el flujo).
+
+        Contrato: ``{"tipo":"captcha_api","estado":...,"metodo":"capsolver",
+        "usuario":...,"email":...,"segundos":N,"detalle":...}``.
+        """
+        aviso = getattr(self, "aviso", None)
+        if not callable(aviso):
+            return
+        cuenta = dict(self.cuenta or {})
+        info = {
+            "tipo": "captcha_api",
+            "estado": str(estado or ""),
+            "metodo": "capsolver",
+            "usuario": str(cuenta.get("usuario") or ""),
+            "email": str(cuenta.get("email") or ""),
+            "segundos": int(extra.pop("segundos", 0) or 0),
+            "detalle": str(extra.pop("detalle", "") or ""),
+        }
+        info.update(extra)
+        try:
+            aviso(info)
+        except Exception as e:  # pragma: no cover - callback de terceros
+            logger.debug(f"Change.org: el aviso de captcha API fallo: {e}")
+
+    def _reto_caido(self, segundos: int = 10) -> bool:
+        """True si el reto/captcha YA no esta visible (polling corto ~N segundos).
+
+        Cancelable; nunca lanza. Con la deteccion inicial limpia devuelve True
+        de inmediato.
+        """
+        intentos = max(1, int(segundos * 2))
+        for _ in range(intentos):
+            if self._cancelado():
+                return False
+            if not (self._detectar_reto_humano() or self._detectar_captcha()):
+                return True
+            time.sleep(0.5)
+        return not (self._detectar_reto_humano() or self._detectar_captcha())
+
+    def _resolver_reto_captcha_api(self, reto: str = "") -> bool:
+        """Intenta resolver el reto anti-bot con CapSolver (sin humano).
+
+        Flujo best-effort: aviso "iniciando" -> extrae la config del Turnstile
+        -> con sitekey resuelve `resolver_turnstile` SIN proxy (ProxyLess) e
+        inyecta el token (si falla o el reto sigue, UN reintento con el proxy
+        crudo de la cuenta) -> sin sitekey resuelve el interstitial con
+        `resolver_challenge_cloudflare` (requiere proxy) e inyecta las cookies
+        por CDP (y el `userAgent` con `aplicar_user_agent`). Si el reto es
+        PerimeterX/HUMAN (`_detectar_perimeterx`, `#px-captcha`) y no hay
+        sitekey Turnstile se SALTA al instante con UN aviso `captcha_api`
+        "fallo" (`_ERROR_PERIMETERX_API`), SIN llamar a CapSolver. Devuelve True
+        SOLO si el reto desaparece. NUNCA lanza; jamas deja `ultimo_error`
+        envenenado (se restaura salvo cancelacion) y emite los avisos
+        `captcha_api` "iniciando"/"resuelto"/"fallo".
+        """
+        if not self._resolver_captcha_activo():
+            return False
+        clave_reto = str(reto or "captcha").strip().lower() or "captcha"
+        fallidos = getattr(self, "_captcha_api_fallidos", None)
+        if fallidos is None:
+            fallidos = set()
+            self._captcha_api_fallidos = fallidos
+        if clave_reto in fallidos:
+            # Ya se intento y fallo en ESTA sesion: no se repite en cada vuelta
+            # del bucle (el flujo clasico/asistido decide).
+            logger.debug(
+                f"Change.org: el reto '{clave_reto}' ya fallo con CapSolver; "
+                "no se reintenta en esta sesion"
+            )
+            return False
+        error_previo = self.ultimo_error
+        inicio = time.time()
+        resuelto = False
+        detalle = ""
+        # FAST-SKIP PerimeterX/HUMAN: Change.org puede servir su check propio
+        # "no eres un bot" (`#px-captcha`, `_pxAppId`, `px-cloud.net`) que
+        # CapSolver NO cubre. Se detecta ANTES del aviso "iniciando" (un UNICO
+        # aviso "fallo") y SIN llamar a la API; el llamador cae de inmediato al
+        # MODO ASISTIDO/clasico sin gastar timeouts.
+        try:
+            config_inicial = self._extraer_config_turnstile() or {}
+        except Exception:
+            config_inicial = {}
+        sitekey_inicial = str(config_inicial.get("sitekey") or "").strip()
+        if not sitekey_inicial and not self._cancelado():
+            etiqueta_px = self._detectar_perimeterx()
+            if etiqueta_px:
+                logger.info(
+                    f"Change.org: reto PerimeterX detectado ({etiqueta_px}); "
+                    "CapSolver no lo cubre: se salta al MODO ASISTIDO/clasico"
+                )
+                fallidos.add(clave_reto)
+                self.ultimo_error = error_previo
+                self._avisar_captcha_api(
+                    "fallo",
+                    segundos=int(max(0.0, time.time() - inicio)),
+                    detalle=_ERROR_PERIMETERX_API,
+                )
+                return False
+        self._avisar_captcha_api(
+            "iniciando", detalle=f"reto detectado: {str(reto or 'captcha')}"
+        )
+        try:
+            from utils.captcha_solver import (
+                resolver_challenge_cloudflare,
+                resolver_turnstile,
+            )
+
+            url = ""
+            try:
+                url = str(self._url_actual() or "")
+            except Exception:
+                url = ""
+            config = config_inicial
+            sitekey = sitekey_inicial
+            if self._cancelado():
+                detalle = MENSAJE_CANCELADO
+            elif not url:
+                detalle = "sin URL actual: CapSolver no puede resolver el reto"
+            elif sitekey:
+                detalle = self._intentar_turnstile_api(
+                    resolver_turnstile, url, config
+                )
+                resuelto = detalle.startswith("resuelto")
+            else:
+                detalle = self._intentar_interstitial_api(
+                    resolver_challenge_cloudflare, url
+                )
+                resuelto = detalle.startswith("resuelto")
+        except Exception as e:
+            detalle = f"error inesperado: {e}"
+            logger.debug(f"Change.org: el solucionador de captcha fallo: {e}")
+        finally:
+            segundos_totales = int(max(0.0, time.time() - inicio))
+            if self._cancelado():
+                self.ultimo_error = MENSAJE_CANCELADO
+                detalle = detalle or MENSAJE_CANCELADO
+            else:
+                # El flujo clasico/asistido conserva sus mensajes EXACTOS: el
+                # intento API no deja rastro en `ultimo_error`.
+                self.ultimo_error = error_previo
+                if resuelto:
+                    fallidos.discard(clave_reto)
+                else:
+                    # Un fallo por reto y sesion: si aparece de nuevo el MISMO
+                    # reto no se repite la llamada (coste/tiempo); un exito
+                    # limpia la marca para retos futuros.
+                    fallidos.add(clave_reto)
+            self._avisar_captcha_api(
+                "resuelto" if resuelto else "fallo",
+                segundos=segundos_totales,
+                detalle=detalle,
+            )
+        return bool(resuelto)
+
+    def _intentar_turnstile_api(self, resolver_turnstile, url: str, config: dict) -> str:
+        """Intento Turnstile: ProxyLess y, si falla, UNA vez con proxy crudo.
+
+        Devuelve un detalle legible; el exito se reconoce por el prefijo
+        "resuelto".
+        """
+        sitekey = str(config.get("sitekey") or "").strip()
+        action = str(config.get("action") or "")
+        cdata = str(config.get("cdata") or "")
+        chl_page_data = str(config.get("chl_page_data") or "")
+        datos = resolver_turnstile(
+            url,
+            sitekey,
+            action=action,
+            cdata=cdata,
+            chl_page_data=chl_page_data,
+        )
+        if self._cancelado():
+            return MENSAJE_CANCELADO
+        detalle = self._aplicar_token_api(datos)
+        if detalle.startswith("resuelto"):
+            return detalle
+        proxy = self._proxy_crudo_change()
+        if not proxy:
+            return detalle or "CapSolver no devolvio token (sin proxy para reintentar)"
+        datos = resolver_turnstile(
+            url,
+            sitekey,
+            proxy=proxy,
+            action=action,
+            cdata=cdata,
+            chl_page_data=chl_page_data,
+        )
+        if self._cancelado():
+            return MENSAJE_CANCELADO
+        detalle_proxy = self._aplicar_token_api(datos)
+        if detalle_proxy.startswith("resuelto"):
+            return detalle_proxy
+        return (
+            f"{detalle or 'sin token'} | con proxy: "
+            f"{detalle_proxy or 'sin token'}"
+        )
+
+    def _aplicar_token_api(self, datos: dict) -> str:
+        """Inyecta el token resuelto y confirma que el reto cayo (detalle)."""
+        datos = dict(datos or {})
+        if not datos.get("ok"):
+            return str(datos.get("error") or "CapSolver no devolvio token")
+        token = str(datos.get("token") or "")
+        if not self._inyectar_token_turnstile(token):
+            return "CapSolver resolvio pero no se encontro el input del token"
+        if self._reto_caido(10):
+            return (
+                "resuelto: token Turnstile inyectado "
+                f"({int(datos.get('segundos') or 0)}s)"
+            )
+        return "token inyectado pero el reto sigue visible"
+
+    def _intentar_interstitial_api(self, resolver_challenge, url: str) -> str:
+        """Intento interstitial: CapSolver + cookies cf_clearance por CDP."""
+        proxy = self._proxy_crudo_change()
+        datos = resolver_challenge(url, proxy=proxy)
+        if self._cancelado():
+            return MENSAJE_CANCELADO
+        datos = dict(datos or {})
+        if not datos.get("ok"):
+            return str(datos.get("error") or "CapSolver no resolvio el interstitial")
+        cookies = dict(datos.get("cookies") or {})
+        inyectadas = 0
+        if cookies:
+            inyectadas = self._inyectar_cookies_cdp(
+                [
+                    {"name": nombre, "value": valor, "domain": ".change.org"}
+                    for nombre, valor in cookies.items()
+                    if str(nombre)
+                ]
+            )
+        user_agent = str(datos.get("user_agent") or "")
+        if user_agent and aplicar_user_agent is not None:
+            try:
+                aplicar_user_agent(getattr(self, "driver", None), user_agent)
+            except Exception as e:
+                logger.debug(f"Change.org: no se pudo aplicar el UA resuelto: {e}")
+        if inyectadas <= 0 and not cookies:
+            return "CapSolver resolvio el interstitial pero sin cookies que inyectar"
+        if self._cancelado():
+            return MENSAJE_CANCELADO
+        try:
+            self._navegar(url)
+        except Exception as e:
+            logger.debug(f"Change.org: no se pudo recargar tras el interstitial: {e}")
+        if self._reto_caido(10):
+            return (
+                f"resuelto: interstitial Cloudflare superado "
+                f"({inyectadas} cookies, {int(datos.get('segundos') or 0)}s)"
+            )
+        return "cookies inyectadas pero el reto sigue visible"
 
     def _mensaje_error_sesion(self, frase: str) -> str:
         """Mensaje accionable para el UI a partir de la señal detectada."""
@@ -2612,7 +3350,9 @@ class ChangeOrgReportBot:
         `_evidencia_home_logueada`) hasta ~8s. Devuelve True SOLO con
         evidencia real de sesion. Si hay error de red o aparece un reto/captcha
         devuelve False sin bloquear (el flujo normal de login/registro decidi-
-        ra). NUNCA lanza.
+        ra). Antes de rendirse, un reto/captcha se intenta resolver con
+        CapSolver si `resolver_captcha` esta activo; si se resuelve, la espera
+        continua hasta la evidencia. NUNCA lanza.
         """
         if not _reutilizar_sesion_activo():
             return False
@@ -2647,8 +3387,15 @@ class ChangeOrgReportBot:
                         f"({inyectadas} cookies): {evidencia}"
                     )
                     return True
-                if self._detectar_reto_humano() or self._detectar_captcha():
-                    return False
+                reto_restaurar = self._detectar_reto_humano() or self._detectar_captcha()
+                if reto_restaurar:
+                    if self._cancelado():
+                        return False
+                    # CAPTCHA AUTOMATICO: resolver el reto sin humano y seguir
+                    # esperando la evidencia (si falla, el flujo normal decide).
+                    if not self._resolver_reto_captcha_api(reto_restaurar):
+                        return False
+                    continue
                 time.sleep(0.5)
             return False
         except Exception as e:
@@ -2780,6 +3527,10 @@ class ChangeOrgReportBot:
                     if evidencia:
                         confirmado = evidencia
                         break
+                    if self._resolver_reto_captcha_api(captcha):
+                        # CAPTCHA AUTOMATICO (CapSolver): resuelto sin humano.
+                        reto_iter = 0
+                        continue
                     if self.esperar_captcha_seg > 0:
                         # MODO ASISTIDO: un humano lo resuelve y seguimos.
                         if self._esperar_reto_humano(captcha):
@@ -2796,6 +3547,10 @@ class ChangeOrgReportBot:
                     if evidencia:
                         confirmado = evidencia
                         break
+                    if self._resolver_reto_captcha_api(reto):
+                        # CAPTCHA AUTOMATICO (CapSolver): resuelto sin humano.
+                        reto_iter = 0
+                        continue
                     if self.esperar_captcha_seg > 0:
                         # MODO ASISTIDO: espera (visible) y continua al limpiarse.
                         if self._esperar_reto_humano(reto):
@@ -3632,6 +4387,19 @@ class ChangeOrgReportBot:
             if ok:
                 return True, evidencia
             ultima = evidencia
+            # Captcha en la confirmacion: intento automatico con CapSolver
+            # antes de rendirse (best-effort; el mensaje clasico no cambia).
+            if (
+                "captcha detectado" in str(evidencia or "").lower()
+                and self._resolver_captcha_activo()
+            ):
+                reto_confirmacion = (
+                    self._detectar_reto_humano() or self._detectar_captcha()
+                )
+                if reto_confirmacion and self._resolver_reto_captcha_api(
+                    reto_confirmacion
+                ):
+                    continue
             time.sleep(0.5)
         ok, evidencia = self._reporte_exitoso()
         if ok:
@@ -3858,6 +4626,16 @@ class ChangeOrgReportBot:
             self._cerrar_banner_cookies()
             if _paro():
                 return resultado
+
+            # Reto anti-bot en la peticion (Cloudflare/Turnstile): intento
+            # automatico con CapSolver (best-effort; si falla o no esta activo
+            # se conserva el flujo clasico con sus mensajes exactos).
+            if self._resolver_captcha_activo():
+                reto_peticion = self._detectar_reto_humano() or self._detectar_captcha()
+                if reto_peticion:
+                    self._resolver_reto_captcha_api(reto_peticion)
+                    if _paro():
+                        return resultado
 
             # La app React puede tardar en hidratar (el panel "Firma esta
             # peticion" se queda con spinner y el clic NO abre el modal). La
@@ -4089,6 +4867,7 @@ def ejecutar_un_reporte(
     esperar_captcha_seg=None,
     *,
     _aviso=None,
+    resolver_captcha=None,
 ) -> dict:
     """Genera identidad + queja IA, corre el bot y guarda la identidad si fue OK.
 
@@ -4102,6 +4881,8 @@ def ejecutar_un_reporte(
     `esperar_captcha_seg` activa el MODO ASISTIDO del bot (None -> env
     CHANGE_ESPERAR_CAPTCHA_SEG -> 0; ver `ChangeOrgReportBot`). `_aviso` es
     interno: el callback de aviso de espera que usan las campanas.
+    `resolver_captcha` (None -> env CHANGE_CAPTCHA_SOLVER -> "auto") activa
+    el solucionador CapSolver: "auto" lo intenta si hay API key, "off" no.
 
     Devuelve el dict de `reportar()` + ``{"identidad", "identidad_guardada",
     "guardado", "cancelado"}``. Con `cancelar` ya seteado devuelve
@@ -4150,6 +4931,7 @@ def ejecutar_un_reporte(
             cuenta=cuenta or None,
             esperar_captcha_seg=esperar_captcha_seg,
             aviso=_aviso,
+            resolver_captcha=resolver_captcha,
         )
         resultado = bot.reportar(identidad=identidad, queja=queja)
         if not isinstance(resultado, dict):
@@ -4212,6 +4994,7 @@ def registrar_cuenta_change(
     esperar_captcha_seg=None,
     *,
     _aviso=None,
+    resolver_captcha=None,
 ) -> dict:
     """Registra (o inicia sesion en) UNA cuenta de Change.org.
 
@@ -4223,7 +5006,8 @@ def registrar_cuenta_change(
 
     `esperar_captcha_seg` activa el MODO ASISTIDO dentro del bot (None -> env
     CHANGE_ESPERAR_CAPTCHA_SEG -> 0; acotado a [0, 900]); `_aviso` es interno:
-    el callback de aviso de espera que usan las campanas.
+    el callback de aviso de espera que usan las campanas. `resolver_captcha`
+    (None -> env CHANGE_CAPTCHA_SOLVER -> "auto") activa/desactiva CapSolver.
 
     Resultado: ``{"ok","usuario","email","estado","nombre","apellido","error",
     "evidencia","url","cancelado","sesion_restaurada"}`` con ``estado in
@@ -4278,6 +5062,7 @@ def registrar_cuenta_change(
             },
             esperar_captcha_seg=esperar_captcha_seg,
             aviso=_aviso,
+            resolver_captcha=resolver_captcha,
         )
         if not bot.preparar_driver():
             resultado["error"] = bot.ultimo_error or "no se pudo iniciar el navegador"
@@ -4320,6 +5105,7 @@ def ejecutar_campana_registros(
     cancelar=None,
     callback=None,
     esperar_captcha_seg=None,
+    resolver_captcha=None,
 ) -> dict:
     """Registra/entra en Change.org con un lote de cuentas de la BD.
 
@@ -4335,6 +5121,8 @@ def ejecutar_campana_registros(
       "espera_captcha","hechas":i,"total":N,"usuario":str,"email":str,
       "detalle":"esperando captcha (Ns)"}`` (tambien si el reto aparece al
       inicio del registro).
+    - `resolver_captcha`: solucionador CapSolver (None -> env
+      CHANGE_CAPTCHA_SOLVER -> "auto"; "off" lo desactiva).
     - `callback`: ``{"tipo":"inicio","total":N}`` y por cuenta terminada
       ``{"tipo":"registro","hechas":i,"total":N,"ok":bool,"usuario":str,
       "email":str,"estado":str,"detalle":str}``.
@@ -4490,6 +5278,7 @@ def ejecutar_campana_registros(
                     cancelar=cancelar,
                     esperar_captcha_seg=esperar_captcha_seg,
                     _aviso=_aviso_captcha,
+                    resolver_captcha=resolver_captcha,
                 )
             except Exception as e:
                 resultado = {
@@ -4632,6 +5421,7 @@ def ejecutar_campana_reportes(
     callback=None,
     cuentas=None,
     esperar_captcha_seg=None,
+    resolver_captcha=None,
 ) -> dict:
     """Lanza N reportes en paralelo con proxy round-robin por reporte.
 
@@ -4646,6 +5436,8 @@ def ejecutar_campana_reportes(
       CHANGE_ESPERAR_CAPTCHA_SEG -> 0). Cuando el bot avisa que espera el reto
       anti-bot, el callback recibe ``{"tipo":"espera_captcha","hechas":i,
       "total":N,"usuario":str,"email":str,"detalle":"esperando captcha (Ns)"}``.
+    - `resolver_captcha`: solucionador CapSolver (None -> env
+      CHANGE_CAPTCHA_SOLVER -> "auto"; "off" lo desactiva).
     - `callback` recibe ``{"tipo": "inicio", "total": N}`` y luego, por CADA
       reporte terminado, ``{"tipo": "reporte", "hechas": i, "total": N,
       "ok": bool, "email": str, "identidad": {...}, "detalle": str}``.
@@ -4775,6 +5567,7 @@ def ejecutar_campana_reportes(
                     guardar_identidad=guardar_identidades,
                     esperar_captcha_seg=esperar_captcha_seg,
                     _aviso=_aviso_captcha,
+                    resolver_captcha=resolver_captcha,
                 )
                 if cuenta_actual is not None:
                     kwargs["cuenta"] = cuenta_actual
