@@ -1,4 +1,4 @@
-"""Operacion ACTIVACION MASIVA: cita masiva clasica + campana por roles + 3+3+3.
+"""Operacion ACTIVACION MASIVA: cita masiva clasica + estrategia de tiers.
 
 Ambas pestanas de activacion incluyen el panel "📰 Contexto desde noticias
 (solo trasfondo)": ahi se pegan links de prensa (uno por linea, con o sin
@@ -18,7 +18,7 @@ SECCION (CI/IP/Libertad/Justicia o Todas: solo publican sus cuentas) y, con
 "🔁 Repetir", el % minimo/maximo de cuentas que entra en cada ronda
 (subconjunto aleatorio). Requiere URLs (tweet ancla).
 
-Pestana B ("🗂️ Por roles (subcuentas)"): divide las cuentas twitter activas en
+Pestana B ("🏅 Estrategia de Tiers"): divide las cuentas twitter activas en
 SUBCUENTAS por rol (`Cuenta.rol_activacion`, ver `core/roles.py`):
   - "cita"       -> Retweet con cita.
   - "hashtags"   -> Hashtags y menciones.
@@ -48,13 +48,6 @@ SUBCONJUNTO ALEATORIO de cuentas: mas del minimo% y menos del maximo%, la
 primera ronda tambien. Sin URLs no hay cita/rt/comentario; sin hashtags,
 contexto manual, texto base ni trasfondo de noticias no hay posts con
 hashtag.
-
-Pestana C ("📋 Campaña 3+3+3"): por cuenta 3 posts + 3 comentarios + 3 RTs
-del tweet principal (9 acciones). Genera los 9 textos con
-`ia.generador_contenido.generar_pool_campana_por_cuenta` (atajo
-`generar_textos_campana_3_3_3`), muestra el preview por cuenta y programa
-las 9 acciones en el scheduler con `scheduler.distribucion_horaria`
-(igual que "⏰ Reparto por Hora").
 
 Anti-atasco del contexto: el panel de noticias guarda la foto de los links
 (`links_crudos`) y, si los links cambian o se borran sin volver a extraer, el
@@ -2853,6 +2846,14 @@ def _por_roles():
     # necesita al abrir esta pestana (evita acoplar el arranque del dashboard).
     from web.operaciones.cuentas import _selector_masivo
 
+    # Cabecera interna de la pestana (estrategia de tiers).
+    st.markdown("### 🏅 Estrategia de Tiers (Curva de Aceleración)")
+    st.caption(
+        "Reparte las cuentas por roles (Hashtags/Cita/RT/Comentario) respetando "
+        "el Tier de cada cuenta (Tier 1 lidera, Tier 2 volumen, Tier 3 solo "
+        "RT/likes) y lanza la campaña con Curva de Aceleración opcional."
+    )
+
     # Limpieza diferida del contexto (fin de campana / "Limpiar contexto"):
     # SIEMPRE antes de crear cualquier widget de la pestana (incluido
     # `act_roles_contexto`).
@@ -2881,6 +2882,65 @@ def _por_roles():
             "'🗂️ Cuentas: Perfiles, Secciones & Nombres'."
         )
         return
+
+    # ---------------- Sección (filtro prominente) ----------------
+    opciones_seccion = [OPCION_TODAS_SECCIONES] + [
+        etiqueta_seccion(clave) for clave in SECCIONES
+    ]
+    seccion_opcion = st.selectbox(
+        "Sección",
+        opciones_seccion,
+        key="act_roles_seccion",
+        help=(
+            "Solo se usan las cuentas de esa sección. «Todas» no filtra por "
+            "sección; las cuentas sin asignar también entran con «Todas»."
+        ),
+    )
+    secciones_param = (
+        None
+        if seccion_opcion == OPCION_TODAS_SECCIONES
+        else [normalizar_seccion(seccion_opcion)]
+    )
+    if secciones_param:
+        n_seccion = sum(
+            1 for f in cuentas if f.get("seccion") == secciones_param[0]
+        )
+        st.info(
+            f"🚦 La campaña usará las cuentas de "
+            f"**{etiqueta_seccion(secciones_param[0])}**: "
+            f"{n_seccion} de {len(cuentas)} activas."
+        )
+    else:
+        st.info(
+            f"🚦 La campaña usará todas las cuentas activas: {len(cuentas)}."
+        )
+
+    # ---------------- Modo Tendencia (ráfaga) ----------------
+    # Preset que afina la estrategia para "tendencia en X": ráfaga corta y
+    # mezcla pesada en RT/cita/comentario (que mueven más la aguja que los
+    # likes). Solo setea session_state ANTES de que se instancien los widgets
+    # de abajo y re-ejecuta; no toca la lógica de lanzamiento ni el motor.
+    with st.expander("🎯 Modo Tendencia (ráfaga) — recomendado", expanded=True):
+        st.caption(
+            "Guía de eficacia: (a) elige un tweet ancla fuerte (Tier 1); "
+            "(b) la ráfaga debe ser CORTA (la fase 1 de 3 min dispara la "
+            "cascada rápido); (c) RT/cita/comentario pesan más que likes; "
+            "(d) no subas las cuotas por cuenta (12/día) para no quemar "
+            "cuentas: más volumen se logra con MÁS cuentas sanas e IPs "
+            "diversas, no con más acciones por cuenta."
+        )
+        if st.button("⚡ Aplicar preset de ráfaga", key="btn_tendencia_preset"):
+            try:
+                st.session_state["act_roles_curva"] = True
+                st.session_state["act_roles_curva_fase1"] = 3
+                st.session_state["act_roles_pct_hashtags"] = 15
+                st.session_state["act_roles_pct_cita"] = 30
+                st.session_state["act_roles_pct_rt"] = 35
+                st.session_state["act_roles_pct_comentario"] = 20
+            except Exception:
+                # Alguna key de widget no disponible: ignorar sin romper.
+                pass
+            st.rerun()
 
     # ---------------- Cuentas objetivo ----------------
     st.markdown("### 👥 Cuentas objetivo")
@@ -3080,37 +3140,6 @@ def _por_roles():
 
     # ---------------- Lanzar campana ----------------
     st.markdown("### 🚀 Lanzar campaña por roles")
-    opciones_seccion = [OPCION_TODAS_SECCIONES] + [
-        etiqueta_seccion(clave) for clave in SECCIONES
-    ]
-    seccion_opcion = st.selectbox(
-        "Sección",
-        opciones_seccion,
-        key="act_roles_seccion",
-        help=(
-            "Solo se usan las cuentas de esa sección. «Todas» no filtra por "
-            "sección; las cuentas sin asignar también entran con «Todas»."
-        ),
-    )
-    secciones_param = (
-        None
-        if seccion_opcion == OPCION_TODAS_SECCIONES
-        else [normalizar_seccion(seccion_opcion)]
-    )
-    if secciones_param:
-        n_seccion = sum(
-            1 for f in cuentas if f.get("seccion") == secciones_param[0]
-        )
-        st.caption(
-            f"🚦 La campaña usará las cuentas de "
-            f"**{etiqueta_seccion(secciones_param[0])}**: "
-            f"{n_seccion} de {len(cuentas)} activas."
-        )
-    else:
-        st.caption(
-            f"🚦 La campaña usará todas las cuentas activas: {len(cuentas)}."
-        )
-
     sin_ancla = st.checkbox(
         "📝 Campaña solo de posts (sin tweet ancla)",
         value=False,
@@ -3726,7 +3755,7 @@ def _por_roles():
 def render(usuario: dict):
     cabecera(
         "🎯 ACTIVACIÓN MASIVA",
-        "RT con cita masivo, campañas por roles y campaña 3+3+3",
+        "RT con cita masivo y estrategia de tiers (Curva de Aceleración)",
     )
 
     st.info(
@@ -3738,429 +3767,9 @@ def render(usuario: dict):
         f"Headless: **{settings.headless}**."
     )
 
-    tabs = st.tabs(["🎯 Cita masiva", "🗂️ Por roles (subcuentas)", "📋 Campaña 3+3+3"])
+    tabs = st.tabs(["🎯 Cita masiva", "🏅 Estrategia de Tiers"])
     with tabs[0]:
         _cita_masiva()
     with tabs[1]:
         _por_roles()
-    with tabs[2]:
-        _campana_3_3_3(usuario)
 
-
-# ============================ PESTANA C: 3+3+3 ============================
-
-def _campana_3_3_3(usuario: dict):
-    """Pestana C: 3 posts + 3 comentarios + 3 RTs del principal por cuenta.
-
-    Genera los 9 textos con `ia.generador_contenido.
-    generar_pool_campana_por_cuenta` (fallback al atajo
-    `generar_textos_campana_3_3_3`), muestra el preview por cuenta con los 9
-    textos y programa las acciones en el scheduler con
-    `scheduler.distribucion_horaria.plan_hora_cuenta` (n_posts=3,
-    n_comentarios=3, n_rts=3). Solo llama a ia//scheduler: no edita esos
-    modulos."""
-    from datetime import datetime, timedelta
-
-    from web.operaciones._helpers import cuentas_por_plataforma
-
-    st.markdown("### 📋 Campaña 3+3+3 (9 acciones por cuenta)")
-    st.caption(
-        "Por cuenta: **3 posts + 3 comentarios + 3 RTs del tweet principal**. "
-        "Los 9 textos se generan con la campaña 3+3+3 respetando registro y "
-        "perfil de cada cuenta (hashtag en medio) y se programan en el "
-        "scheduler a lo largo de la ventana."
-    )
-
-    cuentas = cuentas_por_plataforma("twitter")
-    if not cuentas:
-        st.info(
-            "No hay cuentas twitter activas. Importa/activa cuentas en "
-            "'🗂️ Cuentas: Perfiles, Secciones & Nombres'."
-        )
-        return
-
-    perfiles = {}
-    for c in cuentas:
-        try:
-            from core.perfiles import etiqueta_perfil
-
-            perfiles[c.usuario] = etiqueta_perfil(
-                getattr(c, "perfil_personalidad", "")
-            )
-        except Exception:
-            perfiles[c.usuario] = ""
-    opciones = {f"@{c.usuario} · {perfiles[c.usuario]}": c for c in cuentas}
-    seleccion_nombres = st.multiselect(
-        "Cuentas (por defecto, todas)",
-        list(opciones),
-        default=list(opciones),
-        key="act333_cuentas",
-    )
-    seleccion = [opciones[n] for n in seleccion_nombres]
-    if not seleccion:
-        st.warning("Selecciona al menos una cuenta.")
-        return
-
-    url_principal = st.text_input(
-        "Tweet principal (URL del tweet a retwittear)",
-        key="act333_url",
-        placeholder="https://x.com/…/status/…",
-    )
-    col_com, col_cita = st.columns(2)
-    with col_com:
-        urls_com = st.text_area(
-            "URLs para comentar/responder (una por línea)",
-            height=100,
-            key="act333_urls_com",
-            placeholder="https://x.com/…/status/…",
-        )
-    with col_cita:
-        base_cita = st.text_area(
-            "Texto base de la cita (opcional)",
-            height=100,
-            key="act333_base_cita",
-            placeholder="Si lo das, las 3 citas son variaciones suyas.",
-        )
-
-    col_fecha, col_hora, col_vent = st.columns(3)
-    with col_fecha:
-        fecha_base = st.date_input(
-            "Fecha de inicio",
-            value=(datetime.now() + timedelta(hours=1)).date(),
-            key="act333_fecha",
-        )
-    with col_hora:
-        hora_base = st.time_input(
-            "Hora de inicio",
-            value=(datetime.now() + timedelta(hours=1)).replace(
-                minute=0, second=0, microsecond=0
-            ).time(),
-            key="act333_hora",
-        )
-    with col_vent:
-        ventana = st.number_input(
-            "Ventana (min)", 30, 240, 60, step=10, key="act333_ventana"
-        )
-
-    inicio_dt = datetime.combine(fecha_base, hora_base)
-    if inicio_dt <= datetime.now():
-        st.error("La hora de inicio debe ser futura.")
-        return
-
-    col_g, col_p, col_l = st.columns(3)
-    with col_g:
-        generar = st.button(
-            "🧠 Generar 9 textos por cuenta",
-            type="primary",
-            key="btn_act333_generar",
-        )
-    with col_p:
-        programar = st.button(
-            "✅ Programar en el scheduler",
-            key="btn_act333_programar",
-            disabled="act333_plan" not in st.session_state,
-        )
-    with col_l:
-        limpiar = st.button("🗑️ Descartar", key="btn_act333_limpiar")
-
-    if limpiar:
-        for k in ("act333_plan", "act333_pool", "act333_preview"):
-            st.session_state.pop(k, None)
-        st.rerun()
-
-    if generar:
-        urls_com_list = [
-            l.strip() for l in str(urls_com or "").splitlines() if l.strip()
-        ]
-        if not (url_principal or "").strip():
-            st.error("Pega la URL del tweet principal.")
-        elif not urls_com_list:
-            st.error("Pega al menos una URL para los comentarios.")
-        else:
-            _generar_333(
-                seleccion,
-                inicio_dt,
-                ventana=int(ventana),
-                url_principal=url_principal.strip(),
-                urls_com=urls_com_list,
-                base_cita=(base_cita or "").strip(),
-            )
-
-    preview = st.session_state.get("act333_preview") or []
-    if preview:
-        _preview_333(preview)
-        if programar:
-            _programar_333(st.session_state.get("act333_plan") or [], usuario)
-
-
-def _generar_333(seleccion, inicio_dt, ventana, url_principal, urls_com, base_cita):
-    """Genera el pool 3+3+3, arma el plan horario y lo guarda en session."""
-    import random
-
-    from loguru import logger
-
-    from scheduler.distribucion_horaria import (
-        construir_plan_completo,
-        plan_hora_cuenta,
-    )
-
-    try:
-        from core.perfiles import normalizar_perfil
-    except Exception:
-        def normalizar_perfil(v):
-            return str(v or "").strip()
-
-    perfil_por_usuario = {
-        c.usuario: normalizar_perfil(getattr(c, "perfil_personalidad", ""))
-        for c in seleccion
-    }
-
-    orden = []
-    for c in seleccion:
-        rng = random.Random(hash((c.usuario, inicio_dt.isoformat())) & 0xFFFFFFFF)
-        orden.extend(
-            plan_hora_cuenta(
-                c.usuario,
-                perfil_por_usuario.get(c.usuario, ""),
-                inicio_dt,
-                n_posts=3,
-                n_comentarios=3,
-                n_rts=3,
-                ventana_minutos=int(ventana),
-                rng=rng,
-            )
-        )
-
-    cuentas_info = [
-        {
-            "usuario": c.usuario,
-            "registro": getattr(c, "tipo_cuenta", "") or "",
-            "personalidad": getattr(c, "personalidad", "") or "",
-            "seccion": getattr(c, "seccion", "") or "",
-            "nombre": getattr(c, "nombre_mostrado", "") or c.usuario,
-            "perfil": perfil_por_usuario.get(c.usuario, ""),
-        }
-        for c in seleccion
-    ]
-
-    progreso = st.progress(0.0)
-    estado = st.empty()
-
-    def _cb(hechas, total):
-        try:
-            progreso.progress(min(1.0, float(hechas) / max(1, int(total or 1))))
-            estado.caption(f"✍️ Generando campaña 3+3+3: {hechas}/{total}...")
-        except Exception:
-            pass
-
-    try:
-        from ia.generador_contenido import generar_pool_campana_por_cuenta
-
-        pool = generar_pool_campana_por_cuenta(
-            cuentas_info,
-            n_posts=3,
-            n_comentarios=3,
-            n_citas=3,
-            base_cita=base_cita or "",
-            callback=_cb,
-        )
-    except TypeError:
-        from ia.generador_contenido import generar_textos_campana_3_3_3
-
-        pool = generar_textos_campana_3_3_3(
-            cuentas_info, base_cita=base_cita or "", callback=_cb
-        )
-    except Exception as e:
-        logger.exception(f"Error generando campaña 3+3+3: {e}")
-        st.error(f"Error generando textos: {e}")
-        return
-
-    textos_posts, textos_com, textos_citas = {}, {}, {}
-    for i, c in enumerate(seleccion):
-        fila = (
-            pool[i]
-            if isinstance(pool, list) and i < len(pool) and isinstance(pool[i], dict)
-            else {}
-        )
-        textos_posts[c.usuario] = [
-            str(t).strip() for t in (fila.get("posts") or []) if str(t).strip()
-        ]
-        textos_com[c.usuario] = [
-            str(t).strip()
-            for t in (fila.get("comentarios") or [])
-            if str(t).strip()
-        ]
-        textos_citas[c.usuario] = [
-            str(t).strip() for t in (fila.get("citas") or []) if str(t).strip()
-        ]
-
-    progreso.progress(1.0)
-    estado.caption("✅ Textos listos (9 por cuenta).")
-
-    plan = construir_plan_completo(
-        orden,
-        posts_por_cuenta=textos_posts,
-        comentarios_por_cuenta=textos_com,
-        urls_rt=[url_principal],
-        urls_comentario=urls_com,
-    )
-    citas_restantes = {u: list(v) for u, v in textos_citas.items()}
-    for p in plan:
-        if p.get("tipo") == "retweet":
-            bolsa = citas_restantes.get(p.get("usuario")) or []
-            if bolsa:
-                p["texto"] = bolsa.pop(0)
-
-    st.session_state["act333_plan"] = plan
-    st.session_state["act333_pool"] = {
-        c.usuario: {
-            "posts": textos_posts.get(c.usuario, []),
-            "comentarios": textos_com.get(c.usuario, []),
-            "citas": textos_citas.get(c.usuario, []),
-        }
-        for c in seleccion
-    }
-    por_usuario: dict[str, list] = {}
-    for p in plan:
-        por_usuario.setdefault(p["usuario"], []).append(p)
-    st.session_state["act333_preview"] = sorted(por_usuario)
-    st.success(
-        f"✅ Plan 3+3+3 listo: {len(plan)} acciones "
-        f"({sum(1 for p in plan if p['tipo'] == 'post')} posts · "
-        f"{sum(1 for p in plan if p['tipo'] == 'comentario')} comentarios · "
-        f"{sum(1 for p in plan if p['tipo'] == 'retweet')} RTs)."
-    )
-    st.rerun()
-
-
-def _preview_333(usuarios: list):
-    """Tabla resumen + expanders por cuenta con los 9 textos."""
-    pool = st.session_state.get("act333_pool") or {}
-    plan = st.session_state.get("act333_plan") or []
-    por_usuario: dict[str, list] = {}
-    for p in plan:
-        por_usuario.setdefault(p.get("usuario"), []).append(p)
-
-    filas = []
-    for u in usuarios:
-        accs = por_usuario.get(u, [])
-        detalle = pool.get(u) or {}
-        filas.append(
-            {
-                "cuenta": f"@{u}",
-                "posts": len(detalle.get("posts") or []),
-                "comentarios": len(detalle.get("comentarios") or []),
-                "citas (RTs)": len(detalle.get("citas") or []),
-                "acciones": len(accs),
-            }
-        )
-    st.dataframe(filas, use_container_width=True, hide_index=True)
-
-    st.markdown("#### 📝 Textos por cuenta (9 por cuenta)")
-    for u in usuarios:
-        detalle = pool.get(u) or {}
-        posts = detalle.get("posts") or []
-        comentarios = detalle.get("comentarios") or []
-        citas = detalle.get("citas") or []
-        with st.expander(f"@{u} — {len(posts) + len(comentarios) + len(citas)} textos"):
-            st.markdown("**📝 Posts**")
-            for i, t in enumerate(posts, start=1):
-                st.markdown(f"{i}. {t}")
-            st.markdown("**💬 Comentarios**")
-            for i, t in enumerate(comentarios, start=1):
-                st.markdown(f"{i}. {t}")
-            st.markdown("**🔁 Citas (textos de los RTs del principal)**")
-            for i, t in enumerate(citas, start=1):
-                st.markdown(f"{i}. {t}")
-
-
-def _programar_333(plan: list, usuario: dict):
-    """Programa el plan 3+3+3 como Tareas (post/comentario/retweet)."""
-    from loguru import logger
-
-    from core.database import get_db_session
-    from core.models import Cuenta, Tarea
-    from scheduler.manager import SchedulerManager
-
-    usuarios = sorted({p.get("usuario") for p in (plan or []) if p.get("usuario")})
-    try:
-        with get_db_session() as db:
-            filas = db.query(Cuenta).filter(Cuenta.usuario.in_(usuarios)).all()
-            id_por_usuario = {c.usuario: c.id for c in filas}
-    except Exception as e:
-        st.error(f"No se pudieron cargar las cuentas: {e}")
-        return
-
-    try:
-        manager = SchedulerManager()
-    except Exception as e:
-        logger.exception(f"No se pudo iniciar el scheduler: {e}")
-        st.error(f"No se pudo iniciar el scheduler: {e}")
-        return
-
-    programadas = omitidas = fallidas = 0
-    for p in plan or []:
-        cuenta_id = id_por_usuario.get(p.get("usuario"))
-        if cuenta_id is None or p.get("fecha_hora") is None:
-            omitidas += 1
-            continue
-        texto = (p.get("texto") or "").strip()
-        url = (p.get("url") or "").strip()
-        tipo = p.get("tipo")
-        if tipo in ("post", "comentario") and not texto:
-            omitidas += 1
-            continue
-        if tipo in ("retweet", "comentario") and not url:
-            omitidas += 1
-            continue
-        try:
-            if tipo == "post":
-                tarea = Tarea(
-                    tipo="post",
-                    plataforma="twitter",
-                    contenido=texto,
-                    cuentas_ids=str([cuenta_id]),
-                    fecha_hora=p["fecha_hora"],
-                    estado="pendiente",
-                    creada_por=(usuario or {}).get("username"),
-                )
-            elif tipo == "comentario":
-                import json as _json
-
-                tarea = Tarea(
-                    tipo="comentario",
-                    plataforma="twitter",
-                    contenido=_json.dumps({"url": url, "texto": texto}),
-                    cuentas_ids=str([cuenta_id]),
-                    fecha_hora=p["fecha_hora"],
-                    estado="pendiente",
-                    creada_por=(usuario or {}).get("username"),
-                )
-            else:
-                import json as _json
-
-                tarea = Tarea(
-                    tipo="retweet",
-                    plataforma="twitter",
-                    contenido=_json.dumps([url]),
-                    cuentas_ids=str([cuenta_id]),
-                    fecha_hora=p["fecha_hora"],
-                    estado="pendiente",
-                    creada_por=(usuario or {}).get("username"),
-                )
-            if manager.programar_tarea(tarea):
-                programadas += 1
-            else:
-                fallidas += 1
-        except Exception as e:
-            logger.exception(f"Error programando acción 3+3+3: {e}")
-            fallidas += 1
-
-    if programadas:
-        st.success(f"✅ {programadas} acción(es) 3+3+3 programadas.")
-    if fallidas:
-        st.error(f"❌ {fallidas} acción(es) no se pudieron programar.")
-    if omitidas:
-        st.warning(f"⚠️ {omitidas} acción(es) omitidas (sin cuenta, texto o URL).")
-    for k in ("act333_plan", "act333_pool", "act333_preview"):
-        st.session_state.pop(k, None)

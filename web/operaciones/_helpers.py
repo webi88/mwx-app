@@ -1,3 +1,6 @@
+import random
+import time
+
 import streamlit as st
 from core.database import get_db_session
 from core.models import Cuenta
@@ -306,9 +309,30 @@ def aviso_pausadas(pausadas) -> None:
         st.caption(texto)
 
 
+def _pausa_entre_cuentas(pausa_entre) -> None:
+    """Duerme la pausa humana configurada (float fijo o tupla (min, max)).
+
+    Sirve para espaciar las cuentas como lo haría una persona (anti-detección
+    de coordinación). Nunca lanza: un valor inválido simplemente no duerme."""
+    if pausa_entre is None:
+        return
+    try:
+        if isinstance(pausa_entre, (tuple, list)):
+            minimo = float(pausa_entre[0])
+            maximo = float(pausa_entre[1])
+            segundos = random.uniform(minimo, maximo)
+        else:
+            segundos = float(pausa_entre)
+        if segundos > 0:
+            time.sleep(segundos)
+    except Exception:
+        return
+
+
 def ejecutar_en_cuentas(cuentas: list[Cuenta], accion, plataforma: str = "twitter",
                         progreso: st.progress = None, estado: st.empty = None,
-                        tipo: str = "post", incluir_pausadas: bool = False) -> dict:
+                        tipo: str = "post", incluir_pausadas: bool = False,
+                        pausa_entre=None) -> dict:
     """Ejecuta 'accion(bot)' sobre cada cuenta y acumula resultados.
 
     'accion' puede ser un callable o una lista/tupla de callables (uno por
@@ -324,7 +348,13 @@ def ejecutar_en_cuentas(cuentas: list[Cuenta], accion, plataforma: str = "twitte
     ver `core.pausas`) tampoco se ejecutan: suman a `resultados["omitidas"]` con
     el detalle "⏸️ ...", sin abrir navegador ni registrar nada. SOLO los flujos
     de mantenimiento pasan `incluir_pausadas=True` (mantenimiento programado,
-    publicar texto e IA de `posts.py`): ahi las pausadas siguen publicando."""
+    publicar texto e IA de `posts.py`): ahi las pausadas siguen publicando.
+
+    `pausa_entre` (opcional, al final) añade una pausa humana ENTRE cuenta y
+    cuenta para mitigar la detección de coordinación: un `float` duerme esa
+    cantidad fija; una tupla `(min, max)` sortea `random.uniform(min, max)`.
+    Nunca duerme antes de la primera cuenta y no cambia el resto del flujo
+    (Tier, pausadas, `RegistroAccion` ni `bot.cerrar()`)."""
     from plataformas.base import PlataformaFactory
     
     resultados = {"exitos": 0, "fallidos": 0, "detalles": [], "omitidas": 0}
@@ -335,6 +365,11 @@ def ejecutar_en_cuentas(cuentas: list[Cuenta], accion, plataforma: str = "twitte
         acciones = [accion] * total
     
     for i, cuenta in enumerate(cuentas):
+        # Pausa humana ENTRE cuenta y cuenta (NO antes de la primera). El
+        # `bot.cerrar()` de la cuenta anterior ya ocurrió en la iteración
+        # previa, así que el navegador de la siguiente cuenta abre después.
+        if i > 0:
+            _pausa_entre_cuentas(pausa_entre)
         if not incluir_pausadas and es_pausada_activacion(cuenta):
             usuario = getattr(cuenta, "usuario", "?")
             resultados["omitidas"] += 1
