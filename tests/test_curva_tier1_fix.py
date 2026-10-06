@@ -780,6 +780,153 @@ def test_claves_siempre_presentes(check):
 
 
 # --------------------------------------------------------------------------- #
+# (8) Curva NO desactivada por Tier 1 sin sesion
+# --------------------------------------------------------------------------- #
+def _partir_sesion_marcada(cuentas):
+    """Splitter de sesion que respeta el marker `_sin_sesion` de las cuentas.
+
+    Reproduce el escenario real sin tocar disco: una cuenta con el atributo
+    `_sin_sesion` (sin credenciales) cae a `sin_sesion`, el resto conserva
+    sesion.
+    """
+    con, sin = [], []
+    for cuenta in (cuentas or []):
+        (sin if getattr(cuenta, "_sin_sesion", False) else con).append(cuenta)
+    return con, sin
+
+
+def _lanzar_roles_con_sesion(motor, cuentas, duracion=9, fase1=3):
+    """Como `_lanzar_roles` pero con `_partir_por_sesion` respetando el marker."""
+    registros: list = []
+    with _parches(
+        (motor_mod, "_partir_por_sesion", _partir_sesion_marcada),
+        (motor_mod, "registrar_accion", lambda *a, **k: registros.append(a)),
+    ):
+        resumen = motor.ejecutar_por_roles(
+            urls=["https://x.com/ancla/status/9"],
+            texto_base="texto base",
+            hashtags="#x",
+            usuarios=[c.usuario for c in cuentas],
+            duracion_min=duracion,
+            cohortes=1,
+            repetir=True,
+            roles_aleatorios=False,
+            curva_aceleracion=True,
+            curva_fase1_min=fase1,
+        )
+    return resumen, registros
+
+
+def _cuenta_sin_sesion(usuario, rol, tier):
+    cuenta = _CuentaFake(usuario, rol_activacion=rol, tier_calidad=tier)
+    cuenta.auth_token = ""
+    cuenta._sin_sesion = True
+    return cuenta
+
+
+def test_curva_sigue_activa_con_tier1_sin_sesion(check):
+    print("(8) curva NO se desactiva por Tier 1 sin sesion (quedan otros con sesion)")
+    t1_con = [
+        _CuentaFake("t1_a", rol_activacion="hashtags", tier_calidad="tier1"),
+        _CuentaFake("t1_b", rol_activacion="hashtags", tier_calidad="tier1"),
+    ]
+    t1_sin = _cuenta_sin_sesion("t1_sin", "hashtags", "tier1")
+    otros = [
+        _CuentaFake("o_0", rol_activacion="rt", tier_calidad="tier2"),
+        _CuentaFake("o_1", rol_activacion="cita", tier_calidad="tier2"),
+    ]
+    cuentas = t1_con + [t1_sin] + otros
+    motor = MotorActivacion(max_concurrente=1)
+    acciones: list = []
+    _preparar_e2e(motor, cuentas, acciones)
+    original_time = motor_mod.time
+    motor_mod.time = _RelojFalso(paso=0.5)
+    try:
+        with _parches(
+            (cuotas_mod, "contar_acciones_por_usuario",
+             lambda *a, **k: {}),
+            (cuotas_mod, "contar_acciones_dia_por_usuario",
+             lambda *a, **k: {}),
+        ):
+            resumen, _registros = _lanzar_roles_con_sesion(motor, cuentas)
+    finally:
+        motor_mod.time = original_time
+    check(
+        "curva_aceleracion=True (NO se desactivo por el Tier 1 sin sesion)",
+        resumen.get("curva_aceleracion") is True,
+        f"(curva_aceleracion={resumen.get('curva_aceleracion')})",
+    )
+    en_fase1 = [(u, r) for u, r, _t, en2 in acciones if en2 is False]
+    check(
+        "fase 1: solo se despachan Tier 1 CON sesion (nunca Tier 2 ni sin sesion)",
+        bool(en_fase1)
+        and all(u in ("t1_a", "t1_b") for u, _r in en_fase1),
+        f"(fase1={en_fase1})",
+    )
+    check(
+        "los Tier 1 sin sesion se reportan como sin_sesion (no abren navegador)",
+        int(resumen.get("sin_sesion", 0)) == 1
+        and "t1_sin" in [str(u) for u in resumen.get("sin_sesion_usuarios", [])],
+        f"(sin_sesion={resumen.get('sin_sesion')}, "
+        f"usuarios={resumen.get('sin_sesion_usuarios')})",
+    )
+    check(
+        "en fase 2 los Tier 2 SI se despachan (cascada)",
+        any(u not in ("t1_a", "t1_b", "t1_sin") for u, _r, _t, _e in acciones),
+        f"(tier2={[(u, r) for u, r, _t, _e in acciones if u.startswith('o_')]})",
+    )
+
+
+def test_curva_anticipada_si_todos_tier1_sin_sesion(check):
+    print("(9) TODOS los Tier 1 sin sesion: curva activa y fase 2 anticipada")
+    t1_sin = [
+        _cuenta_sin_sesion("t1_s1", "hashtags", "tier1"),
+        _cuenta_sin_sesion("t1_s2", "hashtags", "tier1"),
+    ]
+    otros = [
+        _CuentaFake("o_0", rol_activacion="rt", tier_calidad="tier2"),
+        _CuentaFake("o_1", rol_activacion="cita", tier_calidad="tier2"),
+    ]
+    cuentas = t1_sin + otros
+    motor = MotorActivacion(max_concurrente=1)
+    acciones: list = []
+    _preparar_e2e(motor, cuentas, acciones)
+    original_time = motor_mod.time
+    motor_mod.time = _RelojFalso(paso=0.5)
+    try:
+        with _parches(
+            (cuotas_mod, "contar_acciones_por_usuario",
+             lambda *a, **k: {}),
+            (cuotas_mod, "contar_acciones_dia_por_usuario",
+             lambda *a, **k: {}),
+        ):
+            resumen, _registros = _lanzar_roles_con_sesion(motor, cuentas)
+    finally:
+        motor_mod.time = original_time
+    check(
+        "curva_aceleracion=True (antes del fix se DESACTIVABA y arrancaba en modo normal)",
+        resumen.get("curva_aceleracion") is True,
+        f"(curva_aceleracion={resumen.get('curva_aceleracion')})",
+    )
+    check(
+        "no queda Tier 1 utilizable -> fase 2 ANTICIPADA",
+        resumen.get("curva_fase2_anticipada") is True,
+        f"(anticipada={resumen.get('curva_fase2_anticipada')}, "
+        f"motivo={resumen.get('curva_fase2_motivo')!r})",
+    )
+    check(
+        "los Tier 1 sin sesion NUNCA abren navegador (solo sin_sesion)",
+        not any(str(u).startswith("t1_") for u, _r, _t, _e in acciones),
+        f"(tier1 despachados={[(u, r) for u, r, _t, _e in acciones if u.startswith('t1_')]})",
+    )
+    check(
+        "los Tier 2 si trabajan (fase 2 anticipada)",
+        any(u.startswith("o_") for u, _r, _t, _e in acciones),
+        f"(tier2={[(u, r) for u, r, _t, _e in acciones if u.startswith('o_')]})",
+    )
+
+
+# --------------------------------------------------------------------------- #
 # Runner
 # --------------------------------------------------------------------------- #
 def run(check):
@@ -795,6 +942,8 @@ def run(check):
     test_e2e_algun_tier1_vivo(check)
     test_e2e_cita_masiva_sin_cupo(check)
     test_claves_siempre_presentes(check)
+    test_curva_sigue_activa_con_tier1_sin_sesion(check)
+    test_curva_anticipada_si_todos_tier1_sin_sesion(check)
 
 
 if __name__ == "__main__":

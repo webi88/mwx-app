@@ -10,7 +10,28 @@ def render_sidebar(usuario: dict):
     
     col_user, col_logout = st.columns([3, 1])
     with col_user:
-        st.markdown(f"{rol_emoji} **{usuario['nombre']}** `({usuario['rol']})`")
+        st.markdown(
+            f"""
+            <div style="
+                display:flex; align-items:center; gap:8px;
+                background:linear-gradient(90deg, rgba(0,180,196,0.16), rgba(124,92,255,0.10));
+                border:1px solid rgba(255,255,255,0.08);
+                border-radius:10px; padding:6px 10px;
+            ">
+                <span style="font-size:15px;">{rol_emoji}</span>
+                <span style="font-weight:700; color:#fff; font-size:0.85rem;">{usuario['nombre']}</span>
+                <span style="
+                    margin-left:auto; font-size:0.62rem; letter-spacing:1px;
+                    text-transform:uppercase; color:rgba(0,180,196,0.9);
+                ">{usuario['rol']}</span>
+                <span style="
+                    display:inline-block; width:7px; height:7px; border-radius:50%;
+                    background:#2dd4a7;
+                "></span>
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
     with col_logout:
         if st.button("🚪 Salir", key="btn_logout_web"):
             # Cierra la sesión: limpia auth + navegación persistente (?op=,

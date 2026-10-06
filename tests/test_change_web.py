@@ -1447,9 +1447,10 @@ def run(check):
         )
         etiquetas_tabs = [str(t.label) for t in at.tabs]
         check(
-            "change AppTest: 2 pestanas (ataque de reportes + cuentas Change)",
+            "change AppTest: 3 pestanas (ataque de reportes + cuentas Change + firmar)",
             any("Ataque de reportes" in etiqueta for etiqueta in etiquetas_tabs)
-            and any("Cuentas Change.org" in etiqueta for etiqueta in etiquetas_tabs),
+            and any("Cuentas Change.org" in etiqueta for etiqueta in etiquetas_tabs)
+            and any("Firmar peticiones" in etiqueta for etiqueta in etiquetas_tabs),
             ascii(str(etiquetas_tabs))[:200],
         )
         radio_modo = _widget_por_key(at, "radio", "change_rep_modo")

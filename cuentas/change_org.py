@@ -300,6 +300,36 @@ Contrato congelado (el frontend y los tests dependen de el; no romper):
         Intento automatico con CapSolver (ver seccion 6): True SOLO si el reto
         desaparecio. Best-effort y jamas lanza.
 
+    marcar_identidad_firmada(email) -> dict
+        {"marcada": bool, "id": int|None, "motivo": str}. Marca
+        `CuentaChange.usada_firma=True` para `email` (granja anonima, tras una
+        firma exitosa). NUNCA lanza.
+
+    ChangeOrgReportBot.firmar(identidad=None) -> dict
+        Firma la peticion de `self.url_peticion` con el flujo de 8 pasos:
+        "Firmar la peticion" -> "¡Ya firmaste! Ahora aporta o comparte" ->
+        "No, prefiero compartirla" -> "Copiar enlace" -> "Continuar". Exito
+        SOLO con evidencia positiva ("ya firmaste"/confirmacion/URL). Con
+        `cuenta` restaura la sesion persistida primero (anti-captcha). Devuelve
+        ``{"ok","email","nombre","apellido","error","evidencia","url","captura",
+        "usada_firma"}`` (+ "usuario"/"estado_cuenta"/"sesion_restaurada" en
+        modo cuenta). NUNCA lanza.
+
+    ejecutar_un_firma(url_peticion, proxy="", headless=None, cancelar=None,
+                      cuenta=None, identidad=None, guardar_identidad=True,
+                      esperar_captcha_seg=None, *, resolver_captcha=None) -> dict
+        Una firma (modo cuenta o anonimo). En anonimo ok guarda la identidad en
+        la granja (origen="firma") y marca `usada_firma`. Cierra SIEMPRE.
+
+    ejecutar_campana_firmas(url_peticion, cantidad=5, max_workers=2,
+                            usar_proxies=True, pais_proxy="", guardar_identidades=True,
+                            headless=None, cancelar=None, callback=None, cuentas=None,
+                            esperar_captcha_seg=None, resolver_captcha=None) -> dict
+        N firmas en paralelo con proxy round-robin. Resumen:
+        {"total","firmadas","fallidos","cancelada","identidades_guardadas",
+        "resultados","proxies_total","sin_proxy","proxies_descartados","error",
+        "con_cuentas","cuentas_total"}. NUNCA lanza.
+
 Reglas de oro del flujo Selenium:
     - `driver.get` tolera `TimeoutException` (sigue con esperas explicitas).
     - Escritura humana REAL con `send_keys` caracter por caracter (los eventos
@@ -356,10 +386,13 @@ __all__ = [
     "guardar_sesion_change",
     "cargar_sesion_change",
     "borrar_sesion_change",
+    "marcar_identidad_firmada",
     "registrar_cuenta_change",
     "ejecutar_un_reporte",
     "ejecutar_campana_reportes",
     "ejecutar_campana_registros",
+    "ejecutar_un_firma",
+    "ejecutar_campana_firmas",
 ]
 
 
@@ -428,6 +461,70 @@ _FRASES_FIRMADO = (
     "already signed",
     "thank you for signing",
 )
+# --------------------------------------------------------------------------- #
+# Firmar peticiones (ademas de denunciar). Flujo de 8 pasos del dueno:
+# (1) link de la peticion -> (2) "Firmar la peticion" -> (3) pantalla
+# "¡Ya firmaste! Ahora aporta o comparte" -> (4) "No, prefiero compartirla" ->
+# (5) OTRA pestana con el enlace de compartir -> (6) "Copiar enlace" ->
+# (7) "Continuar" -> (8) la firma queda lista. Todas las frases estan
+# normalizadas (minusculas y sin acentos).
+# --------------------------------------------------------------------------- #
+# Boton de firma de la peticion (coincide por 'frase in texto').
+_FRASES_BOTON_FIRMAR = _FRASES_FIRMA
+# Evidencia positiva de que la firma quedo registrada.
+_FRASES_FIRMA_EXITO = (
+    "ya firmaste",
+    "has firmado",
+    "firmaste esta peticion",
+    "gracias por firmar",
+    "has apoyado esta peticion",
+    "tu firma ha sido",
+    "firma registrada",
+    "firma completada",
+    "you signed",
+    "already signed",
+    "thank you for signing",
+)
+# Pantalla intermedia de aportacion/compartir ("¡Ya firmaste! Ahora aporta o
+# comparte"). Se detecta para saber que hay que pulsar "No, prefiero
+# compartirla" y seguir con el flujo de compartir.
+_FRASES_PANTALLA_COMPARTIR = (
+    "ahora aporta o comparte",
+    "ahora comparte",
+    "aporta o comparte",
+    "comparte esta peticion",
+    "share this petition",
+    "share and spread the word",
+    "spread the word",
+)
+# Boton para NO aportar (pasar al compartir): "No, prefiero compartirla".
+_FRASES_NO_COMPARTIR = (
+    "no, prefiero compartirla",
+    "no prefiero compartirla",
+    "no, prefiero compartir",
+    "no quiero compartir",
+    "prefiero compartirla",
+    "no thanks",
+    "no, thanks",
+    "not now",
+    "maybe later",
+    "skip",
+)
+# Boton "Copiar enlace" (ES/EN) de la pestana de compartir.
+_FRASES_COPIAR_ENLACE = (
+    "copiar enlace",
+    "copiar link",
+    "copiar vinculo",
+    "copy link",
+    "copy url",
+    "copiar",
+)
+# URL de confirmacion de la firma (fragmentos normalizados).
+_FRASES_URL_FIRMA = (
+    "signed", "firmado", "confirm", "success", "thank", "gracias",
+)
+# Mensaje de exito estandar cuando la firma quedo registrada.
+_ERROR_BOTON_FIRMAR = "no se encontro el boton Firmar la peticion"
 # Poll JS del panel de firma de la peticion: devuelve
 # {"panel": bool, "spinner": bool, "texto": str} o null. El marcador
 # "change_org:app_peticion" permite a los tests (fakes) interceptarlo.
@@ -1704,6 +1801,50 @@ def guardar_identidad_change(
                 }
 
         return {"guardada": False, "id": None, "motivo": "error", "error": str(e)}
+
+
+def marcar_identidad_firmada(email: str) -> dict:
+    """Marca `CuentaChange.usada_firma = True` para `email` (best-effort).
+
+    Se usa al terminar una FIRMA exitosa (granja anonima): la identidad queda
+    marcada como "ya usada para firmar" (columna que ya existe en
+    `core.models.CuentaChange`). Devuelve ``{"marcada": bool, "id": int|None,
+    "motivo": str}``; si la tabla/BD no existe, intenta `init_db()` UNA vez y
+    reintenta. NUNCA lanza.
+    """
+    email = str(email or "").strip().lower()
+    if not email:
+        return {"marcada": False, "id": None, "motivo": "sin email"}
+
+    def _marcar() -> dict:
+        with obtener_sesion() as db:
+            registro = (
+                db.query(CuentaChange)
+                .filter(CuentaChange.email == email)
+                .first()
+            )
+            if registro is None:
+                return {"marcada": False, "id": None, "motivo": "no existe"}
+            registro.usada_firma = True
+            return {"marcada": True, "id": registro.id, "motivo": ""}
+
+    try:
+        return _marcar()
+    except Exception as e:
+        try:
+            from core.database import init_db
+
+            init_db()
+        except Exception:  # pragma: no cover - defensa extrema
+            pass
+        try:
+            return _marcar()
+        except Exception as e_reintento:
+            return {
+                "marcada": False,
+                "id": None,
+                "motivo": f"error: {e_reintento}",
+            }
 
 
 # --------------------------------------------------------------------------- #
@@ -3386,6 +3527,20 @@ class ChangeOrgReportBot:
                         f"Change.org: sesion restaurada de {usuario or '(sin usuario)'} "
                         f"({inyectadas} cookies): {evidencia}"
                     )
+                    # (A) Re-guardar la sesion tras la restauracion: el servidor
+                    # pudo rotar/refrescar las cookies durante la navegacion y
+                    # asi las corridas siguientes (incluso en Railway) entran
+                    # con las cookies mas frescas sin volver a pedir captcha.
+                    # Best-effort: con un driver fake sin cookies no hace nada.
+                    try:
+                        guardar_sesion_change(
+                            usuario,
+                            self.driver,
+                            email,
+                            self.proxy,
+                        )
+                    except Exception:  # pragma: no cover - defensa extrema
+                        pass
                     return True
                 reto_restaurar = self._detectar_reto_humano() or self._detectar_captcha()
                 if reto_restaurar:
@@ -4781,6 +4936,287 @@ class ChangeOrgReportBot:
             time.sleep(0.5)
         return self._formulario_presente()
 
+    # ------------------------------------------------------------------ #
+    # Firma de peticiones (ademas de denunciar)
+    # ------------------------------------------------------------------ #
+    def _buscar_boton_por_frases(self, frases, intentos: int = 1):
+        """Boton/link visible e interactuable por una lista de frases.
+
+        Recorre `button`/`[role='button']`/`a`/`input[submit]` y acepta
+        coincidencia por `frase in texto` (texto visible o `value`). Devuelve el
+        primero que coincide o None. Tolerante a fallos. NUNCA lanza.
+        """
+        for _ in range(max(1, int(intentos or 1))):
+            for by, selector in (
+                (By.TAG_NAME, "button"),
+                (By.CSS_SELECTOR, "[role='button']"),
+                (By.TAG_NAME, "a"),
+                (By.CSS_SELECTOR, "input[type='submit']"),
+            ):
+                for elemento in self._buscar_elementos(by, selector):
+                    if not (
+                        self._visible(elemento) and self._interactuable(elemento)
+                    ):
+                        continue
+                    texto = self._texto_boton_candidato(elemento)
+                    if not texto:
+                        continue
+                    if any(frase in texto for frase in frases):
+                        return elemento
+            if intentos > 1:
+                time.sleep(0.5)
+        return None
+
+    def _firma_exitosa(self):
+        """(ok, evidencia/motivo) de la firma. Exito SOLO con evidencia positiva.
+
+        Prioridad: captcha -> error de pagina -> URL de confirmacion -> texto de
+        "ya firmaste"/confirmacion. Nunca marca exito "por hacer clic".
+        """
+        captcha = self._detectar_captcha()
+        if captcha:
+            return False, f"captcha detectado: {captcha}"
+        error = self._detectar_error_envio()
+        if error:
+            return False, f"error en la pagina: '{error}'"
+        url = self._url_actual()
+        url_norm = _normalizar(url)
+        for fragmento in _FRASES_URL_FIRMA:
+            if fragmento and fragmento in url_norm:
+                return True, f"URL de confirmacion: {url}"
+        texto = _normalizar(self._texto_visible())
+        for frase in _FRASES_FIRMA_EXITO:
+            if frase in texto:
+                return True, f"confirmacion en pantalla: '{frase}'"
+        return False, "sin evidencia de firma en la pagina"
+
+    def _esperar_firma(self, intentos: int = 30):
+        """Espera (~15s) la evidencia positiva de la firma. Devuelve (ok, evidencia)."""
+        ultima = ""
+        for _ in range(max(1, intentos)):
+            if self._cancelado():
+                return False, MENSAJE_CANCELADO
+            ok, evidencia = self._firma_exitosa()
+            if ok:
+                return True, evidencia
+            ultima = evidencia
+            time.sleep(0.5)
+        ok, evidencia = self._firma_exitosa()
+        if ok:
+            return True, evidencia
+        return False, evidencia or ultima
+
+    def _pantalla_compartir_presente(self) -> bool:
+        texto = _normalizar(self._texto_visible())
+        return any(frase in texto for frase in _FRASES_PANTALLA_COMPARTIR)
+
+    def firmar(self, identidad: dict = None) -> dict:
+        """Firma la peticion de `self.url_peticion` (flujo de 8 pasos del dueno).
+
+        Si el bot trae `cuenta`, PRIMERO ejecuta `registrar_o_entrar()` (restaura
+        la sesion persistida o hace login/registro) para NO pedir captcha.
+
+        Flujo: (1) navega a la peticion -> (2) "Firmar la peticion" -> (3)
+        pantalla "¡Ya firmaste! Ahora aporta o comparte" -> (4) "No, prefiero
+        compartirla" -> (5) OTRA pestana con el enlace -> (6) "Copiar enlace" ->
+        (7) "Continuar" -> (8) firma lista. Exito SOLO con evidencia positiva
+        ("ya firmaste"/confirmacion tras "Continuar"/URL de confirmacion).
+
+        Devuelve ``{"ok","email","nombre","apellido","error","evidencia","url",
+        "captura","usada_firma"}`` (+ ``"usuario"``, ``"estado_cuenta"`` y
+        ``"sesion_restaurada"`` en modo cuenta; + ``"cancelado"`` si se pidio el
+        paro). `captura` es la ruta del PNG de evidencia cuando ok=True y "" en
+        cualquier otro caso. NUNCA lanza.
+        """
+        identidad = dict(identidad or {})
+        if not identidad and self.cuenta:
+            identidad = _identidad_desde_cuenta(self.cuenta)
+        resultado = {
+            "ok": False,
+            "email": str(identidad.get("email") or ""),
+            "nombre": str(identidad.get("nombre") or ""),
+            "apellido": str(identidad.get("apellido") or ""),
+            "error": "",
+            "evidencia": "",
+            "url": self.url_peticion,
+            "captura": "",
+            "usada_firma": False,
+            "sesion_restaurada": False,
+        }
+        if self.cuenta:
+            resultado["usuario"] = str(self.cuenta.get("usuario") or "")
+        if self._cancelado():
+            resultado["cancelado"] = True
+            resultado["error"] = MENSAJE_CANCELADO
+            return resultado
+        if not self.url_peticion:
+            resultado["error"] = "falta la URL de la peticion a firmar"
+            return resultado
+
+        def _paro() -> bool:
+            if self._cancelado():
+                resultado["cancelado"] = True
+                resultado["error"] = MENSAJE_CANCELADO
+                return True
+            return False
+
+        try:
+            if not self.preparar_driver():
+                resultado["error"] = self.ultimo_error or "no se pudo iniciar el navegador"
+                return resultado
+
+            if self.cuenta:
+                registro = self.registrar_o_entrar()
+                resultado["estado_cuenta"] = str(registro.get("estado") or "fallo")
+                resultado["sesion_restaurada"] = bool(
+                    registro.get("sesion_restaurada")
+                )
+                if not registro.get("ok"):
+                    resultado["error"] = str(
+                        registro.get("error")
+                        or "no se pudo registrar o iniciar sesion en Change.org"
+                    )
+                    if self._cancelado():
+                        resultado["cancelado"] = True
+                        resultado["error"] = MENSAJE_CANCELADO
+                    return resultado
+                if _paro():
+                    return resultado
+
+            codigo_red = self._navegar(self.url_peticion)
+            resultado["url"] = self._url_actual() or resultado["url"]
+            if _paro():
+                return resultado
+            if codigo_red:
+                resultado["error"] = self.ultimo_error
+                return resultado
+
+            self._esperar_documento_listo(30)
+            if _paro():
+                return resultado
+
+            # Error de servidor -> UN refresh (como en `reportar`).
+            error_servidor = self._pagina_error_servidor()
+            if error_servidor:
+                try:
+                    self.driver.refresh()
+                except Exception as e:
+                    logger.debug(f"Change.org: el refresh fallo: {e}")
+                time.sleep(6)
+                self._esperar_documento_listo(30)
+                if _paro():
+                    return resultado
+                if self._pagina_error_servidor():
+                    resultado["error"] = _ERROR_SERVIDOR_PETICION
+                    return resultado
+
+            self._cerrar_banner_cookies()
+            if _paro():
+                return resultado
+
+            # Reto anti-bot (captcha/Turnstile): intento automatico con
+            # CapSolver (best-effort; el PerimeterX NO se automatiza: CapSolver
+            # no lo cubre y `_resolver_reto_captcha_api` lo salta).
+            if self._resolver_captcha_activo():
+                reto_peticion = (
+                    self._detectar_reto_humano() or self._detectar_captcha()
+                )
+                if reto_peticion:
+                    self._resolver_reto_captcha_api(reto_peticion)
+                    if _paro():
+                        return resultado
+
+            self._esperar_app_peticion(30)
+            if _paro():
+                return resultado
+
+            # Paso 2: boton "Firmar la peticion".
+            boton_firmar = self._buscar_boton_por_frases(
+                _FRASES_BOTON_FIRMAR, intentos=3
+            )
+            if boton_firmar is None:
+                if not self._cancelado():
+                    resultado["error"] = _ERROR_BOTON_FIRMAR
+                return resultado
+            if not self._clic_elemento(boton_firmar):
+                resultado["error"] = (
+                    self.ultimo_error
+                    or "no se pudo pulsar el boton Firmar la peticion"
+                )
+                return resultado
+
+            # Pasos 3-8: pantalla de compartir -> "No, prefiero compartirla"
+            # -> "Copiar enlace" -> "Continuar".
+            ok, evidencia = self._completar_firma_flujo()
+            resultado["ok"] = bool(ok)
+            resultado["evidencia"] = evidencia
+            resultado["url"] = self._url_actual() or resultado["url"]
+            if ok:
+                resultado["captura"] = self._capturar_evidencia()
+                resultado["usada_firma"] = True
+            if not ok and not self._cancelado():
+                resultado["error"] = evidencia or "la firma no se pudo confirmar"
+            if self._cancelado():
+                resultado["cancelado"] = True
+                resultado["error"] = MENSAJE_CANCELADO
+            return resultado
+        except Exception as e:
+            resultado["error"] = f"error inesperado: {e}"
+            logger.error(
+                f"Change.org: error firmando {resultado['email'] or '(sin email)'}: {e}"
+            )
+            return resultado
+        finally:
+            try:
+                if not resultado["ok"] and not resultado.get("cancelado"):
+                    self._capturar_fallo()
+            except Exception:
+                pass
+
+    def _completar_firma_flujo(self):
+        """Pasos 3-8: pantalla de compartir -> copiar enlace -> Continuar.
+
+        Devuelve (ok, evidencia). Best-effort por paso: si algun boton no
+        aparece (porque el flujo ya avanzo o la UI difiere) se sigue con el
+        siguiente; la evidencia final la da `_esperar_firma`. La deteccion de
+        captcha/PerimeterX se respeta via `_firma_exitosa` (el PerimeterX jamas
+        se automatiza: el flujo cae al error/clasico)."""
+        for _ in range(20):  # ~10s: espera la pantalla de compartir
+            if self._cancelado():
+                return False, MENSAJE_CANCELADO
+            if self._pantalla_compartir_presente():
+                break
+            # La firma pudo confirmarse directo (sin pantalla de compartir).
+            ok, evidencia = self._firma_exitosa()
+            if ok:
+                return True, evidencia
+            time.sleep(0.5)
+
+        # Paso 4: "No, prefiero compartirla" (abre OTRA pestana).
+        boton_no = self._buscar_boton_por_frases(_FRASES_NO_COMPARTIR, intentos=2)
+        if boton_no is not None and self._clic_elemento(boton_no):
+            time.sleep(random.uniform(0.4, 1.0))
+        if self._cancelado():
+            return False, MENSAJE_CANCELADO
+
+        # Paso 6: "Copiar enlace" (en la pestana de compartir abierta).
+        boton_copiar = self._buscar_boton_por_frases(
+            _FRASES_COPIAR_ENLACE, intentos=3
+        )
+        if boton_copiar is not None:
+            self._clic_elemento(boton_copiar)
+        if self._cancelado():
+            return False, MENSAJE_CANCELADO
+
+        # Paso 8: "Continuar" (aparece abajo).
+        boton_continuar = self._buscar_boton_por_frases(
+            _FRASES_CONTINUAR, intentos=3
+        )
+        if boton_continuar is not None and self._clic_elemento(boton_continuar):
+            time.sleep(random.uniform(0.3, 0.8))
+
+        return self._esperar_firma(30)
+
 
 # --------------------------------------------------------------------------- #
 # Orquestacion: un reporte y campana
@@ -5701,3 +6137,389 @@ def ejecutar_campana_reportes(
         resumen["error"] = f"{type(e).__name__}: {e}"
         logger.error(f"Change.org: la campana de reportes fallo: {e}")
         return resumen
+
+
+def ejecutar_un_firma(
+    url_peticion: str,
+    proxy: str = "",
+    headless: bool = None,
+    cancelar=None,
+    cuenta=None,
+    identidad=None,
+    guardar_identidad: bool = True,
+    esperar_captcha_seg=None,
+    *,
+    _aviso=None,
+    resolver_captcha=None,
+) -> dict:
+    """Firma UNA peticion de Change.org (flujo de 8 pasos del dueno).
+
+    Modo clasico (sin `cuenta`): genera una identidad IA, firma y, si el
+    resultado fue OK, la persiste en la granja (`CuentaChange`, origen="firma")
+    y marca `usada_firma=True` (columna que ya existe).
+    Modo cuenta (`cuenta` = dict con "usuario","email","password"/"email_password",
+    "nombre","apellido","nombre_mostrado"): NO genera identidad (usa los datos
+    de la cuenta), NO guarda en la granja (`identidad_guardada=False`) y agrega
+    "usuario"/"estado_cuenta" al resultado. El bot hace login/registro (o
+    restaura la sesion persistida) ANTES de firmar.
+    `esperar_captcha_seg` activa el MODO ASISTIDO del bot. `resolver_captcha`
+    (None -> env CHANGE_CAPTCHA_SOLVER -> "auto") activa/desactiva CapSolver.
+
+    Devuelve el dict de `firmar()` + ``{"identidad","identidad_guardada",
+    "guardado","cancelado"}``. Con `cancelar` ya seteado devuelve
+    ``{"ok": False, "cancelado": True, "error": MENSAJE_CANCELADO}`` sin abrir
+    navegador. Cierra el navegador SIEMPRE (finally). NUNCA lanza.
+    """
+    if cancelar is not None:
+        try:
+            if cancelar.is_set():
+                return {
+                    "ok": False,
+                    "cancelado": True,
+                    "error": MENSAJE_CANCELADO,
+                }
+        except Exception:
+            pass
+
+    esperar_captcha_seg = _resolver_esperar_captcha_seg(esperar_captcha_seg)
+    cuenta = dict(cuenta or {}) if isinstance(cuenta, dict) else {}
+    if cuenta:
+        identidad = _identidad_desde_cuenta(cuenta)
+    elif isinstance(identidad, dict) and identidad:
+        identidad = dict(identidad)
+    else:
+        identidad = generar_identidad_change()
+
+    bot = None
+    try:
+        bot = ChangeOrgReportBot(
+            url_peticion=url_peticion,
+            proxy=proxy,
+            headless=headless,
+            cancelar=cancelar,
+            cuenta=cuenta or None,
+            esperar_captcha_seg=esperar_captcha_seg,
+            aviso=_aviso,
+            resolver_captcha=resolver_captcha,
+        )
+        resultado = bot.firmar(identidad=identidad)
+        if not isinstance(resultado, dict):
+            resultado = {}
+    except Exception as e:
+        logger.error(f"Change.org: el bot de firmas fallo: {e}")
+        resultado = {"ok": False, "error": f"error inesperado: {e}"}
+    finally:
+        if bot is not None:
+            bot.cerrar()
+
+    resultado = dict(resultado)
+    resultado.setdefault("email", identidad.get("email", ""))
+    resultado.setdefault("nombre", identidad.get("nombre", ""))
+    resultado.setdefault("apellido", identidad.get("apellido", ""))
+    resultado.setdefault("error", "")
+    resultado.setdefault("evidencia", "")
+    resultado.setdefault("url", str(url_peticion or ""))
+    resultado.setdefault("captura", "")
+    resultado.setdefault("sesion_restaurada", False)
+    resultado.setdefault("usada_firma", False)
+    resultado["identidad"] = identidad
+    resultado["cancelado"] = bool(resultado.get("cancelado", False)) or None
+
+    if cuenta:
+        resultado["usuario"] = str(cuenta.get("usuario") or "")
+        resultado.setdefault("estado_cuenta", "fallo")
+        resultado["identidad_guardada"] = False
+        resultado["guardado"] = None
+        return resultado
+
+    guardado = None
+    identidad_guardada = False
+    usada_firma = False
+    if resultado.get("ok"):
+        if guardar_identidad:
+            guardado = guardar_identidad_change(
+                identidad,
+                url_peticion=url_peticion,
+                contexto="",
+                queja="",
+                origen="firma",
+            )
+            identidad_guardada = bool((guardado or {}).get("guardada"))
+        marcado = marcar_identidad_firmada(identidad.get("email") or "")
+        usada_firma = bool((marcado or {}).get("marcada"))
+    resultado["identidad_guardada"] = identidad_guardada
+    resultado["guardado"] = guardado
+    resultado["usada_firma"] = usada_firma
+    return resultado
+
+
+def ejecutar_campana_firmas(
+    url_peticion: str,
+    cantidad: int = 5,
+    max_workers: int = 2,
+    usar_proxies: bool = True,
+    pais_proxy: str = "",
+    guardar_identidades: bool = True,
+    headless: bool = None,
+    cancelar=None,
+    callback=None,
+    cuentas=None,
+    esperar_captcha_seg=None,
+    resolver_captcha=None,
+) -> dict:
+    """Lanza N firmas en paralelo con proxy round-robin por firma.
+
+    - `cantidad` se acota a [1, 200] y `max_workers` a [1, 5].
+    - `cuentas` (opcional): lista de dicts de cuentas de la BD; con una lista
+      no vacia cada firma usa la SIGUIENTE cuenta en round-robin
+      (`ejecutar_un_firma(..., cuenta=...)`: login/registro o sesion restaurada
+      primero). El evento agrega ``"usuario"`` y ``"con_cuenta": True`` (sin
+      ``"identidad"``) y el resumen agrega ``"con_cuentas"`` y
+      ``"cuentas_total"``. Sin cuentas: flujo anonimo clasico.
+    - `esperar_captcha_seg`: MODO ASISTIDO (None -> env). `resolver_captcha`:
+      solucionador CapSolver (None -> env CHANGE_CAPTCHA_SOLVER -> "auto").
+    - `callback`: ``{"tipo":"inicio","total":N}`` y por cada firma
+      ``{"tipo":"firma","hechas":i,"total":N,"ok":bool,"email":str,
+      "identidad":{...},"detalle":str}`` (con cuenta agrega "usuario" y
+      "con_cuenta": True).
+    - `cancelar` (threading.Event): para de encolar (shutdown cancel_futures).
+    - Resumen: ``{"total","firmadas","fallidos","cancelada",
+      "identidades_guardadas","resultados","proxies_total","sin_proxy",
+      "proxies_descartados","error","con_cuentas","cuentas_total"}``. NUNCA lanza.
+    """
+    resumen = {
+        "total": 0,
+        "firmadas": 0,
+        "fallidos": 0,
+        "cancelada": False,
+        "identidades_guardadas": 0,
+        "resultados": [],
+        "proxies_total": 0,
+        "sin_proxy": 0,
+        "proxies_descartados": 0,
+        "error": "",
+        "con_cuentas": False,
+        "cuentas_total": 0,
+    }
+    try:
+        try:
+            total = max(1, min(200, int(cantidad)))
+        except (TypeError, ValueError):
+            total = 5
+        try:
+            workers = max(1, min(5, int(max_workers)))
+        except (TypeError, ValueError):
+            workers = 2
+        resumen["total"] = total
+
+        esperar_captcha_seg = _resolver_esperar_captcha_seg(esperar_captcha_seg)
+
+        cuentas_lista = []
+        try:
+            for item in cuentas or []:
+                if isinstance(item, dict):
+                    cuentas_lista.append(dict(item))
+        except TypeError:
+            cuentas_lista = []
+        resumen["con_cuentas"] = bool(cuentas_lista)
+        resumen["cuentas_total"] = len(cuentas_lista)
+
+        def _evento_cancelado() -> bool:
+            if cancelar is None:
+                return False
+            try:
+                return bool(cancelar.is_set())
+            except Exception:
+                return False
+
+        cancelada = _evento_cancelado()
+        resumen["cancelada"] = cancelada
+        _notificar(callback, {"tipo": "inicio", "total": total})
+        if cancelada:
+            return resumen
+
+        proxies = []
+        if usar_proxies:
+            try:
+                proxies = [p for p in (proxies_disponibles(pais_proxy) or []) if p]
+            except Exception:
+                proxies = []
+        resumen["proxies_total"] = len(proxies)
+
+        lock = threading.Lock()
+        contadores = {
+            "hechas": 0,
+            "firmadas": 0,
+            "fallidos": 0,
+            "guardadas": 0,
+            "cuenta": 0,
+        }
+        selector_proxy = _SelectorProxy(proxies)
+
+        def _siguiente_proxy() -> str:
+            return selector_proxy.siguiente()
+
+        def _siguiente_cuenta():
+            with lock:
+                if not cuentas_lista:
+                    return None
+                cuenta = cuentas_lista[contadores["cuenta"] % len(cuentas_lista)]
+                contadores["cuenta"] += 1
+                return dict(cuenta)
+
+        def _trabajo(cuenta_actual=None) -> dict:
+            proxy = _siguiente_proxy()
+
+            def _aviso_captcha(info: dict) -> None:
+                info = dict(info or {})
+                with lock:
+                    hechas = contadores["hechas"]
+                cuenta_info = dict(cuenta_actual or {})
+                _notificar(
+                    callback,
+                    {
+                        "tipo": "espera_captcha",
+                        "hechas": hechas,
+                        "total": total,
+                        "usuario": str(cuenta_info.get("usuario") or ""),
+                        "email": str(cuenta_info.get("email") or ""),
+                        "detalle": (
+                            f"esperando captcha ({info.get('segundos')}s)"
+                        ),
+                    },
+                )
+
+            try:
+                kwargs = dict(
+                    url_peticion=url_peticion,
+                    proxy=proxy,
+                    headless=headless,
+                    cancelar=cancelar,
+                    guardar_identidad=guardar_identidades,
+                    esperar_captcha_seg=esperar_captcha_seg,
+                    _aviso=_aviso_captcha,
+                    resolver_captcha=resolver_captcha,
+                )
+                if cuenta_actual is not None:
+                    kwargs["cuenta"] = cuenta_actual
+                resultado = ejecutar_un_firma(**kwargs)
+            except Exception as e:
+                resultado = {
+                    "ok": False,
+                    "error": f"{type(e).__name__}: {e}",
+                    "email": "",
+                    "identidad": {},
+                    "identidad_guardada": False,
+                }
+            if not isinstance(resultado, dict):
+                resultado = {
+                    "ok": False,
+                    "error": "respuesta invalida de la firma",
+                    "identidad": {},
+                }
+            return resultado
+
+        def _procesar(resultado: dict) -> None:
+            resumen["resultados"].append(resultado)
+            with lock:
+                contadores["hechas"] += 1
+                if resultado.get("ok"):
+                    contadores["firmadas"] += 1
+                else:
+                    contadores["fallidos"] += 1
+                if resultado.get("identidad_guardada"):
+                    contadores["guardadas"] += 1
+                hechas = contadores["hechas"]
+            ok = bool(resultado.get("ok"))
+            info = {
+                "tipo": "firma",
+                "hechas": hechas,
+                "total": total,
+                "ok": ok,
+                "email": str(resultado.get("email") or ""),
+                "detalle": (
+                    "éxito"
+                    if ok
+                    else str(resultado.get("error") or "fallo sin detalle")
+                ),
+            }
+            if cuentas_lista:
+                info["usuario"] = str(resultado.get("usuario") or "")
+                info["con_cuenta"] = True
+            else:
+                info["identidad"] = dict(resultado.get("identidad") or {})
+            _notificar(callback, info)
+
+        executor = ThreadPoolExecutor(max_workers=workers)
+        futuros: dict = {}
+        siguiente = 0
+        try:
+            while True:
+                while (
+                    not _evento_cancelado()
+                    and siguiente < total
+                    and len(futuros) < max(1, workers * 2)
+                ):
+                    cuenta_actual = _siguiente_cuenta()
+                    futuros[executor.submit(_trabajo, cuenta_actual)] = siguiente
+                    siguiente += 1
+                if _evento_cancelado():
+                    cancelada = True
+                    break
+                if not futuros:
+                    break
+                completado = None
+                for futuro in as_completed(list(futuros)):
+                    completado = futuro
+                    break
+                if completado is None:
+                    break
+                futuros.pop(completado, None)
+                try:
+                    resultado = completado.result()
+                except Exception as e:
+                    resultado = {
+                        "ok": False,
+                        "error": f"{type(e).__name__}: {e}",
+                        "email": "",
+                        "identidad": {},
+                        "identidad_guardada": False,
+                    }
+                if not isinstance(resultado, dict):
+                    resultado = {
+                        "ok": False,
+                        "error": "respuesta invalida de la firma",
+                        "identidad": {},
+                    }
+                _procesar(resultado)
+                if _evento_cancelado():
+                    cancelada = True
+        finally:
+            if _evento_cancelado():
+                cancelada = True
+            try:
+                executor.shutdown(wait=not cancelada, cancel_futures=cancelada)
+            except TypeError:  # pragma: no cover - Python < 3.9
+                executor.shutdown(wait=not cancelada)
+
+        resumen["firmadas"] = contadores["firmadas"]
+        resumen["fallidos"] = contadores["fallidos"]
+        resumen["identidades_guardadas"] = contadores["guardadas"]
+        resumen["sin_proxy"] = selector_proxy.sin_proxy
+        resumen["proxies_descartados"] = selector_proxy.descartados
+        resumen["cancelada"] = bool(cancelada)
+        logger.info(
+            "Change.org: campana de firmas terminada "
+            f"({contadores['firmadas']} firmadas, {contadores['fallidos']} fallidos, "
+            f"{contadores['guardadas']} identidades guardadas, "
+            f"{selector_proxy.descartados} proxies descartados"
+            + (", cancelada" if cancelada else "")
+            + ")"
+        )
+        return resumen
+    except Exception as e:
+        resumen["error"] = f"{type(e).__name__}: {e}"
+        logger.error(f"Change.org: la campana de firmas fallo: {e}")
+        return resumen
+
+

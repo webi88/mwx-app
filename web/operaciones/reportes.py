@@ -299,7 +299,7 @@ def render(usuario: dict):
 
     st.markdown("## Historial de acciones (mantenimientos / activaciones)")
     try:
-        acciones = obtener_acciones(limit=50, solo_exitosas=True)
+        acciones = obtener_acciones(limit=None, solo_exitosas=True)
     except TypeError:
         # Compatibilidad mientras core/registro.py no tenga el parámetro:
         estados_ok = {"exito", "exitoso", "ok"}

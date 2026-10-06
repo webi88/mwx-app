@@ -1,6 +1,6 @@
-"""Operacion CHANGE.ORG: REPORTES DE POLITICAS + REGISTRO DE CUENTAS.
+"""Operacion CHANGE.ORG: REPORTES DE POLITICAS + REGISTRO + FIRMAS.
 
-La pagina tiene DOS pestanas:
+La pagina tiene TRES pestanas:
 
 1. "🚩 Ataque de reportes": reporta una peticion de Change.org por violar sus
    normas. Dos modos:
@@ -12,7 +12,15 @@ La pagina tiene DOS pestanas:
        generadas por IA que quedan en la granja `CuentaChange`.
 2. "🧾 Cuentas Change.org": registra o inicia sesion en Change.org con el
    correo y la contrasena de las cuentas de X (los avisos de Change llegan a
-   esos correos; si el correo ya tiene cuenta, solo inicia sesion).
+   esos correos; si el correo ya tiene cuenta, solo inicia sesion). Al
+   registrar/entrar con exito, la sesion (cookies) se guarda en
+   `data/cookies/change/` y en la BD `sesion_change`, y se REUTILIZA en las
+   corridas siguientes (incluso en Railway) para no volver a pedir captcha.
+3. "✍️ Firmar peticiones": firma masivamente una peticion con el flujo de 8
+   pasos (Firmar la peticion -> ¡Ya firmaste! -> No, prefiero compartirla ->
+   Copiar enlace -> Continuar). Con cuentas registradas usa la sesion
+   persistida (sin captcha); en anonimo genera identidades y las marca como
+   firmadas (`CuentaChange.usada_firma`).
 
 Backend congelado (`cuentas/change_org.py`), importado PEREZOSAMENTE dentro
 del handler del boton para que la pagina cargue sin Chrome:
@@ -105,6 +113,7 @@ from web.ui import cabecera
 # Tipos de campana del registro/panel (etiquetan el panel en vivo).
 TIPO_REPORTES = "reportes"
 TIPO_REGISTROS = "registros"
+TIPO_FIRMAS = "firmas"
 
 # Modos del ataque de reportes (radio de la pestana 1).
 MODO_CON_CUENTAS = "🧾 Con cuentas registradas (recomendado)"
@@ -359,6 +368,31 @@ def _anotar_evento(id_campana, evento) -> None:
                 return
             _agregar_linea(entrada, linea)
             return
+        if tipo == "firma":
+            # Firma de peticiones: mismo contador que los reportes (enviados =
+            # firmadas), con su etiqueta de log propia.
+            email = str(evento.get("email") or "").strip()
+            usuario = str(evento.get("usuario") or "").strip().lstrip("@")
+            identificador = email or (f"@{usuario}" if usuario else "?")
+            ok = bool(evento.get("ok"))
+            detalle = str(evento.get("detalle") or "").strip()
+            entrada["hechas"] = _entero(
+                evento.get("hechas"), _entero(entrada.get("hechas")) + 1
+            )
+            total = _entero(evento.get("total"))
+            if total:
+                entrada["total"] = total
+            if ok:
+                entrada["enviados"] = _entero(entrada.get("enviados")) + 1
+                linea = f"✍️ Firma registrada por {identificador}"
+            else:
+                entrada["fallidos"] = _entero(entrada.get("fallidos")) + 1
+                linea = f"❌ {identificador} — {detalle}"
+            identidad = evento.get("identidad")
+            if isinstance(identidad, dict) and identidad:
+                entrada["identidades"] = _entero(entrada.get("identidades")) + 1
+            _agregar_linea(entrada, linea)
+            return
         if tipo != "reporte":
             return
 
@@ -411,7 +445,10 @@ def _finalizar_campana(id_campana, resumen=None, error=None) -> None:
         if resumen_dict:
             entrada["resumen"] = resumen_dict
             entrada["enviados"] = _entero(
-                resumen_dict.get("enviados", resumen_dict.get("exitosos")),
+                resumen_dict.get(
+                    "enviados",
+                    resumen_dict.get("exitosos", resumen_dict.get("firmadas")),
+                ),
                 _entero(entrada.get("enviados")),
             )
             entrada["fallidos"] = _entero(
@@ -796,19 +833,93 @@ def _pintar_registros_final(snap: dict) -> None:
     )
 
 
+def _pintar_firmas_en_vivo(snap: dict) -> None:
+    """Panel en vivo de la firma de peticiones (modo cuentas o anonimo)."""
+    st.markdown("#### ✍️ Firma de peticiones en vivo")
+    total = max(1, snap["total"])
+    hechas = min(snap["hechas"], total) if snap["total"] else snap["hechas"]
+    st.progress(min(1.0, hechas / total))
+    st.markdown(
+        f"✍️ **{snap['enviados']} firmadas** · ❌ {snap['fallidos']} "
+        f"fallidas · 🧾 {snap['identidades']} identidades"
+    )
+    lineas = snap["log"][-12:]
+    if lineas:
+        st.markdown("  \n".join(lineas))
+    else:
+        st.markdown("⏳ Esperando las primeras firmas…")
+    if snap["deteniendo"]:
+        st.warning("⛔ Detención solicitada: terminando la firma en curso…")
+    _boton_detener(snap)
+
+
+def _pintar_firmas_final(snap: dict) -> None:
+    """Resumen final de la ultima firma de peticiones (terminada/cancelada/error)."""
+    st.markdown("#### 🧾 Última firma de peticiones")
+    resumen = snap["resumen"] or {}
+    if snap["estado"] == "error" or snap["error"]:
+        st.error(
+            "❌ Firma de peticiones interrumpida: "
+            + (snap["error"] or "error inesperado del backend")
+        )
+    elif snap["estado"] == "cancelada" or resumen.get("cancelada"):
+        st.warning(
+            f"⛔ Firma de peticiones detenida: {snap['enviados']} firmadas / "
+            f"{snap['fallidos']} fallidas"
+        )
+    else:
+        st.success(
+            f"✅ Firma de peticiones terminada: {snap['enviados']} firmadas / "
+            f"{snap['fallidos']} fallidas"
+        )
+    filas = _filas_resultados(resumen)
+    if filas:
+        st.dataframe(filas, use_container_width=True, hide_index=True)
+        st.caption(
+            f"✍️ {snap['enviados']} firmadas · "
+            f"❌ {snap['fallidos']} fallidas (no se muestran)"
+        )
+    else:
+        st.caption("Sin firmas exitosas.")
+    capturas = _capturas_exitos(resumen)
+    if capturas:
+        with st.expander(
+            f"🖼️ Imagen del éxito ({len(capturas)})", expanded=False
+        ):
+            for ruta, quien, detalle in capturas:
+                etiqueta = f"@{quien}" if quien else "?"
+                if detalle:
+                    etiqueta += f" — {_detalle_corto(detalle)}"
+                try:
+                    st.image(ruta, caption=etiqueta)
+                except Exception:
+                    continue
+    guardadas = _entero(resumen.get("identidades_guardadas"))
+    if guardadas > 0:
+        st.caption(f"🧾 Identidades guardadas: {guardadas}")
+
+
 def _pintar_proceso(snap=None) -> None:
     """Pinta UNA pasada del panel: en vivo o el resumen final (`st.*` aqui).
 
-    Etiqueta el panel segun el tipo de campana ("reportes" o "registros")."""
+    Etiqueta el panel segun el tipo de campana ("reportes", "registros" o
+    "firmas")."""
     if snap is None:
         snap = _snapshot()
     if not snap:
         return
-    if str(snap.get("tipo") or TIPO_REPORTES) == TIPO_REGISTROS:
+    tipo = str(snap.get("tipo") or TIPO_REPORTES)
+    if tipo == TIPO_REGISTROS:
         if snap["en_curso"]:
             _pintar_registros_en_vivo(snap)
         else:
             _pintar_registros_final(snap)
+        return
+    if tipo == TIPO_FIRMAS:
+        if snap["en_curso"]:
+            _pintar_firmas_en_vivo(snap)
+        else:
+            _pintar_firmas_final(snap)
         return
     if snap["en_curso"]:
         _pintar_reportes_en_vivo(snap)
@@ -1349,6 +1460,116 @@ def _lanzar_registros(cuentas, workers, usar_proxies, pais_proxy,
         st.rerun()
 
 
+def _lanzar_firmas(url, cantidad, workers, usar_proxies, pais_proxy,
+                   guardar_identidades, headless, cuentas=None,
+                   esperar_captcha_seg=0, resolver_captcha="auto") -> None:
+    """Valida y lanza la firma de peticiones en un hilo daemon (nunca lanza).
+
+    `cuentas` (opcional) = filas seleccionadas del selector; None/[] = modo
+    anonimo con identidades IA. El backend se importa AQUI (perezoso): la
+    pagina carga sin Chrome. El callback solo muta `_CAMPANAS` bajo lock."""
+    direccion = str(url or "").strip()
+    if not direccion or "change.org" not in direccion.lower():
+        st.warning(
+            "La URL debe ser una petición de Change.org "
+            "(https://www.change.org/p/...)."
+        )
+        return
+    # `cuentas is None` = modo anónimo; `[]` = modo con cuentas sin selección.
+    es_modo_cuentas = cuentas is not None
+    cuentas_envio = _cuentas_para_backend(cuentas) if cuentas else []
+    if es_modo_cuentas and not cuentas_envio:
+        st.warning(
+            "Selecciona al menos una cuenta con correo y contraseña para "
+            "firmar (o cambia al modo anónimo)."
+        )
+        return
+    if _campana_en_curso() is not None:
+        st.warning(
+            "⛔ Ya hay una campaña de Change.org en curso: espera a que "
+            "termine o pulsa «⛔ Detener» en el panel de arriba."
+        )
+        return
+
+    try:
+        from cuentas.change_org import ejecutar_campana_firmas
+    except Exception as e:  # noqa: BLE001
+        st.error(f"No se pudo importar el backend de firmas: {e}")
+        return
+    if cuentas_envio and not _acepta_kwarg(ejecutar_campana_firmas, "cuentas"):
+        st.error(
+            "El backend de firmas todavía no soporta el modo con cuentas "
+            "registradas (`cuentas=`): actualiza `cuentas/change_org.py` o "
+            "usa el modo anónimo."
+        )
+        return
+
+    # Modo asistido anti-bot: el kwarg se pasa SOLO si la firma lo acepta.
+    asistido = bool(esperar_captcha_seg)
+    soporta_captcha = _acepta_kwarg(
+        ejecutar_campana_firmas, "esperar_captcha_seg"
+    )
+    if asistido and not soporta_captcha:
+        if _en_contexto_streamlit():
+            st.session_state["change_fir_aviso_asistido"] = CAPTCHA_AVISO_BACKEND
+        st.warning(CAPTCHA_AVISO_BACKEND)
+    soporta_solver = _acepta_kwarg(ejecutar_campana_firmas, "resolver_captcha")
+
+    evento = threading.Event()
+    id_campana = _registrar_campana(
+        tipo=TIPO_FIRMAS,
+        evento=evento,
+        parametros={
+            "url": direccion,
+            "cantidad": int(cantidad),
+            "workers": int(workers),
+            "usar_proxies": bool(usar_proxies),
+            "pais_proxy": str(pais_proxy or ""),
+            "guardar_identidades": bool(guardar_identidades),
+            "headless": bool(headless),
+            "esperar_captcha_seg": _entero(esperar_captcha_seg),
+            "resolver_captcha": str(resolver_captcha or "auto"),
+            "modo": MODO_CON_CUENTAS if cuentas_envio else MODO_ANONIMO,
+            "cuentas_total": len(cuentas_envio),
+        },
+    )
+
+    def _cb(evento_cb):
+        _anotar_evento(id_campana, evento_cb)
+
+    def _runner():
+        resumen = None
+        error = None
+        try:
+            kwargs = dict(
+                url_peticion=direccion,
+                cantidad=int(cantidad),
+                max_workers=int(workers),
+                usar_proxies=bool(usar_proxies),
+                pais_proxy=str(pais_proxy or ""),
+                guardar_identidades=bool(guardar_identidades),
+                headless=bool(headless),
+                cancelar=evento,
+                callback=_cb,
+            )
+            if _acepta_kwarg(ejecutar_campana_firmas, "cuentas"):
+                kwargs["cuentas"] = cuentas_envio or None
+            if soporta_captcha:
+                kwargs["esperar_captcha_seg"] = _entero(esperar_captcha_seg)
+            if soporta_solver:
+                kwargs["resolver_captcha"] = str(resolver_captcha or "auto")
+            resumen = ejecutar_campana_firmas(**kwargs)
+        except BaseException as e:  # noqa: BLE001
+            error = e
+        finally:
+            _finalizar_campana(id_campana, resumen=resumen, error=error)
+
+    if not _iniciar_hilo(id_campana, _runner, "change-firmas"):
+        return
+    if _en_contexto_streamlit():
+        st.rerun()
+
+
 # ============================ FORMULARIOS ============================
 
 def _estado_solver_captcha() -> dict:
@@ -1633,6 +1854,14 @@ def _formulario_registros(cuentas: list) -> None:
         "de las cuentas de X (así los avisos de Change llegan a esos correos). "
         "Si el correo ya tiene cuenta, solo inicia sesión."
     )
+    st.info(
+        "🔐 **Sesión persistente:** al registrar/entrar con éxito, el bot guarda "
+        "las cookies de la sesión (en `data/cookies/change/` y en la BD "
+        "`sesion_change`). En las siguientes corridas —incluida Railway— esas "
+        "cookies se reutilizan y **ya no se vuelve a pedir captcha**. Crea las "
+        "cuentas en tu máquina LOCAL (Chrome visible + modo asistido) para "
+        "resolver el captcha rápido y reutiliza la sesión después."
+    )
     if not cuentas:
         st.info(
             "No hay cuentas de X con correo y contraseña cargados. Importa o "
@@ -1710,11 +1939,151 @@ def _formulario_registros(cuentas: list) -> None:
         )
 
 
+def _formulario_firmas(cuentas: list) -> None:
+    """Pestana "✍️ Firmar peticiones": firma masiva de una peticion."""
+    aviso = st.session_state.pop("change_fir_aviso_asistido", "")
+    if aviso:
+        st.warning(aviso)
+    st.markdown("### 🎯 Objetivo de la firma")
+    url = st.text_input(
+        "URL de la petición a firmar",
+        key="change_fir_url",
+        placeholder="https://www.change.org/p/...",
+        help="Petición de Change.org que se va a firmar masivamente.",
+    )
+
+    modo = st.radio(
+        "Modo de firma",
+        [MODO_CON_CUENTAS, MODO_ANONIMO],
+        index=0,
+        key="change_fir_modo",
+        help=(
+            "Con cuentas registradas cada firma sale con una cuenta de X "
+            "(round-robin) que inicia sesión o restaura su sesión en "
+            "Change.org; en anónimo se generan identidades con IA."
+        ),
+    )
+    es_cuentas = modo == MODO_CON_CUENTAS
+
+    seleccion: list = []
+    if es_cuentas:
+        if not cuentas:
+            st.info(
+                "No hay cuentas de X con correo y contraseña cargados. Importa "
+                "o edita cuentas con su email y la contraseña del correo en "
+                "«🗂️ Cuentas: Perfiles, Secciones & Nombres» para firmar con "
+                "cuentas registradas."
+            )
+        else:
+            from web.operaciones.cuentas import _selector_masivo
+
+            seleccion = _selector_masivo(cuentas, "change_fir_selector")
+            st.caption(
+                f"🧾 {len(seleccion)} cuenta(s) seleccionada(s): cada firma "
+                "usa una cuenta en round-robin."
+            )
+
+    col_cantidad, col_workers = st.columns(2)
+    with col_cantidad:
+        cantidad = st.number_input(
+            "Cantidad de firmas a enviar",
+            min_value=1,
+            max_value=100,
+            value=5,
+            step=1,
+            key="change_fir_cantidad",
+            help=(
+                "Total de firmas; las cuentas se reparten en round-robin "
+                "(una cuenta por firma) en el modo con cuentas."
+            ),
+        )
+    with col_workers:
+        workers = st.number_input(
+            "Navegadores simultáneos",
+            min_value=1,
+            max_value=5,
+            value=2,
+            step=1,
+            key="change_fir_workers",
+            help=(
+                "Firmas en paralelo (1-5). En Railway no conviene pasar de "
+                "2-3: cada Chrome consume RAM/CPU/hilos."
+            ),
+        )
+
+    with st.expander("⚙️ Opciones avanzadas", expanded=False):
+        rotar_proxies = st.checkbox(
+            "🌐 Rotar proxy residencial por firma",
+            value=True,
+            key="change_fir_proxies",
+            help=(
+                "Cada firma sale con una IP distinta (menos bloqueos de "
+                "Change.org). Si no hay proxies, la campaña sigue sin proxy."
+            ),
+        )
+        paises = _paises_proxy()
+        pais_sel = st.selectbox(
+            "País del proxy",
+            [PAIS_TODAS] + paises,
+            index=0,
+            key="change_fir_pais",
+            help=(
+                "Filtra los proxies por país (archivos de `data/proxies/`). "
+                "«Todas» usa cualquier proxy disponible."
+            ),
+        )
+        pais_proxy = "" if pais_sel == PAIS_TODAS else str(pais_sel)
+        if rotar_proxies:
+            _aviso_proxies(pais_proxy, pais_sel)
+        if es_cuentas:
+            guardar_identidades = False
+        else:
+            guardar_identidades = st.checkbox(
+                "🧾 Guardar identidades en la base de datos",
+                value=True,
+                key="change_fir_guardar",
+                help=(
+                    "Las identidades usadas quedan en la granja "
+                    "(`CuentaChange`) y se marcan como firmadas "
+                    "(`usada_firma`)."
+                ),
+            )
+        resolver_captcha = _controles_solver_captcha("change_fir_solver")
+        esperar_captcha_seg, chrome_visible = _controles_modo_asistido(
+            "change_fir_captcha", "change_fir_captcha_seg", "change_fir_visible"
+        )
+        headless = not bool(chrome_visible)
+
+    if st.button(
+        "✍️ Lanzar firma de peticiones",
+        type="primary",
+        key="btn_change_firmas",
+        disabled=bool(es_cuentas and not cuentas),
+        help=(
+            "Con cuentas registradas: cada firma inicia sesión o restaura su "
+            "sesión en Change.org. En anónimo: genera identidades con IA. El "
+            "progreso se muestra arriba y sobrevive a las recargas."
+        ),
+    ):
+        _lanzar_firmas(
+            url=url,
+            cantidad=cantidad,
+            workers=workers,
+            usar_proxies=bool(rotar_proxies),
+            pais_proxy=pais_proxy,
+            guardar_identidades=bool(guardar_identidades),
+            headless=headless,
+            cuentas=seleccion if es_cuentas else None,
+            esperar_captcha_seg=int(esperar_captcha_seg),
+            resolver_captcha=resolver_captcha,
+        )
+
+
 def render(usuario: dict):
-    """Pagina "✍️ Change.org: Reportes": reportes y registro de cuentas."""
+    """Pagina "✍️ Change.org: Reportes": reportes, registro y firmas."""
     cabecera(
-        "✍️ CHANGE.ORG: REPORTES DE POLÍTICAS",
-        "Reportes masivos y registro de cuentas de X en Change.org",
+        "✍️ CHANGE.ORG: REPORTES, REGISTRO Y FIRMAS",
+        "Reportes masivos, registro de cuentas y firmas de peticiones",
     )
 
     # Panel persistente: SIEMPRE al inicio, para que el avance/log siga visible
@@ -1723,12 +2092,14 @@ def render(usuario: dict):
 
     cuentas = _cargar_cuentas_change()
 
-    pestana_reportes, pestana_registros = st.tabs(
-        ["🚩 Ataque de reportes", "🧾 Cuentas Change.org"]
+    pestana_reportes, pestana_registros, pestana_firmas = st.tabs(
+        ["🚩 Ataque de reportes", "🧾 Cuentas Change.org", "✍️ Firmar peticiones"]
     )
     with pestana_reportes:
         _formulario_reportes(cuentas)
     with pestana_registros:
         _formulario_registros(cuentas)
+    with pestana_firmas:
+        _formulario_firmas(cuentas)
 
     _visor_granja()

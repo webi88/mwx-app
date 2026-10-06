@@ -5250,7 +5250,7 @@ class MotorActivacion:
             ),
         }
         curva_activa, fase1_min = self._configurar_curva(
-            con_sesion, curva_aceleracion, curva_fase1_min, duracion_min,
+            cuentas, curva_aceleracion, curva_fase1_min, duracion_min,
             claves_dinamicas,
         )
         if not repetir and reservas:
@@ -6076,7 +6076,7 @@ class MotorActivacion:
             "rotadas_por_cuota_dia": 0,
         }
         curva_activa, fase1_min = self._configurar_curva(
-            ejecutables, curva_aceleracion, curva_fase1_min, duracion_min,
+            procesables, curva_aceleracion, curva_fase1_min, duracion_min,
             claves_dinamicas,
         )
         resumen.update(claves_dinamicas)

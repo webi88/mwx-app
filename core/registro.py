@@ -90,10 +90,11 @@ def marcar_cuenta_suspendida(usuario: str) -> None:
 
 
 def obtener_acciones(limit: int = 100, solo_exitosas: bool = False) -> list:
-    """Devuelve las ultimas 'limit' acciones ordenadas por fecha descendente.
+    """Devuelve las acciones ordenadas por fecha descendente.
 
     Args:
-        limit: maximo de acciones a devolver (default 100).
+        limit: maximo de acciones a devolver (default 100). Si es None, no se
+            aplica limite y devuelve TODAS las acciones.
         solo_exitosas: si es True, filtra solo las acciones con estado exitoso
             ("exito", "exitoso" u "ok"); si es False (default) devuelve todas.
 
@@ -106,10 +107,10 @@ def obtener_acciones(limit: int = 100, solo_exitosas: bool = False) -> list:
                 query = query.filter(
                     RegistroAccion.estado.in_(("exito", "exitoso", "ok"))
                 )
-            acciones = (
-                query.order_by(RegistroAccion.fecha.desc()).limit(limit).all()
-            )
-            return list(acciones)
+            query = query.order_by(RegistroAccion.fecha.desc())
+            if limit is not None:
+                query = query.limit(limit)
+            return list(query.all())
     except Exception as e:
         logger.warning(f"Error obteniendo acciones: {e}")
         return []

@@ -13,6 +13,7 @@ from web.auth import (
     verificar_token_sesion,
 )
 from web.ui import inyectar_css, cabecera
+from web.effects import inyectar_efectos
 from web.sidebar import render_sidebar
 
 # Configuración de la página
@@ -290,26 +291,37 @@ def main():
             st.session_state["web_nav_selector"]
         )
 
-    col_categoria, col_operacion = st.columns([2, 3])
-    with col_categoria:
-        categoria = st.selectbox(
-            "📂 CATEGORÍA:",
-            list(mapa_categorias),
-            key="web_nav_categoria",
-        )
+    # --- Barra de estado en vivo (reloj + indicador "en línea") ---
+    # Se inyecta UNA vez por render: un iframe autónomo que no puede tocar el
+    # DOM de Streamlit ni romper la navegación.
+    inyectar_efectos()
+    st.write("")  # separación sutil entre la barra y la navegación
+
+    # --- Navegación visual (píldoras de categoría + select de operación) ---
+    # La categoría se muestra como píldoras (`st.segmented_control`) en lugar
+    # de un selectbox: más visual e inmediato. La operación sigue siendo un
+    # selectbox (sus etiquetas son largas). La persistencia `?op=`/`?tab=` y
+    # el `on_change` se mantienen intactos (mismas claves de session_state).
+    st.markdown("##### 🧭 Navegación")
+    categoria = st.segmented_control(
+        "Categoría",
+        list(mapa_categorias),
+        key="web_nav_categoria",
+        selection_mode="single",
+        label_visibility="collapsed",
+    )
     opciones_categoria = mapa_categorias.get(categoria) or opciones
     if st.session_state.get("web_nav_selector") not in opciones_categoria:
         # Cambió la categoría: abrir la primera operación de la nueva. Se
         # escribe ANTES de instanciar el selectbox de operación, así el widget
         # la toma como valor válido (sin "value not in options").
         st.session_state["web_nav_selector"] = opciones_categoria[0]
-    with col_operacion:
-        seleccion = st.selectbox(
-            "📍 SELECCIONA LA OPERACIÓN:",
-            opciones_categoria,
-            key="web_nav_selector",
-            on_change=_on_cambio_operacion,
-        )
+    seleccion = st.selectbox(
+        "📍 SELECCIONA LA OPERACIÓN:",
+        opciones_categoria,
+        key="web_nav_selector",
+        on_change=_on_cambio_operacion,
+    )
     st.session_state["operacion_actual"] = seleccion
     _sincronizar_op_en_url(seleccion)
 
