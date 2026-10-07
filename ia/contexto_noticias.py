@@ -208,22 +208,84 @@ def _deduplicar_con_conteo(urls: list[str]) -> tuple[list[str], int]:
 # --------------------------------------------------------------------------- #
 # 2) Descarga y parseo de noticias
 # --------------------------------------------------------------------------- #
-def _decodificar(contenido: bytes, encoding: str = "") -> str:
-    """Decodifica bytes a texto probando el encoding declarado, utf-8 y latin-1."""
-    datos = (contenido or b"")[:MAX_BODY_BYTES]
-    if encoding:
-        try:
-            return datos.decode(encoding, errors="replace")
-        except (LookupError, TypeError):
-            pass
+def _detectar_charset_meta(datos: bytes) -> str:
+    """Busca el charset declarado dentro del HTML (``<meta charset>`` o
+    ``<meta http-equiv="Content-Type">``).
+
+    Es la senal mas fiable (los navegadores la usan por encima del header
+    ``Content-Type``). Devuelve ``""`` si no lo encuentra. Nunca lanza.
+    """
+    try:
+        prefijo = datos[:4096].decode("ascii", errors="ignore").lower()
+    except Exception:
+        return ""
+    m = re.search(r"<meta\s+charset\s*=\s*[\"']?\s*([a-zA-Z0-9_\-]+)", prefijo)
+    if m:
+        return m.group(1).strip()
+    m = re.search(
+        r"<meta[^>]+content\s*=\s*[\"'][^\"']*charset\s*=\s*([a-zA-Z0-9_\-]+)",
+        prefijo,
+    )
+    if m:
+        return m.group(1).strip()
+    return ""
+
+
+def _decodificar_utf8(datos: bytes):
+    """Intenta decodificar ``datos`` como UTF-8.
+
+    Devuelve el texto, o ``None`` si el contenido no es UTF-8 valido. Si el
+    error cae justo en el borde del recorte de ``MAX_BODY_BYTES`` (un caracter
+    multibyte partido por la mitad), devuelve el prefijo valido.
+    """
     try:
         return datos.decode("utf-8")
     except UnicodeDecodeError as e:
-        # Si el error cae justo en el borde del recorte, no es un problema de
-        # encoding sino del limite de bytes: decodificamos el prefijo valido.
         if 0 < e.start <= len(datos) and e.start >= MAX_BODY_BYTES - 4:
             return datos[: e.start].decode("utf-8", errors="replace")
+        return None
+
+
+def _decodificar(contenido: bytes, encoding: str = "") -> str:
+    """Decodifica bytes a texto sin romper tildes/nies ni lanzar.
+
+    Orden (como hacen los navegadores):
+
+    1. charset declarado en el HTML (``<meta charset>``/``http-equiv``);
+    2. ``encoding`` del cliente HTTP (header ``Content-Type``);
+    3. utf-8 estricto;
+    4. latin-1 de rescate (nunca falla).
+
+    Ademas, si el charset declarado NO es utf-8, se prueba primero utf-8
+    estricto: muchos servidores declaran mal (p. ej. ``requests`` devuelve
+    ``ISO-8859-1`` por defecto cuando no hay header) y el contenido real es
+    UTF-8, lo que antes producia mojibake ("EL PAÃS", "MÃ©xico").
+    """
+    datos = (contenido or b"")[:MAX_BODY_BYTES]
+
+    declarado = (_detectar_charset_meta(datos) or encoding or "").strip()
+    declarado = declarado.lstrip('"').rstrip('"').strip().lower()
+
+    if declarado in ("utf-8", "utf8", "utf_8", "unicode", "unicode-1-1-utf-8"):
+        texto = _decodificar_utf8(datos)
+        if texto is not None:
+            return texto
+        # El charset dice utf-8 pero el contenido no lo es: rescate latin-1.
         return datos.decode("latin-1", errors="replace")
+
+    # charset distinto de utf-8 (o ausente): probar utf-8 primero porque es lo
+    # mas comun en prensa actual y evita el mojibake por encoding mal declarado.
+    texto = _decodificar_utf8(datos)
+    if texto is not None:
+        return texto
+
+    if declarado:
+        try:
+            return datos.decode(declarado, errors="replace")
+        except (LookupError, TypeError):
+            pass
+
+    return datos.decode("latin-1", errors="replace")
 
 
 def _descargar_html(url: str, timeout: int = 20) -> tuple[str, str]:
@@ -239,7 +301,11 @@ def _descargar_html(url: str, timeout: int = 20) -> tuple[str, str]:
         from curl_cffi import requests as curl_requests
 
         response = curl_requests.get(
-            url, impersonate="chrome", timeout=timeout, allow_redirects=True
+            url,
+            impersonate="chrome",
+            timeout=timeout,
+            allow_redirects=True,
+            headers=_HEADERS_NAVEGADOR,
         )
         if response.status_code >= 400:
             errores.append(f"curl_cffi HTTP {response.status_code}")
@@ -540,15 +606,22 @@ def _llamar_ia(prompt: str, temperature: float = 0.4) -> str:
     """Llama a OpenAI (compatible con openai 0.28 y >= 1.0) y devuelve el texto.
 
     Replica el patron de ``ia/generador_contenido.py``. Propaga la excepcion
-    para que el llamador aplique el fallback local.
+    para que el llamador aplique el fallback local. Devuelve ``""`` si la
+    respuesta no trae contenido (choices vacio o content ``None``) y acota el
+    tiempo de espera para no dejar al usuario colgado si la red falla.
     """
+    timeout_seg = 60
+
     if hasattr(openai, "OpenAI"):  # openai >= 1.0
         cliente = openai.OpenAI(api_key=settings.openai_api_key)
         respuesta = cliente.chat.completions.create(
             model="gpt-4o-mini",
             messages=[{"role": "user", "content": prompt}],
             temperature=temperature,
+            timeout=timeout_seg,
         )
+        if not getattr(respuesta, "choices", None):
+            return ""
         return (respuesta.choices[0].message.content or "").strip()
 
     # openai 0.28.x
@@ -557,7 +630,10 @@ def _llamar_ia(prompt: str, temperature: float = 0.4) -> str:
         model="gpt-4o-mini",
         messages=[{"role": "user", "content": prompt}],
         temperature=temperature,
+        request_timeout=timeout_seg,
     )
+    if not getattr(respuesta, "choices", None):
+        return ""
     return (respuesta.choices[0].message.content or "").strip()
 
 

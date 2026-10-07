@@ -51,6 +51,7 @@ HANDLE_RE = re.compile(r"^[A-Za-z0-9_]{4,15}$")
 TABS = [
     "📥 Importar",
     "🔎 Validar",
+    "🔑 Login y cookies",
     "🗂️ Secciones (IP/CI/Libertad/Justicia)",
     "🎭 Registro",
     "🎨 Perfiles",
@@ -75,6 +76,7 @@ MODOS_TABS = {
     "🗂️ Cuentas": [
         "📥 Importar",
         "🔎 Validar",
+        "🔑 Login y cookies",
         "⏸️ Estado",
         "🗑️ Eliminar",
         "🏅 Tiers",
@@ -1265,6 +1267,213 @@ def _tab_validar():
             c6.metric("Total", res.get("total", 0))
         except Exception as e:
             st.error(f"Falló la validación de sesiones: {e}")
+
+
+def _parsear_lote_login(texto):
+    """Parsea el lote `usuario:contraseña` (una cuenta por línea).
+
+    Devuelve `(cuentas, invalidas)`:
+    - `cuentas`: lista de tuplas `(usuario, contraseña)` ya limpias de espacios.
+    - `invalidas`: líneas no vacías sin `:` o con usuario/contraseña vacíos.
+
+    Tolerante a líneas vacías, espacios alrededor y contraseñas que CONTIENEN
+    `:` (todo lo que sigue al PRIMER `:` es la contraseña). Nunca lanza.
+    """
+    cuentas = []
+    invalidas = []
+    for linea in (texto or "").splitlines():
+        raw = linea.strip()
+        if not raw:
+            continue
+        if ":" not in raw:
+            invalidas.append(raw)
+            continue
+        usuario, contraseña = raw.split(":", 1)
+        usuario = usuario.strip()
+        contraseña = contraseña.strip()
+        if not usuario or not contraseña:
+            invalidas.append(raw)
+            continue
+        cuentas.append((usuario, contraseña))
+    return cuentas, invalidas
+
+
+def _tab_login_cookies():
+    st.markdown("### 🔑 Login y cookies")
+    st.caption(
+        "Pega cuentas en formato `usuario:contraseña` (una por línea). Por cada "
+        "cuenta se abre Chrome, se inicia sesión en X con usuario y contraseña "
+        "(resolviendo el reto de TOTP si la cuenta tiene `totp_secret`) y, si "
+        "entra al home, se guardan las cookies (`.pkl` + BD) y se marca como "
+        "**Tier 1**."
+    )
+
+    texto_lote = st.text_area(
+        "Cuentas (una por línea, `usuario:contraseña`)",
+        height=200,
+        key="login_cookies_lote",
+        placeholder="micuenta:miContraseña123\notra_cuenta:pass:con:dos.puntos",
+    )
+    chrome_visible = st.checkbox(
+        "🖥️ Chrome visible (headless OFF)",
+        value=False,
+        key="login_cookies_visible",
+        help=(
+            "Marca esta casilla para ver el login en vivo. Se aplica SOLO "
+            "durante el proceso y `settings.headless` se restaura al terminar."
+        ),
+    )
+
+    if st.button(
+        "🔑 Iniciar sesión y extraer cookies (marcar Tier 1)",
+        type="primary",
+        use_container_width=True,
+        key="btn_login_cookies",
+    ):
+        cuentas, invalidas = _parsear_lote_login(texto_lote)
+        if invalidas:
+            with st.expander(
+                f"⚠️ Líneas ignoradas ({len(invalidas)}) — sin `:` o campos vacíos"
+            ):
+                for linea in invalidas:
+                    st.markdown(f"- `{linea}`")
+        if not cuentas:
+            st.warning(
+                "No hay cuentas válidas. Pega al menos una línea con formato "
+                "`usuario:contraseña`."
+            )
+            return
+
+        # Import perezoso: Selenium y config solo se cargan al pulsar el botón,
+        # para que la página importe sin Chrome instalado.
+        try:
+            from core.config import settings
+            from plataformas.twitter.selenium_bot import TwitterBot
+        except Exception as e:
+            st.error(f"No se pudieron cargar las dependencias de login: {e}")
+            return
+
+        headless_previo = bool(getattr(settings, "headless", True))
+        if chrome_visible:
+            try:
+                settings.headless = False
+            except Exception:
+                pass
+
+        exitosas = []
+        fallidas = []
+        total = len(cuentas)
+        barra = st.progress(0.0)
+        estado_linea = st.empty()
+
+        try:
+            for idx, (usuario, contraseña) in enumerate(cuentas, start=1):
+                estado_linea.markdown(
+                    f"🔑 **@{usuario}** ({idx}/{total}) — iniciando sesión…"
+                )
+                barra.progress((idx - 1) / total)
+
+                # a) Asegurar la cuenta en BD (crear o actualizar password).
+                try:
+                    with get_db_session() as db:
+                        cuenta = (
+                            db.query(Cuenta)
+                            .filter(Cuenta.usuario == usuario)
+                            .first()
+                        )
+                        if cuenta is None:
+                            db.add(
+                                Cuenta(
+                                    usuario=usuario,
+                                    password=contraseña,
+                                    plataforma="twitter",
+                                    activa=True,
+                                    status="imported",
+                                )
+                            )
+                        else:
+                            cuenta.password = contraseña
+                except Exception as e:
+                    fallidas.append((usuario, f"error de BD: {e}"))
+                    barra.progress(idx / total)
+                    continue
+
+                # b) Login real con Selenium (bloqueante, secuencial).
+                bot = None
+                ok = False
+                try:
+                    bot = TwitterBot(usuario)
+                    ok = bool(bot.login_con_password(contraseña, timeout=120))
+                except Exception as e:
+                    fallidas.append((usuario, f"excepción: {e}"))
+                    barra.progress(idx / total)
+                    continue
+                finally:
+                    if bot is not None:
+                        try:
+                            bot.cerrar()
+                        except Exception:
+                            pass
+
+                # c) Éxito: marcar Tier 1 / activa.
+                if ok:
+                    try:
+                        with get_db_session() as db:
+                            cuenta = (
+                                db.query(Cuenta)
+                                .filter(Cuenta.usuario == usuario)
+                                .first()
+                            )
+                            if cuenta is not None:
+                                cuenta.tier_calidad = "tier1"
+                                cuenta.status = "active"
+                                cuenta.activa = True
+                    except Exception as e:
+                        fallidas.append(
+                            (
+                                usuario,
+                                f"login OK pero no se pudo marcar Tier 1: {e}",
+                            )
+                        )
+                        barra.progress(idx / total)
+                        continue
+                    exitosas.append(usuario)
+                    estado_linea.markdown(f"✅ @{usuario} — login OK, Tier 1")
+                else:
+                    # d) Fallo: reportar `ultimo_error` (o "login fallido").
+                    motivo = str(
+                        getattr(bot, "ultimo_error", "") or ""
+                    ).strip() or "login fallido"
+                    fallidas.append((usuario, motivo))
+                    estado_linea.markdown(f"❌ @{usuario} — {motivo}")
+
+                barra.progress(idx / total)
+        finally:
+            # Restaurar headless SIEMPRE, pase lo que pase.
+            try:
+                settings.headless = headless_previo
+            except Exception:
+                pass
+
+        barra.progress(1.0)
+        estado_linea.markdown("✅ Proceso terminado")
+        _listar_cuentas.clear()
+
+        st.markdown("---")
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Exitosas", len(exitosas))
+        c2.metric("Fallidas", len(fallidas))
+        c3.metric("Total", total)
+
+        if exitosas:
+            st.success(
+                "Cookies extraídas y marcadas como Tier 1: "
+                + ", ".join(f"@{u}" for u in exitosas)
+            )
+        if fallidas:
+            with st.expander(f"⚠️ Fallos ({len(fallidas)})"):
+                for usuario, motivo in fallidas:
+                    st.markdown(f"- @{usuario}: {motivo}")
 
 
 def _tab_secciones():
@@ -5092,6 +5301,7 @@ def render(usuario):
     paginas = {
         "📥 Importar": _tab_importar,
         "🔎 Validar": _tab_validar,
+        "🔑 Login y cookies": _tab_login_cookies,
         "🗂️ Secciones (IP/CI/Libertad/Justicia)": _tab_secciones,
         "🎭 Registro": _tab_registro,
         "🎨 Perfiles": _tab_perfiles,
