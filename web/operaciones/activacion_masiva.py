@@ -2063,6 +2063,51 @@ def _actualizar_roles(usuarios: list, codigo: str) -> int:
         return 0
 
 
+def _asignar_roles_por_tier(filas: list) -> dict:
+    """Auto-asigna `rol_activacion` segun el tier de cada cuenta.
+
+    Mapeo (respeta el blindaje de tiers que YA aplica el motor):
+    - Tier 1 -> "hashtags" (posts con hashtag, SI O SI).
+    - Tier 3 -> "rt" (solo RT/likes).
+    - Tier 2 y cuentas SIN tier -> rotan "cita" -> "comentario" -> "rt"
+      (en ese orden ciclico).
+
+    Muta `f["rol_activacion"] = rol` EN EL MISMO dict, de modo que las listas
+    que comparten referencias (`cuentas`, `base_objetivo`) reflejan el rol
+    nuevo sin re-consultar la BD. Persiste en lote con `_actualizar_roles`
+    (un UPDATE por rol con cuentas). Devuelve `{usuario: rol}` con los
+    codigos canonicos ("cita", "hashtags", "comentario", "rt").
+    """
+    roles_resto = ("cita", "comentario", "rt")
+    asignacion: dict = {}
+    por_rol: dict = {}
+    idx_resto = 0
+
+    for fila in filas or []:
+        if not isinstance(fila, dict):
+            continue
+        usuario = str(fila.get("usuario") or "").strip().lstrip("@")
+        if not usuario:
+            continue
+        tier = str(fila.get("tier_calidad") or "").strip().lower()
+        if tier == "tier1":
+            rol = "hashtags"
+        elif tier == "tier3":
+            rol = "rt"
+        else:
+            # Tier 2 y sin tier comparten la rotacion ciclica.
+            rol = roles_resto[idx_resto % len(roles_resto)]
+            idx_resto += 1
+        fila["rol_activacion"] = rol
+        asignacion[usuario] = rol
+        por_rol.setdefault(rol, []).append(usuario)
+
+    for rol, usuarios in por_rol.items():
+        _actualizar_roles(usuarios, rol)
+
+    return asignacion
+
+
 # ============================ UI: PANEL ============================
 
 def _mostrar_panel_roles(cuentas: list):
@@ -2563,10 +2608,7 @@ def _cita_masiva():
         )
         _caption_cuota_diaria()
 
-    with st.expander(
-        "📰 Contexto desde noticias (opcional, solo trasfondo)", expanded=False
-    ):
-        panel_noticias = _panel_contexto_noticias("act")
+    panel_noticias = _panel_contexto_noticias("act")
 
     with st.expander("⚙️ Opciones avanzadas (ya vienen configuradas)", expanded=False):
         st.caption(
@@ -3057,6 +3099,37 @@ def _por_roles():
     if mensaje_pct:
         st.success(mensaje_pct)
 
+    # ---------------- Auto-asignar roles por Tier (recomendado) ----------------
+    st.markdown("#### 🎯 Auto-asignar roles por Tier (recomendado)")
+    st.caption(
+        "Deriva el rol de cada cuenta automáticamente de su tier, sin tener que "
+        "hacer el reparto por porcentajes a mano: **Tier 1 → Hashtags**, "
+        "**Tier 3 → RT** y **Tier 2 / sin tier → rotan Cita → Comentario → RT**."
+    )
+    if st.button(
+        "🎯 Auto-asignar roles por Tier",
+        type="primary",
+        key="btn_act_roles_auto_tier",
+    ):
+        if not usuarios_sel:
+            st.warning(
+                "Selecciona al menos una cuenta para auto-asignar los roles "
+                "por Tier."
+            )
+        else:
+            filas_sel = [
+                filas_por_usuario.get(u) or {"usuario": u}
+                for u in usuarios_sel
+            ]
+            asignacion = _asignar_roles_por_tier(filas_sel)
+            resumen = " · ".join(
+                f"{etiqueta_rol_activacion(rol)}: {n}"
+                for rol in ORDEN_ROLES
+                if (n := sum(1 for r in asignacion.values() if r == rol))
+            )
+            st.success("🎯 Roles auto-asignados por Tier → " + resumen)
+            st.rerun()
+
     # ---------------- Asignar roles manualmente (avanzado) ----------------
     # El reparto masivo vive en «🎚️ Reparto por porcentajes»; este expander
     # queda para asignar rol a cuentas sueltas y ver los conteos actuales.
@@ -3243,10 +3316,7 @@ def _por_roles():
                 "se ignorarán."
             )
 
-    with st.expander(
-        "📰 Contexto desde noticias (opcional, solo trasfondo)", expanded=False
-    ):
-        panel_noticias = _panel_contexto_noticias("act_roles")
+    panel_noticias = _panel_contexto_noticias("act_roles")
 
     duracion_min = st.number_input(
         "Duración (min)", min_value=1, max_value=360, value=60, step=5,
@@ -3562,6 +3632,18 @@ def _por_roles():
             "útiles para el reparto por porcentajes."
         )
 
+    auto_tier = st.checkbox(
+        "🎯 Auto-asignar roles por Tier al lanzar (recomendado)",
+        value=True,
+        key="act_roles_auto_tier",
+        help=(
+            "Deriva el rol de cada cuenta de su tier justo antes de validar y "
+            "lanzar la campaña (Tier 1 → Hashtags, Tier 3 → RT, Tier 2/sin "
+            "tier → rotan Cita → Comentario → RT). Con esto ya no necesitas el "
+            "«🎚️ Reparto por porcentajes» manual."
+        ),
+    )
+
     if st.button(
         "🗂️ Lanzar campaña por roles",
         type="primary",
@@ -3594,6 +3676,17 @@ def _por_roles():
             solo_roles_param = ["hashtags"]
         else:
             solo_roles_param = list(ORDEN_ROLES) if solo_con_rol else None
+
+        if auto_tier:
+            target_filas = _cuentas_objetivo(base_objetivo, usuarios_param)
+            if target_filas:
+                asignacion_tier = _asignar_roles_por_tier(target_filas)
+                resumen = " · ".join(
+                    f"{etiqueta_rol_activacion(rol)}: {n}"
+                    for rol in ORDEN_ROLES
+                    if (n := sum(1 for r in asignacion_tier.values() if r == rol))
+                )
+                st.success("🎯 Roles auto-asignados por Tier → " + resumen)
 
         # VALIDACION BLOQUEANTE de tiers: con roles FIJOS, ninguna cuenta
         # Tier 2 puede quedarse con el rol "hashtags" y ninguna Tier 3 con

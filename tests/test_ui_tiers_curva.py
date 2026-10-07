@@ -388,6 +388,15 @@ def _app_test_roles_launch(con_curva: bool, incluir_tier2: bool = False,
         if at.exception:
             datos["excepcion"] = str(at.exception[0].value)[:200]
             return False, datos["excepcion"], datos
+        # Los escenarios de bloqueo por TIER (incluir_tier2/incluir_tier3)
+        # prueban la validacion MANUAL (rol guardado que viola el tier). Se
+        # desactiva la auto-asignacion por tier (que, al venir ON por defecto,
+        # corregiria ese mismatch y no dejaria disparar el bloqueo).
+        if incluir_tier2 or incluir_tier3:
+            at.checkbox(key="act_roles_auto_tier").uncheck().run()
+            if at.exception:
+                datos["excepcion"] = str(at.exception[0].value)[:200]
+                return False, datos["excepcion"], datos
         if con_curva:
             at.checkbox(key="act_roles_curva").check().run()
             at.number_input(key="act_roles_curva_fase1").set_value(20).run()

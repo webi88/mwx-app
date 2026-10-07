@@ -363,10 +363,7 @@ def _formulario() -> None:
             ),
         )
 
-    with st.expander(
-        "📰 Contexto desde noticias (opcional, solo trasfondo)", expanded=False
-    ):
-        panel_noticias = _panel_contexto_noticias(PREFIX)
+    panel_noticias = _panel_contexto_noticias(PREFIX)
 
     st.markdown("### 👥 Cuentas objetivo")
     incluir_pausadas = st.checkbox(
