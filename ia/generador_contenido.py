@@ -2843,11 +2843,23 @@ def _prompt_lote_mantenimiento(
         angulo = _ANGULOS_MANTENIMIENTO[
             (idx - 1) % len(_ANGULOS_MANTENIMIENTO)
         ]
+        sin_tema = accion == "comentario" and not tema
+        tema_txt = (
+            "EXACTAMENTE el del contexto/tweet ancla indicado arriba"
+            if sin_tema else tema
+        )
         linea = (
             f"PERFIL {idx} | usuario: {usuario or 'cuenta'} | registro: "
             f"{registro or 'libre'} | perfil: {etiqueta_perfil(perfil)} | "
-            f"accion: {accion} | tema: {tema} | angulo: {angulo}"
+            f"accion: {accion} | tema: {tema_txt} | angulo: {angulo}"
         )
+        if sin_tema:
+            linea += (
+                "\nTEMA OBLIGATORIO: comenta SOLO sobre el contexto/tweet ancla "
+                "indicado arriba. PROHIBIDO desviarte a otros temas (futbol, "
+                "deportes, comida, clima, series, etc.) aunque la personalidad "
+                "los mencione: la personalidad solo define el TONO."
+            )
         linea += (
             "\nANGULO NARRATIVO OBLIGATORIO DE ESTE TEXTO: "
             f"{angulo} (escribe el texto desde ESE angulo; no lo repitas con "
@@ -2959,7 +2971,9 @@ def _prompt_lote_mantenimiento(
     return "\n\n".join(partes)
 
 
-def _fallback_estructura_mantenimiento(cuentas_info, n_por_cuenta) -> list[list[str]]:
+def _fallback_estructura_mantenimiento(
+    cuentas_info, n_por_cuenta, desplazamiento_tema: int = 0
+) -> list[list[str]]:
     """Ultimo recurso: estructura valida con textos no vacios (nunca lanza).
 
     Usa el fallback local DINAMICO por partes (`_generar_plantilla_local`):
@@ -2998,7 +3012,9 @@ def _fallback_estructura_mantenimiento(cuentas_info, n_por_cuenta) -> list[list[
         vistos: set = set()
         evitar: set = set()
         for j in range(n):
-            tema = _TEMAS_MANTENIMIENTO[(i * n + j) % total_temas]
+            tema = _TEMAS_MANTENIMIENTO[
+                (i * n + j + int(desplazamiento_tema or 0)) % total_temas
+            ]
             t = _texto_local_diverso(
                 perfil=perfil,
                 registro=registro,
@@ -3077,10 +3093,32 @@ def _generar_textos_mantenimiento_impl(
     #    NATURAL (i, j), MEZCLANDO temas: cada lote de <=15 slots lleva temas
     #    TODOS distintos (antes se agrupaba por tema y los lotes salian
     #    homogeneos, con textos clonados).
+    # Los COMENTARIOS con contexto (tweet ancla o contexto/narrativa de la
+    # campana) NO reciben un tema aleatorio (futbol, cafe...): hablan del
+    # contexto dado. Tema "" = sin tema asignado.
+    hay_contexto = bool(
+        (tweet_ancla_texto or "").strip() or (narrativa or "").strip()
+    )
+
+    def _comentario_con_contexto(i: int) -> bool:
+        if not hay_contexto:
+            return False
+        try:
+            return _normalizar_accion(
+                _info_cuenta(lista, i).get("tipo_accion")
+            ) == "comentario"
+        except Exception:
+            return False
+
     slots = []
     for i in range(total_cuentas):
+        sin_tema = _comentario_con_contexto(i)
         for j in range(n):
-            tema = temas_limpios[(i * n + j) % len(temas_limpios)]
+            tema = (
+                ""
+                if sin_tema
+                else temas_limpios[(i * n + j) % len(temas_limpios)]
+            )
             slots.append((i, j, tema))
 
     generador = None
@@ -3148,14 +3186,15 @@ def _generar_textos_mantenimiento_impl(
             compartan palabras clave ni se repitan (y `vistos_global` para no
             repetirse entre cuentas).
             """
-            tema = temas_limpios[(i * n + j) % total_temas]
+            sin_tema = es_comentario and _comentario_con_contexto(i)
+            tema = "" if sin_tema else temas_limpios[(i * n + j) % total_temas]
             return _texto_local_diverso(
                 perfil=perfil,
                 registro=registro,
                 tema=tema,
                 es_comentario=es_comentario,
-                nombre=nombre,
-                personalidad=personalidad,
+                nombre="" if sin_tema else nombre,
+                personalidad="" if sin_tema else personalidad,
                 semilla_base=_semilla_plantilla(i, j, usuario) + (i * n + j),
                 evitar=evitar,
                 vistos=vistos,

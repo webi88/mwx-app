@@ -199,6 +199,19 @@ MENSAJE_TIER3_SIN_ROL = (
 )
 
 
+def _registrar_like_exitoso(usuario, rol, ok, dar_like) -> None:
+    """Registra un exito de tipo "like" cuando un RT/cita con dar_like salio bien.
+
+    El like no cuenta para las cuotas (no esta en ACCIONES_OPERATIVAS) y no
+    genera link; solo aparece en la tabla de exitos de Reportes.
+    """
+    try:
+        if ok and dar_like and str(rol or "").strip().lower() in ("rt", "cita"):
+            registrar_accion(usuario, "like", "exito", "", "like dado")
+    except Exception:
+        pass
+
+
 def _avisar_cuota_agotada_log(cuotas, usuario) -> bool:
     """Avisa (una vez por minuto y cuenta) que la cuenta agoto sus cuotas.
 
@@ -3636,12 +3649,24 @@ class MotorActivacion:
                             narrativa_com = "\n".join(
                                 x for x in [instruccion, trasfondo] if x
                             )
-                            resultado_ia = generar_textos_comentario(
-                                cuentas_info,
-                                n_por_cuenta=1,
-                                narrativa=narrativa_com,
-                                entrenamiento=entrenamiento,
-                            )
+                            try:
+                                # El contexto manual es el TEMA del comentario
+                                # (no trasfondo invisible): viaja como tema
+                                # principal y queda exento de la red anti-fuga.
+                                resultado_ia = generar_textos_comentario(
+                                    cuentas_info,
+                                    n_por_cuenta=1,
+                                    narrativa=trasfondo,
+                                    entrenamiento=entrenamiento,
+                                    tweet_ancla_texto=material or "",
+                                )
+                            except TypeError:
+                                resultado_ia = generar_textos_comentario(
+                                    cuentas_info,
+                                    n_por_cuenta=1,
+                                    narrativa=narrativa_com,
+                                    entrenamiento=entrenamiento,
+                                )
                         for i, cuenta in enumerate(grupo):
                             lista = None
                             if isinstance(resultado_ia, dict):
@@ -5361,6 +5386,7 @@ class MotorActivacion:
                         url,
                         detalle,
                     )
+                    _registrar_like_exitoso(usuario_res, "cita", ok, dar_like)
                     resumen["detalles"].append({
                         "usuario": usuario_res,
                         "ok": ok,
@@ -5517,6 +5543,7 @@ class MotorActivacion:
                             url,
                             detalle,
                         )
+                        _registrar_like_exitoso(usuario_res, "cita", ok, dar_like)
                         resultados.append({"usuario": usuario_res, "ok": ok, "detalle": detalle, "url": url})
                         if callback:
                             callback(self.progreso["hechas"], len(cuentas), usuario_res, ok)
@@ -6303,6 +6330,7 @@ class MotorActivacion:
                         url,
                         detalle,
                     )
+                    _registrar_like_exitoso(usuario_res, rol_res, ok, dar_like)
                     resumen["detalles"].append({
                         "usuario": usuario_res,
                         "rol": rol_res,
@@ -6521,6 +6549,7 @@ class MotorActivacion:
                             url,
                             detalle,
                         )
+                        _registrar_like_exitoso(usuario_res, rol_res, ok, dar_like)
                         resumen["detalles"].append({
                             "usuario": usuario_res,
                             "rol": rol_res,
@@ -6941,6 +6970,7 @@ class MotorActivacion:
                             usuario_res, tipo_registro_rol(rol_res),
                             "exito" if ok else "fallido", url, detalle,
                         )
+                        _registrar_like_exitoso(usuario_res, rol_res, ok, dar_like)
                         base_resumen["detalles"].append({
                             "usuario": usuario_res,
                             "rol": rol_res,

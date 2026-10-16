@@ -189,6 +189,41 @@ def _filas_con_separacion(filas: list[dict]) -> list[dict]:
     return separadas
 
 
+MAX_CAMPANAS_EXCEL = 3
+HUECO_CAMPANA_MIN = 30
+
+
+def _ultimas_campanas(filas: list[dict], max_campanas: int = MAX_CAMPANAS_EXCEL,
+                      hueco_min: int = HUECO_CAMPANA_MIN) -> list[dict]:
+    """Deja solo los exitos de las `max_campanas` campanas mas recientes.
+
+    `filas` viene de la mas reciente a la mas antigua. Una campana nueva
+    empieza cuando entre dos acciones consecutivas hay mas de `hueco_min`
+    minutos. Filas sin fecha valida se pegan a la campana en curso. Nunca lanza.
+    """
+    try:
+        from datetime import datetime as _dt
+
+        resultado, campanas, previa = [], 0, None
+        for fila in filas or []:
+            try:
+                actual = _dt.strptime(str(fila.get("Fecha", "")), "%Y-%m-%d %H:%M")
+            except Exception:
+                actual = None
+            if actual is not None:
+                if previa is None or (previa - actual).total_seconds() > hueco_min * 60:
+                    campanas += 1
+                previa = actual
+            elif previa is None:
+                campanas += 1
+            if campanas > max_campanas:
+                break
+            resultado.append(fila)
+        return resultado
+    except Exception:
+        return list(filas or [])
+
+
 def _excel_exitos_bytes(filas: list[dict]) -> bytes:
     """Genera EN MEMORIA el .xlsx de exitos con una fila vacia en medio.
 
@@ -332,8 +367,14 @@ def render(usuario: dict):
         st.dataframe(filas_mostradas, use_container_width=True, column_config={
             "Link": st.column_config.LinkColumn("Link", display_text="🔗 Abrir"),
         })
-        datos_excel = _excel_exitos_bytes(filas_mostradas)
+        # El Excel guarda como maximo las ultimas 3 campanas (no todo el historial).
+        datos_excel = _excel_exitos_bytes(
+            _filas_con_separacion(_ultimas_campanas(filas))
+        )
         if datos_excel:
+            st.caption(
+                f"📥 El Excel incluye solo las últimas {MAX_CAMPANAS_EXCEL} campañas."
+            )
             st.download_button(
                 "⬇️ Descargar Excel (.xlsx)",
                 data=datos_excel,

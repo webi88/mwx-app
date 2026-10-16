@@ -3826,7 +3826,9 @@ def _por_roles():
             prefix="act_roles",
             limpiar=bool(limpiar_contexto_al_terminar),
             sin_proxy=bool(sin_proxy),
-            sin_imagenes=bool(sin_imagenes),
+            # Con imagenes para los posts, Chrome debe cargarlas (con
+            # "no cargar imagenes" X no adjunta la subida).
+            sin_imagenes=bool(sin_imagenes) and not bool(imagen_kwargs),
             rt_api=bool(rt_api),
             api_primero=bool(rt_api),
             max_workers=int(max_workers),

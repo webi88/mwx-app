@@ -562,7 +562,9 @@ def _lanzar(tags, usuarios_sel, posts_min, posts_max, pausa_min, pausa_max,
         # Valores recomendados fijos de velocidad (los mismos de Activacion
         # Masiva): sin proxy, sin imagenes, sin API, pestana persistente.
         sin_proxy=False,
-        sin_imagenes=True,
+        # Con imagenes para los posts Chrome DEBE poder cargarlas: con
+        # "no cargar imagenes" X no adjunta la subida.
+        sin_imagenes=not bool(imagen_kwargs),
         rt_api=False,
         api_primero=False,
         max_workers=12,

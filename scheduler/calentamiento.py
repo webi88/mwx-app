@@ -344,7 +344,11 @@ def _texto_local(info: dict) -> str:
     try:
         from ia.generador_contenido import _fallback_estructura_mantenimiento
 
-        return _primer_texto(_fallback_estructura_mantenimiento([info], 1))
+        return _primer_texto(
+            _fallback_estructura_mantenimiento(
+                [info], 1, desplazamiento_tema=random.randrange(1000)
+            )
+        )
     except Exception as e:  # noqa: BLE001
         logger.debug(f"Calentamiento: fallback local no disponible: {e}")
         return ""
@@ -374,9 +378,15 @@ def generar_texto(cuenta) -> str:
         if cfg["usar_ia"]:
             try:
                 from ia.generador_contenido import generar_textos_mantenimiento
+                from ia.prompts import TEMAS_MANTENIMIENTO
 
+                # Una llamada = 1 texto: el tema se elige por indice y siempre
+                # caia en el primero ("azteca"). Se sortea uno de los 42.
+                tema = random.choice(list(TEMAS_MANTENIMIENTO))
                 texto = _primer_texto(
-                    generar_textos_mantenimiento([info], n_por_cuenta=1)
+                    generar_textos_mantenimiento(
+                        [info], n_por_cuenta=1, temas=[tema]
+                    )
                 )
             except Exception as e:  # noqa: BLE001
                 logger.warning(f"Calentamiento: la IA fallo, uso fallback local: {e}")
