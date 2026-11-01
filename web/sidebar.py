@@ -22,11 +22,11 @@ def render_sidebar(usuario: dict):
                 <span style="font-weight:700; color:#fff; font-size:0.85rem;">{usuario['nombre']}</span>
                 <span style="
                     margin-left:auto; font-size:0.62rem; letter-spacing:1px;
-                    text-transform:uppercase; color:rgba(0,180,196,0.9);
+                    text-transform:uppercase; color:#5ee6c9;
                 ">{usuario['rol']}</span>
                 <span style="
                     display:inline-block; width:7px; height:7px; border-radius:50%;
-                    background:#2dd4a7;
+                    background:#5ee6c9;
                 "></span>
             </div>
             """,
