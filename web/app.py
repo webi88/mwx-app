@@ -16,6 +16,10 @@ from web.ui import inyectar_css, cabecera
 from web.effects import inyectar_efectos
 from web.ui import sin_emoji
 from web.sidebar import render_sidebar
+from web.limpieza_ui import instalar_limpieza_emojis
+
+# Oculta los iconitos (emojis) en toda la interfaz sin tocar la navegacion.
+instalar_limpieza_emojis()
 
 # Configuración de la página
 st.set_page_config(
