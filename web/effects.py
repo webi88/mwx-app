@@ -20,7 +20,7 @@ _HTML = r"""
     padding:8px 4px;
     border-bottom:1px solid #e6ecee;
     background:transparent;
-    font-family: 'Inter', -apple-system, 'Segoe UI', sans-serif;
+    font-family: 'Poppins', -apple-system, 'Segoe UI', sans-serif;
     color:#1d2a30;
 ">
     <div style="display:flex; align-items:center; gap:8px;">

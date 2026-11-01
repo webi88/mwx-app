@@ -8,7 +8,7 @@ import streamlit as st
 # --------------------------------------------------------------------------- #
 CSS = """
 <style>
-    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=Source+Serif+4:opsz,wght@8..60,500;8..60,600&display=swap');
+    @import url('https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;500;600&display=swap');
 
     /* Estilo minimalista: area principal blanca con acentos turquesa y la
        barra lateral en azul petroleo (branding). Titulos en serif y texto
@@ -36,7 +36,7 @@ CSS = """
     html, body, [class*="css"], [data-testid="stAppViewContainer"],
     [data-testid="stAppViewContainer"] :is(p, li, label, input, textarea, button, td, th, summary, div),
     [data-testid="stSidebar"] :is(p, li, label, input, button, summary) {
-        font-family: 'Inter', -apple-system, 'Segoe UI', sans-serif;
+        font-family: 'Poppins', -apple-system, 'Segoe UI', sans-serif;
     }
     [data-testid="stIconMaterial"] { font-family: 'Material Symbols Rounded' !important; }
     html, body { font-size: 14px; }
@@ -49,7 +49,7 @@ CSS = """
         font-weight: 500 !important;
     }
     h1, h2, h3, h4, h5, h6, [data-testid="stHeading"] * {
-        font-family: 'Source Serif 4', Georgia, serif !important;
+        font-family: 'Poppins', -apple-system, sans-serif !important;
         font-weight: 500 !important;
         color: var(--mw-text);
         letter-spacing: -0.2px;
@@ -73,7 +73,7 @@ CSS = """
     /* Login centrado */
     .mw-login { text-align: center; margin: 9vh 0 22px 0; }
     .mw-login h1 {
-        font-family: 'Source Serif 4', Georgia, serif !important;
+        font-family: 'Poppins', -apple-system, sans-serif !important;
         font-weight: 500 !important;
         font-size: 1.9rem !important;
         margin: 6px 0 4px 0; padding: 0;
@@ -148,7 +148,7 @@ CSS = """
         margin-bottom: 10px;
     }
     .mw-header h1 {
-        font-family: 'Source Serif 4', Georgia, serif !important;
+        font-family: 'Poppins', -apple-system, sans-serif !important;
         color: var(--mw-text);
         font-size: 1.75rem !important;
         font-weight: 500 !important;
@@ -212,7 +212,7 @@ CSS = """
     }
     .mw-stat:hover { border-color: var(--mw-border-strong); }
     .mw-stat .valor {
-        font-family: 'Source Serif 4', Georgia, serif;
+        font-family: 'Poppins', -apple-system, sans-serif;
         font-size: 1.6rem;
         font-weight: 500;
         color: var(--mw-text);
@@ -345,7 +345,7 @@ CSS = """
     }
     [data-testid="stMetricLabel"] p { font-size: 0.78rem !important; color: var(--mw-muted) !important; }
     [data-testid="stMetricValue"] {
-        font-family: 'Source Serif 4', Georgia, serif;
+        font-family: 'Poppins', -apple-system, sans-serif;
         font-size: 1.5rem !important;
         color: var(--mw-text);
     }
