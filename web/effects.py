@@ -17,49 +17,43 @@ _HTML = r"""
     box-sizing:border-box;
     display:flex; align-items:center; gap:16px; flex-wrap:wrap;
     width:100%;
-    padding:10px 18px;
-    border-radius:14px;
-    border:1px solid rgba(255,255,255,0.08);
-    background:
-        radial-gradient(120% 200% at 0% 50%, rgba(0,180,196,0.12) 0%, transparent 50%),
-        linear-gradient(90deg, rgba(17,22,29,0.92), rgba(17,22,29,0.92));
-    box-shadow: 0 6px 24px rgba(0,0,0,0.35);
+    padding:8px 4px;
+    border-bottom:1px solid #e6ecee;
+    background:transparent;
     font-family: 'Inter', -apple-system, 'Segoe UI', sans-serif;
-    color:#e6edf3;
+    color:#1d2a30;
 ">
-    <div style="display:flex; align-items:center; gap:10px;">
-        <span style="font-size:18px;">📡</span>
-        <span style="font-weight:700; letter-spacing:.4px; font-size:14px;">MWX.app</span>
+    <div style="display:flex; align-items:center; gap:8px;">
+        <span style="
+            display:inline-block; width:8px; height:8px; border-radius:50%;
+            background:linear-gradient(135deg,#1d8f97,#3cc8b4);
+        "></span>
+        <span style="font-weight:600; font-size:13px; letter-spacing:.2px;">MWX.app</span>
     </div>
 
-    <div style="display:flex; align-items:center; gap:8px; margin-left:auto;">
+    <div style="display:flex; align-items:center; gap:7px; margin-left:auto;">
         <span style="
-            display:inline-block; width:9px; height:9px; border-radius:50%;
-            background:#2dd4a7; box-shadow:0 0 0 0 rgba(45,212,167,.7);
+            display:inline-block; width:7px; height:7px; border-radius:50%;
+            background:#3cc8b4; box-shadow:0 0 0 0 rgba(60,200,180,.6);
             animation:mwPulse 1.8s ease-out infinite;
         "></span>
-        <span style="font-size:12px; letter-spacing:1px; text-transform:uppercase; color:rgba(230,237,243,.7);">
-            En línea
-        </span>
+        <span style="font-size:12px; color:#6b7a80;">En línea</span>
     </div>
 
-    <div style="display:flex; flex-direction:column; align-items:flex-end; gap:1px;">
+    <div style="display:flex; align-items:baseline; gap:10px;">
+        <span id="mw-date" style="font-size:12px; color:#6b7a80;"></span>
         <span id="mw-clock" style="
-            font-size:20px; font-weight:800; letter-spacing:1.5px;
-            font-variant-numeric:tabular-nums; color:#ffffff;
+            font-size:13px; font-weight:600;
+            font-variant-numeric:tabular-nums; color:#1d2a30;
         ">--:--:--</span>
-        <span id="mw-date" style="
-            font-size:11px; letter-spacing:1px; text-transform:uppercase;
-            color:rgba(0,180,196,.85);
-        "></span>
     </div>
 </div>
 
 <style>
     @keyframes mwPulse {
-        0%   { box-shadow: 0 0 0 0 rgba(45,212,167,.7); }
-        70%  { box-shadow: 0 0 0 8px rgba(45,212,167,0); }
-        100% { box-shadow: 0 0 0 0 rgba(45,212,167,0); }
+        0%   { box-shadow: 0 0 0 0 rgba(60,200,180,.6); }
+        70%  { box-shadow: 0 0 0 8px rgba(60,200,180,0); }
+        100% { box-shadow: 0 0 0 0 rgba(60,200,180,0); }
     }
 </style>
 
@@ -75,8 +69,6 @@ _HTML = r"""
         var now = new Date();
         clock.textContent = pad(now.getHours()) + ':' + pad(now.getMinutes()) + ':' + pad(now.getSeconds());
         // Pequeño "flash" sutil al cambiar de segundo = sensación de vida.
-        clock.style.transform = 'scale(1.06)';
-        window.setTimeout(function () { clock.style.transform = 'scale(1)'; }, 120);
     }
 
     function fecha() {

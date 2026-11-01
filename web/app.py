@@ -221,13 +221,21 @@ def _recuperar_sesion() -> bool:
 
 
 def _login():
-    cabecera("MWX.app", "Acceso al Sistema de Comunicación Estratégica")
-    st.markdown("#### Iniciar sesión")
-    
-    with st.form("login_form_web"):
-        username = st.text_input("Usuario")
-        password = st.text_input("Contraseña", type="password")
-        submitted = st.form_submit_button("Entrar", type="primary", use_container_width=True)
+    # Caja centrada y angosta (estilo minimalista).
+    _, centro, _ = st.columns([1, 1.3, 1])
+    with centro:
+        st.markdown(
+            "<div class='mw-login'>"
+            "<span class='mw-header__tag'>MWX · Plataforma de gestión</span>"
+            "<h1>Bienvenido</h1>"
+            "<p>Acceso al Sistema de Comunicación Estratégica</p>"
+            "</div>",
+            unsafe_allow_html=True,
+        )
+        with st.form("login_form_web"):
+            username = st.text_input("Usuario")
+            password = st.text_input("Contraseña", type="password")
+            submitted = st.form_submit_button("Entrar", type="primary", use_container_width=True)
     
     if submitted:
         if not username or not password:
@@ -302,7 +310,7 @@ def main():
     # de un selectbox: más visual e inmediato. La operación sigue siendo un
     # selectbox (sus etiquetas son largas). La persistencia `?op=`/`?tab=` y
     # el `on_change` se mantienen intactos (mismas claves de session_state).
-    st.markdown("##### 🧭 Navegación")
+    st.markdown("##### Navegación")
     categoria = st.segmented_control(
         "Categoría",
         list(mapa_categorias),
@@ -317,7 +325,7 @@ def main():
         # la toma como valor válido (sin "value not in options").
         st.session_state["web_nav_selector"] = opciones_categoria[0]
     seleccion = st.selectbox(
-        "📍 SELECCIONA LA OPERACIÓN:",
+        "Operación",
         opciones_categoria,
         key="web_nav_selector",
         on_change=_on_cambio_operacion,

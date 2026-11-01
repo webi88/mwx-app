@@ -14,12 +14,12 @@ def render_sidebar(usuario: dict):
             f"""
             <div style="
                 display:flex; align-items:center; gap:8px;
-                background:linear-gradient(90deg, rgba(0,180,196,0.16), rgba(124,92,255,0.10));
-                border:1px solid rgba(255,255,255,0.08);
+                background:rgba(255,255,255,0.04);
+                border:1px solid rgba(94,230,214,0.14);
                 border-radius:10px; padding:6px 10px;
             ">
                 <span style="font-size:15px;">{rol_emoji}</span>
-                <span style="font-weight:700; color:#fff; font-size:0.85rem;">{usuario['nombre']}</span>
+                <span style="font-weight:600; color:#fff; font-size:0.82rem;">{usuario['nombre']}</span>
                 <span style="
                     margin-left:auto; font-size:0.62rem; letter-spacing:1px;
                     text-transform:uppercase; color:#5ee6c9;
@@ -33,7 +33,7 @@ def render_sidebar(usuario: dict):
             unsafe_allow_html=True
         )
     with col_logout:
-        if st.button("🚪 Salir", key="btn_logout_web"):
+        if st.button("Salir", key="btn_logout_web"):
             # Cierra la sesión: limpia auth + navegación persistente (?op=,
             # ?tab=) para que el siguiente login empiece limpio en Alertas.
             for key in [
@@ -53,7 +53,7 @@ def render_sidebar(usuario: dict):
             st.rerun()
     
     divider()
-    st.markdown("### ≡ PANEL DE CONTROL")
+    st.markdown("#### Panel de control")
     
     _seccion_gestion_clientes(usuario)
     _seccion_asistente_ia(usuario)
