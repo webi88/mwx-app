@@ -10,7 +10,7 @@ MENSAJE_BIENVENIDA = """
 ╔══════════════════════════════════════╗
 ║        DASHBOARD WEB MWX.app         ║
 ║      Sistema de Comunicacion         ║
-║      Estrategica | By MW Group       ║
+║      Estrategica                     ║
 ╚══════════════════════════════════════╝
 
   Iniciando Streamlit...

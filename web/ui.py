@@ -254,9 +254,9 @@ def cabecera(titulo: str, subtitulo: str = "Sistema de Comunicación Estratégic
     st.markdown(
         f"""
         <div class="mw-header">
-            <span class="mw-header__tag">📡 MW Group · Plataforma de gestión</span>
+            <span class="mw-header__tag">📡 MWX · Plataforma de gestión</span>
             <h1>{titulo}</h1>
-            <p>{subtitulo} · By MW Group</p>
+            <p>{subtitulo}</p>
         </div>
         """,
         unsafe_allow_html=True
