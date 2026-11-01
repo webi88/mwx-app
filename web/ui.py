@@ -1,4 +1,18 @@
 import streamlit as st
+import re as _re
+
+_RE_EMOJI = _re.compile(
+    "[\U0001F000-\U0001FAFF\U00002600-\U000027BF\U00002B00-\U00002BFF"
+    "\U0001F1E6-\U0001F1FF\u2190-\u21FF\u2B05\uFE0F\u20E3]"
+)
+
+
+def sin_emoji(texto: str) -> str:
+    """Quita emojis/iconitos de un texto SOLO para mostrarlo (no cambia claves)."""
+    limpio = _RE_EMOJI.sub("", str(texto))
+    return _re.sub(r"\s{2,}", " ", limpio).strip(" ·-")
+
+
 
 
 # --------------------------------------------------------------------------- #
@@ -323,18 +337,24 @@ CSS = """
     [data-testid="stButtonGroup"] button {
         border-radius: 999px !important;
         font-size: 0.82rem !important;
-        border-color: var(--mw-border) !important;
-        background: #ffffff;
+        border: 1px solid transparent !important;
+        background: transparent;
+        color: var(--mw-muted);
     }
     [data-testid="stSegmentedControl"] button p,
     [data-testid="stButtonGroup"] button p { font-size: 0.82rem !important; }
     [data-testid="stButtonGroup"] { gap: 6px; }
+    [data-testid="stSegmentedControl"] button:hover,
+    [data-testid="stButtonGroup"] button:hover { background: var(--mw-surface-2); }
     [data-testid="stButtonGroup"] button[kind$="Active"],
     [data-testid="stSegmentedControl"] button[aria-checked="true"] {
         background: var(--mw-accent-soft) !important;
-        border-color: var(--mw-accent) !important;
+        border: 1px solid transparent !important;
     }
-    [data-testid="stButtonGroup"] button[kind$="Active"] p { color: var(--mw-accent-deep) !important; }
+    [data-testid="stButtonGroup"] button[kind$="Active"] p,
+    [data-testid="stSegmentedControl"] button[aria-checked="true"] p {
+        color: var(--mw-accent-deep) !important;
+    }
 
     /* Metricas nativas */
     [data-testid="stMetric"] {
@@ -387,8 +407,8 @@ def cabecera(titulo: str, subtitulo: str = "Sistema de Comunicación Estratégic
         f"""
         <div class="mw-header">
             <span class="mw-header__tag">MWX · Plataforma de gestión</span>
-            <h1>{titulo}</h1>
-            <p>{subtitulo}</p>
+            <h1>{sin_emoji(titulo)}</h1>
+            <p>{sin_emoji(subtitulo)}</p>
         </div>
         """,
         unsafe_allow_html=True

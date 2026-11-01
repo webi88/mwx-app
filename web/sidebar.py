@@ -6,7 +6,6 @@ from web.ui import emoji_plataforma, divider
 
 
 def render_sidebar(usuario: dict):
-    rol_emoji = "👑" if usuario["rol"] == "admin" else "👤"
     
     col_user, col_logout = st.columns([3, 1])
     with col_user:
@@ -17,9 +16,7 @@ def render_sidebar(usuario: dict):
                 background:rgba(255,255,255,0.04);
                 border:1px solid rgba(94,230,214,0.14);
                 border-radius:10px; padding:6px 10px;
-            ">
-                <span style="font-size:15px;">{rol_emoji}</span>
-                <span style="font-weight:600; color:#fff; font-size:0.82rem;">{usuario['nombre']}</span>
+            ">                <span style="font-weight:600; color:#fff; font-size:0.82rem;">{usuario['nombre']}</span>
                 <span style="
                     margin-left:auto; font-size:0.62rem; letter-spacing:1px;
                     text-transform:uppercase; color:#5ee6c9;
@@ -61,7 +58,7 @@ def render_sidebar(usuario: dict):
 
 
 def _seccion_gestion_clientes(usuario: dict):
-    with st.expander("👥 GESTIÓN DE CLIENTES", expanded=False):
+    with st.expander("Gestión de clientes", expanded=False):
         manager = CelulasManager()
         celulas = manager.obtener_celulas()
         
@@ -125,7 +122,7 @@ def _seccion_gestion_clientes(usuario: dict):
 
 
 def _seccion_asistente_ia(usuario: dict):
-    with st.expander("◈ ASISTENTE IA", expanded=False):
+    with st.expander("Asistente IA", expanded=False):
         st.caption("Generar contenido con OpenAI")
         
         tipos = [
@@ -218,7 +215,7 @@ def _generar_contenido_sidebar(tipo: str, celula_id, cliente_id, contexto: str, 
 
 
 def _seccion_inventario(usuario: dict):
-    with st.expander("▤ INVENTARIO", expanded=False):
+    with st.expander("Inventario", expanded=False):
         with get_db_session() as db:
             cuentas = db.query(Cuenta).all()
         

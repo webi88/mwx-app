@@ -14,6 +14,7 @@ from web.auth import (
 )
 from web.ui import inyectar_css, cabecera
 from web.effects import inyectar_efectos
+from web.ui import sin_emoji
 from web.sidebar import render_sidebar
 
 # Configuración de la página
@@ -317,6 +318,7 @@ def main():
         key="web_nav_categoria",
         selection_mode="single",
         label_visibility="collapsed",
+        format_func=sin_emoji,
     )
     opciones_categoria = mapa_categorias.get(categoria) or opciones
     if st.session_state.get("web_nav_selector") not in opciones_categoria:
@@ -329,6 +331,7 @@ def main():
         opciones_categoria,
         key="web_nav_selector",
         on_change=_on_cambio_operacion,
+        format_func=sin_emoji,
     )
     st.session_state["operacion_actual"] = seleccion
     _sincronizar_op_en_url(seleccion)
