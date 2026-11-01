@@ -4032,6 +4032,18 @@ class MotorActivacion:
         logger.warning(f"Login fallido para @{usuario}: {motivo}")
         return False, _detalle_login_fallido(motivo)
 
+    def _kwargs_captura_cita(self) -> dict:
+        """Kwargs extra para `solo_retwittear` en las citas.
+
+        Solo con `CAPTURAR_URL_POST=0` pasa `buscar_url=False` (omite la
+        captura del link de la cita: ~5-10s menos por accion). Con el default
+        devuelve `{}` (firma y comportamiento intactos).
+        """
+        try:
+            return {} if self._capturar_url_post() else {"buscar_url": False}
+        except Exception:
+            return {}
+
     def _capturar_url_post(self) -> bool:
         """True si se debe capturar la URL real de posts/citas (`CAPTURAR_URL_POST`).
 
@@ -4190,6 +4202,7 @@ class MotorActivacion:
                     cuenta.usuario,
                     mensaje_cita=texto,
                     dar_like=dar_like,
+                    **self._kwargs_captura_cita(),
                 )
                 ok = res.get("exitos", 0) > 0
                 urls_pub = res.get("urls") or []
@@ -4427,6 +4440,7 @@ class MotorActivacion:
                 cuenta.usuario,
                 mensaje_cita=texto,
                 dar_like=dar_like,
+                **self._kwargs_captura_cita(),
             )
             ok = res.get("exitos", 0) > 0
             urls_pub = res.get("urls") or []
@@ -4505,6 +4519,7 @@ class MotorActivacion:
                 cuenta.usuario,
                 mensaje_cita=texto,
                 dar_like=dar_like,
+                **self._kwargs_captura_cita(),
             )
 
             ok = res.get("exitos", 0) > 0
