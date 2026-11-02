@@ -5,7 +5,8 @@ from ia.celulas import CelulasManager
 from web.ui import emoji_plataforma, divider
 
 
-def render_sidebar(usuario: dict):
+def render_sidebar(usuario: dict, menu=None):
+    """Barra lateral. `menu` (opcional) pinta el menu de operaciones."""
     
     col_user, col_logout = st.columns([3, 1])
     with col_user:
@@ -49,6 +50,9 @@ def render_sidebar(usuario: dict):
                     pass
             st.rerun()
     
+    if menu is not None:
+        menu()
+
     divider()
     st.markdown("#### Panel de control")
     

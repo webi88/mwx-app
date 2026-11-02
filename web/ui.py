@@ -3,7 +3,7 @@ import re as _re
 
 _RE_EMOJI = _re.compile(
     "[\U0001F000-\U0001FAFF\U00002600-\U000027BF\U00002B00-\U00002BFF"
-    "\U0001F1E6-\U0001F1FF\u2190-\u21FF\u2B05\uFE0F\u20E3]"
+    "\U0001F1E6-\U0001F1FF\u2190-\u21FF\u2300-\u23FF\u2B05\uFE0F\u20E3]"
 )
 
 
@@ -139,6 +139,64 @@ CSS = """
         background: rgba(60,200,180,0.08);
     }
     [data-testid="stSidebar"] hr { border-color: var(--mw-side-border) !important; }
+    /* ---------------------- Menu de operaciones (sidebar) ---------------- */
+    .mw-nav-titulo {
+        font-size: 0.7rem;
+        font-weight: 600;
+        letter-spacing: 1.4px;
+        text-transform: uppercase;
+        color: var(--mw-side-muted);
+        margin: 4px 0 6px 2px;
+    }
+    .mw-nav-cat {
+        font-size: 0.72rem;
+        font-weight: 500;
+        color: rgba(94,230,214,0.75);
+        margin: 14px 0 2px 10px;
+    }
+    [data-testid="stSidebar"] [class*="st-key-nav_op_"] { margin-bottom: -10px; }
+    [data-testid="stSidebar"] [class*="st-key-nav_op_"] button {
+        justify-content: flex-start !important;
+        text-align: left;
+        border: none !important;
+        background: transparent !important;
+        padding: 0.3rem 0.7rem !important;
+        min-height: 2rem !important;
+        border-radius: 8px !important;
+        box-shadow: none !important;
+    }
+    [data-testid="stSidebar"] [class*="st-key-nav_op_"] button div,
+    [data-testid="stSidebar"] [class*="st-key-nav_op_"] button p {
+        justify-content: flex-start !important;
+        text-align: left !important;
+        width: 100%;
+    }
+    [data-testid="stSidebar"] [class*="st-key-nav_op_"] button p {
+        font-size: 0.86rem !important;
+        font-weight: 400 !important;
+        color: var(--mw-side-text) !important;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+    }
+    [data-testid="stSidebar"] [class*="st-key-nav_op_"] button:hover {
+        background: rgba(255,255,255,0.06) !important;
+    }
+    [data-testid="stSidebar"] [class*="st-key-nav_op_"] button[kind="primary"],
+    [data-testid="stSidebar"] [class*="st-key-nav_op_"] button[kind="primary"]:hover,
+    [data-testid="stSidebar"] [class*="st-key-nav_op_"] button[kind="primary"]:focus,
+    [data-testid="stSidebar"] [class*="st-key-nav_op_"] button[kind="primary"]:active {
+        background: rgba(60,200,180,0.16) !important;
+        border: none !important;
+    }
+    [data-testid="stSidebar"] [class*="st-key-nav_op_"] button:focus:not(:active) {
+        box-shadow: none !important;
+    }
+    [data-testid="stSidebar"] [class*="st-key-nav_op_"] button[kind="primary"] p {
+        color: #ffffff !important;
+        font-weight: 500 !important;
+    }
+
 
     /* ------------------------------- Cabecera ---------------------------- */
     .mw-header {

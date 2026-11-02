@@ -270,9 +270,6 @@ def main():
     if not _leer_token_query_params():
         _guardar_token_sesion(usuario)
     
-    with st.sidebar:
-        render_sidebar(usuario)
-    
     categorias = _categorias_para(usuario["rol"])
     mapa_categorias = dict(categorias)
     opciones = [op for _, ops in categorias for op in ops]
@@ -304,39 +301,47 @@ def main():
             st.session_state["web_nav_selector"]
         )
 
+    # --- Menu de operaciones en la barra lateral ---
+    # Lista agrupada por categoria; la operacion activa queda resaltada. Cada
+    # boton escribe `web_nav_selector` en su callback (antes del rerun), asi la
+    # persistencia `?op=`/`?tab=` sigue igual que con el selectbox anterior.
+    def _ir_a_operacion(op: str):
+        st.session_state["web_nav_selector"] = op
+        st.session_state["web_nav_categoria"] = _categoria_de_op(op)
+        _on_cambio_operacion()
+
+    def _menu_lateral():
+        st.markdown(
+            "<div class='mw-nav-titulo'>Operaciones</div>",
+            unsafe_allow_html=True,
+        )
+        activa = st.session_state.get("web_nav_selector")
+        indice = 0
+        for nombre_cat, ops_cat in categorias:
+            st.markdown(
+                f"<div class='mw-nav-cat'>{sin_emoji(nombre_cat)}</div>",
+                unsafe_allow_html=True,
+            )
+            for op in ops_cat:
+                st.button(
+                    op,
+                    key=f"nav_op_{indice}",
+                    on_click=_ir_a_operacion,
+                    args=(op,),
+                    use_container_width=True,
+                    type="primary" if op == activa else "secondary",
+                )
+                indice += 1
+
+    with st.sidebar:
+        render_sidebar(usuario, menu=_menu_lateral)
+
     # --- Barra de estado en vivo (reloj + indicador "en línea") ---
     # Se inyecta UNA vez por render: un iframe autónomo que no puede tocar el
     # DOM de Streamlit ni romper la navegación.
     inyectar_efectos()
-    st.write("")  # separación sutil entre la barra y la navegación
 
-    # --- Navegación visual (píldoras de categoría + select de operación) ---
-    # La categoría se muestra como píldoras (`st.segmented_control`) en lugar
-    # de un selectbox: más visual e inmediato. La operación sigue siendo un
-    # selectbox (sus etiquetas son largas). La persistencia `?op=`/`?tab=` y
-    # el `on_change` se mantienen intactos (mismas claves de session_state).
-    st.markdown("##### Navegación")
-    categoria = st.segmented_control(
-        "Categoría",
-        list(mapa_categorias),
-        key="web_nav_categoria",
-        selection_mode="single",
-        label_visibility="collapsed",
-        format_func=sin_emoji,
-    )
-    opciones_categoria = mapa_categorias.get(categoria) or opciones
-    if st.session_state.get("web_nav_selector") not in opciones_categoria:
-        # Cambió la categoría: abrir la primera operación de la nueva. Se
-        # escribe ANTES de instanciar el selectbox de operación, así el widget
-        # la toma como valor válido (sin "value not in options").
-        st.session_state["web_nav_selector"] = opciones_categoria[0]
-    seleccion = st.selectbox(
-        "Operación",
-        opciones_categoria,
-        key="web_nav_selector",
-        on_change=_on_cambio_operacion,
-        format_func=sin_emoji,
-    )
+    seleccion = st.session_state["web_nav_selector"]
     st.session_state["operacion_actual"] = seleccion
     _sincronizar_op_en_url(seleccion)
 
@@ -347,9 +352,7 @@ def main():
                 del st.query_params["tab"]
         except Exception:
             pass
-    
-    st.markdown("---")
-    
+
     if seleccion.startswith("📰"):
         from web.operaciones.posts import render
         render(usuario)
