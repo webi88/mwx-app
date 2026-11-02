@@ -14,7 +14,12 @@ from web.auth import (
 )
 from web.ui import inyectar_css, cabecera
 from web.effects import inyectar_efectos
+from web.ui import sin_emoji
 from web.sidebar import render_sidebar
+from web.limpieza_ui import instalar_limpieza_emojis
+
+# Oculta los iconitos (emojis) en toda la interfaz sin tocar la navegacion.
+instalar_limpieza_emojis()
 
 # Configuración de la página
 st.set_page_config(
@@ -221,13 +226,21 @@ def _recuperar_sesion() -> bool:
 
 
 def _login():
-    cabecera("MWX.app", "Acceso al Sistema de Comunicación Estratégica")
-    st.markdown("#### Iniciar sesión")
-    
-    with st.form("login_form_web"):
-        username = st.text_input("Usuario")
-        password = st.text_input("Contraseña", type="password")
-        submitted = st.form_submit_button("Entrar", type="primary", use_container_width=True)
+    # Caja centrada y angosta (estilo minimalista).
+    _, centro, _ = st.columns([1, 1.3, 1])
+    with centro:
+        st.markdown(
+            "<div class='mw-login'>"
+            "<span class='mw-header__tag'>MWX · Plataforma de gestión</span>"
+            "<h1>Bienvenido</h1>"
+            "<p>Acceso al Sistema de Comunicación Estratégica</p>"
+            "</div>",
+            unsafe_allow_html=True,
+        )
+        with st.form("login_form_web"):
+            username = st.text_input("Usuario")
+            password = st.text_input("Contraseña", type="password")
+            submitted = st.form_submit_button("Entrar", type="primary", use_container_width=True)
     
     if submitted:
         if not username or not password:
@@ -256,9 +269,6 @@ def main():
     # una recarga del navegador no bote la sesion.
     if not _leer_token_query_params():
         _guardar_token_sesion(usuario)
-    
-    with st.sidebar:
-        render_sidebar(usuario)
     
     categorias = _categorias_para(usuario["rol"])
     mapa_categorias = dict(categorias)
@@ -291,37 +301,47 @@ def main():
             st.session_state["web_nav_selector"]
         )
 
+    # --- Menu de operaciones en la barra lateral ---
+    # Lista agrupada por categoria; la operacion activa queda resaltada. Cada
+    # boton escribe `web_nav_selector` en su callback (antes del rerun), asi la
+    # persistencia `?op=`/`?tab=` sigue igual que con el selectbox anterior.
+    def _ir_a_operacion(op: str):
+        st.session_state["web_nav_selector"] = op
+        st.session_state["web_nav_categoria"] = _categoria_de_op(op)
+        _on_cambio_operacion()
+
+    def _menu_lateral():
+        st.markdown(
+            "<div class='mw-nav-titulo'>Operaciones</div>",
+            unsafe_allow_html=True,
+        )
+        activa = st.session_state.get("web_nav_selector")
+        indice = 0
+        for nombre_cat, ops_cat in categorias:
+            st.markdown(
+                f"<div class='mw-nav-cat'>{sin_emoji(nombre_cat)}</div>",
+                unsafe_allow_html=True,
+            )
+            for op in ops_cat:
+                st.button(
+                    op,
+                    key=f"nav_op_{indice}",
+                    on_click=_ir_a_operacion,
+                    args=(op,),
+                    use_container_width=True,
+                    type="primary" if op == activa else "secondary",
+                )
+                indice += 1
+
+    with st.sidebar:
+        render_sidebar(usuario, menu=_menu_lateral)
+
     # --- Barra de estado en vivo (reloj + indicador "en línea") ---
     # Se inyecta UNA vez por render: un iframe autónomo que no puede tocar el
     # DOM de Streamlit ni romper la navegación.
     inyectar_efectos()
-    st.write("")  # separación sutil entre la barra y la navegación
 
-    # --- Navegación visual (píldoras de categoría + select de operación) ---
-    # La categoría se muestra como píldoras (`st.segmented_control`) en lugar
-    # de un selectbox: más visual e inmediato. La operación sigue siendo un
-    # selectbox (sus etiquetas son largas). La persistencia `?op=`/`?tab=` y
-    # el `on_change` se mantienen intactos (mismas claves de session_state).
-    st.markdown("##### 🧭 Navegación")
-    categoria = st.segmented_control(
-        "Categoría",
-        list(mapa_categorias),
-        key="web_nav_categoria",
-        selection_mode="single",
-        label_visibility="collapsed",
-    )
-    opciones_categoria = mapa_categorias.get(categoria) or opciones
-    if st.session_state.get("web_nav_selector") not in opciones_categoria:
-        # Cambió la categoría: abrir la primera operación de la nueva. Se
-        # escribe ANTES de instanciar el selectbox de operación, así el widget
-        # la toma como valor válido (sin "value not in options").
-        st.session_state["web_nav_selector"] = opciones_categoria[0]
-    seleccion = st.selectbox(
-        "📍 SELECCIONA LA OPERACIÓN:",
-        opciones_categoria,
-        key="web_nav_selector",
-        on_change=_on_cambio_operacion,
-    )
+    seleccion = st.session_state["web_nav_selector"]
     st.session_state["operacion_actual"] = seleccion
     _sincronizar_op_en_url(seleccion)
 
@@ -332,9 +352,7 @@ def main():
                 del st.query_params["tab"]
         except Exception:
             pass
-    
-    st.markdown("---")
-    
+
     if seleccion.startswith("📰"):
         from web.operaciones.posts import render
         render(usuario)

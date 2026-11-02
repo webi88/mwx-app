@@ -1,4 +1,18 @@
 import streamlit as st
+import re as _re
+
+_RE_EMOJI = _re.compile(
+    "[\U0001F000-\U0001FAFF\U00002600-\U000027BF\U00002B00-\U00002BFF"
+    "\U0001F1E6-\U0001F1FF\u2190-\u21FF\u2300-\u23FF\u2B05\uFE0F\u20E3]"
+)
+
+
+def sin_emoji(texto: str) -> str:
+    """Quita emojis/iconitos de un texto SOLO para mostrarlo (no cambia claves)."""
+    limpio = _RE_EMOJI.sub("", str(texto))
+    return _re.sub(r"\s{2,}", " ", limpio).strip(" ·-")
+
+
 
 
 # --------------------------------------------------------------------------- #
@@ -8,240 +22,436 @@ import streamlit as st
 # --------------------------------------------------------------------------- #
 CSS = """
 <style>
-    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap');
+    @import url('https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;500;600&display=swap');
 
+    /* Estilo minimalista: area principal blanca con acentos turquesa y la
+       barra lateral en azul petroleo (branding). Titulos en serif y texto
+       en sans pequeno, al estilo de Claude. */
     :root {
-        --mw-bg: #0a0e13;
-        --mw-surface: #11161d;
-        --mw-surface-2: #171e27;
-        --mw-border: rgba(255,255,255,0.08);
-        --mw-border-strong: rgba(255,255,255,0.14);
-        --mw-text: #e6edf3;
-        --mw-muted: rgba(230,237,243,0.55);
-        --mw-accent: #00b4c4;
-        --mw-accent-2: #7c5cff;
-        --mw-success: #2dd4a7;
-        --mw-glow: 0 8px 32px rgba(0, 180, 196, 0.16);
+        --mw-bg: #ffffff;
+        --mw-surface: #ffffff;
+        --mw-surface-2: #f6f9fa;
+        --mw-border: #e6ecee;
+        --mw-border-strong: #d4dee1;
+        --mw-text: #1d2a30;
+        --mw-muted: #6b7a80;
+        --mw-accent: #1d8f97;
+        --mw-accent-deep: #17707a;
+        --mw-accent-soft: rgba(29,143,151,0.08);
+        --mw-accent-2: #3cc8b4;
+        --mw-navy: #0b2433;
+        --mw-navy-2: #0f2e40;
+        --mw-side-text: #e3eef1;
+        --mw-side-muted: rgba(227,238,241,0.6);
+        --mw-side-border: rgba(94,230,214,0.14);
     }
 
-    html, body, [class*="css"], [data-testid="stAppViewContainer"] {
-        font-family: 'Inter', -apple-system, sans-serif;
+    /* ----------------------------- Tipografia ---------------------------- */
+    html, body, [class*="css"], [data-testid="stAppViewContainer"],
+    [data-testid="stAppViewContainer"] :is(p, li, label, input, textarea, button, td, th, summary, div),
+    [data-testid="stSidebar"] :is(p, li, label, input, button, summary) {
+        font-family: 'Poppins', -apple-system, 'Segoe UI', sans-serif;
+    }
+    [data-testid="stIconMaterial"] { font-family: 'Material Symbols Rounded' !important; }
+    html, body { font-size: 14px; }
+    [data-testid="stAppViewContainer"] p,
+    [data-testid="stAppViewContainer"] li,
+    [data-testid="stMarkdownContainer"] { font-size: 0.93rem; line-height: 1.6; }
+    label, [data-testid="stWidgetLabel"] p {
+        font-size: 0.82rem !important;
+        color: var(--mw-muted) !important;
+        font-weight: 500 !important;
+    }
+    h1, h2, h3, h4, h5, h6, [data-testid="stHeading"] * {
+        font-family: 'Poppins', -apple-system, sans-serif !important;
+        font-weight: 500 !important;
+        color: var(--mw-text);
+        letter-spacing: -0.2px;
+    }
+    h1 { font-size: 1.7rem !important; }
+    h2 { font-size: 1.35rem !important; }
+    h3 { font-size: 1.12rem !important; }
+    h4, h5, h6 { font-size: 0.98rem !important; }
+
+    /* ------------------------------ Fondo -------------------------------- */
+    [data-testid="stAppViewContainer"] {
+        background:
+            radial-gradient(40% 30% at 100% 0%, rgba(60,200,180,0.07) 0%, transparent 70%),
+            radial-gradient(35% 25% at 0% 100%, rgba(29,143,151,0.05) 0%, transparent 70%),
+            var(--mw-bg);
+    }
+    [data-testid="stHeader"] { background: transparent; }
+    [data-testid="stDecoration"], [data-testid="stDeployButton"],
+    .stDeployButton, [data-testid="stAppDeployButton"] { display: none !important; }
+
+    /* Login centrado */
+    .mw-login { text-align: center; margin: 9vh 0 22px 0; }
+    .mw-login h1 {
+        font-family: 'Poppins', -apple-system, sans-serif !important;
+        font-weight: 500 !important;
+        font-size: 1.9rem !important;
+        margin: 6px 0 4px 0; padding: 0;
+    }
+    .mw-login p { color: var(--mw-muted); font-size: 0.88rem; margin: 0; }
+    [data-testid="stForm"] {
+        border: 1px solid var(--mw-border);
+        border-radius: 12px;
+        padding: 18px 18px 14px;
+        background: #ffffff;
+        box-shadow: 0 6px 24px rgba(11,36,51,0.05);
+    }
+    .block-container { padding-top: 1.4rem; padding-bottom: 3rem; }
+    [data-testid="stAppViewContainer"] > .main .block-container { max-width: 1120px; }
+    hr { border-color: var(--mw-border) !important; }
+
+    /* ------------------------ Barra lateral (oscura) --------------------- */
+    [data-testid="stSidebar"] {
+        background: linear-gradient(180deg, var(--mw-navy-2) 0%, var(--mw-navy) 100%);
+        border-right: 1px solid var(--mw-side-border);
+    }
+    [data-testid="stSidebar"] :is(p, span, label, li, h1, h2, h3, h4, h5, h6, summary, small) {
+        color: var(--mw-side-text) !important;
+    }
+    [data-testid="stSidebar"] [data-testid="stWidgetLabel"] p,
+    [data-testid="stSidebar"] .stCaption, [data-testid="stSidebar"] small {
+        color: var(--mw-side-muted) !important;
+    }
+    [data-testid="stSidebar"] [data-testid="stExpander"] {
+        background: rgba(255,255,255,0.03);
+        border: 1px solid var(--mw-side-border);
+    }
+    [data-testid="stSidebar"] [data-testid="stExpander"] summary:hover * { color: #ffffff !important; }
+    [data-testid="stSidebar"] :is(input, textarea),
+    [data-testid="stSidebar"] [data-baseweb="select"] > div {
+        background-color: rgba(255,255,255,0.06) !important;
+        color: var(--mw-side-text) !important;
+        border-color: var(--mw-side-border) !important;
+    }
+    [data-testid="stSidebar"] .stButton > button {
+        background: transparent;
+        color: var(--mw-side-text);
+        border: 1px solid var(--mw-side-border) !important;
+        padding: 0.35rem 0.75rem;
+    }
+    [data-testid="stSidebar"] .stButton > button:hover {
+        border-color: var(--mw-accent-2) !important;
+        color: #ffffff;
+        background: rgba(60,200,180,0.08);
+    }
+    [data-testid="stSidebar"] hr { border-color: var(--mw-side-border) !important; }
+    /* ---------------------- Menu de operaciones (sidebar) ---------------- */
+    .mw-nav-titulo {
+        font-size: 0.7rem;
+        font-weight: 600;
+        letter-spacing: 1.4px;
+        text-transform: uppercase;
+        color: var(--mw-side-muted);
+        margin: 4px 0 6px 2px;
+    }
+    .mw-nav-cat {
+        font-size: 0.72rem;
+        font-weight: 500;
+        color: rgba(94,230,214,0.75);
+        margin: 14px 0 2px 10px;
+    }
+    [data-testid="stSidebar"] [class*="st-key-nav_op_"] { margin-bottom: -10px; }
+    [data-testid="stSidebar"] [class*="st-key-nav_op_"] button {
+        justify-content: flex-start !important;
+        text-align: left;
+        border: none !important;
+        background: transparent !important;
+        padding: 0.3rem 0.7rem !important;
+        min-height: 2rem !important;
+        border-radius: 8px !important;
+        box-shadow: none !important;
+    }
+    [data-testid="stSidebar"] [class*="st-key-nav_op_"] button div,
+    [data-testid="stSidebar"] [class*="st-key-nav_op_"] button p {
+        justify-content: flex-start !important;
+        text-align: left !important;
+        width: 100%;
+    }
+    [data-testid="stSidebar"] [class*="st-key-nav_op_"] button p {
+        font-size: 0.86rem !important;
+        font-weight: 400 !important;
+        color: var(--mw-side-text) !important;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+    }
+    [data-testid="stSidebar"] [class*="st-key-nav_op_"] button:hover {
+        background: rgba(255,255,255,0.06) !important;
+    }
+    [data-testid="stSidebar"] [class*="st-key-nav_op_"] button[kind="primary"],
+    [data-testid="stSidebar"] [class*="st-key-nav_op_"] button[kind="primary"]:hover,
+    [data-testid="stSidebar"] [class*="st-key-nav_op_"] button[kind="primary"]:focus,
+    [data-testid="stSidebar"] [class*="st-key-nav_op_"] button[kind="primary"]:active {
+        background: rgba(60,200,180,0.16) !important;
+        border: none !important;
+    }
+    [data-testid="stSidebar"] [class*="st-key-nav_op_"] button:focus:not(:active) {
+        box-shadow: none !important;
+    }
+    [data-testid="stSidebar"] [class*="st-key-nav_op_"] button[kind="primary"] p {
+        color: #ffffff !important;
+        font-weight: 500 !important;
     }
 
-    /* Quita el "padding" muerto superior que Streamlit agrega por defecto */
-    .block-container { padding-top: 1.6rem; padding-bottom: 3rem; }
-    [data-testid="stAppViewContainer"] > .main .block-container {
-        max-width: 1200px;
-    }
 
     /* ------------------------------- Cabecera ---------------------------- */
     .mw-header {
         position: relative;
-        overflow: hidden;
-        background:
-            radial-gradient(120% 160% at 0% 0%, rgba(0,180,196,0.18) 0%, transparent 55%),
-            radial-gradient(120% 160% at 100% 0%, rgba(124,92,255,0.16) 0%, transparent 55%),
-            linear-gradient(135deg, #0c1420 0%, #0f1b2c 100%);
-        padding: 24px 28px;
-        border-radius: 18px;
-        border: 1px solid var(--mw-border-strong);
-        margin-bottom: 20px;
-        box-shadow: 0 12px 40px rgba(0,0,0,0.45), var(--mw-glow);
-        animation: mwFadeUp .45s cubic-bezier(.22,.8,.36,1) both;
-    }
-    .mw-header::before {
-        content: "";
-        position: absolute;
-        inset: 0 0 auto 0;
-        height: 3px;
-        background: linear-gradient(90deg, var(--mw-accent), var(--mw-accent-2), var(--mw-accent));
-        background-size: 200% 100%;
-        animation: mwShimmer 6s linear infinite;
+        padding: 6px 0 18px 0;
+        margin-bottom: 22px;
+        border-bottom: 1px solid var(--mw-border);
+        animation: mwFadeUp .35s ease both;
     }
     .mw-header__tag {
-        display: inline-block;
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
         color: var(--mw-accent);
-        letter-spacing: 2.5px;
-        font-size: 0.66rem;
-        font-weight: 700;
-        text-transform: uppercase;
-        margin-bottom: 8px;
+        font-size: 0.72rem;
+        font-weight: 500;
+        letter-spacing: 0.4px;
+        padding: 3px 10px;
+        border-radius: 999px;
+        background: var(--mw-accent-soft);
+        margin-bottom: 10px;
     }
     .mw-header h1 {
-        color: #ffffff;
-        font-size: 1.7rem;
-        letter-spacing: 1px;
-        font-weight: 700;
+        font-family: 'Poppins', -apple-system, sans-serif !important;
+        color: var(--mw-text);
+        font-size: 1.75rem !important;
+        font-weight: 500 !important;
         margin: 0;
+        padding: 0;
         line-height: 1.2;
     }
     .mw-header p {
         color: var(--mw-muted);
-        letter-spacing: 1px;
-        font-size: 0.8rem;
-        text-transform: uppercase;
-        margin: 8px 0 0 0;
+        font-size: 0.88rem;
+        margin: 6px 0 0 0;
     }
 
     /* ------------------------------- Tarjetas ---------------------------- */
     .mw-card {
-        background: linear-gradient(180deg, var(--mw-surface-2) 0%, var(--mw-surface) 100%);
+        background: var(--mw-surface);
         border: 1px solid var(--mw-border);
-        border-radius: 14px;
-        padding: 18px 20px;
-        margin-bottom: 14px;
-        box-shadow: 0 4px 18px rgba(0,0,0,0.28);
-        transition: transform .18s ease, border-color .18s ease, box-shadow .18s ease;
-        animation: mwFadeUp .4s cubic-bezier(.22,.8,.36,1) both;
+        border-radius: 12px;
+        padding: 16px 18px;
+        margin-bottom: 12px;
+        transition: border-color .15s ease, box-shadow .15s ease;
     }
     .mw-card:hover {
-        transform: translateY(-2px);
-        border-color: rgba(0,180,196,0.4);
-        box-shadow: 0 10px 30px rgba(0,0,0,0.4), var(--mw-glow);
+        border-color: var(--mw-border-strong);
+        box-shadow: 0 4px 16px rgba(11,36,51,0.05);
     }
     .mw-card h3 {
-        color: #ffffff;
-        font-size: 1rem;
-        margin: 0 0 10px 0;
-        letter-spacing: 0.5px;
-        font-weight: 600;
+        color: var(--mw-text);
+        font-size: 0.98rem !important;
+        margin: 0 0 8px 0;
     }
 
     .mw-badge {
         display: inline-block;
-        background: linear-gradient(90deg, var(--mw-accent), var(--mw-accent-2));
-        color: white;
-        padding: 3px 12px;
-        border-radius: 20px;
-        font-size: 0.7rem;
-        font-weight: 700;
-        letter-spacing: 1px;
-        box-shadow: 0 4px 12px rgba(0,180,196,0.35);
+        background: var(--mw-accent-soft);
+        color: var(--mw-accent-deep);
+        padding: 2px 10px;
+        border-radius: 999px;
+        font-size: 0.72rem;
+        font-weight: 500;
     }
 
-    /* ------------------------------ Estadísticas ------------------------- */
+    /* ------------------------------ Estadisticas ------------------------- */
     .mw-stat {
         position: relative;
-        background: linear-gradient(180deg, rgba(0,180,196,0.14) 0%, rgba(0,180,196,0.04) 100%);
-        border: 1px solid rgba(0,180,196,0.28);
-        border-radius: 14px;
-        padding: 18px 16px 14px;
-        text-align: center;
-        transition: transform .18s ease, box-shadow .18s ease, border-color .18s ease;
-        animation: mwFadeUp .45s cubic-bezier(.22,.8,.36,1) both;
+        background: var(--mw-surface);
+        border: 1px solid var(--mw-border);
+        border-radius: 12px;
+        padding: 14px 16px 12px;
+        text-align: left;
         overflow: hidden;
+        transition: border-color .15s ease;
     }
     .mw-stat::before {
         content: "";
         position: absolute;
-        top: 0; left: 0; right: 0;
-        height: 2px;
-        background: linear-gradient(90deg, var(--mw-accent), var(--mw-accent-2));
-        opacity: .7;
+        left: 0; top: 14px; bottom: 14px;
+        width: 2px;
+        border-radius: 2px;
+        background: linear-gradient(180deg, var(--mw-accent), var(--mw-accent-2));
     }
-    .mw-stat:hover {
-        transform: translateY(-2px);
-        border-color: rgba(0,180,196,0.55);
-        box-shadow: var(--mw-glow);
-    }
+    .mw-stat:hover { border-color: var(--mw-border-strong); }
     .mw-stat .valor {
-        font-size: 1.9rem;
-        font-weight: 800;
-        color: #ffffff;
+        font-family: 'Poppins', -apple-system, sans-serif;
+        font-size: 1.6rem;
+        font-weight: 500;
+        color: var(--mw-text);
         line-height: 1.1;
     }
     .mw-stat .etiqueta {
-        font-size: 0.68rem;
+        font-size: 0.74rem;
         color: var(--mw-muted);
-        text-transform: uppercase;
-        letter-spacing: 1.2px;
-        margin-top: 6px;
+        margin-top: 4px;
     }
 
-    /* ---------------------------- Widgets base --------------------------- */
-    .stButton > button {
-        border-radius: 10px;
-        font-weight: 600;
-        letter-spacing: 0.2px;
-        transition: transform .12s ease, box-shadow .12s ease;
+    /* -------------------------------- Botones ---------------------------- */
+    .stButton > button, .stDownloadButton > button, .stFormSubmitButton > button {
+        border-radius: 8px !important;
+        font-size: 0.85rem !important;
+        font-weight: 500;
+        padding: 0.35rem 0.9rem;
+        min-height: 2.2rem;
+        white-space: nowrap;
+        border: 1px solid var(--mw-border-strong) !important;
+        background: var(--mw-surface);
+        color: var(--mw-text);
+        box-shadow: none;
+        transition: border-color .12s ease, background .12s ease, color .12s ease;
     }
-    .stButton > button:hover {
-        transform: translateY(-1px);
-        box-shadow: 0 6px 18px rgba(0,0,0,0.3);
+    .stButton > button p, .stDownloadButton > button p, .stFormSubmitButton > button p {
+        font-size: 0.85rem !important;
     }
-    .stTextInput input, .stTextArea textarea, .stNumberInput input {
-        border-radius: 10px !important;
+    .stButton > button:hover, .stDownloadButton > button:hover {
+        border-color: var(--mw-accent) !important;
+        color: var(--mw-accent-deep);
+        background: var(--mw-accent-soft);
+    }
+    .stButton > button[kind="primary"], .stFormSubmitButton > button {
+        background: var(--mw-accent-deep) !important;
+        border-color: var(--mw-accent-deep) !important;
+        color: #ffffff !important;
+    }
+    .stButton > button[kind="primary"] p, .stFormSubmitButton > button p { color: #ffffff !important; }
+    .stButton > button[kind="primary"]:hover, .stFormSubmitButton > button:hover {
+        background: var(--mw-accent) !important;
+        border-color: var(--mw-accent) !important;
+    }
+
+    /* --------------------------------- Campos ---------------------------- */
+    .stTextInput input, .stTextArea textarea, .stNumberInput input,
+    .stDateInput input, .stTimeInput input {
+        border-radius: 8px !important;
+        font-size: 0.88rem !important;
+        background-color: #ffffff !important;
+    }
+    [data-testid="stAppViewContainer"] .stTextInput [data-baseweb="input"],
+    [data-testid="stAppViewContainer"] .stTextArea [data-baseweb="textarea"],
+    [data-testid="stAppViewContainer"] .stNumberInput [data-baseweb="input"] {
+        border-radius: 8px !important;
+        border: 1px solid var(--mw-border-strong) !important;
+        background-color: #ffffff !important;
     }
     .stTextInput input:focus, .stTextArea textarea:focus, .stNumberInput input:focus {
-        border-color: var(--mw-accent) !important;
-        box-shadow: 0 0 0 1px var(--mw-accent) !important;
+        box-shadow: none !important;
     }
+    [data-testid="stAppViewContainer"] [data-baseweb="input"]:focus-within,
+    [data-testid="stAppViewContainer"] [data-baseweb="textarea"]:focus-within {
+        border-color: var(--mw-accent) !important;
+        box-shadow: 0 0 0 3px var(--mw-accent-soft) !important;
+    }
+    [data-testid="stAppViewContainer"] [data-baseweb="select"] > div {
+        border-radius: 8px !important;
+        border-color: var(--mw-border-strong) !important;
+        background-color: #ffffff !important;
+        font-size: 0.88rem;
+    }
+    [data-baseweb="tag"] {
+        border-radius: 999px !important;
+        background-color: var(--mw-accent-soft) !important;
+    }
+    [data-baseweb="tag"] span { color: var(--mw-accent-deep) !important; }
 
     /* Expanders */
     [data-testid="stExpander"] {
         border: 1px solid var(--mw-border);
-        border-radius: 12px;
+        border-radius: 10px;
         overflow: hidden;
         background: var(--mw-surface);
     }
+    [data-testid="stExpander"] summary { font-size: 0.88rem; }
 
-    /* Tabs */
+    /* Pestanas: subrayado fino */
     [data-testid="stTabs"] [data-baseweb="tab-list"] {
-        gap: 4px;
+        gap: 18px;
+        border-bottom: 1px solid var(--mw-border);
     }
     [data-testid="stTabs"] [data-baseweb="tab"] {
-        border-radius: 10px 10px 0 0;
+        padding: 6px 2px;
+        height: auto;
+        background: transparent;
     }
-    [data-testid="stTabs"] [aria-selected="true"] {
-        color: var(--mw-accent) !important;
-    }
+    [data-testid="stTabs"] [data-baseweb="tab"] p { font-size: 0.86rem; color: var(--mw-muted); }
+    [data-testid="stTabs"] [aria-selected="true"] p { color: var(--mw-text) !important; font-weight: 500; }
     [data-testid="stTabs"] [data-baseweb="tab-highlight"] {
         background-color: var(--mw-accent);
+        height: 2px;
+    }
+    [data-testid="stTabs"] [data-baseweb="tab-border"] { display: none; }
+
+    /* Selector de categorias */
+    [data-testid="stSegmentedControl"] button,
+    [data-testid="stButtonGroup"] button {
+        border-radius: 999px !important;
+        font-size: 0.82rem !important;
+        border: 1px solid transparent !important;
+        background: transparent;
+        color: var(--mw-muted);
+    }
+    [data-testid="stSegmentedControl"] button p,
+    [data-testid="stButtonGroup"] button p { font-size: 0.82rem !important; }
+    [data-testid="stButtonGroup"] { gap: 6px; }
+    [data-testid="stSegmentedControl"] button:hover,
+    [data-testid="stButtonGroup"] button:hover { background: var(--mw-surface-2); }
+    [data-testid="stButtonGroup"] button[kind$="Active"],
+    [data-testid="stSegmentedControl"] button[aria-checked="true"] {
+        background: var(--mw-accent-soft) !important;
+        border: 1px solid transparent !important;
+    }
+    [data-testid="stButtonGroup"] button[kind$="Active"] p,
+    [data-testid="stSegmentedControl"] button[aria-checked="true"] p {
+        color: var(--mw-accent-deep) !important;
     }
 
-    /* Selectbox / multiselect */
-    [data-baseweb="select"] > div {
-        border-radius: 10px !important;
-        border-color: var(--mw-border-strong) !important;
-        background-color: var(--mw-surface-2) !important;
-    }
-
-    /* Segmented control (píldoras de categoría) */
-    [data-testid="stSegmentedControl"] {
-        gap: 6px;
-        padding: 4px;
-        background: rgba(255,255,255,0.03);
+    /* Metricas nativas */
+    [data-testid="stMetric"] {
+        background: var(--mw-surface);
         border: 1px solid var(--mw-border);
-        border-radius: 14px;
+        border-radius: 12px;
+        padding: 12px 16px;
     }
-    [data-testid="stSegmentedControl"] button {
-        border-radius: 10px !important;
-        transition: all .16s ease;
+    [data-testid="stMetricLabel"] p { font-size: 0.78rem !important; color: var(--mw-muted) !important; }
+    [data-testid="stMetricValue"] {
+        font-family: 'Poppins', -apple-system, sans-serif;
+        font-size: 1.5rem !important;
+        color: var(--mw-text);
     }
 
-    /* Dataframes */
+    /* Tablas, avisos y progreso */
     [data-testid="stDataFrame"] {
-        border-radius: 12px;
+        border-radius: 10px;
         overflow: hidden;
         border: 1px solid var(--mw-border);
     }
+    [data-testid="stAlert"] { border-radius: 10px; font-size: 0.88rem; }
+    [data-testid="stProgress"] > div > div > div > div {
+        background: linear-gradient(90deg, var(--mw-accent), var(--mw-accent-2)) !important;
+    }
+    [data-testid="stCaptionContainer"], .stCaption { color: var(--mw-muted) !important; font-size: 0.8rem; }
 
-    /* ---------------------------- Animaciones ---------------------------- */
+    a { color: var(--mw-accent); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    code { color: var(--mw-accent-deep); background: var(--mw-surface-2); }
+
     @keyframes mwFadeUp {
-        from { opacity: 0; transform: translateY(10px); }
+        from { opacity: 0; transform: translateY(6px); }
         to   { opacity: 1; transform: translateY(0); }
     }
-    @keyframes mwShimmer {
-        0%   { background-position: 0% 50%; }
-        100% { background-position: 200% 50%; }
-    }
 
-    /* Barra lateral: scrollbar más sutil */
-    [data-testid="stSidebar"] ::-webkit-scrollbar { width: 8px; }
-    [data-testid="stSidebar"] ::-webkit-scrollbar-thumb {
-        background: rgba(255,255,255,0.12);
-        border-radius: 8px;
-    }
+    ::-webkit-scrollbar { width: 8px; height: 8px; }
+    ::-webkit-scrollbar-thumb { background: #d4dee1; border-radius: 8px; }
+    [data-testid="stSidebar"] ::-webkit-scrollbar-thumb { background: rgba(94,230,214,0.18); }
 </style>
 """
 
@@ -254,9 +464,9 @@ def cabecera(titulo: str, subtitulo: str = "Sistema de Comunicación Estratégic
     st.markdown(
         f"""
         <div class="mw-header">
-            <span class="mw-header__tag">📡 MW Group · Plataforma de gestión</span>
-            <h1>{titulo}</h1>
-            <p>{subtitulo} · By MW Group</p>
+            <span class="mw-header__tag">MWX · Plataforma de gestión</span>
+            <h1>{sin_emoji(titulo)}</h1>
+            <p>{sin_emoji(subtitulo)}</p>
         </div>
         """,
         unsafe_allow_html=True
@@ -289,7 +499,7 @@ def stat(valor, etiqueta):
 
 def empty_state(mensaje: str):
     st.markdown(
-        f"<div style='text-align:center; color:rgba(255,255,255,0.4); padding:40px 0;'>"
+        f"<div style='text-align:center; color:var(--mw-muted); padding:40px 0;'>"
         f"{mensaje}</div>",
         unsafe_allow_html=True
     )

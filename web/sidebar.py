@@ -5,8 +5,8 @@ from ia.celulas import CelulasManager
 from web.ui import emoji_plataforma, divider
 
 
-def render_sidebar(usuario: dict):
-    rol_emoji = "👑" if usuario["rol"] == "admin" else "👤"
+def render_sidebar(usuario: dict, menu=None):
+    """Barra lateral. `menu` (opcional) pinta el menu de operaciones."""
     
     col_user, col_logout = st.columns([3, 1])
     with col_user:
@@ -14,26 +14,24 @@ def render_sidebar(usuario: dict):
             f"""
             <div style="
                 display:flex; align-items:center; gap:8px;
-                background:linear-gradient(90deg, rgba(0,180,196,0.16), rgba(124,92,255,0.10));
-                border:1px solid rgba(255,255,255,0.08);
+                background:rgba(255,255,255,0.04);
+                border:1px solid rgba(94,230,214,0.14);
                 border-radius:10px; padding:6px 10px;
-            ">
-                <span style="font-size:15px;">{rol_emoji}</span>
-                <span style="font-weight:700; color:#fff; font-size:0.85rem;">{usuario['nombre']}</span>
+            ">                <span style="font-weight:600; color:#fff; font-size:0.82rem;">{usuario['nombre']}</span>
                 <span style="
                     margin-left:auto; font-size:0.62rem; letter-spacing:1px;
-                    text-transform:uppercase; color:rgba(0,180,196,0.9);
+                    text-transform:uppercase; color:#5ee6c9;
                 ">{usuario['rol']}</span>
                 <span style="
                     display:inline-block; width:7px; height:7px; border-radius:50%;
-                    background:#2dd4a7;
+                    background:#5ee6c9;
                 "></span>
             </div>
             """,
             unsafe_allow_html=True
         )
     with col_logout:
-        if st.button("🚪 Salir", key="btn_logout_web"):
+        if st.button("Salir", key="btn_logout_web"):
             # Cierra la sesión: limpia auth + navegación persistente (?op=,
             # ?tab=) para que el siguiente login empiece limpio en Alertas.
             for key in [
@@ -52,8 +50,11 @@ def render_sidebar(usuario: dict):
                     pass
             st.rerun()
     
+    if menu is not None:
+        menu()
+
     divider()
-    st.markdown("### ≡ PANEL DE CONTROL")
+    st.markdown("#### Panel de control")
     
     _seccion_gestion_clientes(usuario)
     _seccion_asistente_ia(usuario)
@@ -61,7 +62,7 @@ def render_sidebar(usuario: dict):
 
 
 def _seccion_gestion_clientes(usuario: dict):
-    with st.expander("👥 GESTIÓN DE CLIENTES", expanded=False):
+    with st.expander("Gestión de clientes", expanded=False):
         manager = CelulasManager()
         celulas = manager.obtener_celulas()
         
@@ -125,7 +126,7 @@ def _seccion_gestion_clientes(usuario: dict):
 
 
 def _seccion_asistente_ia(usuario: dict):
-    with st.expander("◈ ASISTENTE IA", expanded=False):
+    with st.expander("Asistente IA", expanded=False):
         st.caption("Generar contenido con OpenAI")
         
         tipos = [
@@ -218,7 +219,7 @@ def _generar_contenido_sidebar(tipo: str, celula_id, cliente_id, contexto: str, 
 
 
 def _seccion_inventario(usuario: dict):
-    with st.expander("▤ INVENTARIO", expanded=False):
+    with st.expander("Inventario", expanded=False):
         with get_db_session() as db:
             cuentas = db.query(Cuenta).all()
         
