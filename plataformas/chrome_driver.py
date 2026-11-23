@@ -18,6 +18,16 @@ uso concurrente).
 Ademas aplica flags de ahorro de datos para que Chrome no gaste proxy
 residencial en trafico de fondo (``update.googleapis.com``,
 ``clients2.google.com``, ``accounts.google.com``, ...).
+
+Empaquetado (MWX APP / PyInstaller en Windows): la carpeta del ``.exe`` suele
+ser de SOLO LECTURA, asi que el driver ya no se asume en ``data/bin``. La
+carpeta se elige con ``_dir_drivers()`` (env ``MWX_DRIVER_DIR`` ->
+``settings.data_dir/data/bin`` -> ``resolver_ruta("data/bin")`` -> respaldo de
+usuario), se prueba escritura y, en congelado, se reutiliza primero un
+chromedriver YA PARCHEADO empaquetado en ``sys._MEIPASS/bin``. Si nada se
+puede escribir, el bootstrap cae a ``%LOCALAPPDATA%/MWX APP/bin``. El modo
+normal (sin congelar, Chrome instalado en la maquina) conserva exactamente los
+mismos nombres de archivo, locks y concurrencia entre procesos.
 """
 from __future__ import annotations
 
@@ -26,16 +36,18 @@ import os
 import random
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import time
 from contextlib import contextmanager
+from pathlib import Path
 
 import undetected_chromedriver as uc
 from loguru import logger
 from selenium.common.exceptions import WebDriverException
 
-from core.config import detectar_chrome_version, resolver_ruta
+from core.config import detectar_chrome_version, resolver_ruta, settings
 
 try:  # selenium >= 4.10
     from selenium.common.exceptions import NoSuchDriverException
@@ -71,7 +83,13 @@ FLAGS_AHORRO = [
     # acelera las cargas (los videos de X son el mayor consumidor de red/CPU
     # en las paginas de status de las campanas).
     "--autoplay-policy=user-gesture-required",
-    "--disable-features=Translate,TranslateUI,OptimizationHints,OptimizationGuideModelDownloading,MediaRouter,AutofillServerCommunication,CalculateNativeWinOcclusion",
+    # Cache en disco moderada: acelera las recargas de la SPA de X/FB/IG sin
+    # llenar el disco (256MB de cache normal + 32MB de media).
+    "--disk-cache-size=268435456",
+    "--media-cache-size=33554432",
+    # `PreloadMediaEngagementData`/`MediaEngagementBypassAutoplayPolicies`
+    # evitan precargas de media en segundo plano (datos del proxy).
+    "--disable-features=Translate,TranslateUI,OptimizationHints,OptimizationGuideModelDownloading,MediaRouter,AutofillServerCommunication,CalculateNativeWinOcclusion,PreloadMediaEngagementData,MediaEngagementBypassAutoplayPolicies",
 ]
 
 # Flags de ESTABILIDAD del renderer: en Railway (CPU compartida, 3 Chrome a la
@@ -279,8 +297,291 @@ _SEMAFORO_LANZAMIENTO = threading.Semaphore(_LANZAMIENTOS_MAX)
 # Driver compartido pre-parcheado
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Carpeta del driver (frozen-safe para MWX APP / PyInstaller)
+# ---------------------------------------------------------------------------
+
+# La decision se toma UNA vez por proceso (probar permisos cuesta y el entorno
+# no cambia durante la sesion). Los tests la reinician con
+# `_limpiar_cache_dir_drivers()`.
+_CACHE_DIR_DRIVERS = ""
+_CACHE_MOTIVO_DIR_DRIVERS = ""
+_LOCK_DIR_DRIVERS = threading.Lock()
+
+
+def _es_congelado() -> bool:
+    """True si corremos dentro de un ejecutable empaquetado (PyInstaller)."""
+    return bool(getattr(sys, "frozen", False))
+
+
+def _entorno_path(nombre: str) -> str:
+    """Lee una ruta de entorno expandiendo ``~``/``%VAR%``; "" si no existe."""
+    valor = (os.environ.get(nombre) or "").strip()
+    if not valor:
+        return ""
+    try:
+        return os.path.abspath(os.path.expandvars(os.path.expanduser(valor)))
+    except Exception:
+        return valor
+
+
+def _candidatos_fallback() -> list:
+    """Carpetas ESCRIBIBLES de respaldo, en orden de preferencia.
+
+    Windows: ``%LOCALAPPDATA%\\MWX APP\\bin`` -> ``%APPDATA%\\MWX APP\\bin``.
+    Otros: ``~/.mwx_app/bin``. Siempre se agrega una carpeta bajo TEMP como
+    ultimo recurso (el ejecutable puede correr en un usuario sin perfil).
+    """
+    candidatos = []
+    if os.name == "nt":
+        for base in (os.environ.get("LOCALAPPDATA"), os.environ.get("APPDATA")):
+            if base:
+                candidatos.append(os.path.join(base, "MWX APP", "bin"))
+        try:
+            candidatos.append(
+                os.path.join(
+                    os.path.expanduser("~"), "AppData", "Local", "MWX APP", "bin"
+                )
+            )
+        except Exception:
+            pass
+    else:
+        try:
+            candidatos.append(
+                os.path.join(os.path.expanduser("~"), ".mwx_app", "bin")
+            )
+        except Exception:
+            pass
+    candidatos.append(os.path.join(tempfile.gettempdir(), "MWX APP", "bin"))
+
+    # Dedupe case-insensitive (Windows) conservando el orden.
+    unicos = []
+    vistos = set()
+    for carpeta in candidatos:
+        if not carpeta:
+            continue
+        clave = os.path.normcase(os.path.abspath(carpeta))
+        if clave in vistos:
+            continue
+        vistos.add(clave)
+        unicos.append(carpeta)
+    return unicos
+
+
+def _dir_drivers_fallback() -> str:
+    """Carpeta de respaldo principal (``%LOCALAPPDATA%/MWX APP/bin`` o similar)."""
+    candidatos = _candidatos_fallback()
+    return candidatos[0] if candidatos else os.path.join(
+        tempfile.gettempdir(), "MWX APP", "bin"
+    )
+
+
+def _puede_escribir(carpeta: str) -> bool:
+    """Crea la carpeta y comprueba con un archivo sonda que se puede escribir.
+
+    No lanza: devuelve False ante cualquier error de permisos/disco. El archivo
+    sonda se borra de inmediato y NO se toca ningun driver existente.
+    """
+    if not carpeta:
+        return False
+    try:
+        Path(carpeta).mkdir(parents=True, exist_ok=True)
+        sonda = Path(carpeta) / (
+            f".mwx_write_{os.getpid()}_{int(time.time() * 1000)}"
+        )
+        sonda.write_bytes(b"ok")
+        sonda.unlink()
+        return True
+    except OSError as e:
+        logger.debug(
+            f"[chrome_driver] Sin permiso de escritura en {carpeta}: "
+            f"{type(e).__name__}: {e}"
+        )
+        return False
+    except Exception as e:  # pragma: no cover - defensivo
+        logger.debug(
+            f"[chrome_driver] No se pudo probar escritura en {carpeta}: "
+            f"{type(e).__name__}: {e}"
+        )
+        return False
+
+
+def _carpeta_datos_configurada() -> str:
+    """``data/bin`` segun ``core.config.settings`` o ``resolver_ruta``.
+
+    En ``core.config`` actual ``settings.data_dir`` es la RAIZ DE ESCRITURA
+    (en desarrollo la raiz del proyecto; en el .exe ``%LOCALAPPDATA%/MWX APP``)
+    que CONTIENE la carpeta ``data``; por eso el driver va a
+    ``<data_dir>/data/bin``. ``resolver_ruta("data/bin")`` produce esa misma
+    ruta en ambos modos y queda como ultimo recurso si otra rama aun no expone
+    los atributos nuevos.
+    """
+    # `data_dir` es la raiz de escritura que CONTIENE `data/` en core.config,
+    # pero si alguna variante lo define ya como la carpeta `data`, no se
+    # duplica (`data/data/bin`).
+    data_dir = getattr(settings, "data_dir", "") or ""
+    if data_dir:
+        try:
+            ruta = Path(str(data_dir))
+            if ruta.name.lower() == "data":
+                return str(ruta / "bin")
+            return str(ruta / "data" / "bin")
+        except Exception:
+            pass
+    for atributo in ("app_dir", "base_dir"):
+        valor = getattr(settings, atributo, "") or ""
+        if not valor:
+            continue
+        try:
+            return os.path.join(str(valor), "data", "bin")
+        except Exception:
+            continue
+    try:
+        return resolver_ruta("data/bin")
+    except Exception:
+        return ""
+
+
+def _carpeta_fallback_escribible() -> str:
+    """Primera carpeta de respaldo donde de verdad se puede escribir."""
+    for carpeta in _candidatos_fallback():
+        if _puede_escribir(carpeta):
+            return carpeta
+    return _dir_drivers_fallback()
+
+
+def _dir_drivers() -> str:
+    """Devuelve la carpeta donde vive el chromedriver compartido (cacheada).
+
+    Prioridad:
+      1. ``MWX_DRIVER_DIR`` (override explicito, util en el .exe/MWX APP).
+      2. ``settings.data_dir/data/bin`` (o ``app_dir``/``base_dir``/data/bin).
+      3. ``resolver_ruta("data/bin")`` (comportamiento historico).
+      4. ``%LOCALAPPDATA%/MWX APP/bin`` (Windows) o ``~/.mwx_app/bin``.
+
+    Se elige la PRIMERA donde se pueda escribir; en un .exe instalado en una
+    carpeta de solo lectura cae sola al respaldo de usuario. Nunca asume que
+    ``data/`` esta en la carpeta del ejecutable.
+    """
+    global _CACHE_DIR_DRIVERS, _CACHE_MOTIVO_DIR_DRIVERS
+    if _CACHE_DIR_DRIVERS:
+        return _CACHE_DIR_DRIVERS
+
+    with _LOCK_DIR_DRIVERS:
+        if _CACHE_DIR_DRIVERS:  # otro hilo la eligio mientras esperabamos
+            return _CACHE_DIR_DRIVERS
+
+        candidatos = []
+        env_dir = _entorno_path("MWX_DRIVER_DIR")
+        if env_dir:
+            candidatos.append((env_dir, "env MWX_DRIVER_DIR"))
+        configurada = _carpeta_datos_configurada()
+        if configurada:
+            candidatos.append(
+                (configurada, "settings/resolver_ruta (data/bin)")
+            )
+        for carpeta in _candidatos_fallback():
+            candidatos.append((carpeta, "respaldo de usuario (LOCALAPPDATA/~)"))
+
+        elegida = ""
+        motivo = ""
+        for carpeta, razon in candidatos:
+            if _puede_escribir(carpeta):
+                elegida, motivo = carpeta, razon
+                break
+
+        if not elegida:
+            # Ni el override ni el perfil del usuario son escribibles: TEMP
+            # suele serlo aunque el resto del sistema este restringido. Si
+            # tampoco, se deja la ruta de respaldo y el error de permisos se
+            # reporta al preparar el driver (con su ruta exacta).
+            elegida = _dir_drivers_fallback()
+            motivo = "respaldo de usuario (sin permiso verificado)"
+            logger.error(
+                f"[chrome_driver] No se pudo escribir en ninguna carpeta de "
+                f"drivers; se intentara {elegida}"
+            )
+
+        _CACHE_DIR_DRIVERS = elegida
+        _CACHE_MOTIVO_DIR_DRIVERS = motivo
+        logger.info(
+            f"[chrome_driver] Carpeta de drivers: {elegida} ({motivo})"
+            f"{' [frozen]' if _es_congelado() else ''}"
+        )
+        return elegida
+
+
+def _limpiar_cache_dir_drivers() -> None:
+    """Olvida la carpeta elegida (tests o cambio de entorno en caliente)."""
+    global _CACHE_DIR_DRIVERS, _CACHE_MOTIVO_DIR_DRIVERS
+    with _LOCK_DIR_DRIVERS:
+        _CACHE_DIR_DRIVERS = ""
+        _CACHE_MOTIVO_DIR_DRIVERS = ""
+
+
+def _es_error_permiso(e) -> bool:
+    """True si el error es de permisos/solo-lectura (candidato a fallback)."""
+    if isinstance(e, PermissionError):
+        return True
+    codigos = {
+        errno.EACCES,
+        errno.EPERM,
+        getattr(errno, "EROFS", None),
+        getattr(errno, "ENOTDIR", None),
+    }
+    if getattr(e, "errno", None) in codigos:
+        return True
+    if os.name == "nt" and getattr(e, "winerror", None) in (5, 19, 82):
+        # 5=ACCESS_DENIED, 19=WRITE_PROTECT, 82=CANNOT_MAKE
+        return True
+    texto = str(e).lower()
+    return (
+        "permission denied" in texto
+        or "access is denied" in texto
+        or "read-only file system" in texto
+        or "acceso denegado" in texto
+    )
+
+
+def _driver_empaquetado(version) -> str:
+    """Busca un chromedriver YA PARCHEADO dentro del bundle de PyInstaller.
+
+    Solo aplica en congelado (``sys.frozen``). Nombres esperados dentro de
+    ``sys._MEIPASS[\\bin]``: ``undetected_chromedriver_<version>.exe`` (exacto)
+    y, como comodin, ``undetected_chromedriver.exe`` / ``chromedriver.exe``.
+    Devuelve "" si no hay ninguno parcheado.
+    """
+    if not _es_congelado():
+        return ""
+    base = getattr(sys, "_MEIPASS", "") or ""
+    if not base or not os.path.isdir(base):
+        return ""
+
+    ext = ".exe" if os.name == "nt" else ""
+    sufijo = f"_{version}" if version else ""
+    nombres = []
+    if sufijo:
+        nombres.append(f"undetected_chromedriver{sufijo}{ext}")
+    nombres.append(f"undetected_chromedriver{ext}")
+    nombres.append(f"chromedriver{ext}")
+
+    for subcarpeta in ("bin", os.path.join("data", "bin"), ""):
+        for nombre in nombres:
+            ruta = (
+                os.path.join(base, subcarpeta, nombre)
+                if subcarpeta
+                else os.path.join(base, nombre)
+            )
+            if os.path.isfile(ruta) and _esta_parcheado(ruta):
+                logger.debug(
+                    f"[chrome_driver] Driver empaquetado encontrado: {ruta}"
+                )
+                return ruta
+    return ""
+
+
 def _ruta_driver_estable(version) -> str:
-    """Ruta estable del chromedriver compartido dentro de ``data/bin``.
+    """Ruta estable del chromedriver compartido dentro de ``_dir_drivers()``.
 
     En Windows se agrega ``.exe`` porque uc.Patcher se lo agrega a cualquier
     ruta custom que no lo traiga; mantener el mismo nombre evita desajustes.
@@ -289,7 +590,7 @@ def _ruta_driver_estable(version) -> str:
     nombre = f"undetected_chromedriver{sufijo}"
     if os.name == "nt":
         nombre += ".exe"
-    return resolver_ruta(f"data/bin/{nombre}")
+    return os.path.join(_dir_drivers(), nombre)
 
 
 def _esta_parcheado(ruta) -> bool:
@@ -399,6 +700,80 @@ def _lock_archivo(ruta_lock: str, timeout: float = None):
                 pass
 
 
+def _lock_driver(carpeta: str):
+    """Lock de archivo del driver, SIEMPRE dentro de la carpeta del driver."""
+    return _lock_archivo(os.path.join(carpeta, ".chromedriver.lock"))
+
+
+def _copiar_driver_atomico(origen: str, destino: str) -> str:
+    """Copia el driver con temporal + ``os.replace`` (sin dejar binarios a medias)."""
+    os.makedirs(os.path.dirname(destino), exist_ok=True)
+    tmp = f"{destino}.tmp{os.getpid()}"
+    shutil.copy2(origen, tmp)
+    if os.name != "nt":
+        try:
+            os.chmod(tmp, 0o755)
+        except OSError:
+            pass
+    try:
+        os.replace(tmp, destino)
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    return destino
+
+
+def _preparar_driver_empaquetado(origen: str, destino: str) -> str:
+    """Copia el driver empaquetado a la carpeta elegida o lo ejecuta in-place.
+
+    Si la carpeta destino es de solo lectura (o el binario esta en uso) NO se
+    falla: se ejecuta directo desde ``sys._MEIPASS`` (``_ruta_ejecutable`` lo
+    copia a TEMP si esa ubicacion tampoco permite ejecutar).
+    """
+    try:
+        _copiar_driver_atomico(origen, destino)
+        if _esta_parcheado(destino):
+            logger.info(
+                f"[chrome_driver] chromedriver empaquetado copiado a {destino}"
+            )
+            return destino
+        logger.warning(
+            f"[chrome_driver] El driver copiado desde {origen} no quedo "
+            f"parcheado; se usara el binario empaquetado"
+        )
+    except OSError as e:
+        logger.warning(
+            f"[chrome_driver] No se pudo copiar el driver empaquetado a "
+            f"{destino} ({type(e).__name__}: {e}); se ejecutara desde {origen}"
+        )
+    return _ruta_ejecutable(origen)
+
+
+def _preparar_en_carpeta(
+    ruta_destino: str, version, origen_empaquetado: str = ""
+) -> str:
+    """Prepara el driver en ``ruta_destino`` bajo lock entre procesos.
+
+    Debe llamarse con una carpeta ESCRIBIBLE (``_dir_drivers`` ya la probo);
+    si aun asi falla por permisos, ``_driver_compartido`` reintenta en el
+    respaldo de usuario. Reutiliza sin escribir si otro proceso ya lo dejo.
+    """
+    carpeta = os.path.dirname(ruta_destino)
+    with _lock_driver(carpeta):
+        if _esta_parcheado(ruta_destino):
+            logger.info(
+                f"[chrome_driver] Otro proceso preparo el chromedriver; "
+                f"reutilizando {ruta_destino}"
+            )
+            return ruta_destino
+        if origen_empaquetado:
+            return _preparar_driver_empaquetado(origen_empaquetado, ruta_destino)
+        return _bootstrap_driver(ruta_destino, version)
+
+
 def _bootstrap_driver(ruta_destino: str, version) -> str:
     """Descarga/parchea chromedriver UNA vez y lo copia a la ruta estable.
 
@@ -406,7 +781,7 @@ def _bootstrap_driver(ruta_destino: str, version) -> str:
     """
     logger.info(
         f"[chrome_driver] Preparando chromedriver compartido por primera vez "
-        f"(version_main={version})..."
+        f"(version_main={version}) en {ruta_destino}..."
     )
     patcher = uc.Patcher(version_main=version or 0)
     patcher.auto()
@@ -498,21 +873,40 @@ def _ruta_ejecutable(ruta: str) -> str:
 
 
 def _driver_compartido(version) -> str:
-    """Devuelve la ruta del chromedriver compartido, preparandolo si falta."""
+    """Devuelve la ruta del chromedriver compartido, preparandolo si falta.
+
+    Orden:
+      1. Reutilizar el driver ya presente en ``_dir_drivers()`` (sin escribir).
+      2. En congelado, usar/copiar el driver pre-parcheado de ``sys._MEIPASS``.
+      3. Bootstrapear (descargar/parchear) bajo lock en ``_dir_drivers()``.
+      4. Si el punto 3 falla por permisos, bootstrapear en el respaldo de
+         usuario (``%LOCALAPPDATA%/MWX APP/bin`` o ``~/.mwx_app/bin``).
+    """
     ruta = _ruta_driver_estable(version)
     if _esta_parcheado(ruta):
         logger.debug(f"[chrome_driver] Reutilizando chromedriver compartido: {ruta}")
         return _ruta_ejecutable(ruta)
 
-    with _lock_archivo(resolver_ruta("data/bin/.chromedriver.lock")):
-        # Doble verificacion: otro proceso pudo prepararlo mientras esperabamos.
-        if _esta_parcheado(ruta):
-            logger.info(
-                f"[chrome_driver] Otro proceso preparo el chromedriver; "
-                f"reutilizando {ruta}"
-            )
-            return _ruta_ejecutable(ruta)
-        return _ruta_ejecutable(_bootstrap_driver(ruta, version))
+    empaquetado = _driver_empaquetado(version)
+    if empaquetado:
+        logger.info(
+            f"[chrome_driver] Usando chromedriver empaquetado: {empaquetado}"
+        )
+
+    try:
+        preparado = _preparar_en_carpeta(ruta, version, empaquetado)
+    except OSError as e:
+        if not _es_error_permiso(e):
+            raise
+        carpeta_alt = _carpeta_fallback_escribible()
+        ruta_alt = os.path.join(carpeta_alt, os.path.basename(ruta))
+        logger.warning(
+            f"[chrome_driver] No se pudo escribir el driver en "
+            f"{os.path.dirname(ruta)} ({type(e).__name__}: {e}); "
+            f"se prepara en la carpeta de respaldo {ruta_alt}"
+        )
+        preparado = _preparar_en_carpeta(ruta_alt, version, empaquetado)
+    return _ruta_ejecutable(preparado)
 
 
 # ---------------------------------------------------------------------------
@@ -569,8 +963,9 @@ def crear_chrome(options, version_main=None, intentos=3):
       ``--disable-component-extensions-with-background-pages``,
       ``--mute-audio``, renderer-process-limit, heap capado, site-per-process
       off y ``--disable-features`` fusionado en UNA sola bandera).
-    - Usa SIEMPRE el chromedriver pre-parcheado de ``data/bin/`` (se prepara una
-      sola vez bajo lock de archivo entre procesos).
+    - Usa SIEMPRE el chromedriver pre-parcheado de ``_dir_drivers()`` (por
+      defecto ``data/bin/``; en el .exe cae a una carpeta escribible) y se
+      prepara una sola vez bajo lock de archivo entre procesos.
     - Limita los lanzamientos concurrentes (``CHROME_LAUNCH_MAX``, default 2)
       con un jitter de 0.2-0.5s para que N workers no hagan fork/exec al mismo
       tiempo (causa de ``BlockingIOError: [Errno 11]``).

@@ -127,6 +127,37 @@ class _BotViejo:
         return True
 
 
+class _BotConPerfil:
+    """Bot fake NUEVO: acepta `buscar_url_perfil` y registra los kwargs."""
+
+    def __init__(self):
+        self.llamadas: list = []
+        self.ultimo_error = ""
+        self.ultima_url_publicada = ""
+        self.cuenta_suspendida = False
+
+    def publicar_tweet(self, texto, imagen_path=None, buscar_url=True,
+                       buscar_url_perfil=None):
+        self.llamadas.append(
+            (
+                "publicar_tweet", texto, imagen_path, buscar_url,
+                buscar_url_perfil,
+            )
+        )
+        return True
+
+    def solo_retwittear(self, urls, usuario, mensaje_cita=None,
+                        dar_like=False, buscar_url=True,
+                        buscar_url_perfil=None):
+        self.llamadas.append(
+            (
+                "solo_retwittear", list(urls), mensaje_cita, dar_like,
+                buscar_url_perfil,
+            )
+        )
+        return {"exitos": 1, "urls": []}
+
+
 class _PestanaFake:
     """Pestaña minima del pool (solo `bot`)."""
 
@@ -599,6 +630,115 @@ def test_fake_viejo(check):
 
 
 # --------------------------------------------------------------------------- #
+# (7) `buscar_url_perfil`: sin salto al perfil por defecto
+# --------------------------------------------------------------------------- #
+def test_buscar_url_perfil(check):
+    print("(7) buscar_url_perfil: default 0 (sin perfil) y CAPTURAR_URL_PERFIL=1")
+    motor = MotorActivacion(max_concurrente=1)
+    cuenta = _CuentaFake()
+    ancla = "https://x.com/ancla/status/1"
+
+    with mock.patch.dict(os.environ, {"CAPTURAR_URL_PERFIL": "0"}):
+        check(
+            "CAPTURAR_URL_PERFIL=0: NO se visita el perfil",
+            motor._buscar_url_perfil_post() is False,
+        )
+    with mock.patch.dict(os.environ, {"CAPTURAR_URL_PERFIL": "1"}):
+        check(
+            "CAPTURAR_URL_PERFIL=1: se permite el fallback al perfil",
+            motor._buscar_url_perfil_post() is True,
+        )
+    with mock.patch.dict(os.environ, {}, clear=False):
+        os.environ.pop("CAPTURAR_URL_PERFIL", None)
+        check(
+            "sin env: default 0 (NO se visita el perfil)",
+            motor._buscar_url_perfil_post() is False,
+        )
+
+    # Post con imagen: buscar_url_perfil=False por defecto (ruta rapida).
+    bot = _BotConPerfil()
+    with mock.patch.dict(
+        os.environ,
+        {"CAPTURAR_URL_POST": "1", "CAPTURAR_URL_PERFIL": "0"},
+    ):
+        resultado = motor._accion_en_bot(
+            bot, cuenta, "hashtags", "texto con imagen", False, "",
+            imagen_path="C:/imagenes/a.png",
+        )
+    check(
+        "post con imagen: buscar_url_perfil=False por defecto",
+        resultado[2] is True
+        and bot.llamadas
+        == [
+            (
+                "publicar_tweet", "texto con imagen",
+                "C:/imagenes/a.png", True, False,
+            )
+        ],
+        f"({bot.llamadas})",
+    )
+
+    # Post sin imagen: con el env en 1 se conserva el comportamiento historico.
+    bot2 = _BotConPerfil()
+    with mock.patch.dict(
+        os.environ,
+        {"CAPTURAR_URL_POST": "1", "CAPTURAR_URL_PERFIL": "1"},
+    ):
+        motor._accion_en_bot(
+            bot2, cuenta, "hashtags", "texto sin imagen", False, ""
+        )
+    check(
+        "post sin imagen: CAPTURAR_URL_PERFIL=1 pasa True",
+        bot2.llamadas
+        == [
+            (
+                "publicar_tweet", "texto sin imagen",
+                None, True, True,
+            )
+        ],
+        f"({bot2.llamadas})",
+    )
+
+    # Cita: mismo criterio (default False, env 1 -> True).
+    bot_cita = _BotConPerfil()
+    with mock.patch.dict(os.environ, {"CAPTURAR_URL_PERFIL": "0"}):
+        motor._accion_en_bot(
+            bot_cita, cuenta, "cita", "texto de cita", False, ancla
+        )
+    check(
+        "cita: buscar_url_perfil=False por defecto",
+        bot_cita.llamadas
+        == [("solo_retwittear", [ancla], "texto de cita", False, False)],
+        f"({bot_cita.llamadas})",
+    )
+
+    bot_cita2 = _BotConPerfil()
+    with mock.patch.dict(os.environ, {"CAPTURAR_URL_PERFIL": "1"}):
+        motor._accion_en_bot(
+            bot_cita2, cuenta, "cita", "texto de cita", False, ancla
+        )
+    check(
+        "cita: CAPTURAR_URL_PERFIL=1 pasa True",
+        bot_cita2.llamadas
+        == [("solo_retwittear", [ancla], "texto de cita", False, True)],
+        f"({bot_cita2.llamadas})",
+    )
+
+    # Bot viejo: no recibe el kwarg y su llamada queda identica (sin TypeError).
+    bot_viejo = _BotFake()
+    with mock.patch.dict(os.environ, {"CAPTURAR_URL_PERFIL": "0"}):
+        resultado_viejo = motor._accion_en_bot(
+            bot_viejo, cuenta, "hashtags", "texto", False, ""
+        )
+    check(
+        "bot viejo: NO recibe buscar_url_perfil y no lanza",
+        resultado_viejo[2] is True
+        and bot_viejo.llamadas == [("texto", None, True)],
+        f"({resultado_viejo}, {bot_viejo.llamadas})",
+    )
+
+
+# --------------------------------------------------------------------------- #
 # Runner
 # --------------------------------------------------------------------------- #
 def run(check):
@@ -609,6 +749,7 @@ def run(check):
     test_intentar_accion_rol(check)
     test_firmas_y_e2e(check)
     test_fake_viejo(check)
+    test_buscar_url_perfil(check)
 
 
 if __name__ == "__main__":

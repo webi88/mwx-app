@@ -35,7 +35,11 @@ import re
 import streamlit as st
 
 from web.ui import cabecera
-from web.operaciones._helpers import aviso_pausadas, separar_pausadas
+from web.operaciones._helpers import (
+    aviso_pausadas,
+    aviso_verificacion,
+    separar_pausadas,
+)
 from web.operaciones.activacion_masiva import (
     _aplicar_limpieza_contexto_pendiente,
     _campana_en_curso,
@@ -391,6 +395,7 @@ def _formulario() -> None:
             )
     else:
         aviso_pausadas(pausadas)
+    aviso_verificacion(corto=True)
     st.caption(f"Cuentas twitter activas disponibles: **{len(cuentas)}**")
 
     if not cuentas:

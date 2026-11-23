@@ -1,4 +1,6 @@
+import difflib
 import json
+import os
 import random
 import re
 import unicodedata
@@ -15,8 +17,10 @@ from core.perfiles import (
 from core.registros import normalizar_tipo_cuenta
 from ia.prompts import (
     ANGULOS_QUEJA_CHANGE,
+    ANGULOS_VARIACION,
     REGLA_MAX_100,
     TEMAS_MANTENIMIENTO,
+    bloque_diversidad,
     bloque_estilo_perfil,
     bloque_tweet_ancla,
     get_prompt_hashtags,
@@ -25,6 +29,8 @@ from ia.prompts import (
     get_prompt_por_tipo,
     get_prompt_queja_change,
     instrucciones_tema,
+    _angulos_para,
+    _recortar_evitar,
     _normalizar_tema,
     _reglas_registro,
     _reglas_trasfondo,
@@ -32,10 +38,862 @@ from ia.prompts import (
 from loguru import logger
 
 
+# ===================================================================== #
+# CONFIGURACION DE OPENAI (compatible con openai 0.28 y >= 1.0)
+#
+# La clave y la base se leen de settings o del entorno. `OPENAI_API_BASE`
+# permite apuntar a un proxy compatible con OpenAI (p. ej. la API MWX APP,
+# que expone `/v1/chat/completions` y reemplaza el token de sesion por la
+# key real). Base vacia = comportamiento historico (api.openai.com).
+# La clave NUNCA se registra en logs.
+# ===================================================================== #
+_OPENAI_DEBUG_LOGUEADO = False
+
+
+def _config_openai() -> tuple[str, str]:
+    """Devuelve ``(api_key, api_base)`` normalizados (nunca lanza).
+
+    Lee ``settings.openai_api_key``/``settings.openai_api_base`` y cae al
+    entorno (``OPENAI_API_KEY``, ``OPENAI_API_BASE`` y ``OPENAI_BASE_URL``).
+    ``api_base`` vacio significa "usar el default de la libreria"
+    (``https://api.openai.com/v1``). Se recortan espacios y la barra final.
+    """
+    api_key = ""
+    api_base = ""
+
+    try:
+        api_key = getattr(settings, "openai_api_key", "") or ""
+    except Exception:
+        api_key = ""
+    if not api_key:
+        try:
+            api_key = os.environ.get("OPENAI_API_KEY", "") or ""
+        except Exception:
+            api_key = ""
+
+    try:
+        api_base = getattr(settings, "openai_api_base", "") or ""
+    except Exception:
+        api_base = ""
+    if not api_base:
+        try:
+            api_base = (
+                os.environ.get("OPENAI_API_BASE", "")
+                or os.environ.get("OPENAI_BASE_URL", "")
+                or ""
+            )
+        except Exception:
+            api_base = ""
+
+    try:
+        api_key = str(api_key).strip()
+    except Exception:
+        api_key = ""
+    try:
+        api_base = str(api_base).strip().rstrip("/")
+    except Exception:
+        api_base = ""
+    return api_key, api_base
+
+
+def _opciones_cliente_openai(api_key: str, api_base: str) -> dict:
+    """Kwargs de ``openai.OpenAI`` (>= 1.0); solo agrega ``base_url`` si hay proxy."""
+    opciones = {"api_key": api_key}
+    if api_base:
+        opciones["base_url"] = api_base
+    return opciones
+
+
+def _log_config_openai(modelo: str = "gpt-4o-mini") -> None:
+    """Registra UNA vez por proceso la base y el modelo (nunca la clave)."""
+    global _OPENAI_DEBUG_LOGUEADO
+    if _OPENAI_DEBUG_LOGUEADO:
+        return
+    _OPENAI_DEBUG_LOGUEADO = True
+    try:
+        _, api_base = _config_openai()
+        logger.debug(
+            f"openai: base={api_base or 'api.openai.com'} modelo={modelo}"
+        )
+    except Exception:
+        pass
+
+
+# ===================================================================== #
+# DIVERSIDAD DE TEXTOS (anti-repeticion real entre cuentas)
+#
+# Pedido del dueño: en las campanas, CADA publicacion (y sobre todo cada
+# RETWEET CON CITA) debe tener un texto REALMENTE distinto. La IA a veces
+# devuelve variaciones casi identicas; aqui hay utilidades deterministas para
+# medir similitud, elegir solo textos suficientemente distintos y generar un
+# fallback local diverso (sin IA) cuando el modelo falla o repite.
+# ===================================================================== #
+def _env_float(nombre: str, default: float) -> float:
+    """Lee un float del entorno con default seguro (nunca lanza)."""
+    try:
+        valor = os.environ.get(nombre)
+        if valor is None or not str(valor).strip():
+            return float(default)
+        return float(str(valor).strip())
+    except (TypeError, ValueError):
+        return float(default)
+    except Exception:
+        return float(default)
+
+
+# Umbral de similitud (0..1): a partir de aqui dos textos se consideran
+# "casi el mismo". Los POSTS toleran mas parecido (0.82) porque son cortos;
+# las CITAS exigen mas diferencia (0.72). Configurables por env.
+DIVERSIDAD_UMBRAL_POST = _env_float("DIVERSIDAD_UMBRAL_POST", 0.82)
+DIVERSIDAD_UMBRAL_CITA = _env_float("DIVERSIDAD_UMBRAL_CITA", 0.72)
+
+_RE_URL_COMPARAR = re.compile(r"(?:https?://|www\.)\S+", re.IGNORECASE)
+_RE_TAG_COMPARAR = re.compile(r"#[A-Za-z0-9ÁÉÍÓÚÜÑáéíóúüñ_]+")
+_RE_MENCION_COMPARAR = re.compile(r"@[A-Za-z0-9_]{1,15}")
+
+
+def normalizar_para_comparar(texto) -> str:
+    """Normaliza un texto para comparar similitud (nunca lanza).
+
+    Minusculas, sin acentos, sin hashtags, URLs ni @menciones, sin
+    puntuacion y con espacios colapsados. Devuelve "" ante entradas raras.
+    """
+    try:
+        t = str(texto or "").lower()
+    except Exception:
+        return ""
+    try:
+        t = _RE_URL_COMPARAR.sub(" ", t)
+        t = _RE_TAG_COMPARAR.sub(" ", t)
+        t = _RE_MENCION_COMPARAR.sub(" ", t)
+        t = unicodedata.normalize("NFD", t)
+        t = "".join(c for c in t if unicodedata.category(c) != "Mn")
+        t = re.sub(r"[^a-z0-9]+", " ", t)
+        return re.sub(r"\s+", " ", t).strip()
+    except Exception:
+        return ""
+
+
+def _ngramas_palabras(tokens: list, n: int = 3) -> set:
+    """Set de n-gramas de palabras; con textos cortos usa unigramas."""
+    try:
+        if not tokens:
+            return set()
+        if len(tokens) >= n:
+            return {tuple(tokens[i:i + n]) for i in range(len(tokens) - n + 1)}
+        return {(token,) for token in tokens}
+    except Exception:
+        return set()
+
+
+def similitud_textos(a, b) -> float:
+    """Similitud 0..1 entre dos textos (nunca lanza).
+
+    Combina el ratio de ``difflib.SequenceMatcher`` sobre la cadena
+    normalizada con el indice de Jaccard de 3-gramas de palabras. El ratio se
+    promedia en AMBOS sentidos (a->b y b->a) para que la medida sea simetrica
+    y estable. Para textos muy cortos (menos de 3 palabras) usa unigramas, de
+    modo que sigue siendo util. Textos vacios: 1.0 si ambos lo estan, 0.0 si
+    solo uno.
+    """
+    try:
+        na = normalizar_para_comparar(a)
+        nb = normalizar_para_comparar(b)
+        if not na or not nb:
+            return 1.0 if na == nb else 0.0
+        ratio_ab = difflib.SequenceMatcher(None, na, nb).ratio()
+        ratio_ba = difflib.SequenceMatcher(None, nb, na).ratio()
+        ratio = 0.5 * (ratio_ab + ratio_ba)
+        ta, tb = na.split(), nb.split()
+        sa = _ngramas_palabras(ta, 3)
+        sb = _ngramas_palabras(tb, 3)
+        union = sa | sb
+        jaccard = (len(sa & sb) / len(union)) if union else 0.0
+        return max(0.0, min(1.0, 0.5 * ratio + 0.5 * jaccard))
+    except Exception:
+        return 0.0
+
+
+def son_textos_similares(a, b, umbral=None) -> bool:
+    """True si ``a`` y ``b`` son iguales o superan el umbral de similitud.
+
+    ``umbral`` default ``DIVERSIDAD_UMBRAL_CITA`` (0.72). Nunca lanza.
+    """
+    try:
+        if umbral is None:
+            umbral = DIVERSIDAD_UMBRAL_CITA
+        limite = max(0.0, min(1.0, float(umbral)))
+    except (TypeError, ValueError):
+        limite = DIVERSIDAD_UMBRAL_CITA
+    except Exception:
+        limite = DIVERSIDAD_UMBRAL_CITA
+    return similitud_textos(a, b) >= limite
+
+
+def _lista_textos(otros) -> list:
+    """Normaliza ``otros``/``evitar`` a una lista de strings (nunca lanza)."""
+    if otros is None:
+        return []
+    if isinstance(otros, str):
+        candidatos = [otros]
+    else:
+        try:
+            candidatos = list(otros)
+        except TypeError:
+            candidatos = [otros]
+    salida: list = []
+    for item in candidatos:
+        if item is None:
+            continue
+        try:
+            texto = str(item).strip()
+        except Exception:
+            continue
+        if texto:
+            salida.append(texto)
+    return salida
+
+
+def texto_es_suficientemente_distinto(texto, otros, umbral=None) -> bool:
+    """True si ``texto`` no es igual ni similar a ninguno de ``otros``.
+
+    Tolera ``otros=None``, un string suelto o cualquier iterable. Nunca lanza:
+    ante texto vacio devuelve False.
+    """
+    try:
+        t = str(texto or "").strip()
+    except Exception:
+        return False
+    if not t:
+        return False
+    clave = normalizar_para_comparar(t)
+    for otro in _lista_textos(otros):
+        try:
+            if t == otro:
+                return False
+            if clave and clave == normalizar_para_comparar(otro):
+                return False
+            if son_textos_similares(t, otro, umbral):
+                return False
+        except Exception:
+            continue
+    return True
+
+
+def elegir_textos_diversos(candidatos, cantidad, evitar=None, umbral=None) -> list:
+    """Recorre ``candidatos`` y acepta solo los suficientemente distintos.
+
+    Compara contra ``evitar`` y contra los ya aceptados (no solo igualdad
+    exacta: tambien similitud). Devuelve una lista que puede ser mas corta que
+    ``cantidad``; el llamador decide como rellenar. Nunca lanza.
+    """
+    try:
+        n = int(cantidad)
+    except (TypeError, ValueError):
+        n = 0
+    if n <= 0:
+        return []
+    aceptados: list = []
+    comparar = _lista_textos(evitar)
+    for candidato in _lista_textos(candidatos):
+        if len(aceptados) >= n:
+            break
+        if texto_es_suficientemente_distinto(
+            candidato, comparar + aceptados, umbral
+        ):
+            aceptados.append(candidato)
+    return aceptados
+
+
+# ===================================================================== #
+# GENERADOR LOCAL DIVERSO (sin IA): reordena ideas, cambia conectores,
+# aperturas, estructuras y cierres. Nunca devuelve el texto base tal cual.
+# ===================================================================== #
+_CONECTORES_DIVERSOS = (
+    "En concreto", "Sin rodeos", "Para ser claros", "Les cuento que",
+    "En resumen", "Lo cierto es que", "Debido a esto", "Por eso",
+    "Miren", "Ojo", "Sin duda", "Al final", "Y sí", "La verdad",
+)
+
+_CIERRES_DIVERSOS = (
+    "Así de simple.", "Eso es todo.", "Vale la pena pensarlo.",
+    "No hay que darle vueltas.", "Queda claro.", "Ese es el punto.",
+    "Sigamos hablando de esto.", "Para que no se pierda el contexto.",
+    "Es lo que hay.", "Y que cada quien saque sus conclusiones.",
+)
+
+_SINONIMOS_DIVERSOS = (
+    (r"\bmuy\b", "bastante"),
+    (r"\btambién\b", "igual"),
+    (r"\btambien\b", "igual"),
+    (r"\bporque\b", "ya que"),
+    (r"\bpero\b", "aunque"),
+    (r"\bsiempre\b", "en todo momento"),
+    (r"\bnunca\b", "jamás"),
+    (r"\bgrande\b", "enorme"),
+    (r"\bproblema\b", "asunto"),
+    (r"\bdifícil\b", "complicado"),
+    (r"\bdificil\b", "complicado"),
+)
+
+_IDEAS_GENERICAS = (
+    "lo que está pasando",
+    "la situación que vivimos",
+    "lo que tenemos enfrente",
+    "este tema que nos toca",
+    "lo que la gente comenta",
+)
+
+
+def _reemplazo_con_mayuscula(match, reemplazo: str) -> str:
+    """Conserva la capitalizacion al sustituir un sinonimo (nunca lanza)."""
+    original = match.group(0)
+    try:
+        if original.isupper():
+            return reemplazo.upper()
+        if original[:1].isupper():
+            return reemplazo[:1].upper() + reemplazo[1:]
+    except Exception:
+        pass
+    return reemplazo
+
+
+def _sinonimizar_local(texto: str, rng, max_cambios: int = 2) -> str:
+    """Aplica 0..``max_cambios`` sinonimos seguros (sin tocar hashtags)."""
+    t = str(texto or "")
+    if not t:
+        return t
+    pares = list(_SINONIMOS_DIVERSOS)
+    try:
+        rng.shuffle(pares)
+    except Exception:
+        pass
+    cambios = 0
+    for patron, reemplazo in pares:
+        if cambios >= max_cambios:
+            break
+        try:
+            nuevo, n = re.subn(
+                patron,
+                lambda m, r=reemplazo: _reemplazo_con_mayuscula(m, r),
+                t,
+                count=1,
+                flags=re.IGNORECASE,
+            )
+        except Exception:
+            continue
+        if n:
+            t = nuevo
+            cambios += 1
+    return t
+
+
+def _limpiar_frase_diversa(frase) -> str:
+    """Quita espacios y puntuacion suelta de los extremos (nunca lanza)."""
+    try:
+        t = re.sub(r"\s+", " ", str(frase or "")).strip()
+        return t.strip(" \t\n,;:.-")
+    except Exception:
+        return ""
+
+
+def _minuscula_inicial(frase: str) -> str:
+    """Baja la primera letra (para encadenar tras un conector)."""
+    t = str(frase or "")
+    if not t:
+        return t
+    return t[0].lower() + t[1:] if t[0].isupper() else t
+
+
+def _analizar_base_diversa(base: str) -> tuple:
+    """Separa el base en oraciones e ideas/clausulas utiles (nunca lanza).
+
+    Devuelve ``(oraciones, ideas)`` sin frases vacias ni duplicadas exactas.
+    Si no hay puntuacion, cada oracion/clausula es una pieza utilizable.
+    """
+    texto = " ".join(str(base or "").split())
+    if not texto:
+        return [], []
+    try:
+        oraciones = [
+            s.strip()
+            for s in re.split(r"(?<=[.!?;])\s+|\n+", texto)
+            if len(s.strip()) >= 3
+        ]
+    except Exception:
+        oraciones = [texto]
+    if not oraciones:
+        oraciones = [texto]
+    ideas: list = []
+    for oracion in oraciones:
+        for parte in re.split(r"[,;:]\s+", oracion):
+            limpia = _limpiar_frase_diversa(parte)
+            if not limpia:
+                continue
+            if len(limpia.split()) < 2 and len(oraciones) > 1:
+                continue
+            if limpia not in ideas:
+                ideas.append(limpia)
+    if not ideas:
+        ideas = [_limpiar_frase_diversa(o) for o in oraciones if o.strip()]
+    return oraciones, ideas
+
+
+def _tema_corto_contexto(
+    contexto, limite: int = 100, rng=None, variante: int = 0
+) -> str:
+    """Tema corto (1-2 oraciones/clausulas) en vez del parrafo entero.
+
+    Con ``limite`` alto (modo LOCAL 280) admite hasta ~160 chars para que el
+    texto conserve contexto; en campanas de 100 usa <=60 chars. ``variante``
+    rota la clausula inicial para que cada cuenta/texto use un trozo DISTINTO
+    del contexto (no todas publican el mismo bloque). Nunca lanza.
+    """
+    texto = " ".join(str(contexto or "").split())
+    if not texto:
+        return "lo que tenemos"
+    try:
+        tope = 160 if int(limite) >= 180 else 60
+    except (TypeError, ValueError):
+        tope = 60
+    try:
+        partes = [
+            p.strip()
+            for p in re.split(r"(?<=[.!?])\s+|[,;:]\s+|\n+", texto)
+            if p.strip()
+        ]
+    except Exception:
+        partes = [texto]
+    if not partes:
+        return "lo que tenemos"
+    try:
+        inicio = int(variante) % len(partes)
+    except (TypeError, ValueError):
+        inicio = 0
+    orden = partes[inicio:] + partes[:inicio]
+    elegido = ""
+    for parte in orden:
+        if not elegido:
+            elegido = parte
+        elif len(elegido) + 1 + len(parte) <= tope:
+            elegido = f"{elegido} {parte}".strip()
+        else:
+            break
+    if len(elegido) > tope:
+        corte = elegido.rfind(" ", 0, tope)
+        elegido = elegido[: corte if corte > 0 else tope].rstrip(" ,;:.-")
+    # El tema se inserta a media frase en las plantillas: minuscula inicial
+    # (salvo siglas como ESCOM o UNAM).
+    if elegido:
+        primera = elegido.split()[0] if elegido.split() else ""
+        if elegido[0].isupper() and not (
+            len(primera) > 1 and primera.isupper()
+        ):
+            elegido = elegido[0].lower() + elegido[1:]
+    return elegido or "lo que tenemos"
+
+
+def _cortar_limite_local(texto: str, limite: int = 100) -> str:
+    """Corta a ``limite`` en cierre de frase o ultima palabra completa.
+
+    A diferencia de ``_acotar_limite`` respeta limites pequenos (20+), sin
+    agregar "…" ni partir palabras. Nunca lanza.
+    """
+    t = str(texto or "").strip()
+    try:
+        limite = max(20, min(280, int(limite)))
+    except (TypeError, ValueError):
+        limite = 100
+    if len(t) <= limite:
+        return t
+    corte = None
+    for signo in (".", "!", "?"):
+        pos = t.rfind(signo, 0, limite)
+        if pos >= max(8, limite // 2) and (corte is None or pos > corte):
+            corte = pos
+    if corte is not None:
+        return t[: corte + 1].strip()
+    pos = t.rfind(" ", 0, limite)
+    if pos <= 0:
+        return t[:limite].rstrip()
+    return t[:pos].rstrip()
+
+
+def _limite_menor_40(limite) -> bool:
+    """True si ``limite`` normalizado queda por debajo de 40 (edge 20..39)."""
+    try:
+        return max(20, min(280, int(limite))) < 40
+    except (TypeError, ValueError):
+        return False
+
+
+def _asegurar_no_tag_final(texto: str, limite: int = 100) -> str:
+    """Garantiza que el texto NO termine en hashtag (aun con limite bajo).
+
+    Con limites muy chicos el recorte puede dejar el hashtag como ultima
+    palabra; aqui se agrega un cierre corto si cabe o se reconstruye una
+    plantilla minima con el primer tag EN MEDIO. Nunca lanza.
+    """
+    t = str(texto or "").strip()
+    if not t:
+        return t
+    try:
+        if not _hashtag_al_final(t):
+            return t
+    except Exception:
+        return t
+    try:
+        lim = max(20, min(280, int(limite)))
+    except (TypeError, ValueError):
+        lim = 100
+    try:
+        tags = list(dict.fromkeys(
+            m.group(0) for m in re.finditer(
+                r"#[A-Za-z0-9ÁÉÍÓÚÜÑáéíóúüñ_]+", t
+            )
+        ))
+    except Exception:
+        tags = []
+    if not tags:
+        return t
+    for sufijo in (" fin.", " ya.", " hoy."):
+        if len(t) + len(sufijo) <= lim:
+            return f"{t}{sufijo}"
+    tag = tags[0]
+    grupo = " ".join(tags)
+    for plantilla in (
+        f"Hoy {grupo} fin.",
+        f"Hoy {tag} fin.",
+        f"{tag} es clave hoy.",
+        f"Hablamos de {tag} hoy.",
+    ):
+        if len(plantilla) <= lim and not _hashtag_al_final(plantilla):
+            return plantilla
+    try:
+        limpio = re.sub(r"#[A-Za-z0-9ÁÉÍÓÚÜÑáéíóúüñ_]+", " ", t)
+        limpio = _limpiar_espacios_y_saltos(limpio)
+        if limpio:
+            return _cortar_limite_local(limpio, lim)
+    except Exception:
+        pass
+    return t
+
+
+def _acotar_diverso(texto: str, limite: int = 100) -> str:
+    """Corte seguro para 20..280: usa `_cortar_limite_local` si <40.
+
+    ``_acotar_limite``/``_recortar_limite_hashtag`` tienen un piso historico de
+    40; para ``limite=20`` se usa el corte local (sin "…" ni palabras a
+    medias). Nunca lanza.
+    """
+    try:
+        lim = max(20, min(280, int(limite)))
+    except (TypeError, ValueError):
+        lim = 100
+    if lim < 40:
+        return _cortar_limite_local(texto, lim)
+    return _acotar_limite(texto, lim)
+
+
+def _formatear_perfil_local(texto: str, perfil: str) -> str:
+    """Ajusta minimamente el texto al perfil (formal 3 bloques / popular 1)."""
+    try:
+        clave = normalizar_perfil(perfil)
+    except Exception:
+        clave = ""
+    t = str(texto or "").strip()
+    if not t:
+        return t
+    if clave == "formal":
+        if "\n\n" not in t and len(t) > 90:
+            partes = re.split(r"(?<=[.!?])\s+", t, maxsplit=2)
+            if len(partes) >= 3:
+                return f"{partes[0]}\n\n{partes[1]}\n\n{' '.join(partes[2:])}".strip()
+        return t
+    if clave == "popular":
+        t = re.sub(r"\n{2,}", " ", t)
+        frases = re.split(r"(?<=[.!?])\s+", t)
+        if len(frases) > 2:
+            t = " ".join(frases[:2]).strip()
+        return " ".join(t.split())
+    return t
+
+
+def _insertar_hashtags_diversos(texto: str, hashtags, limite: int, rng) -> str:
+    """Integra un subconjunto 1..len de ``hashtags`` EN MEDIO (nunca al final).
+
+    ``hashtags=None`` o vacio: no agrega ninguno. Solo usa los pedidos (jamás
+    inventa). Respeta ``limite`` recortando el cuerpo antes de insertar.
+    Nunca lanza.
+    """
+    t = str(texto or "").strip()
+    if hashtags is None:
+        return t
+    try:
+        pedidos = _normalizar_hashtags_pedidos(hashtags)
+    except Exception:
+        pedidos = []
+    if not pedidos:
+        return t
+    try:
+        k = rng.randint(1, len(pedidos))
+        indices = sorted(rng.sample(range(len(pedidos)), k))
+    except Exception:
+        indices = [0]
+    subset = [pedidos[i] for i in indices]
+    if not subset:
+        return t
+    grupo = " ".join(subset)
+    try:
+        presupuesto = max(10, int(limite) - len(grupo) - 2)
+    except (TypeError, ValueError):
+        presupuesto = max(10, 100 - len(grupo) - 2)
+    cuerpo = _cortar_limite_local(_RE_TAG_COMPARAR.sub(" ", t), presupuesto)
+    cuerpo = _limpiar_espacios_y_saltos(cuerpo)
+    if not cuerpo:
+        cuerpo = "Hoy toca hablar de esto"
+    try:
+        colocado = colocar_hashtag_en_medio(cuerpo, hashtag=subset[0])
+        if len(subset) > 1:
+            colocado = _reemplazar_tag_exacto(
+                colocado, subset[0], grupo
+            )
+    except Exception:
+        colocado = f"{cuerpo} {grupo}"
+    colocado = _limpiar_espacios_y_saltos(colocado)
+    if _hashtag_al_final(colocado) and len(subset) > 1:
+        # La reubicacion de `colocar_hashtag_en_medio` ya deja texto detras;
+        # este guardia cubre casos raros de cuerpos muy cortos.
+        colocado = f"{colocado} Gracias."
+    resultado = _cortar_limite_local(colocado, limite)
+    # Con limites muy chicos el recorte puede llevarse el hashtag: se
+    # reconstruye una plantilla minima que SI lo conserva EN MEDIO.
+    if subset and subset[0].lower() not in resultado.lower():
+        for plantilla in (
+            f"Hoy {subset[0]} fin.",
+            f"{subset[0]} es clave hoy.",
+            f"{subset[0]} hoy.",
+        ):
+            if len(plantilla) <= limite:
+                resultado = plantilla
+                break
+    return _asegurar_no_tag_final(resultado, limite)
+
+
+def _componer_variacion_diversa(
+    ideas: list,
+    tema: str,
+    angulo_idx: int,
+    rng,
+    perfil: str = "",
+) -> str:
+    """Compone UNA variante con una estructura/angulo distinto (nunca lanza).
+
+    Usa 1-3 ideas reordenadas y conectores distintos segun ``angulo_idx``.
+    El mismo indice con otro ``rng`` produce otra variante. No devuelve el
+    base literal (el llamador lo verifica ademas con similitud).
+    """
+    piezas = list(ideas or []) or list(_IDEAS_GENERICAS)
+    n = len(piezas)
+    try:
+        orden = list(range(n))
+        rng.shuffle(orden)
+    except Exception:
+        orden = list(range(n))
+
+    def pick(k: int) -> str:
+        return piezas[orden[k % n]]
+
+    i0 = pick(0)
+    i1 = pick(1) if n > 1 else _IDEAS_GENERICAS[1]
+    i2 = pick(2) if n > 2 else _CIERRES_DIVERSOS[0]
+    conector = _CONECTORES_DIVERSOS[
+        (int(angulo_idx) + (orden[0] if orden else 0)) % len(_CONECTORES_DIVERSOS)
+    ]
+    cierre = _CIERRES_DIVERSOS[
+        (int(angulo_idx) * 3 + (orden[-1] if orden else 0)) % len(_CIERRES_DIVERSOS)
+    ]
+    sep = "\n\n" if normalizar_perfil(perfil) == "formal" else " "
+    a = int(angulo_idx) % 20
+
+    if a == 0:
+        return f"{conector}: {i0}. {i1}. {cierre}"
+    if a == 1:
+        return f"¿Qué opinan de esto? {i0}. {i1}."
+    if a == 2:
+        return f"Les cuento que {_minuscula_inicial(i0)}. {i1}. {cierre}"
+    if a == 3:
+        return f"Por un lado, {_minuscula_inicial(i0)}. Por otro, {_minuscula_inicial(i1)}."
+    if a == 4:
+        return f"Mi recomendación es clara: {_minuscula_inicial(i0)}. {i1}."
+    if a == 5:
+        return f"Ojo con esto: {_minuscula_inicial(i0)}. {i1}."
+    if a == 6:
+        return f"Entiendo la situación: {_minuscula_inicial(i0)}. {i1}."
+    if a == 7:
+        return f"Hay que decirlo ya: {_minuscula_inicial(i0)}. {i1}."
+    if a == 8:
+        return f"En resumen, {_minuscula_inicial(i0)} y {_minuscula_inicial(i1)}."
+    if a == 9:
+        return f"Lo cierto es que {_minuscula_inicial(i0)}. {i1}. {cierre}"
+    if a == 10:
+        return f"Ustedes dirán, pero {_minuscula_inicial(i0)}. {i1}."
+    if a == 11:
+        return f"{i1}. {i0}. {cierre}"
+    if a == 12:
+        return f"Es como pasa siempre: {_minuscula_inicial(i0)}. {i1}."
+    if a == 13:
+        return f"Y sí, {_minuscula_inicial(i0)}. {i1}. {cierre}"
+    if a == 14:
+        return f"Debido a esto, {_minuscula_inicial(i0)}. Por eso {_minuscula_inicial(i1)}."
+    if a == 15:
+        return f"{i0}. {cierre}"
+    if a == 16:
+        return f"Miren, {_minuscula_inicial(i0)}. {i1}. ¿Qué harían ustedes?"
+    if a == 17:
+        return (
+            f"Punto uno: {_minuscula_inicial(i0)}.{sep}"
+            f"Punto dos: {_minuscula_inicial(i1)}.{sep}"
+            f"Punto tres: {_minuscula_inicial(i2)}."
+        )
+    if a == 18:
+        # Estructura "todas las ideas": las reordena y las encadena.
+        cuerpo = ". ".join(
+            _minuscula_inicial(pick(k)) for k in range(min(n, 6))
+        )
+        return f"Hablando de {tema}, {cuerpo}. {cierre}"
+    return f"Yo lo veo así: {_minuscula_inicial(i0)}. {i1}. {i2}"
+
+
+def generar_variaciones_locales_diversas(
+    base: str,
+    cantidad: int,
+    registro: str = "",
+    perfil: str = "",
+    hashtags=None,
+    evitar=None,
+    limite: int = 100,
+    semilla=None,
+) -> list[str]:
+    """Genera ``cantidad`` variaciones REALMENTE distintas SIN IA.
+
+    Analiza el ``base`` en oraciones/clausulas y compone cada variante con una
+    estructura/angulo distinto (>=12): reordena ideas, cambia conectores,
+    aperturas y cierres, aplica sinonimos seguros y respeta el registro
+    (politica/activista/ciudadana) y el perfil (formal/ciudadano/popular).
+    Evita similitud (umbral de cita) contra ``evitar`` y entre las generadas;
+    si no alcanza, al menos cambia apertura/estructura/cierre y NUNCA devuelve
+    el base literal.
+
+    - ``hashtags``: None = no agrega hashtags (los llamadores de citas pasan
+      la lista explicita); lista/str no vacio = SOLO un subconjunto 1..len de
+      los pedidos, EN MEDIO y nunca al final.
+    - ``limite`` se normaliza a [20, 280] y se corta en cierre de frase o
+      ultima palabra completa.
+    - ``semilla`` opcional para reproducibilidad (default aleatoria).
+
+    Devuelve EXACTAMENTE ``cantidad`` strings (cantidad<=0 -> []). Nunca lanza.
+    """
+    try:
+        n = int(cantidad)
+    except (TypeError, ValueError):
+        n = 0
+    if n <= 0:
+        return []
+    try:
+        limite = max(20, min(280, int(limite)))
+    except (TypeError, ValueError):
+        limite = 100
+    base = " ".join(str(base or "").split())
+    try:
+        semilla_base = int(semilla) if semilla is not None else random.randrange(1, 10 ** 9)
+    except (TypeError, ValueError):
+        semilla_base = random.randrange(1, 10 ** 9)
+    except Exception:
+        semilla_base = 7
+
+    oraciones, ideas = _analizar_base_diversa(base)
+    base_norm = normalizar_para_comparar(base)
+    tema = ""
+    if oraciones:
+        tema = _tema_corto_contexto(oraciones[0], limite)
+    if not tema:
+        tema = "lo que tenemos"
+    evitar_lista = _lista_textos(evitar)
+    aceptados: list = []
+
+    def _construir(slot: int, intento: int) -> str:
+        rng = random.Random(semilla_base + slot * 1013 + intento * 7919)
+        angulo = (slot + intento * 3) % 20
+        texto = _componer_variacion_diversa(
+            ideas, tema, angulo, rng, perfil=perfil
+        )
+        texto = _sinonimizar_local(texto, rng, max_cambios=1 + (intento % 2))
+        texto = _formatear_perfil_local(texto, perfil)
+        texto = _insertar_hashtags_diversos(texto, hashtags, limite, rng)
+        texto = _humanizar_por_registro(texto, registro, semilla=semilla_base + slot * 37 + intento)
+        texto = _quitar_signos_por_registro(texto, registro)
+        if hashtags is not None:
+            try:
+                pedidos = _normalizar_hashtags_pedidos(hashtags)
+            except Exception:
+                pedidos = []
+            if pedidos and limite >= 40:
+                texto = garantizar_texto_hashtag(
+                    texto, pedidos, limite=limite,
+                    semilla=semilla_base + slot * 53 + intento,
+                )
+        texto = _cortar_limite_local(texto, limite)
+        texto = _asegurar_no_tag_final(texto, limite)
+        # No devolver jamas el base literal (ni normalizado).
+        if texto and normalizar_para_comparar(texto) == base_norm:
+            rng2 = random.Random(semilla_base + slot + 4241)
+            prefijo = _CONECTORES_DIVERSOS[rng2.randrange(len(_CONECTORES_DIVERSOS))]
+            texto = _cortar_limite_local(
+                f"{prefijo}: {_minuscula_inicial(texto)}", limite
+            )
+        return texto
+
+    for slot in range(n):
+        elegido = ""
+        ultimo = ""
+        for intento in range(48):
+            candidato = _construir(slot, intento)
+            if not candidato:
+                continue
+            ultimo = candidato
+            if (
+                normalizar_para_comparar(candidato) != base_norm
+                and texto_es_suficientemente_distinto(
+                    candidato, evitar_lista + aceptados, DIVERSIDAD_UMBRAL_CITA
+                )
+            ):
+                elegido = candidato
+                break
+        if not elegido:
+            # Best effort: estructura/cierre distinto aunque no baje del umbral.
+            rng = random.Random(semilla_base + slot * 97 + 313)
+            cierre = _CIERRES_DIVERSOS[rng.randrange(len(_CIERRES_DIVERSOS))]
+            abridor = _CONECTORES_DIVERSOS[rng.randrange(len(_CONECTORES_DIVERSOS))]
+            base_txt = ultimo or _construir(slot, 0)
+            candidato = _cortar_limite_local(
+                f"{abridor}: {_minuscula_inicial(base_txt)} {cierre}", limite
+            )
+            if not candidato or candidato in aceptados or normalizar_para_comparar(candidato) == base_norm:
+                candidato = _cortar_limite_local(
+                    f"{base_txt} ({slot + 1})", limite
+                )
+            elegido = candidato or f"Opinión {slot + 1} sobre el tema."
+        aceptados.append(elegido)
+    return aceptados[:n]
+
+
 class GeneradorContenido:
     def __init__(self):
         self.ultimo_error = ""
-        openai.api_key = settings.openai_api_key
+        api_key, _ = _config_openai()
+        openai.api_key = api_key
+        _log_config_openai("gpt-4o-mini")
 
     # ------------------------------------------------------------------ #
     # Llamada a OpenAI (compatible con openai 0.28 y >= 1.0)
@@ -44,11 +902,15 @@ class GeneradorContenido:
         """Hace una llamada de chat y devuelve el texto.
 
         Guarda `self.ultimo_error` y propaga la excepcion para que el
-        llamador decida como continuar.
+        llamador decida como continuar. Usa ``OPENAI_API_BASE`` (si existe)
+        para hablar con un proxy compatible con OpenAI.
         """
+        api_key, api_base = _config_openai()
         try:
             if hasattr(openai, "OpenAI"):  # openai >= 1.0
-                client = openai.OpenAI(api_key=settings.openai_api_key)
+                client = openai.OpenAI(
+                    **_opciones_cliente_openai(api_key, api_base)
+                )
                 response = client.chat.completions.create(
                     model="gpt-4o-mini",
                     messages=[{"role": "user", "content": prompt}],
@@ -57,7 +919,9 @@ class GeneradorContenido:
                 return (response.choices[0].message.content or "").strip()
 
             # openai 0.28.x
-            openai.api_key = settings.openai_api_key
+            openai.api_key = api_key
+            if api_base:
+                openai.api_base = api_base
             response = openai.ChatCompletion.create(
                 model="gpt-4o-mini",
                 messages=[{"role": "user", "content": prompt}],
@@ -225,8 +1089,10 @@ class GeneradorContenido:
         entrenamiento: str = "",
         registro: str = "",
         perfil: str = "",
+        evitar=None,
+        limite: int = 100,
     ) -> list[str]:
-        """Genera EXACTAMENTE 'cantidad' versiones distintas y unicas de 'base'.
+        """Genera EXACTAMENTE 'cantidad' versiones REALMENTE distintas de 'base'.
 
         `registro` ("politica"/"ciudadana"/"") agrega las reglas de estilo al
         prompt para que las variaciones respeten el registro de la cuenta.
@@ -234,8 +1100,28 @@ class GeneradorContenido:
         del perfil (3 bloques / par de renglones / un renglon casual) y
         garantiza hashtag integrado en medio del texto.
 
-        Nunca lanza excepcion: si OpenAI falla o no alcanza, rellena con
-        variaciones locales y, en ultimo caso, con sufijos numerados.
+        ``evitar`` (antes de ``limite``): textos ya usados en la campana que la
+        IA NO debe reutilizar ni reformular; tambien se usan para filtrar la
+        similitud y para el prompt "NO REPITAS".
+
+        ``limite`` (SIEMPRE el ultimo parametro, default 100): máximo de
+        caracteres de cada variación. Con 100 el corte es el histórico; el modo
+        LOCAL usa 280 (límite de X) para que la cita salga completa.
+
+        Estrategia anti-repeticion:
+        1. Un angulo narrativo distinto por slot (``ANGULOS_VARIACION``) y
+           lotes <=25 cuando se piden mas.
+        2. Filtro determinista de exactos y SIMILARES (``DIVERSIDAD_UMBRAL_CITA``)
+           contra ``evitar`` y contra lo ya aceptado.
+        3. Hasta 2 llamadas extra SOLO para los faltantes, con los angulos
+           faltantes y una lista "NO REPITAS".
+        4. Relleno con el generador local diverso (nunca con el base tal cual).
+        5. Re-chequeo de similitud tras acotar; los textos que colisionan se
+           sustituyen por otra variante local con otro angulo.
+
+        Nunca lanza excepcion y siempre devuelve ``cantidad`` strings (si es
+        humanamente imposible bajar todos del umbral, al menos ninguno es
+        identico y cambian apertura/estructura/cierre).
         """
         try:
             cantidad = int(cantidad)
@@ -243,23 +1129,99 @@ class GeneradorContenido:
             cantidad = 0
         if cantidad <= 0:
             return []
-
-        base = (base or "").strip()
-        perfil_norm = normalizar_perfil(perfil)
-        textos: list[str] = []
-
         try:
-            prompt = (
-                f"Genera EXACTAMENTE {cantidad} versiones distintas y únicas de la "
-                "siguiente cita. Mantén el mismo sentido, pero varía la "
-                "redacción, el orden de las ideas y las palabras. Cada texto debe "
-                "tener un MÁXIMO ESTRICTO de 100 caracteres (incluyendo "
-                "hashtags y espacios)."
+            limite = max(20, min(280, int(limite)))
+        except (TypeError, ValueError):
+            limite = 100
+
+        base = " ".join((base or "").split())
+        perfil_norm = normalizar_perfil(perfil)
+        evitar_lista = _lista_textos(evitar)
+        base_norm = normalizar_para_comparar(base)
+        aceptados: list[str] = []
+        regla_oro = (
+            REGLA_MAX_100
+            if limite == 100
+            else (
+                "REGLA DE ORO: EL TEXTO FINAL DEBE TENER UN MÁXIMO ESTRICTO DE "
+                f"{limite} CARACTERES EN TOTAL, INCLUYENDO HASHTAGS Y ESPACIOS. "
+                "SÉ MUY BREVE Y DIRECTO."
             )
+        )
+
+        def _postprocesar(texto) -> str:
+            """Limpieza + estilo + hashtag de perfil + corte duro (nunca lanza)."""
+            try:
+                t = self._limpiar_texto(texto)
+            except Exception:
+                return ""
+            if not t:
+                return ""
+            if narrativa and _fuga_narrativa(t, narrativa):
+                logger.warning(
+                    "Se detecto fuga de la narrativa; se descarta la "
+                    "variacion de IA y se usa fallback local"
+                )
+                return ""
+            t = _quitar_signos_por_registro(t, registro)
+            if perfil_norm:
+                try:
+                    t = colocar_hashtag_en_medio(t)
+                except Exception:
+                    pass
+            t = _acotar_diverso(t, limite)
+            return _asegurar_no_tag_final(t, limite)
+
+        def _aceptar(texto) -> bool:
+            """Agrega ``texto`` si es distinto de base/evitar/aceptados."""
+            try:
+                crudo = self._limpiar_texto(texto)
+            except Exception:
+                return False
+            if not crudo:
+                return False
+            # Copia CASI literal del base: se detecta ANTES de acotar (si se
+            # compara el recorte de 100 chars contra un base de 350 la
+            # similitud artificialmente baja y la IA colaria el mismo texto).
+            if base_norm and similitud_textos(crudo, base) >= 0.90:
+                return False
+            t = _postprocesar(crudo)
+            if not t:
+                return False
+            if base_norm and normalizar_para_comparar(t) == base_norm:
+                return False
+            if base_norm and similitud_textos(t, base) >= 0.90:
+                return False
+            if not texto_es_suficientemente_distinto(
+                t, evitar_lista + aceptados, DIVERSIDAD_UMBRAL_CITA
+            ):
+                return False
+            aceptados.append(t)
+            return True
+
+        def _construir_prompt(pedir: int, angulos: list, no_repetir) -> str:
+            prompt = (
+                f"Genera EXACTAMENTE {pedir} versiones REALMENTE distintas de la "
+                "siguiente cita. Mantén el mismo sentido, pero cambia el angulo, "
+                "el orden de las ideas, la apertura, la estructura y las "
+                f"palabras. Cada texto con un MÁXIMO ESTRICTO de {limite} "
+                "caracteres (incluyendo hashtags y espacios)."
+            )
+            if limite != 100:
+                prompt += (
+                    " Cada texto debe quedar COMPLETO, con su frase de cierre, "
+                    "nunca cortado a la mitad."
+                )
             prompt += _reglas_registro(registro, incluir_limite=False)
-            prompt += f"\n{REGLA_MAX_100}\n"
+            prompt += f"\n{regla_oro}\n"
             prompt += bloque_estilo_perfil(perfil_norm)
             prompt += _reglas_trasfondo()
+            prompt += bloque_diversidad(
+                pedir,
+                evitar=no_repetir,
+                tipo="cita",
+                angulos=angulos,
+            )
             prompt += (
                 "\nLas variaciones conservan el SENTIDO de la CITA BASE y el "
                 "REGISTRO/PERFIL de la cuenta; PROHIBIDO incorporar datos, "
@@ -283,130 +1245,202 @@ class GeneradorContenido:
                 '["texto1", "texto2", ...]. No incluyas numeración, prefijos ni '
                 "texto adicional fuera del JSON."
             )
+            return prompt
 
-            content = self._chat(prompt, temperature=0.9)
-
-            # 1) Array JSON de strings (o dict con lista).
+        # 1) Lotes <=25 para cubrir la cantidad pedida. Si la IA falla o
+        #    devuelve vacio se corta la fase (el relleno local cubre todo).
+        ia_disponible = True
+        for inicio in range(0, cantidad, _MAX_VARIACIONES_POR_LLAMADA):
+            if len(aceptados) >= cantidad:
+                break
+            pedir = min(_MAX_VARIACIONES_POR_LLAMADA, cantidad - inicio)
+            angulos = _angulos_para(
+                pedir,
+                [ANGULOS_VARIACION[(inicio + k) % len(ANGULOS_VARIACION)]
+                 for k in range(pedir)],
+            )
             try:
-                parsed = json.loads(content)
-            except Exception:
-                parsed = None
-            if isinstance(parsed, list):
-                textos = [str(t) for t in parsed]
-            elif isinstance(parsed, dict):
-                for clave in ("textos", "variaciones", "citas", "resultados"):
-                    if isinstance(parsed.get(clave), list):
-                        textos = [str(t) for t in parsed[clave]]
-                        break
-
-            # 2) Fallback: '---' / parrafos / lineas.
-            if not textos:
-                if "---" in content:
-                    textos = content.split("---")
-                elif re.search(r"\n\s*\n", content):
-                    textos = re.split(r"\n\s*\n", content)
-                else:
-                    textos = content.splitlines()
-
-        except Exception as e:
-            self.ultimo_error = str(e)[:300]
-            logger.error(f"Error generando variaciones masivas: {e}")
-            textos = []
-
-        limpios = self._deduplicar(self._limpiar_texto(t) for t in textos)
-
-        # Red de seguridad: la narrativa/noticias son SOLO trasfondo. Si una
-        # variacion de la IA filtra material reconocible de la narrativa, se
-        # DESCARTA; el relleno local de abajo (generar_pool_variaciones) no
-        # lee la narrativa y garantiza la cantidad pedida.
-        if narrativa and limpios:
-            sin_fuga = []
-            for t in limpios:
-                if _fuga_narrativa(t, narrativa):
-                    logger.warning(
-                        "Se detecto fuga de la narrativa; se descarta la "
-                        "variacion de IA y se usa fallback local"
-                    )
-                    continue
-                sin_fuga.append(t)
-            limpios = sin_fuga
-
-        # Signos de apertura: activista/ciudadana NUNCA abren "¿"/"¡"
-        # (aplica tambien a los textos de la IA); politica conserva los suyos.
-        if limpios:
-            limpios = [
-                _quitar_signos_por_registro(t, registro) for t in limpios
-            ]
-
-        # Relleno 1: variaciones locales (sinonimos/hashtags).
-        if len(limpios) < cantidad:
-            try:
-                from activaciones.variaciones import generar_pool_variaciones
-                fallback = generar_pool_variaciones(base, cantidad - len(limpios))
+                content = self._chat(
+                    _construir_prompt(pedir, angulos, evitar_lista),
+                    temperature=0.9,
+                )
             except Exception as e:
-                logger.error(f"Error en fallback local de variaciones: {e}")
-                fallback = []
-            # El fallback local tambien se humaniza segun el registro
-            # (antes del hashtag para no deformar el tag).
-            humanizados = []
-            for idx, t in enumerate(fallback):
-                t = self._limpiar_texto(t)
-                t = _humanizar_por_registro(
-                    t, registro, semilla=len(limpios) + idx
+                self.ultimo_error = str(e)[:300]
+                logger.error(f"Error generando variaciones masivas: {e}")
+                ia_disponible = False
+                break
+            crudos = self._parsear_textos(content or "", pedir)
+            if not crudos:
+                ia_disponible = False
+                break
+            for crudo in crudos:
+                _aceptar(crudo)
+                if len(aceptados) >= cantidad:
+                    break
+
+        # 2) Hasta 2 llamadas extra SOLO para los faltantes, con los angulos
+        #    pendientes y una lista explicita "NO REPITAS".
+        for _extra in range(2):
+            faltan = cantidad - len(aceptados)
+            if faltan <= 0 or not ia_disponible:
+                break
+            pedir = min(faltan, _MAX_VARIACIONES_POR_LLAMADA)
+            angulos = _angulos_para(
+                pedir,
+                [ANGULOS_VARIACION[(len(aceptados) + k) % len(ANGULOS_VARIACION)]
+                 for k in range(pedir)],
+            )
+            no_repetir = _recortar_evitar(evitar_lista + aceptados)
+            try:
+                content = self._chat(
+                    _construir_prompt(pedir, angulos, no_repetir),
+                    temperature=0.95,
                 )
-                humanizados.append(t)
-            limpios = self._deduplicar(limpios + humanizados)
-
-        # Relleno 2 (ultimo caso): sufijos numerados para garantizar cantidad.
-        sufijo = 1
-        vistos = set(limpios)
-        while len(limpios) < cantidad:
-            variante = f"{base} ({sufijo})" if base else f"Variacion {sufijo}"
-            sufijo += 1
-            if variante not in vistos:
-                variante = _humanizar_por_registro(
-                    variante, registro, semilla=len(limpios) + sufijo + 5000
+            except Exception as e:
+                self.ultimo_error = str(e)[:300]
+                logger.error(
+                    f"Error en reintento de variaciones masivas: {e}"
                 )
-                if variante in vistos:
-                    continue
-                vistos.add(variante)
-                limpios.append(variante)
+                break
+            crudos = self._parsear_textos(content or "", pedir)
+            if not crudos:
+                break
+            for crudo in crudos:
+                _aceptar(crudo)
+                if len(aceptados) >= cantidad:
+                    break
 
-        # Regla de perfil: hashtag obligatorio integrado EN MEDIO (nunca al
-        # final), sin importar si el texto vino de OpenAI o del fallback.
-        if perfil_norm:
-            limpios = [colocar_hashtag_en_medio(t) for t in limpios]
+        # 3) Relleno con el generador local DIVERSO (sin IA): nunca el base
+        #    tal cual ni el fallback de sinonimos plano.
+        faltan = cantidad - len(aceptados)
+        if faltan > 0:
+            try:
+                locales = generar_variaciones_locales_diversas(
+                    base,
+                    faltan,
+                    registro=registro,
+                    perfil=perfil_norm,
+                    hashtags=None,
+                    evitar=evitar_lista + aceptados,
+                    limite=limite,
+                )
+            except Exception as e:
+                logger.error(f"Error en fallback local diverso: {e}")
+                locales = []
+            for local in locales:
+                if _aceptar(local) and len(aceptados) >= cantidad:
+                    break
 
-        # Corte DURO final (regla de oro): TODA variacion/cita <= 100 chars,
-        # venga de la IA o del relleno local/sufijos. Contrato "EXACTAMENTE
-        # cantidad": si el recorte crea duplicados se intenta variarlos (3
-        # intentos) y, si siguen colisionando, se CONSERVA el texto acotado
-        # (mejor un duplicado que devolver menos de los pedidos).
-        acotados: list[str] = []
-        vistos_final: set[str] = set()
-        for t in limpios:
-            t = _acotar_limite(t)
+        # 4) Ultimo recurso: cantidad EXACTA aunque sea humanamente imposible
+        #    bajar todos del umbral. Nunca devuelve el base literal.
+        intentos = 0
+        while len(aceptados) < cantidad and intentos < 400:
+            intentos += 1
+            candidato = ""
+            try:
+                local = generar_variaciones_locales_diversas(
+                    base,
+                    1,
+                    registro=registro,
+                    perfil=perfil_norm,
+                    hashtags=None,
+                    evitar=evitar_lista + aceptados,
+                    limite=limite,
+                    semilla=intentos,
+                )
+                candidato = local[0] if local else ""
+            except Exception:
+                candidato = ""
+            if not candidato:
+                try:
+                    candidato = _variar_hasta_unico(
+                        base or "Variacion", set(aceptados), intentos=12
+                    )
+                except Exception:
+                    candidato = base or "Variacion"
+            t = _postprocesar(candidato)
             if not t:
-                continue
-            if t in vistos_final:
-                for _ in range(3):
-                    try:
-                        alterno = _variar_hasta_unico(t, vistos_final)
-                    except Exception:
-                        alterno = ""
-                    alterno = _acotar_limite(alterno)
-                    if alterno and alterno not in vistos_final:
-                        t = alterno
-                        break
-            vistos_final.add(t)
-            acotados.append(t)
+                t = _acotar_diverso(
+                    f"Variacion {len(aceptados) + 1} sobre el tema", limite
+                )
+            if base_norm and normalizar_para_comparar(t) == base_norm:
+                t = _acotar_diverso(
+                    "Para ser claros: " + _minuscula_inicial(t), limite
+                )
+            aceptados.append(t)
 
-        return acotados[:cantidad]
+        # 5) Re-chequeo FINAL de similitud tras acotar/estilizar: si un texto
+        #    colisiona, se sustituye por otra variante local con otro angulo.
+        finales: list[str] = []
+        for t in aceptados[:cantidad]:
+            if texto_es_suficientemente_distinto(
+                t, evitar_lista + finales, DIVERSIDAD_UMBRAL_CITA
+            ):
+                finales.append(t)
+                continue
+            reemplazo = ""
+            for intento in range(24):
+                try:
+                    local = generar_variaciones_locales_diversas(
+                        base,
+                        1,
+                        registro=registro,
+                        perfil=perfil_norm,
+                        hashtags=None,
+                        evitar=evitar_lista + finales,
+                        limite=limite,
+                        semilla=9001 + intento * 131,
+                    )
+                    candidato = local[0] if local else ""
+                except Exception:
+                    candidato = ""
+                candidato = _postprocesar(candidato)
+                if (
+                    candidato
+                    and (not base_norm or normalizar_para_comparar(candidato) != base_norm)
+                    and texto_es_suficientemente_distinto(
+                        candidato, evitar_lista + finales, DIVERSIDAD_UMBRAL_CITA
+                    )
+                ):
+                    reemplazo = candidato
+                    break
+            if reemplazo:
+                finales.append(reemplazo)
+                continue
+            try:
+                alterno = _acotar_diverso(
+                    _variar_hasta_unico(t, set(finales)), limite
+                )
+            except Exception:
+                alterno = ""
+            if alterno and alterno not in finales:
+                finales.append(alterno)
+            else:
+                finales.append(t)
+
+        # 6) Garantia final del contrato: exactamente ``cantidad`` textos.
+        while len(finales) < cantidad:
+            try:
+                local = generar_variaciones_locales_diversas(
+                    base, 1, registro=registro, perfil=perfil_norm,
+                    hashtags=None, evitar=evitar_lista + finales,
+                    limite=limite, semilla=7777 + len(finales),
+                )
+                extra = local[0] if local else ""
+            except Exception:
+                extra = ""
+            extra = _postprocesar(extra) or "Variacion adicional sobre el tema"
+            finales.append(_acotar_diverso(extra, limite))
+
+        return finales[:cantidad]
 
     def generar_imagen(self, prompt: str) -> str:
+        api_key, api_base = _config_openai()
         try:
             if hasattr(openai, "OpenAI"):  # openai >= 1.0
-                client = openai.OpenAI(api_key=settings.openai_api_key)
+                client = openai.OpenAI(
+                    **_opciones_cliente_openai(api_key, api_base)
+                )
                 response = client.images.generate(
                     model="gpt-image-1",
                     prompt=prompt,
@@ -414,7 +1448,9 @@ class GeneradorContenido:
                     size="1024x1024",
                 )
             else:  # openai 0.28.x
-                openai.api_key = settings.openai_api_key
+                openai.api_key = api_key
+                if api_base:
+                    openai.api_base = api_base
                 response = openai.Image.create(
                     model="gpt-image-1",
                     prompt=prompt,
@@ -2929,6 +3965,12 @@ def _prompt_lote_mantenimiento(
         reglas_largo = "- Maximo 100 caracteres por texto.\n"
 
     partes.append(
+        bloque_diversidad(
+            n_textos,
+            tipo="comentario" if solo_comentarios else "post",
+        ).strip()
+    )
+    partes.append(
         "REGLA DE DIVERSIDAD (OBLIGATORIA):\n"
         "- NINGUN texto puede parecerse a otro del lote en TEMA ni en "
         "ESTRUCTURA: cada texto debe poder leerse como de una persona distinta.\n"
@@ -4678,6 +5720,8 @@ def _texto_hashtag_local(
     rng,
     inicio: int | None = None,
     subset_fijo=None,
+    angulo: int | None = None,
+    limite: int = 100,
 ) -> str:
     """Construye un post ORIGINAL local con el contexto y tags en medio.
 
@@ -4688,10 +5732,24 @@ def _texto_hashtag_local(
     ``inicio`` permite fijar el punto de rotacion por cuenta para que dos
     textos consecutivos de la misma cuenta NO repitan plantilla.
 
-    ``subset_fijo`` (kwarg nuevo AL FINAL, opcional): fuerza el subset EXACTO
-    de hashtags a integrar (en vez del subconjunto aleatorio). Lo usa el modo
-    Actividad para garantizar la cobertura total por cuenta; default None =
-    comportamiento anterior identico. Nunca lanza.
+    ``subset_fijo`` (opcional): fuerza el subset EXACTO de hashtags a integrar
+    (en vez del subconjunto aleatorio). Lo usa el modo Actividad para
+    garantizar la cobertura total por cuenta; default None = comportamiento
+    anterior.
+
+    ``angulo`` (opcional, antes de ``limite``): desplaza la plantilla elegida
+    para que cada cuenta/texto use una estructura distinta (diversidad).
+
+    IMPORTANTE (diversidad): en vez de repetir el parrafo completo de
+    ``contexto`` en TODAS las cuentas, usa un "tema corto" (primera
+    oracion/clausula, <=80 chars en campanas de 100; hasta ~160 en modo LOCAL
+    280). Conserva el sentido y evita que miles de cuentas publiquen el mismo
+    bloque de contexto.
+
+    ``limite`` (SIEMPRE el ultimo parametro, default 100): maximo de
+    caracteres del texto final; se pasa a `_recortar_limite_hashtag` en AMBAS
+    salidas (normal y del except). Default 100 = comportamiento historico;
+    el modo LOCAL usa hasta 280. Nunca lanza.
     """
     try:
         registro = _registro_normalizado(info)
@@ -4699,7 +5757,11 @@ def _texto_hashtag_local(
         plantillas = _plantillas_hashtags(registro, perfil) or (
             "Con esto de {contexto} uno valora lo que tiene; {tag} lo dice bien.",
         )
-        ctx = " ".join(str(contexto or "").split()) or "lo que tenemos"
+        try:
+            variante_tema = int(indice) + int(j) + int(angulo or 0)
+        except (TypeError, ValueError):
+            variante_tema = 0
+        ctx = _tema_corto_contexto(contexto, limite, variante=variante_tema)
         if tags or subset_fijo:
             if subset_fijo:
                 subset = [
@@ -4719,6 +5781,11 @@ def _texto_hashtag_local(
                 tag_grupo = "#Mexico"
             subset = [tag_grupo]
         k = int(indice) + int(j)
+        if angulo is not None:
+            try:
+                k += int(angulo)
+            except (TypeError, ValueError):
+                pass
         if inicio is None:
             try:
                 inicio = rng.randrange(len(plantillas))
@@ -4732,15 +5799,25 @@ def _texto_hashtag_local(
             .strip()
         )
         # Contrato de largo tambien para el fallback local.
-        return _recortar_limite_hashtag(texto, subset)
+        resultado = _recortar_limite_hashtag(texto, subset, limite=limite)
+        if _limite_menor_40(limite):
+            resultado = _cortar_limite_local(resultado, limite)
+        return _asegurar_no_tag_final(resultado, limite)
     except Exception as e:
         logger.error(f"Error construyendo texto local de hashtag: {e}")
-        ctx = " ".join(str(contexto or "").split()) or "lo que tenemos"
+        try:
+            ctx = _tema_corto_contexto(contexto, limite)
+        except Exception:
+            ctx = "lo que tenemos"
         tag = (tags or ["#Mexico"])[0]
-        return _recortar_limite_hashtag(
+        resultado = _recortar_limite_hashtag(
             f"Con esto de {ctx} uno aprende a valorarlo; {tag} lo dice bien.",
             [str(tag or "").strip()],
+            limite=limite,
         )
+        if _limite_menor_40(limite):
+            resultado = _cortar_limite_local(resultado, limite)
+        return _asegurar_no_tag_final(resultado, limite)
 
 
 def _garantizar_hashtag_pedido(texto: str, tags, semilla: int = 0) -> str:
@@ -4769,6 +5846,9 @@ def generar_textos_hashtags_por_cuenta(
     narrativa="",
     entrenamiento="",
     callback=None,
+    angulos=None,
+    evitar=None,
+    limite: int = 100,
 ) -> dict:
     """Genera posts ORIGINALES con hashtag(s), ``n_por_cuenta`` por cuenta.
 
@@ -4787,8 +5867,31 @@ def generar_textos_hashtags_por_cuenta(
     Agrupa por (registro, perfil) y pide a OpenAI en lotes de <=15 cuentas
     (``get_prompt_hashtags`` + temperature 0.9). Si OpenAI falla o devuelve
     menos, rellena con plantillas locales por registro/perfil. Nunca lanza.
-    ``callback(hechas, total)`` opcional para progreso. Firma congelada.
+    ``callback(hechas, total)`` opcional para progreso.
+
+    DIVERSIDAD (anti-repeticion): cada texto recibe un angulo/estructura
+    distinto (``ANGULOS_VARIACION`` o ``angulos``) y se filtran los textos
+    exactos y SIMILARES (``DIVERSIDAD_UMBRAL_POST``) contra TODOS los ya
+    aceptados de la campana (global y por cuenta). Si un candidato colisiona,
+    se genera un reemplazo local con otra plantilla/angulo; nunca dos textos
+    practicamente iguales. ``evitar`` permite vetar textos de llamadas previas.
+
+    ``angulos`` / ``evitar`` (antes de ``limite``): opcionales y
+    retrocompatibles. ``angulos`` es una lista/string para forzar el orden de
+    angulos; ``evitar`` son textos ya usados que no deben repetirse.
+
+    ``limite`` (SIEMPRE el ultimo parametro, default 100): maximo de
+    caracteres por texto, normalizado a [20, 280]. Con 100 (default) el
+    comportamiento es el historico (campanas masivas); el modo LOCAL pasa 280
+    para aprovechar el limite de X sin cortar el texto ni perder el hashtag.
     """
+    try:
+        limite = max(20, min(280, int(limite)))
+    except (TypeError, ValueError):
+        limite = 100
+    evitar_lista = _lista_textos(evitar)
+    angulos_base = _angulos_para(0, angulos)
+
     try:
         lista = list(cuentas_info or [])
     except Exception:
@@ -4817,6 +5920,8 @@ def generar_textos_hashtags_por_cuenta(
 
     resultado: list[list] = [[None] * n for _ in range(total)]
     vistos: set = set()
+    vistos_lista: list[str] = []
+    vistos_ia: list[str] = []
     rng = random.Random()
 
     # 1) OpenAI: lotes de <=15 cuentas agrupadas por (registro, perfil).
@@ -4846,6 +5951,10 @@ def generar_textos_hashtags_por_cuenta(
                         inicio:inicio + _MAX_CUENTAS_HASHTAGS_POR_LLAMADA
                     ]
                     cantidad = n * len(lote)
+                    angulos_lote = [
+                        angulos_base[k % len(angulos_base)]
+                        for k in range(cantidad)
+                    ]
                     try:
                         prompt = get_prompt_hashtags(
                             hashtags=" ".join(tags),
@@ -4856,6 +5965,9 @@ def generar_textos_hashtags_por_cuenta(
                             registro=registro,
                             personalidad=_personalidad_del_lote(lista, lote),
                             perfil=perfil,
+                            angulos=angulos_lote,
+                            evitar=evitar_lista + vistos_ia,
+                            limite=limite,
                         )
                         content = generador._chat(prompt, temperature=0.9)
                         textos_lote = generador._parsear_textos(content, cantidad)
@@ -4864,12 +5976,18 @@ def generar_textos_hashtags_por_cuenta(
                         textos_lote = []
 
                     limpios: list[str] = []
-                    vistos_lote: set = set()
                     for t in textos_lote or []:
                         t = generador._limpiar_texto(t)
-                        if t and t not in vistos_lote:
-                            vistos_lote.add(t)
+                        if t:
                             limpios.append(t)
+                    # Filtro anti-repeticion REAL: exactos y SIMILARES contra
+                    # todos los textos ya aceptados de la campana.
+                    limpios = elegir_textos_diversos(
+                        limpios,
+                        cantidad,
+                        evitar=evitar_lista + vistos_ia,
+                        umbral=DIVERSIDAD_UMBRAL_POST,
+                    )
 
                     pos = 0
                     for idx_cuenta in lote:
@@ -4878,6 +5996,7 @@ def generar_textos_hashtags_por_cuenta(
                                 break
                             if resultado[idx_cuenta][j] is None:
                                 resultado[idx_cuenta][j] = limpios[pos]
+                                vistos_ia.append(limpios[pos])
                                 pos += 1
                     _reportar()
 
@@ -4910,86 +6029,138 @@ def generar_textos_hashtags_por_cuenta(
                 return _garantizar_hashtag_pedido(texto, tags, semilla)
 
             def _acotar(texto: str) -> str:
-                return _recortar_limite_hashtag(texto, subset or tags)
+                return _recortar_limite_hashtag(
+                    texto, subset or tags, limite=limite
+                )
+
+            def _local_alt(giro: int) -> str:
+                """Variante local con OTRA plantilla/angulo, ya normalizada."""
+                alt = _texto_hashtag_local(
+                    info, contexto, tags, i + 7919 + giro, j + giro, rng,
+                    inicio=inicio_cuenta + 7919 + giro * 31,
+                    angulo=(i * n + j) * 11 + giro * 17,
+                    limite=limite,
+                )
+                alt = _estilizar(alt, rng.randint(1, 10 ** 9))
+                alt = _ajustar(alt, i * 1000 + j + 17 + giro * 101)
+                alt = _quitar_signos_por_registro(alt, registro)
+                alt = _acotar(alt)
+                alt = garantizar_texto_hashtag(
+                    alt, subset or tags,
+                    limite=limite,
+                    semilla=i * 1000 + j + 6161 + giro * 97,
+                )
+                if limite < 40:
+                    alt = _cortar_limite_local(alt, limite)
+                return _asegurar_no_tag_final(alt, limite)
 
             t = str(resultado[i][j] or "").strip()
             if not t:
-                t = _texto_hashtag_local(
-                    info, contexto, tags, i, j, rng, inicio=inicio_cuenta
-                )
+                t = _local_alt(0)
             elif narrativa:
                 # Red de seguridad: si el texto de la IA filtra la narrativa,
                 # se cambia por el texto local de la MISMA maquinaria (que no
                 # lee la narrativa), conservando hashtag pedido y estilo.
-                t = _reemplazo_sin_fuga(
-                    t,
-                    narrativa,
-                    lambda j=j: _texto_hashtag_local(
-                        info, contexto, tags, i, j, rng, inicio=inicio_cuenta
-                    ),
-                )
+                t = _reemplazo_sin_fuga(t, narrativa, lambda: _local_alt(0))
                 if not t:
-                    t = _texto_hashtag_local(
-                        info, contexto, tags, i, j, rng, inicio=inicio_cuenta
-                    )
+                    t = _local_alt(0)
             t = _estilizar(t, rng.randint(1, 10 ** 9))
             t = _ajustar(t, i * 1000 + j)
 
             # Prohibido: contexto pelado o simple concatenacion contexto+tag.
             if _es_copia_contexto(t, contexto):
-                t = _texto_hashtag_local(
-                    info, contexto, tags, i + 7919, j, rng,
-                    inicio=inicio_cuenta + 7919,
-                )
-                t = _estilizar(t, rng.randint(1, 10 ** 9))
-                t = _ajustar(t, i * 1000 + j + 17)
+                t = _local_alt(1)
 
-            # Unicidad global (y por cuenta, que es subconjunto).
-            if t in vistos:
-                alterno = _texto_hashtag_local(
-                    info, contexto, tags, i + 104729, j + len(vistos), rng,
-                    inicio=inicio_cuenta + 104729,
+            # DIVERSIDAD: exactos y SIMILARES contra todos los ya aceptados
+            # (global y por cuenta). Si colisiona, OTRA plantilla/angulo local.
+            colisiona = (
+                t in vistos
+                or not texto_es_suficientemente_distinto(
+                    t, evitar_lista + vistos_lista, DIVERSIDAD_UMBRAL_POST
                 )
-                alterno = _estilizar(alterno, rng.randint(1, 10 ** 9))
-                alterno = _ajustar(alterno, i * 1000 + j + 997)
-                if (
-                    alterno
-                    and alterno not in vistos
-                    and not _es_copia_contexto(alterno, contexto)
-                ):
-                    t = alterno
+            )
+            if colisiona:
+                reemplazo = ""
+                for giro in range(2, 18):
+                    alt = _local_alt(giro)
+                    if (
+                        alt
+                        and alt not in vistos
+                        and not _es_copia_contexto(alt, contexto)
+                        and texto_es_suficientemente_distinto(
+                            alt,
+                            evitar_lista + vistos_lista,
+                            DIVERSIDAD_UMBRAL_POST,
+                        )
+                    ):
+                        reemplazo = alt
+                        break
+                if reemplazo:
+                    t = reemplazo
                 else:
+                    # Ultimo recurso: variacion (cambia cierre/estructura) y
+                    # se vuelve a garantizar el hashtag.
                     t = _variar_hasta_unico(t, vistos)
+                    t = _estilizar(t, rng.randint(1, 10 ** 9))
                     t = _ajustar(t, i * 1000 + j + 1999)
+                    t = _acotar(t)
+                    t = garantizar_texto_hashtag(
+                        t, subset or tags,
+                        limite=limite,
+                        semilla=i * 1000 + j + 9929,
+                    )
 
             # Signos de apertura: activista/ciudadana nunca "¿"/"¡" (IA
             # incluida); politica conserva los signos correctos.
             t = _quitar_signos_por_registro(t, registro)
-            # Ultima pasada: solo el subset pedido, en medio, y <= 100 chars.
+            # Ultima pasada: solo el subset pedido, en medio, y <= limite.
             t = _ajustar(t, i * 1000 + j + 313)
             t = _acotar(t)
             # VALIDACION RIGUROSA (dueño): PASO FINAL de TODO texto (venga de
             # la IA, del fallback local o de cualquier recorte): el hashtag
-            # pedido queda NATURAL EN MEDIO y el largo no supera los 100.
+            # pedido queda NATURAL EN MEDIO y el largo no supera ``limite``
+            # (100 en campanas masivas; hasta 280 en el modo LOCAL).
             t = garantizar_texto_hashtag(
                 t, subset or tags,
-                limite=_MAX_LARGO_HASHTAG,
+                limite=limite,
                 semilla=i * 1000 + j + 6161,
             )
+            if limite < 40:
+                t = _cortar_limite_local(t, limite)
+            t = _asegurar_no_tag_final(t, limite)
+            # El recorte/garantia pudo volver a acercar dos textos: ultimo
+            # re-chequeo de similitud y sustitucion local si hace falta.
+            if not texto_es_suficientemente_distinto(
+                t, evitar_lista + vistos_lista, DIVERSIDAD_UMBRAL_POST
+            ):
+                for giro in range(18, 34):
+                    alt = _local_alt(giro)
+                    if (
+                        alt
+                        and alt not in vistos
+                        and not _es_copia_contexto(alt, contexto)
+                        and texto_es_suficientemente_distinto(
+                            alt,
+                            evitar_lista + vistos_lista,
+                            DIVERSIDAD_UMBRAL_POST,
+                        )
+                    ):
+                        t = alt
+                        break
             if t in vistos:
-                # El recorte/garantia pudo colisionar: se varía y se
-                # re-garantiza el texto alterno.
+                # Colision exacta: se varía y se re-garantiza el alterno.
                 alterno = _variar_hasta_unico(t, vistos)
                 alterno = _ajustar(alterno, i * 1000 + j + 4919)
                 alterno = _acotar(alterno)
                 alterno = garantizar_texto_hashtag(
                     alterno, subset or tags,
-                    limite=_MAX_LARGO_HASHTAG,
+                    limite=limite,
                     semilla=i * 1000 + j + 7919,
                 )
                 if alterno and alterno not in vistos:
                     t = alterno
             vistos.add(t)
+            vistos_lista.append(t)
             resultado[i][j] = t
             hechas += 1
             _reportar()
@@ -5008,7 +6179,13 @@ def generar_textos_hashtags_por_cuenta(
             clave = f"{clave}_{sufijo}"
         usados.add(clave)
         salida[clave] = [
-            str(resultado[i][j] or "").strip() for j in range(n)
+            _asegurar_no_tag_final(
+                _cortar_limite_local(
+                    str(resultado[i][j] or "").strip(), limite
+                ),
+                limite,
+            )
+            for j in range(n)
         ]
     return salida
 
@@ -5187,7 +6364,7 @@ def _agregar_menciones_actividad(texto, menciones) -> str:
 
 
 def _texto_actividad_local(
-    info, contexto, subset, indice, j, rng, inicio=None
+    info, contexto, subset, indice, j, rng, inicio=None, angulo=None
 ) -> str:
     """Post local del modo Actividad con el subset EXACTO de hashtags.
 
@@ -5196,13 +6373,15 @@ def _texto_actividad_local(
     ``{contexto}`` y ``{tag}`` (el subset COMPLETO unido por espacios) y acota
     a 100 con `_recortar_limite_hashtag` garantizando que TODOS los tags del
     subset queden integrados EN MEDIO. Sin subset reutiliza el comportamiento
-    clasico (hashtag global en medio). Nunca lanza.
+    clasico (hashtag global en medio). ``angulo`` (opcional) desplaza la
+    plantilla/estructura para diversificar textos de la misma cuenta. Nunca
+    lanza.
     """
     tags = [str(t).strip() for t in (subset or []) if str(t).strip()]
     try:
         return _texto_hashtag_local(
             info, contexto, tags, indice, j, rng,
-            inicio=inicio, subset_fijo=tags or None,
+            inicio=inicio, subset_fijo=tags or None, angulo=angulo,
         )
     except Exception as e:
         logger.error(f"Error construyendo texto local de Actividad: {e}")
@@ -5544,6 +6723,26 @@ def generar_textos_actividad_por_cuenta(
         _repartir_hashtags_actividad(tags, ns[i], rng) for i in range(total)
     ]
     todos_caben = _puede_llevar_grupo_hashtags(tags)
+    # Diversidad (mismo criterio que el rol hashtags): textos finales ya
+    # aceptados (global) y textos crudos de IA (para no repetir entre lotes).
+    vistos_lista: list[str] = []
+    vistos_ia: list[str] = []
+
+    def _angulo_slot(indice: int, numero: int) -> str:
+        """Angulo narrativo del slot (rota por cuenta y por texto)."""
+        try:
+            base = list(ANGULOS_VARIACION) or [""]
+            return base[(int(indice) * 7 + int(numero)) % len(base)]
+        except Exception:
+            return ""
+
+    def _indice_angulo(indice: int, numero: int) -> int:
+        try:
+            return (int(indice) * 7 + int(numero)) % max(
+                1, len(ANGULOS_VARIACION)
+            )
+        except Exception:
+            return 0
 
     # 1) IA: lotes de <=15 cuentas agrupadas por (registro, perfil). La
     #    cantidad pedida es la suma de textos del lote (n distinto por cuenta).
@@ -5577,6 +6776,11 @@ def generar_textos_actividad_por_cuenta(
                     cantidad = sum(ns[i] for i in lote)
                     if cantidad <= 0:
                         continue
+                    angulos_lote = [
+                        _angulo_slot(idx_cuenta, j)
+                        for idx_cuenta in lote
+                        for j in range(ns[idx_cuenta])
+                    ]
                     try:
                         prompt = get_prompt_hashtags(
                             hashtags=" ".join(tags),
@@ -5587,6 +6791,8 @@ def generar_textos_actividad_por_cuenta(
                             personalidad=_personalidad_del_lote(lista, lote),
                             perfil=perfil,
                             todos=todos_caben,
+                            angulos=angulos_lote,
+                            evitar=vistos_ia,
                         )
                         content = generador._chat(prompt, temperature=0.9)
                         textos_lote = generador._parsear_textos(
@@ -5599,12 +6805,18 @@ def generar_textos_actividad_por_cuenta(
                         textos_lote = []
 
                     limpios: list[str] = []
-                    vistos_lote: set = set()
                     for t in textos_lote or []:
                         t = generador._limpiar_texto(t)
-                        if t and t not in vistos_lote:
-                            vistos_lote.add(t)
+                        if t:
                             limpios.append(t)
+                    # Filtro anti-repeticion REAL (no solo exactos): descarta
+                    # los practicamente iguales a textos de lotes anteriores.
+                    limpios = elegir_textos_diversos(
+                        limpios,
+                        cantidad,
+                        evitar=vistos_ia,
+                        umbral=DIVERSIDAD_UMBRAL_POST,
+                    )
 
                     pos = 0
                     for idx_cuenta in lote:
@@ -5613,6 +6825,7 @@ def generar_textos_actividad_por_cuenta(
                                 break
                             if resultado[idx_cuenta][j] is None:
                                 resultado[idx_cuenta][j] = limpios[pos]
+                                vistos_ia.append(limpios[pos])
                                 pos += 1
 
     # 2) Normalizacion final por cuenta: relleno local, narrativa como
@@ -5639,66 +6852,107 @@ def generar_textos_actividad_por_cuenta(
                 if j < len(subsets) and subsets[j]
                 else list(tags)
             )
+            angulo = _angulo_slot(i, j)
+            idx_angulo = _indice_angulo(i, j)
 
-            def _local(sub=subset, k=j, giro=0):
+            def _local(sub=subset, k=j, giro=0, ang=idx_angulo):
+                # ``ang`` es un INDICE numerico: `_texto_hashtag_local` lo usa
+                # para rotar plantilla y tema corto (no el nombre del angulo).
                 return _texto_actividad_local(
                     info, contexto, sub,
-                    i + 7919 + giro, k, rng,
-                    inicio=inicio_cuenta + giro,
+                    i + 7919 + giro, k + giro, rng,
+                    inicio=inicio_cuenta + giro * 17,
+                    angulo=ang,
+                )
+
+            def _finalizar(texto, giro: int = 0) -> str:
+                return _finalizar_texto_actividad(
+                    texto, registro, subset,
+                    i * 1000 + j + 37 * giro,
+                )
+
+            def _aceptable(texto) -> bool:
+                """Distinto de TODOS los ya aceptados (exacto y similitud)."""
+                cand = str(texto or "").strip()
+                if not cand or cand in vistos:
+                    return False
+                if _es_copia_contexto(cand, contexto):
+                    return False
+                return texto_es_suficientemente_distinto(
+                    cand, vistos_lista, DIVERSIDAD_UMBRAL_POST
                 )
 
             t = str(resultado[i][j] or "").strip()
             if not t:
-                t = _local()
+                t = _finalizar(_local())
             elif narrativa:
                 # Red de seguridad: si el texto de la IA filtra la narrativa,
                 # se cambia por el texto local (que no lee la narrativa).
                 t = _reemplazo_sin_fuga(t, narrativa, _local)
                 if not t:
-                    t = _local()
-            t = _finalizar_texto_actividad(
-                t, registro, subset, i * 1000 + j
-            )
+                    t = _finalizar(_local())
+            t = _finalizar(t)
             # Prohibido: contexto pelado o simple concatenacion contexto+tag.
             if _es_copia_contexto(t, contexto):
-                t = _finalizar_texto_actividad(
-                    _local(giro=1), registro, subset, i * 1000 + j + 17
+                t = _finalizar(
+                    _local(giro=1, ang=_indice_angulo(i, j + 1)), giro=1
                 )
-            # Unicidad por cuenta y entre cuentas (best effort).
-            if not t or t in usados_cuenta or t in vistos:
-                for k in range(6):
-                    alt = _finalizar_texto_actividad(
-                        _local(giro=k + 1), registro, subset,
-                        i * 1000 + j + 31 * (k + 1),
-                    )
-                    if (
-                        alt
-                        and alt not in usados_cuenta
-                        and alt not in vistos
-                    ):
-                        t = alt
+
+            # DIVERSIDAD REAL: si colisiona (exacto o similar) se prueban
+            # OTROS giros/angulos/rotaciones locales (no solo sufijos).
+            if not _aceptable(t):
+                reemplazo = ""
+                total_ang = max(1, len(ANGULOS_VARIACION))
+                for k in range(1, 19):
+                    ang = (idx_angulo + k) % total_ang
+                    alt = _finalizar(_local(giro=k, ang=ang), giro=k)
+                    if _aceptable(alt):
+                        reemplazo = alt
                         break
+                if reemplazo:
+                    t = reemplazo
                 else:
+                    # Variacion estructural (cambia apertura/cierre/orden) y
+                    # re-garantiza el subset exacto de hashtags.
                     variado = _variar_actividad_unico(
                         t, registro, subset, usados_cuenta | vistos,
                         i * 1000 + j + 977,
                     )
                     if variado:
                         t = variado
+                    else:
+                        # Se prefiere un texto levemente similar antes que
+                        # devolver MENOS cantidad (contrato exacto).
+                        ang = (idx_angulo + 31) % total_ang
+                        t = _finalizar(_local(giro=31, ang=ang), giro=31)
             if not t:
-                t = _finalizar_texto_actividad(
-                    _local(giro=2), registro, subset, i * 1000 + j + 53
-                )
+                total_ang = max(1, len(ANGULOS_VARIACION))
+                ang = (idx_angulo + 2) % total_ang
+                t = _finalizar(_local(giro=2, ang=ang), giro=2)
             fila[j] = t
             usados_cuenta.add(t)
             vistos.add(t)
+            vistos_lista.append(t)
 
         # 3) Cobertura total por cuenta (defensiva: el plan ya la garantiza)
         #    y menciones al final (todas o ninguna), antes de cerrar la fila.
+        antes_cierre = list(fila)
         _cubrir_hashtags_actividad(fila, subsets, tags)
         if mencion_norm:
             for j in range(n):
                 fila[j] = _agregar_menciones_actividad(fila[j], mencion_norm)
+        # Refresca el registro global de diversidad con los textos FINALES
+        # (la cobertura o las menciones pudieron ajustar alguno).
+        base_lista = len(vistos_lista) - n
+        for j in range(n):
+            viejo = str(antes_cierre[j] or "").strip()
+            nuevo = str(fila[j] or "").strip()
+            if viejo and nuevo and viejo != nuevo:
+                vistos.discard(viejo)
+                vistos.add(nuevo)
+                pos = base_lista + j
+                if 0 <= pos < len(vistos_lista):
+                    vistos_lista[pos] = nuevo
         resultado[i] = fila
 
     # 4) Salida {usuario: [n textos]} (tolerante a usuario faltante/duplicado).

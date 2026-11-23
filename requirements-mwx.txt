@@ -1,0 +1,21 @@
+# Dependencias de ejecucion del MWX APP (solo campana local).
+# Instalacion limpia recomendada:
+#   python -m venv .venv-mwx
+#   .venv-mwx\Scripts\python.exe -m pip install -r requirements-mwx.txt
+
+# Versiones probadas del .exe (Chrome 157 / Python 3.11.9).
+selenium==4.48.0
+undetected-chromedriver==3.5.5
+sqlalchemy==2.0.35
+pydantic==2.9.2
+pydantic-settings==2.5.2
+python-dotenv==1.0.1
+loguru==0.7.2
+openai==0.28.0
+requests==2.32.3
+websockets==17.0.1
+pyotp==2.9.0
+
+# Solo para COMPILAR el .exe (build_mwx.bat los instala aparte):
+# pillow==10.4.0
+# pyinstaller==6.11.1

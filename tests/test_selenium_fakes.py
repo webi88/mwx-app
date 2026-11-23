@@ -1255,6 +1255,302 @@ def test_solo_retwittear_cita_ruta_rapida(check):
     )
 
 
+def _bot_publicar_con_urls(driver, toast, timeline, perfil, llamadas):
+    """Bot de `publicar_tweet` con las 3 fuentes de URL instrumentadas."""
+    bot = bot_con_driver(driver)
+    bot.base_url = "https://x.com"
+    bot._detectar_limite_cuenta = lambda: False
+    bot._abrir_compositor = lambda: FakeElement(driver)
+    bot._pegar_texto = lambda editor, texto: None
+    bot._verificar_publicacion = lambda: True
+    bot._esperar_boton_post_habilitado = lambda timeout=10, texto="": FakeBoton()
+
+    def _toast():
+        llamadas["toast"] += 1
+        return toast
+
+    def _timeline(texto_publicado="", timeout=3.0):
+        llamadas["timeline"] += 1
+        llamadas["timeline_timeout"] = timeout
+        return timeline
+
+    def _perfil(usuario):
+        llamadas["perfil"] += 1
+        return perfil
+
+    bot._obtener_enlace_toast = _toast
+    bot._obtener_enlace_reciente_timeline = _timeline
+    bot._obtener_ultimo_enlace = _perfil
+    return bot
+
+
+def test_enlace_toast(check):
+    print("URL real: _obtener_enlace_toast (0 navegaciones)")
+    driver = FakeDriver()
+    toast = FakeElement(driver, texto="Your post was sent")
+    toast.hijos = [
+        FakeElement(
+            driver,
+            tag="a",
+            contenteditable=False,
+            href="https://x.com/cuenta_test/status/555?s=20",
+        )
+    ]
+    driver.editores = [toast]
+    bot = bot_con_driver(driver)
+    url = bot._obtener_enlace_toast()
+    check(
+        "toast: devuelve el link de la propia cuenta",
+        url == "https://x.com/cuenta_test/status/555",
+        repr(url),
+    )
+    check(
+        "toast: limpia query string y fragmento",
+        "?" not in url and "#" not in url,
+        repr(url),
+    )
+
+    driver2 = FakeDriver()
+    toast2 = FakeElement(driver2)
+    toast2.hijos = [
+        FakeElement(
+            driver2,
+            tag="a",
+            contenteditable=False,
+            href="https://x.com/otra_cuenta/status/1",
+        )
+    ]
+    driver2.editores = [toast2]
+    bot2 = bot_con_driver(driver2)
+    check(
+        "toast: ignora un handle ajeno",
+        bot2._obtener_enlace_toast() == "",
+    )
+
+    # El propio toast puede SER el enlace (sin hijos).
+    driver3 = FakeDriver()
+    driver3.editores = [
+        FakeElement(
+            driver3,
+            tag="a",
+            contenteditable=False,
+            href="https://x.com/cuenta_test/status/9",
+        )
+    ]
+    bot3 = bot_con_driver(driver3)
+    check(
+        "toast: acepta el toast que ES el enlace",
+        bot3._obtener_enlace_toast() == "https://x.com/cuenta_test/status/9",
+    )
+
+    # Acepta el handle real conocido (cuenta cambio de @).
+    driver4 = FakeDriver()
+    toast4 = FakeElement(driver4)
+    toast4.hijos = [
+        FakeElement(
+            driver4,
+            tag="a",
+            contenteditable=False,
+            href="https://x.com/HandleReal/status/77",
+        )
+    ]
+    driver4.editores = [toast4]
+    bot4 = bot_con_driver(driver4)
+    bot4.handle_actual = "HandleReal"
+    check(
+        "toast: acepta el handle real de la cuenta",
+        bot4._obtener_enlace_toast() == "https://x.com/HandleReal/status/77",
+    )
+
+    # Sin driver / sin toast / fake sin find_elements: "" y nunca lanza.
+    bot5 = bot_con_driver(None)
+    check(
+        "toast: sin driver devuelve '' (nunca lanza)",
+        bot5._obtener_enlace_toast() == "",
+    )
+    bot6 = bot_con_driver(FakeDriver())
+    check(
+        "toast: sin elementos devuelve ''",
+        bot6._obtener_enlace_toast() == "",
+    )
+    bot7 = bot_con_driver(object())
+    check(
+        "toast: fake sin find_elements devuelve '' (nunca lanza)",
+        bot7._obtener_enlace_toast() == "",
+    )
+
+
+def test_enlace_toast_click(check):
+    print("URL real: toast con 'View' como BOTON (sin href) -> URL del post")
+
+    class _DriverToastBoton(FakeDriver):
+        """Toast con boton 'View' (div, sin href) que navega al post al clic."""
+
+        def __init__(self, texto_toast="Your post was sent"):
+            super().__init__()
+            self.clics = 0
+            self.toast = FakeElement(self, tag="div", texto=texto_toast)
+            self.boton = FakeElement(self, tag="div", texto="View")
+            self.toast.hijos = [self.boton]
+
+        def find_elements(self, by, sel):
+            if sel in ("[data-testid='toast']", "[role='alert']"):
+                return [self.toast]
+            return super().find_elements(by, sel)
+
+        def execute_script(self, script, *args):
+            if "btn.click()" in script:
+                self.clics += 1
+                self.current_url = "https://x.com/cuenta_test/status/987"
+                return None
+            return super().execute_script(script, *args)
+
+    driver = _DriverToastBoton()
+    bot = bot_con_driver(driver)
+    bot.base_url = "https://x.com"
+    check(
+        "toast boton: sin href devuelve '' (no se puede leer el link)",
+        bot._obtener_enlace_toast() == "",
+    )
+    url = bot._obtener_enlace_toast_click(timeout=0.5)
+    check(
+        "toast boton: pulsa View y devuelve la URL del post nuevo",
+        url == "https://x.com/cuenta_test/status/987",
+        repr(url),
+    )
+    check("toast boton: hizo exactamente UN clic", driver.clics == 1, str(driver.clics))
+
+    # Toast de ERROR (u otro aviso): NO se pulsa nada.
+    driver2 = _DriverToastBoton(texto_toast="Something went wrong. Try again")
+    bot2 = bot_con_driver(driver2)
+    bot2.base_url = "https://x.com"
+    check(
+        "toast boton: un toast de error no se pulsa",
+        bot2._obtener_enlace_toast_click(timeout=0.2) == ""
+        and driver2.clics == 0,
+        str(driver2.clics),
+    )
+
+    # Sin toast: "" y sin clics.
+    driver3 = FakeDriver()
+    bot3 = bot_con_driver(driver3)
+    bot3.base_url = "https://x.com"
+    check(
+        "toast boton: sin toast devuelve ''",
+        bot3._obtener_enlace_toast_click(timeout=0.2) == "",
+    )
+
+
+def test_publicar_tweet_toast_preferido(check):
+    print("URL real: publicar_tweet prefiere el toast (0 visitas al perfil)")
+    llamadas = {"toast": 0, "timeline": 0, "perfil": 0, "timeline_timeout": None}
+    driver = FakeDriver()
+    bot = _bot_publicar_con_urls(
+        driver,
+        toast="https://x.com/cuenta_test/status/444",
+        timeline="https://x.com/cuenta_test/status/555",
+        perfil="https://x.com/cuenta_test/status/666",
+        llamadas=llamadas,
+    )
+    resultado = bot.publicar_tweet("Texto con toast")
+    check(
+        "publicar toast: devuelve el link del TOAST",
+        resultado == "https://x.com/cuenta_test/status/444",
+        repr(resultado),
+    )
+    check(
+        "publicar toast: NO cae al timeline si el toast trae link",
+        llamadas["timeline"] == 0,
+        str(llamadas),
+    )
+    check(
+        "publicar toast: NO visita el perfil",
+        llamadas["perfil"] == 0,
+        str(llamadas),
+    )
+    check(
+        "publicar toast: ultima_url_publicada = link del toast",
+        bot.ultima_url_publicada == "https://x.com/cuenta_test/status/444",
+        repr(bot.ultima_url_publicada),
+    )
+
+
+def test_publicar_tweet_sin_perfil(check):
+    print("URL real: buscar_url_perfil=False NUNCA visita el perfil")
+    # (a) toast vacio + timeline vacio + perfil disponible -> sin perfil.
+    llamadas = {"toast": 0, "timeline": 0, "perfil": 0, "timeline_timeout": None}
+    driver = FakeDriver()
+    bot = _bot_publicar_con_urls(
+        driver,
+        toast="",
+        timeline="",
+        perfil="https://x.com/cuenta_test/status/666",
+        llamadas=llamadas,
+    )
+    resultado = bot.publicar_tweet(
+        "Texto sin link", buscar_url=True, buscar_url_perfil=False
+    )
+    check(
+        "buscar_url_perfil=False: exito True aunque no haya link",
+        resultado is True and bot.ultima_url_publicada == "",
+        f"{resultado!r} {bot.ultima_url_publicada!r}",
+    )
+    check(
+        "buscar_url_perfil=False: NO llama _obtener_ultimo_enlace",
+        llamadas["perfil"] == 0,
+        str(llamadas),
+    )
+    check(
+        "buscar_url_perfil=False: SI intenta toast y timeline",
+        llamadas["toast"] == 1 and llamadas["timeline"] == 1,
+        str(llamadas),
+    )
+    check(
+        "buscar_url_perfil=False: timeline con timeout corto 1.2s",
+        llamadas["timeline_timeout"] == 1.2,
+        str(llamadas),
+    )
+
+    # (b) default True conserva el fallback historico al perfil.
+    llamadas2 = {"toast": 0, "timeline": 0, "perfil": 0, "timeline_timeout": None}
+    driver2 = FakeDriver()
+    bot2 = _bot_publicar_con_urls(
+        driver2,
+        toast="",
+        timeline="",
+        perfil="https://x.com/cuenta_test/status/777",
+        llamadas=llamadas2,
+    )
+    resultado2 = bot2.publicar_tweet("Texto sin link")
+    check(
+        "buscar_url_perfil default True: fallback al perfil intacto",
+        resultado2 == "https://x.com/cuenta_test/status/777"
+        and llamadas2["perfil"] == 1,
+        f"{resultado2!r} {llamadas2}",
+    )
+
+    # (c) buscar_url=False: ni toast ni timeline ni perfil.
+    llamadas3 = {"toast": 0, "timeline": 0, "perfil": 0, "timeline_timeout": None}
+    driver3 = FakeDriver()
+    bot3 = _bot_publicar_con_urls(
+        driver3,
+        toast="https://x.com/cuenta_test/status/1",
+        timeline="https://x.com/cuenta_test/status/2",
+        perfil="https://x.com/cuenta_test/status/3",
+        llamadas=llamadas3,
+    )
+    resultado3 = bot3.publicar_tweet("Texto rapido", buscar_url=False)
+    check(
+        "buscar_url=False: ni toast ni timeline ni perfil",
+        resultado3 is True
+        and llamadas3["toast"] == 0
+        and llamadas3["timeline"] == 0
+        and llamadas3["perfil"] == 0
+        and bot3.ultima_url_publicada == "",
+        f"{resultado3!r} {llamadas3} {bot3.ultima_url_publicada!r}",
+    )
+
+
 class _WaitFalso:
     """Reemplazo de `WebDriverWait` para la rama de RT simple."""
 
@@ -1441,6 +1737,352 @@ def test_recuperar_interstitial(check):
 # --------------------------------------------------------------------------- #
 # P0-E: `login_con_cookies` (.pkl) NO declara exito si X pide login
 # --------------------------------------------------------------------------- #
+def test_error_chrome_deteccion(check):
+    print("Error de Chrome: URL/chrome-error, frases ES/EN y sin 'error' generico")
+    # URL chrome-error://chromewebdata (la que deja Chrome al fallar la carga).
+    driver = NavFake()
+    driver.current_url = "chrome-error://chromewebdata/"
+    driver.title = ""
+    bot = bot_con_driver(driver)
+    check(
+        "chrome error: detecta chrome-error://chromewebdata",
+        bot.es_pagina_error_chrome() is True,
+    )
+    check(
+        "chrome error: _es_pagina_error_x tambien la marca",
+        bot._es_pagina_error_x() is True,
+    )
+    check(
+        "chrome error: _estado_pagina devuelve 'error'",
+        bot._estado_pagina() == "error",
+        bot._estado_pagina(),
+    )
+
+    # Aunque el current_url parezca login, el documento de error de Chrome es
+    # un fallo de RED: NO se clasifica como muro de login.
+    driver = NavFake()
+    driver.current_url = "https://x.com/i/flow/login"
+    driver.title = "This site can't be reached"
+    bot = bot_con_driver(driver)
+    check(
+        "chrome error: manda sobre 'login' (fallo de red, no muro)",
+        bot._estado_pagina() == "error",
+        bot._estado_pagina(),
+    )
+
+    # Title/fuente en ingles y espanol.
+    driver = NavFake()
+    driver.title = "This site can’t be reached"
+    bot = bot_con_driver(driver)
+    check(
+        "chrome error: title EN \"This site can't be reached\"",
+        bot.es_pagina_error_chrome() is True,
+    )
+
+    driver = NavFake()
+    driver.title = "No se puede acceder a este sitio"
+    bot = bot_con_driver(driver)
+    check(
+        "chrome error: title ES \"No se puede acceder a este sitio\"",
+        bot.es_pagina_error_chrome() is True,
+    )
+
+    # Sin URL/title reconocibles, se inspecciona el HTML (documento de error).
+    driver = NavFake()
+    driver.current_url = ""
+    driver.title = ""
+    driver.page_source = "<html><body>Aw, Snap!</body></html>"
+    bot = bot_con_driver(driver)
+    check(
+        "chrome error: fuente 'Aw, Snap!'",
+        bot.es_pagina_error_chrome() is True,
+    )
+
+    driver = NavFake()
+    driver.current_url = ""
+    driver.title = ""
+    driver.page_source = (
+        "<html>No hay conexión a Internet. Pulsa el botón de recargar.</html>"
+    )
+    bot = bot_con_driver(driver)
+    check(
+        "chrome error: fuente ES 'No hay conexión... recargar'",
+        bot.es_pagina_error_chrome() is True,
+    )
+
+    driver = NavFake()
+    driver.current_url = ""
+    driver.title = ""
+    driver.page_source = "<html>net::ERR_PROXY_CONNECTION_FAILED</html>"
+    bot = bot_con_driver(driver)
+    check(
+        "chrome error: token ERR_PROXY_",
+        bot.es_pagina_error_chrome() is True,
+    )
+
+    driver = NavFake()
+    driver.current_url = ""
+    driver.title = ""
+    driver.page_source = "<html>net::ERR_TUNNEL_CONNECTION_FAILED</html>"
+    bot = bot_con_driver(driver)
+    check(
+        "chrome error: token ERR_TUNNEL_CONNECTION_FAILED",
+        bot.es_pagina_error_chrome() is True,
+    )
+
+    # Caso REAL (smoke Chrome 153): al fallar la carga de x.com la URL y el
+    # title SIGUEN siendo de x.com; solo el DOM (#main-frame-error) delata el
+    # error del navegador. La sonda DOM debe detectarlo sin leer page_source.
+    class _NavErrorDom(NavFake):
+        def execute_script(self, script, *args):
+            return "main-frame-error" in script
+
+    driver = _NavErrorDom()
+    driver.current_url = "https://x.com/home"
+    driver.title = "x.com"
+    driver.page_source = ""
+    bot = bot_con_driver(driver)
+    check(
+        "chrome error: sonda DOM detecta #main-frame-error con URL/title de x.com",
+        bot.es_pagina_error_chrome() is True,
+    )
+    check(
+        "chrome error: _estado_pagina prioriza el fallo de red sobre 'ok'",
+        bot._estado_pagina() == "error",
+        bot._estado_pagina(),
+    )
+
+    # Errores de RED de Chrome: transitorios (NO driver muerto) y recuperables
+    # re-navegando. Antes "disconnected" los marcaba como duros y abortaba.
+    check(
+        "chrome error: ERR_INTERNET_DISCONNECTED es transitorio (no driver)",
+        TwitterBot._es_error_driver_duro(
+            WebDriverException("unknown error: net::ERR_INTERNET_DISCONNECTED")
+        )
+        is False,
+    )
+    check(
+        "chrome error: net::ERR_NAME_NOT_RESOLVED es transitorio",
+        TwitterBot._es_error_driver_duro(
+            WebDriverException("unknown error: net::ERR_NAME_NOT_RESOLVED")
+        )
+        is False,
+    )
+    check(
+        "chrome error: net::ERR_PROXY_CONNECTION_FAILED es transitorio",
+        TwitterBot._es_error_driver_duro(
+            WebDriverException("net::ERR_PROXY_CONNECTION_FAILED")
+        )
+        is False,
+    )
+    check(
+        "chrome error: chromedriver 'connection refused' sigue siendo DURO",
+        TwitterBot._es_error_driver_duro(
+            WebDriverException("connection refused (chromedriver)")
+        )
+        is True,
+    )
+    check(
+        "chrome error: net::ERR_CONNECTION_REFUSED del SITIO es transitorio",
+        TwitterBot._es_error_driver_duro(
+            WebDriverException("unknown error: net::ERR_CONNECTION_REFUSED")
+        )
+        is False,
+    )
+
+    # Falso positivo: X normal con la palabra "error" NO es pagina de Chrome.
+    driver = NavFake()
+    driver.current_url = "https://x.com/home"
+    driver.title = "X"
+    driver.page_source = (
+        "<html><body>Hubo un error al cargar una imagen (normal en X).</body></html>"
+    )
+    bot = bot_con_driver(driver)
+    check(
+        "chrome error: 'error' generico NO da falso positivo",
+        bot.es_pagina_error_chrome() is False,
+    )
+    check(
+        "chrome error: _es_pagina_error_x tampoco la marca",
+        bot._es_pagina_error_x() is False,
+    )
+
+    # Sin driver / driver muerto: False, nunca lanza.
+    bot = bot_con_driver(None)
+    check(
+        "chrome error: sin driver -> False (nunca lanza)",
+        bot.es_pagina_error_chrome() is False,
+    )
+
+    # Diagnostico: conserva el prefijo y agrega chrome_error al final.
+    driver = NavFake()
+    driver.current_url = "chrome-error://chromewebdata/"
+    driver.title = "Aw, Snap!"
+    bot = bot_con_driver(driver)
+    diagnostico = bot._diagnostico_pagina()
+    check(
+        "diagnostico: conserva 'url=... title=... login=... error=...'",
+        diagnostico.startswith(
+            "url=chrome-error://chromewebdata/ title=Aw, Snap! login=False error="
+        ),
+        diagnostico,
+    )
+    check(
+        "diagnostico: agrega chrome_error=True",
+        "chrome_error=True" in diagnostico,
+        diagnostico,
+    )
+
+
+def test_get_acotado_reintenta_chrome(check):
+    print("_get_acotado: UN reintento si queda la pagina de error de Chrome")
+    driver = NavFake()
+
+    def get(url):
+        driver.get_calls.append(url)
+        if len(driver.get_calls) == 1:
+            driver.current_url = "chrome-error://chromewebdata/"
+            driver.title = "This site can't be reached"
+        else:
+            driver.current_url = "https://x.com/home"
+            driver.title = "X"
+
+    driver.get = get
+    bot = bot_con_driver(driver)
+    bot._esperar_documento_listo = lambda timeout=2: True
+    bot._get_acotado("https://x.com/home")
+    check(
+        "_get_acotado: reintenta UNA vez (2 gets)",
+        driver.get_calls
+        == ["https://x.com/home", "https://x.com/home"],
+        str(driver.get_calls),
+    )
+    check(
+        "_get_acotado: tras el reintento la pagina quedo usable",
+        bot.es_pagina_error_chrome() is False,
+    )
+
+    # Si la pagina de error persiste, NO hay tercer get (sin bucles).
+    driver2 = NavFake()
+
+    def get_persistente(url):
+        driver2.get_calls.append(url)
+        driver2.current_url = "chrome-error://chromewebdata/"
+        driver2.title = "This site can't be reached"
+
+    driver2.get = get_persistente
+    bot2 = bot_con_driver(driver2)
+    bot2._esperar_documento_listo = lambda timeout=2: True
+    bot2._get_acotado("https://x.com/home")
+    check(
+        "_get_acotado: maximo 2 gets aunque el error persista",
+        len(driver2.get_calls) == 2,
+        str(driver2.get_calls),
+    )
+
+
+def test_navegar_tolerante_chrome(check):
+    print("navegar_tolerante: la pagina de error de Chrome se cura con get completo")
+    original_sleep = time.sleep
+    try:
+        # Caso 1: get inicial deja chrome-error -> UN get completo recupera.
+        reloj = Reloj()
+        time.sleep = reloj.dormir
+        driver = NavFake()
+
+        def get(url):
+            driver.get_calls.append(url)
+            if len(driver.get_calls) == 1:
+                driver.current_url = "chrome-error://chromewebdata/"
+                driver.title = "This site can't be reached"
+            else:
+                driver.current_url = "https://x.com/home"
+                driver.title = "X"
+
+        driver.get = get
+        bot = bot_con_driver(driver)
+        bot._ahora = reloj.ahora
+        resultado = bot.navegar_tolerante("https://x.com/home")
+        check(
+            "navegar Chrome: se recupera con UN get completo (ok)",
+            resultado == "ok",
+            resultado,
+        )
+        check(
+            "navegar Chrome: 2 gets (inicial + recuperacion)",
+            len(driver.get_calls) == 2,
+            str(driver.get_calls),
+        )
+        check(
+            "navegar Chrome: NO hizo refrescos",
+            driver.refresh_calls == 0,
+            str(driver.refresh_calls),
+        )
+
+        # Caso 2: el error de Chrome persiste -> refresh acotados y "error".
+        reloj = Reloj()
+        time.sleep = reloj.dormir
+        driver2 = NavFake()
+
+        def get_persistente(url):
+            driver2.get_calls.append(url)
+            driver2.current_url = "chrome-error://chromewebdata/"
+            driver2.title = "No se puede acceder a este sitio"
+
+        driver2.get = get_persistente
+        bot2 = bot_con_driver(driver2)
+        bot2._ahora = reloj.ahora
+        resultado2 = bot2.navegar_tolerante("https://x.com/home")
+        check(
+            "navegar Chrome persistente: error controlado",
+            resultado2 == "error",
+            resultado2,
+        )
+        check(
+            "navegar Chrome persistente: sin bucles de get (2)",
+            len(driver2.get_calls) == 2,
+            str(driver2.get_calls),
+        )
+        check(
+            "navegar Chrome persistente: refrescos acotados (2)",
+            driver2.refresh_calls == 2,
+            str(driver2.refresh_calls),
+        )
+        check(
+            "navegar Chrome persistente: ultimo_error conserva 'pagina de error'",
+            "página de error" in (bot2.ultimo_error or ""),
+            bot2.ultimo_error,
+        )
+    finally:
+        time.sleep = original_sleep
+
+
+def test_recuperar_interstitial_chrome(check):
+    print("interstitial: pagina de error de Chrome delega en navegar_tolerante")
+    driver = FakeDriver()
+    bot = bot_con_driver(driver)
+    llamadas = []
+    bot.es_pagina_anti_bot = lambda: False
+    bot._es_pagina_error_x = lambda: True
+    bot.es_pagina_error_chrome = lambda: True
+    bot._url_en_x = lambda: False
+
+    def spy_navegar(url, timeout_total=45.0):
+        llamadas.append((url, timeout_total))
+        return "ok"
+
+    bot.navegar_tolerante = spy_navegar
+    check(
+        "interstitial Chrome: devuelve el resultado de navegar_tolerante",
+        bot._recuperar_interstitial("u") == "ok",
+    )
+    check(
+        "interstitial Chrome: delega con navegar_tolerante(url, 20s)",
+        llamadas == [("u", 20.0)],
+        str(llamadas),
+    )
+
+
 def test_login_pkl_muro_de_login(check):
     print("P0-E: login_con_cookies (.pkl) detecta el muro de login y delega")
 
@@ -2208,6 +2850,10 @@ def run(check):
         test_cita_prefiere_dialogo(check)
         test_navegar_tolerante_p1(check)
         test_recuperar_interstitial(check)
+        test_error_chrome_deteccion(check)
+        test_get_acotado_reintenta_chrome(check)
+        test_navegar_tolerante_chrome(check)
+        test_recuperar_interstitial_chrome(check)
         test_login_pkl_muro_de_login(check)
         test_login_cdp_inyeccion(check)
         test_login_password_revival(check)
@@ -2217,6 +2863,10 @@ def run(check):
         test_publicar_tweet_ciclo_limpio_una_vez(check)
         test_enlace_reciente_timeline(check)
         test_publicar_tweet_ruta_rapida(check)
+        test_enlace_toast(check)
+        test_enlace_toast_click(check)
+        test_publicar_tweet_toast_preferido(check)
+        test_publicar_tweet_sin_perfil(check)
         test_solo_retwittear_cita_ruta_rapida(check)
         test_solo_retwittear_rt_sin_link(check)
 

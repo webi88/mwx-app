@@ -101,6 +101,7 @@ import streamlit as st
 from web.ui import cabecera
 from web.operaciones._helpers import (
     aviso_pausadas,
+    aviso_verificacion,
     es_pausada_activacion,
     separar_pausadas,
 )
@@ -2532,6 +2533,7 @@ def _cita_masiva():
     # mantenimiento). El aviso muestra el conteo excluido.
     cuentas_activas, pausadas_activas = separar_pausadas(cuentas_activas)
     aviso_pausadas(pausadas_activas)
+    aviso_verificacion(corto=True)
     if secciones_param:
         n_seccion = sum(
             1 for f in cuentas_activas if f.get("seccion") == secciones_param[0]
@@ -2916,6 +2918,7 @@ def _por_roles():
     # mantenimiento). El aviso muestra el conteo excluido.
     cuentas, pausadas = separar_pausadas(cuentas)
     aviso_pausadas(pausadas)
+    aviso_verificacion(corto=True)
     st.caption(f"Cuentas twitter activas: **{len(cuentas)}**")
 
     if not cuentas:

@@ -22,6 +22,14 @@ _DOMINIOS_BLOQUEADOS = (
     ".googlevideo.com",
 )
 
+# Media pesada de X/Twitter que consume GB del proxy residencial: imagenes y
+# video. NO incluye abs.twimg.com (JS/CSS) ni upload.* (subida de imagenes).
+_DOMINIOS_MEDIA = (
+    ".pbs.twimg.com",
+    ".video.twimg.com",
+    ".ton.twimg.com",
+)
+
 
 def _env_activo(nombre: str, por_defecto: bool) -> bool:
     """Lee un booleano de entorno: 0/false/no/off desactivan."""
@@ -35,6 +43,14 @@ def _bloqueo_google_activo() -> bool:
     """True si el bloqueo de dominios Google esta activo (default si)."""
     try:
         return _env_activo("CHROME_BLOQUEAR_GOOGLE", True)
+    except Exception:
+        return True
+
+
+def _bloqueo_media_activo() -> bool:
+    """True si el bloqueo de media de X/Twitter esta activo (default si)."""
+    try:
+        return _env_activo("PROXY_BLOQUEAR_MEDIA", True)
     except Exception:
         return True
 
@@ -65,11 +81,11 @@ def _es_socket_cerrado(error) -> bool:
     return False
 
 
-def _host_bloqueado(host) -> bool:
-    """True si `host` (con o sin puerto) es de un dominio bloqueado.
+def _host_en_dominios(host, dominios) -> bool:
+    """True si `host` (con o sin puerto) cae en `dominios`.
 
     Normaliza a minusculas, quita el puerto final y compara por sufijo
-    exacto: `notgoogle.com` NO se bloquea. Nunca lanza.
+    exacto con punto: `notgoogle.com` NO se bloquea. Nunca lanza.
     """
     try:
         h = str(host or "").strip().lower()
@@ -82,12 +98,33 @@ def _host_bloqueado(host) -> bool:
         h = h.rstrip(".")
         if not h:
             return False
-        for dominio in _DOMINIOS_BLOQUEADOS:
+        for dominio in dominios:
             if h == dominio[1:] or h.endswith(dominio):
                 return True
         return False
     except Exception:
         return False
+
+
+def _host_bloqueado(host) -> bool:
+    """True si `host` (con o sin puerto) es de un dominio Google bloqueado."""
+    return _host_en_dominios(host, _DOMINIOS_BLOQUEADOS)
+
+
+def _host_bloqueado_media(hostport) -> bool:
+    """True si `hostport` es media pesada de X/Twitter (pbs/video/ton)."""
+    return _host_en_dominios(hostport, _DOMINIOS_MEDIA)
+
+
+def _formato_bytes(cantidad) -> str:
+    """Formatea bytes como KB + MB legibles (nunca lanza)."""
+    try:
+        valor = int(cantidad)
+    except Exception:
+        valor = 0
+    kb = valor / 1024.0
+    mb = kb / 1024.0
+    return f"{kb:.1f} KB ({mb:.2f} MB)"
 
 
 class LocalForwardProxy:
@@ -120,6 +157,12 @@ class LocalForwardProxy:
 
     El constructor es TOLERANTE: sin `host`/`port` validos arranca en modo
     directo (sin upstream), pensado para el modo dinamico de `aplicar_a_options`.
+
+    Ahorro de datos: en la ruta CON upstream responde 403 localmente a la media
+    pesada de X (`_DOMINIOS_MEDIA`, env `PROXY_BLOQUEAR_MEDIA`, default activo)
+    para que esos bytes nunca salgan al proxy residencial. `_relay` cuenta los
+    bytes de subida/bajada expuestos por `estadisticas()`, y `close()` deja UNA
+    linea INFO con el total (sin host ni credenciales).
     """
 
     # Tamano maximo de la cola de conexiones pendientes: si se llena, la
@@ -144,6 +187,11 @@ class LocalForwardProxy:
         self._server = None
         self._conns = set()
         self._lock = threading.Lock()
+        # Contadores de trafico (para medir el consumo del proxy residencial).
+        self._bytes_subida = 0   # cliente -> upstream (o destino en directo)
+        self._bytes_bajada = 0   # upstream (o destino) -> cliente
+        self._bytes_lock = threading.Lock()
+        self._estadisticas_logueadas = False
         self._running = False
         self.port_local = 0
         # Pool acotado de workers (tope real de hilos, independiente del
@@ -394,6 +442,20 @@ class LocalForwardProxy:
                 pass
             return
 
+        if _bloqueo_media_activo() and _host_bloqueado_media(hostport):
+            # Media pesada de X: se responde 403 localmente y esos bytes NUNCA
+            # llegan al proxy residencial (ahorro de GB).
+            logger.debug(
+                f"Forward proxy: {hostport} bloqueado (media de X/Twitter)"
+            )
+            try:
+                client.sendall(
+                    b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n"
+                )
+            except Exception:
+                pass
+            return
+
         upstream = None
         buf = b""
         status_line_bytes = b""
@@ -548,6 +610,48 @@ class LocalForwardProxy:
             return
         self._relay(client, upstream)
 
+    def _contar_bytes(self, es_subida, cantidad):
+        """Suma bytes al contador correspondiente (thread-safe, no lanza)."""
+        try:
+            with self._bytes_lock:
+                if es_subida:
+                    self._bytes_subida += int(cantidad)
+                else:
+                    self._bytes_bajada += int(cantidad)
+        except Exception:
+            pass
+
+    def estadisticas(self) -> dict:
+        """Copia thread-safe del trafico: `{"subida", "bajada", "total"}`.
+
+        Cuenta en modo proxy y en modo directo. Nunca lanza.
+        """
+        try:
+            with self._bytes_lock:
+                subida = int(self._bytes_subida)
+                bajada = int(self._bytes_bajada)
+            return {"subida": subida, "bajada": bajada, "total": subida + bajada}
+        except Exception:
+            return {"subida": 0, "bajada": 0, "total": 0}
+
+    def _log_estadisticas_finales(self):
+        """UNA linea INFO con el trafico total (sin host ni credenciales)."""
+        try:
+            if getattr(self, "_estadisticas_logueadas", False):
+                return
+            datos = self.estadisticas()
+            if datos["total"] <= 0:
+                return
+            self._estadisticas_logueadas = True
+            logger.info(
+                "Forward proxy: trafico "
+                f"subida={_formato_bytes(datos['subida'])} "
+                f"bajada={_formato_bytes(datos['bajada'])} "
+                f"total={_formato_bytes(datos['total'])}"
+            )
+        except Exception:
+            pass
+
     def _relay(self, a, b):
         sockets = [a, b]
         try:
@@ -559,6 +663,7 @@ class LocalForwardProxy:
                     data = s.recv(65536)
                     if not data:
                         return
+                    self._contar_bytes(s is a, len(data))
                     (b if s is a else a).sendall(data)
         except Exception:
             pass
@@ -621,3 +726,4 @@ class LocalForwardProxy:
                 pass
         # Los workers restantes son daemon y saldran solos al ver `_running`
         # en False y la cola vacia.
+        self._log_estadisticas_finales()

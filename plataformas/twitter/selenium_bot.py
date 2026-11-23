@@ -75,6 +75,21 @@ def _env_float_seg(nombre: str, por_defecto: float) -> float:
         return float(por_defecto)
 
 
+def _env_int(nombre: str, por_defecto: int) -> int:
+    """Lee un entero de entorno; usa el default si falta o es invalido.
+
+    Acepta `"2"` y `"2.0"` (algunos paneles guardan floats). Nunca lanza: el
+    llamador acota el resultado al rango que necesite.
+    """
+    try:
+        valor = os.environ.get(nombre)
+        if valor is None or not str(valor).strip():
+            return int(por_defecto)
+        return int(float(str(valor).strip()))
+    except Exception:
+        return int(por_defecto)
+
+
 @contextmanager
 def _page_load_timeout_acotado(driver, timeout_max: float = 25.0):
     """Baja TEMPORALMENTE el `page_load_timeout` del driver y lo RESTAURA.
@@ -161,8 +176,17 @@ def _marcar_proxy_x_valido(proxy: str) -> None:
 
 
 class TwitterBot:
-    def __init__(self, usuario: str):
+    # Fallback para instancias creadas sin `__init__` (tests/legado): `__init__`
+    # siempre fija el valor por instancia.
+    modo_local = False
+
+    def __init__(self, usuario: str, modo_local: bool = False):
         self.usuario = usuario
+        # Modo LOCAL (campaña en la computadora del dueño): Chrome SIEMPRE
+        # visible, SIN proxy (conexion directa, no se valida x.com) y pausas de
+        # confirmacion visual recortadas. Default False = comportamiento
+        # historico byte a byte.
+        self.modo_local = bool(modo_local)
         self.driver = None
         self.base_url = "https://x.com"
         self.cookies_path = resolver_ruta(f"data/cookies/twitter/{usuario}.pkl")
@@ -177,10 +201,18 @@ class TwitterBot:
         # `cerrar()` debe cerrarlo siempre (antes quedaba vivo un aceptador +
         # un hilo por conexion de Chrome por CADA navegador lanzado).
         self._fwd_proxy = None
+        # True si el navegador se abrio en `modo_local` CON forwarder dinamico
+        # (`iniciar_driver(proxy_dinamico=True)`): la campana local puede usar
+        # un proxy sticky por cuenta y `cambiar_cuenta` lo cambia en caliente.
+        # False = el modo local historico, conexion DIRECTA (sin proxy).
+        self._local_con_proxy = False
         # True cuando las cookies se inyectaron por CDP sin navegar
         # (`preparar_sesion_cdp`): los flujos van directo a la URL objetivo y,
         # si X pide login, hacen UN fallback a `login_con_cookies()`.
         self._sesion_cdp = False
+        # Ultimo estado del refresh de ENTRADA (`refrescar_pagina_rapido`):
+        # "ok"/"login"/"anti_bot"/"error"/"driver"/"skip". Solo diagnostico.
+        self.ultimo_refresh = ""
 
     @staticmethod
     def _ahora() -> float:
@@ -198,7 +230,38 @@ class TwitterBot:
             return time.time()
         except Exception:
             return 0.0
-    
+
+    def _pausa_visible(self, segundos: float) -> None:
+        """Espera de confirmacion visual. En modo local se recorta a <=0.2s."""
+        try:
+            valor = float(segundos)
+        except (TypeError, ValueError):
+            return
+        if valor <= 0:
+            return
+        if self.modo_local:
+            # Campaña local: no se regalan 5s por post; solo un vistazo.
+            valor = min(valor, 0.2)
+            logger.info(
+                f"Dejando {valor:g}s la pantalla visible para confirmacion "
+                "visual (modo local)"
+            )
+        elif settings.headless:
+            # En headless (Railway) no hay pantalla que mirar: sin espera.
+            return
+        else:
+            logger.info(
+                f"Dejando {valor:g}s la pantalla visible para confirmacion visual..."
+            )
+        time.sleep(valor)
+
+    def _pausa_humana(self) -> None:
+        """Pausa antes de pulsar publicar. En modo local es mas corta."""
+        if self.modo_local:
+            time.sleep(random.uniform(0.3, 0.8))
+        else:
+            time.sleep(random.uniform(1.8, 3.5))
+
     def _obtener_proxy(self) -> str:
         # Modo sin proxy: usa la IP del servidor (Railway) tal cual. Se
         # comprueba ANTES de tocar la BD/ProxyManager para no validar
@@ -266,6 +329,34 @@ class TwitterBot:
                 pickle.dump(cookies, f)
         except Exception as e:
             logger.warning(f"No se pudo escribir el .pkl de {self.usuario}: {e}")
+
+    def guardar_sesion_actual(self) -> bool:
+        """Guarda las cookies VIVAS del navegador en `.pkl` + BD. Nunca lanza.
+
+        Lo usa la campana local (con proxy) tras cada accion exitosa: Cloudflare
+        emite `cf_clearance` (y X renueva `ct0`) al resolver un reto y, sin
+        persistirlos, el reto/la verificacion volveria a pedirse al cambiar de
+        cuenta o en la siguiente corrida. Devuelve True si habia driver y
+        cookies para guardar.
+        """
+        try:
+            driver = self.driver
+            if driver is None:
+                return False
+            cookies = driver.get_cookies()
+            if not cookies:
+                return False
+            self._brandear_cuenta(cookies)
+            logger.debug(
+                f"Sesion de {self.usuario} guardada ({len(cookies)} cookies)"
+            )
+            return True
+        except Exception as e:
+            logger.debug(
+                f"No se pudo guardar la sesion de {self.usuario}: "
+                f"{type(e).__name__}: {e}"
+            )
+            return False
 
     def _cookies_auth_token(self) -> Optional[list]:
         """Cookie mínima (solo auth_token) para que el NAVEGADOR complete la sesión.
@@ -374,7 +465,7 @@ class TwitterBot:
             )
         return ua
     
-    def iniciar_driver(self, pantalla_externa: bool = False, proxy_dinamico: bool = False) -> bool:
+    def iniciar_driver(self, pantalla_externa: bool = False, proxy_dinamico: bool = False, modo_local: bool = None) -> bool:
         """Inicia Chrome para `self.usuario`.
 
         `proxy_dinamico=True` (pestaña persistente): Chrome SIEMPRE se enruta
@@ -383,7 +474,25 @@ class TwitterBot:
         salida en caliente con `cambiar_upstream()`. `proxy_dinamico=False`
         conserva el comportamiento anterior (solo se aplica proxy si la cuenta
         tiene uno).
+
+        `modo_local` (kwarg al final, default None = usa `self.modo_local`):
+        campaña en la computadora del dueño. Chrome SIEMPRE visible (nunca
+        `--headless`, aunque `settings.headless=True`), ventana normal
+        (1366x768) y timeouts de 30s en vez de 60s. El proxy depende de
+        `proxy_dinamico`:
+          * `proxy_dinamico=False` (historico): conexion DIRECTA (no llama
+            `_proxy_para_x()` ni usa proxy).
+          * `proxy_dinamico=True`: usa un proxy sticky por cuenta (el de la
+            BD o el fallback MX) y crea SIEMPRE el forwarder local para poder
+            cambiar el upstream al cambiar de cuenta (`_local_con_proxy`).
         """
+        local = bool(self.modo_local) if modo_local is None else bool(modo_local)
+        # El kwarg explicito tambien aplica al resto de la sesion
+        # (`cambiar_cuenta` y `_pausa_visible` leen `self.modo_local`).
+        self.modo_local = local
+        # Modo local CON proxy: el forwarder vive toda la campaña y
+        # `cambiar_cuenta` cambia el upstream en caliente.
+        self._local_con_proxy = bool(local and proxy_dinamico)
         self.ultimo_error = ""
         try:
             perfil = settings.profiles_dir / self.usuario
@@ -411,19 +520,28 @@ class TwitterBot:
             if ua:
                 options.add_argument(f"--user-agent={ua}")
             
-            if settings.headless:
+            if not local and settings.headless:
                 options.add_argument("--headless=new")
             
-            if pantalla_externa:
+            if local:
+                # Campaña local: una ventana normal, nunca headless.
+                options.add_argument("--window-size=1366,768")
+            elif pantalla_externa:
                 options.add_argument("--window-size=1920,1080")
             else:
                 options.add_argument("--window-size=1366,768")
             
-            proxy = self._proxy_para_x()
+            if local and not proxy_dinamico:
+                # Modo local historico: conexion directa (no se valida x.com
+                # ni se rota la sesion sticky, que costaba segundos por cuenta).
+                proxy = ""
+            else:
+                proxy = self._proxy_para_x()
             if proxy_dinamico:
-                # Pestaña persistente: SIEMPRE forwarder local (modo directo si
-                # la cuenta no tiene proxy) para poder cambiar el upstream en
-                # caliente al cambiar de cuenta.
+                # Pestaña persistente (servidor) Y modo local CON proxy:
+                # SIEMPRE forwarder local (modo directo si la cuenta no tiene
+                # proxy) para poder cambiar el upstream en caliente al cambiar
+                # de cuenta.
                 # El proxy local es de ESTE bot: se guarda para cerrarlo en
                 # `cerrar()`.
                 self._fwd_proxy = ProxyManager().aplicar_a_options(
@@ -443,8 +561,9 @@ class TwitterBot:
             options.page_load_strategy = "eager"
 
             self.driver = crear_chrome(options, version_main=detectar_chrome_version())
-            self.driver.set_page_load_timeout(60)
-            self.driver.set_script_timeout(60)
+            timeout_pagina = 30 if local else 60
+            self.driver.set_page_load_timeout(timeout_pagina)
+            self.driver.set_script_timeout(timeout_pagina)
 
             # Stealth en cada documento nuevo + UA por CDP (incluye
             # userAgentMetadata y Accept-Language coherentes con el UA).
@@ -533,6 +652,7 @@ class TwitterBot:
         usuario: str,
         proxy: str = "",
         validar_proxy: bool = False,
+        refrescar: bool = True,
     ) -> bool:
         """Cambia la sesion EN CALIENTE a `usuario` sobre el MISMO Chrome.
 
@@ -549,12 +669,43 @@ class TwitterBot:
         - Si no hay `_fwd_proxy` y hace falta proxy, se avisa por WARNING: a un
           Chrome ya abierto no se le puede inyectar `--proxy-server`; las
           cookies igual se cambian.
+        - `self.modo_local` (campaña local SIN proxy): `proxy`/`validar_proxy`
+          se ignoran (`proxy_objetivo=""`), no se valida x.com y no se avisa
+          por proxy; la inyeccion de cookies por CDP y el resto no cambian.
+        - `self.modo_local` + `self._local_con_proxy` (campaña local CON
+          proxy): se usa el `proxy` explicito (o `_obtener_proxy()`) y se
+          FUERZA la validacion contra x.com (`_proxy_para_x()`, con
+          `_proxy_cache` limpio) para descartar al vuelo proxies muertos/407;
+          el upstream del forwarder se cambia en caliente. La limpieza de
+          cache se sigue omitiendo y `refrescar=False` se conserva.
+        - `refrescar=True` (default): despues de inyectar las cookies se hace
+          el refresh rapido de ENTRADA (`refrescar_pagina_rapido`): hasta
+          `REFRESH_ENTRADA_MAX` refrescos (default 2, clamp 0..4) para que la
+          pagina quede usable antes de publicar/citar (antes se inyectaban las
+          cookies sin navegar y la pagina podia quedar desactualizada o a medio
+          cargar). Es BEST-EFFORT: `login`/`anti_bot`/`error` NO cambian el
+          retorno (los flujos ya los manejan); solo un driver muerto
+          (`refresh` -> "driver") devuelve False. Se configura con
+          `REFRESH_AL_ENTRAR` (default 1; 0/false/no/off lo apaga),
+          `REFRESH_ENTRADA_MAX` (default 2) y `REFRESH_ENTRADA_TIMEOUT`
+          (default 3.0s; clamp 1.5..10). Con `refrescar=False` el
+          comportamiento es EXACTAMENTE el historico (ni refresh ni
+          navegacion).
+          En `modo_local` NUNCA se refresca (maxima velocidad: el plan local
+          rota de cuenta en CADA accion y cada refresh costaba ~6-8s por
+          publicacion): ni refresh ni navegacion, `ultimo_refresh` queda en
+          "skip" para no arrastrar el estado viejo de la cuenta anterior. Si la
+          sesion quedo mal, el dueño reinicia manualmente. El refresh global
+          (`refrescar_pagina_rapido`) sigue disponible y opt-in
+          (`REFRESH_AL_ENTRAR`) para las campañas masivas/persistentes.
         - Limpieza: `clearBrowserCookies` (+ fallback `delete_all_cookies`) es
           SINCRONA (rapida y critica para no mezclar sesiones);
           `clearBrowserCache` corre en un hilo daemon con tope
           `CAMBIO_CUENTA_CACHE_TIMEOUT` (env, default 3.0s; <=0 la omite): un
           hipo de Chrome/Windows de ~30s ya no puede frenar el cambio de cuenta
           (no borra cookies, asi que se solapa con la inyeccion sin riesgo).
+          En `modo_local` se OMITE `clearBrowserCache` (puede costar hasta 3s
+          por cambio); las cookies se limpian igual por CDP/`delete_all_cookies`.
         - Estado por cuenta que se resetea: `cookies_path`, `_ua_persistente`,
           `_proxy_cache`, `_sesion_cdp`, `ultima_url_publicada`,
           `cuenta_suspendida` y `ultimo_error`. (Escaneado de atributos: son
@@ -621,16 +772,30 @@ class TwitterBot:
                     self.driver.delete_all_cookies()
                 except Exception as e2:
                     logger.debug(f"delete_all_cookies fallo para {usuario}: {e2}")
-            self._limpiar_cache_no_bloqueante(usuario)
+            # En modo local `clearBrowserCache` (hasta 3s por cambio) no aporta:
+            # las cookies ya se limpiaron arriba y el cambio de cuenta debe ser
+            # lo mas rapido posible (con proxy o sin proxy).
+            if not self.modo_local:
+                self._limpiar_cache_no_bloqueante(usuario)
             t_limpieza = self._ahora()
 
-            # Proxy objetivo: explicito o el de la cuenta nueva.
-            proxy_objetivo = (proxy or "").strip()
-            if not proxy_objetivo:
-                proxy_objetivo = self._obtener_proxy()
-            if validar_proxy:
-                self._proxy_cache = None
-                proxy_objetivo = self._proxy_para_x()
+            # Proxy objetivo: explicito o el de la cuenta nueva. En modo local
+            # SIN forwarder se IGNORA por completo: conexion directa, sin
+            # leer/validar proxies (y sin WARNING si no hay forwarder). En
+            # modo local CON forwarder se valida SIEMPRE para descartar
+            # proxies vencidos (407) al cambiar de cuenta.
+            if self.modo_local and not self._local_con_proxy:
+                proxy_objetivo = ""
+            else:
+                proxy_objetivo = (proxy or "").strip()
+                if not proxy_objetivo:
+                    proxy_objetivo = self._obtener_proxy()
+                if self.modo_local:
+                    self._proxy_cache = None
+                    proxy_objetivo = self._proxy_para_x()
+                elif validar_proxy:
+                    self._proxy_cache = None
+                    proxy_objetivo = self._proxy_para_x()
 
             if self._fwd_proxy is not None:
                 self._fwd_proxy.cambiar_upstream(proxy_objetivo)
@@ -649,6 +814,40 @@ class TwitterBot:
             # Inyecta las cookies de la cuenta nueva sin navegar.
             ok = bool(self.preparar_sesion_cdp())
             t_cookies = self._ahora()
+
+            # Refresh rapido de ENTRADA (best-effort): con las cookies ya
+            # inyectadas por CDP, la pagina puede quedar desactualizada o a
+            # medio cargar. `refrescar_pagina_rapido` hace hasta 2 refrescos
+            # (o UNA navegacion a /home si el driver nunca cargo X) con
+            # presupuesto acotado. Solo un driver muerto invalida la cuenta;
+            # login/onboarding/anti-bot/error los maneja el flujo de la accion.
+            # En `modo_local` NUNCA se refresca (maxima velocidad): el plan
+            # local rota de cuenta en CADA accion y 2 refresh costaban ~6-8s
+            # por publicacion. Se deja `ultimo_refresh="skip"` explicito para
+            # no arrastrar un estado viejo ("login"/"anti_bot") de la cuenta
+            # anterior (lo lee `activaciones/local.py`).
+            estado_refresh = "skip"
+            if self.modo_local:
+                self.ultimo_refresh = "skip"
+            elif ok and refrescar:
+                try:
+                    estado_refresh = self.refrescar_pagina_rapido()
+                except Exception as e:
+                    # El metodo promete no lanzar; este guard es por si un
+                    # monkeypatch/test lo reemplaza por algo que lanza.
+                    logger.debug(
+                        f"cambiar_cuenta: refresh de entrada fallo para "
+                        f"{usuario}: {type(e).__name__}: {e}"
+                    )
+                    estado_refresh = "skip"
+                if estado_refresh == "driver":
+                    ok = False
+                    self.ultimo_error = (
+                        self.ultimo_error
+                        or "driver inservible tras entrar a la cuenta"
+                    )
+            t_refresh = self._ahora()
+
             if not ok:
                 self.ultimo_error = (
                     self.ultimo_error
@@ -661,11 +860,13 @@ class TwitterBot:
             try:
                 logger.debug(
                     f"perf @{usuario}: cambiar_cuenta total="
-                    f"{t_cookies - t_inicio:.2f}s "
+                    f"{t_refresh - t_inicio:.2f}s "
                     f"(ua={t_ua - t_inicio:.2f} "
                     f"limpieza={t_limpieza - t_ua:.2f} "
                     f"proxy={t_proxy - t_limpieza:.2f} "
-                    f"cookies={t_cookies - t_proxy:.2f})"
+                    f"cookies={t_cookies - t_proxy:.2f} "
+                    f"refresh={estado_refresh} "
+                    f"({t_refresh - t_cookies:.2f}s))"
                 )
             except Exception:
                 pass
@@ -1336,13 +1537,39 @@ class TwitterBot:
         "target closed",
     )
 
+    # Errores de RED/TUNEL del PROPIO Chrome al navegar (proxy residencial
+    # intermitente, DNS, internet caido). NO son driver muerto: la pagina de
+    # error de Chrome se puede recuperar re-navegando/refrescando. OJO:
+    # "err_internet_disconnected" contiene "disconnected", que antes se
+    # clasificaba como driver DURO y abortaba la accion sin reintento.
+    _SENALES_ERROR_RED_TRANSITORIA = (
+        "err_internet_disconnected",
+        "err_connection_closed",
+        "err_connection_reset",
+        "err_connection_timed_out",
+        "err_connection_aborted",
+        "err_name_not_resolved",
+        "err_proxy_",
+        "err_tunnel_connection_failed",
+        "err_empty_response",
+        "err_timed_out",
+        "err_ssl_",
+        "err_address_unreachable",
+        "err_network_changed",
+        "err_network_access_denied",
+        "net::err_",
+    )
+
     @classmethod
     def _es_error_driver_duro(cls, error) -> bool:
         """True si el error indica que hay que DESCARTAR la pestaña/driver.
 
         Cubre `InvalidSessionIdException`, `NoSuchDriverException`,
         `MaxRetryError` y sus mensajes tipicos ("connection refused", "tab
-        crashed", "cannot connect to chrome"...). Nunca lanza.
+        crashed", "cannot connect to chrome"...). Los errores de RED/TUNEL de
+        Chrome (`ERR_CONNECTION_*`, `ERR_INTERNET_DISCONNECTED`,
+        `ERR_NAME_NOT_RESOLVED`...) NO son driver muerto: son transitorios y se
+        recuperan re-navegando (auto), asi que devuelven False. Nunca lanza.
         """
         try:
             if isinstance(
@@ -1351,14 +1578,128 @@ class TwitterBot:
             ):
                 return True
             texto = str(error or "").lower()
+            # Los `net::ERR_*` (incluido `net::ERR_CONNECTION_REFUSED` de un
+            # SITIO/proxy caido) son fallos de RED recuperables. El puerto local
+            # del chromedriver rechazando la conexion llega como
+            # "Connection refused" SIN `net::err_` (o como MaxRetryError, que
+            # ya retorno arriba): eso SI es driver muerto.
+            if any(senal in texto for senal in cls._SENALES_ERROR_RED_TRANSITORIA):
+                return False
+            if "connection refused" in texto:
+                return True
             return any(senal in texto for senal in cls._SENALES_ERROR_DRIVER_DURO)
         except Exception:
             return False
 
-    def _es_pagina_error_x(self) -> bool:
-        """True si la pagina actual es el interstitial de error de X (o blank).
+    # Tokens INEQUIVOCOS de la pagina de error de Chrome/Google (NO se usa
+    # "error" a secas: el HTML normal de X tambien lo contiene). Cubren la
+    # pestana `chrome-error://chromewebdata` y los fallos de red/proxy reales.
+    _FRAGMENTOS_ERROR_CHROME = (
+        "chrome-error://",
+        "chromewebdata",
+        "chrome://network-error",
+        "err_connection_",
+        "err_proxy_",
+        "err_name_not_resolved",
+        "err_internet_disconnected",
+        "err_timed_out",
+        "err_empty_response",
+        "err_tunnel_connection_failed",
+    )
+    # Frases visibles (ES/EN) de la pagina "No se puede acceder a este sitio"
+    # / "This site can't be reached" / "Aw, Snap!". Incluye variantes sin
+    # acentos porque el `page_source` real a veces las pierde.
+    _FRASES_ERROR_CHROME = (
+        "this site can't be reached",
+        "this site can’t be reached",
+        "no se puede acceder a este sitio",
+        "no se puede acceder a esta página",
+        "no se puede acceder a esta pagina",
+        "no hay conexión a internet",
+        "no hay conexion a internet",
+        "this page isn't working",
+        "this page isn’t working",
+        "aw, snap!",
+        "¡oh, no!",
+        "oh, no!",
+        "se ha producido un error al mostrar esta página",
+        "se ha producido un error al mostrar esta pagina",
+        "pulsa el botón de recargar",
+        "pulsa el boton de recargar",
+        "press the reload button",
+    )
 
-        Combina `_frase_error_pagina()` ("something went wrong"/"algo salió
+    def es_pagina_error_chrome(self) -> bool:
+        """True si la pagina actual es la de error de Chrome/Google.
+
+        Detecta la pestana `chrome-error://chromewebdata` y los errores de red
+        (`ERR_CONNECTION_*`, `ERR_PROXY_*`, `ERR_NAME_NOT_RESOLVED`,
+        `ERR_INTERNET_DISCONNECTED`, `ERR_TIMED_OUT`, `ERR_EMPTY_RESPONSE`,
+        `ERR_TUNNEL_CONNECTION_FAILED`...) por URL, title y `page_source`, ademas
+        de las frases visibles ES/EN ("No se puede acceder a este sitio", "This
+        site can't be reached", "No hay conexión a Internet", "Aw, Snap!"...).
+        NO usa palabras genericas como "error" (falsos positivos con X). Nunca
+        lanza: sin driver o con el driver muerto devuelve False.
+        """
+        try:
+            if not self.driver:
+                return False
+        except Exception:
+            return False
+        try:
+            url = (self.driver.current_url or "").lower()
+        except Exception:
+            url = ""
+        try:
+            title = (self.driver.title or "").lower()
+        except Exception:
+            title = ""
+        if any(frag in url for frag in self._FRAGMENTOS_ERROR_CHROME):
+            return True
+        if any(frag in title for frag in self._FRAGMENTOS_ERROR_CHROME):
+            return True
+        if any(frase in title for frase in self._FRASES_ERROR_CHROME):
+            return True
+        # SONDA DOM BARATA (un execute_script, ~ms): la pagina de error de
+        # Chrome se sirve A VECES bajo la MISMA URL pedida (p. ej.
+        # `https://x.com/home` con `href="x.com"` de title) y solo el DOM
+        # delata el fallo (`#main-frame-error`, `body.neterror`,
+        # `.error-code`). Sin esto, un fallo de red en x.com pasaria inadvertido
+        # y habria que esperar timeouts.
+        try:
+            es_error_dom = self.driver.execute_script(
+                "return !!(document.getElementById('main-frame-error') ||"
+                " (document.body && document.body.classList &&"
+                " document.body.classList.contains('neterror')));"
+            )
+            if es_error_dom:
+                return True
+        except Exception:
+            pass
+        # `page_source` en X pesa varios MB: NO se lee en cada navegacion
+        # normal. Solo se inspecciona el HTML cuando la URL NO esta en X o el
+        # title vino vacio (con la sonda DOM ya cubierto el caso de x.com).
+        try:
+            en_x = self._url_en_x()
+        except Exception:
+            en_x = False
+        if en_x and title:
+            return False
+        try:
+            fuente = (self.driver.page_source or "").lower()
+        except Exception:
+            fuente = ""
+        if any(frag in fuente for frag in self._FRAGMENTOS_ERROR_CHROME):
+            return True
+        return any(frase in fuente for frase in self._FRASES_ERROR_CHROME)
+
+    def _es_pagina_error_x(self) -> bool:
+        """True si la pagina actual es el interstitial de error de X, la pagina
+        de error de Chrome/Google o blank.
+
+        Combina `es_pagina_error_chrome()` (`chrome-error://chromewebdata`,
+        "No se puede acceder a este sitio", ERR_CONNECTION_*...),
+        `_frase_error_pagina()` ("something went wrong"/"algo salió
         mal"/"rate limit"/"try again", tambien en el title) con URL
         vacia/`chrome://`/`about:` y title vacio estando en x.com, que es como
         suele quedar el interstitial real. Nunca lanza.
@@ -1369,6 +1710,11 @@ class TwitterBot:
             return True
         if not url or url.startswith("chrome://") or url.startswith("about:"):
             return True
+        try:
+            if self.es_pagina_error_chrome():
+                return True
+        except Exception:
+            pass
         if self._frase_error_pagina():
             return True
         try:
@@ -1440,9 +1786,17 @@ class TwitterBot:
     def _estado_pagina(self) -> str:
         """Clasifica la pagina actual: "login", "error" u "ok".
 
-        "login" manda sobre "error" (una pagina de login jamas es usable).
-        Nunca lanza.
+        La pagina de error de CHROME/Google manda sobre "login": es un fallo
+        de RED del navegador, no un muro de sesion (el `current_url` puede
+        seguir siendo `/i/flow/login` aunque el documento sea la pagina de
+        error). Para el resto, "login" manda sobre "error" (una pagina de login
+        jamas es usable). Nunca lanza.
         """
+        try:
+            if self.es_pagina_error_chrome():
+                return "error"
+        except Exception:
+            pass
         try:
             if self._hay_muro_login():
                 return "login"
@@ -1471,6 +1825,12 @@ class TwitterBot:
         generico de X a veces necesita un segundo refresh para curarse) con
         detecciones intermedias, siempre dentro de un presupuesto de
         recuperacion de ~15s. NO navega a ninguna otra ruta. Nunca lanza.
+
+        Para la pagina de error de CHROME/Google (`chrome-error://chromewebdata`,
+        "No se puede acceder a este sitio", ERR_CONNECTION_*/ERR_PROXY_*...),
+        donde un refresh no siempre re-navega al destino, se prueba PRIMERO UN
+        `driver.get(url)` completo (a la MISMA url, acotado) y despues los
+        refrescos. Igual que el resto: sin bucles.
 
         El segundo refresh NUNCA se hace para el challenge anti-bot de
         Cloudflare, ni para login, ni para driver roto: esos se clasifican de
@@ -1547,6 +1907,57 @@ class TwitterBot:
             _log("ok")
             return "ok"
 
+        # 2b) Pagina de error de CHROME/Google (no el interstitial de X):
+        #     `chrome-error://chromewebdata`, "No se puede acceder a este
+        #     sitio", ERR_CONNECTION_*/ERR_PROXY_*... La pestana quedo en el
+        #     error del NAVEGADOR y un refresh no siempre re-navega al destino,
+        #     asi que se prueba UN `driver.get(url)` completo (acotado) antes
+        #     de los refrescos. Sin bucles: get -> deteccion -> refrescos.
+        try:
+            error_chrome = self.es_pagina_error_chrome()
+        except Exception:
+            error_chrome = False
+        if error_chrome:
+            logger.info(
+                f"navegar_tolerante: pagina de error de Chrome/Google al ir a "
+                f"{url}; get completo ({self._diagnostico_pagina()})"
+            )
+            restante_get = max(
+                0.0,
+                min(
+                    25.0,
+                    tiempo_total - (self._ahora() - t_inicio),
+                    15.0,
+                ),
+            )
+            with _page_load_timeout_acotado(self.driver, max(1.0, restante_get)):
+                try:
+                    self.driver.get(url)
+                except TimeoutException:
+                    logger.debug(
+                        f"navegar_tolerante: get de recuperacion lento/timed "
+                        f"out en {url}"
+                    )
+                except WebDriverException as e:
+                    if self._es_error_driver_duro(e):
+                        return _marcar_driver(e)
+                    logger.debug(
+                        f"navegar_tolerante: get de recuperacion "
+                        f"WebDriverException transitoria "
+                        f"({type(e).__name__}: {e})"
+                    )
+                except Exception as e:
+                    if self._es_error_driver_duro(e):
+                        return _marcar_driver(e)
+            estado = self._estado_pagina()
+            if estado == "login":
+                self.ultimo_error = self._error_sesion_navegacion(url)
+                _log("login", f"err={self.ultimo_error}")
+                return "login"
+            if estado == "ok":
+                _log("ok", "tras get de recuperacion")
+                return "ok"
+
         # 3) Pagina de error: UN refresh con espera acotada. Desde aqui corre
         #    el presupuesto de recuperacion (P1: incluye un posible SEGUNDO
         #    refresh; nunca mas de ~15s de esperas deliberadas).
@@ -1557,7 +1968,7 @@ class TwitterBot:
             0.0, min(10.0, tiempo_total - transcurrido, presupuesto_recuperacion)
         )
         logger.info(
-            f"navegar_tolerante: pagina de error de X al ir a {url}; "
+            f"navegar_tolerante: pagina de error al ir a {url}; "
             f"UN refresh ({self._diagnostico_pagina()})"
         )
         with _page_load_timeout_acotado(self.driver, 25.0):
@@ -1657,8 +2068,17 @@ class TwitterBot:
                         break
 
         if not self.ultimo_error:
+            try:
+                tipo_error = (
+                    "Chrome/Google"
+                    if self.es_pagina_error_chrome()
+                    else "X"
+                )
+            except Exception:
+                tipo_error = "X"
             self.ultimo_error = (
-                f"página de error de X tras refresh: {self._diagnostico_pagina()}"
+                f"página de error de {tipo_error} tras refresh: "
+                f"{self._diagnostico_pagina()}"
             )
         _log("error", f"err={self.ultimo_error}")
         logger.warning(f"navegar_tolerante: {self.ultimo_error}")
@@ -1689,6 +2109,318 @@ class TwitterBot:
         )
         logger.warning(f"calentar: {self.ultimo_error}")
         return False
+
+    # ------------------------------------------------------------------ #
+    # Refresh rapido de ENTRADA (cambio de cuenta / primera entrada local)
+    # ------------------------------------------------------------------ #
+    # `preparar_sesion_cdp` inyecta las cookies SIN navegar (por contrato) y
+    # al cambiar de cuenta en la pestaña persistente la pagina puede quedar
+    # desactualizada o a medio cargar. Este refresh corto deja la pagina
+    # usable ANTES de publicar/citar. Es BEST-EFFORT y acotado: no bloquea el
+    # flujo si X pide login/anti-bot/error; solo un driver muerto lo aborta.
+    # NO se llama desde `preparar_sesion_cdp` (debe seguir sin navegar) ni
+    # desde `calentar` (ya navega; no se duplica).
+    _REFRESH_READY_TIMEOUT = 1.0
+    _REFRESH_READY_POLL = 0.1
+
+    @staticmethod
+    def _mapear_estado_refresh(resultado: str) -> str:
+        """Normaliza el retorno de `navegar_tolerante` al contrato del refresh.
+
+        Devuelve uno de "ok"/"login"/"driver"/"error". Nunca lanza.
+        """
+        valor = str(resultado or "").strip().lower()
+        if valor in ("ok", "login", "driver", "error"):
+            return valor
+        return "error"
+
+    def _esperar_ready_state_refresh(self) -> None:
+        """Espera ACTIVA (poll 0.1s, tope ~1.0s) a que el DOM este listo.
+
+        No usa esperas fijas largas: en cuanto `document.readyState` es
+        `complete`/`interactive` se continua. El tope bajo (~1s) es clave para
+        que los 2 refrescos de entrada sean rapidos incluso con un renderer
+        lento. Fakes sin `execute_script` o que lancen excepciones no rompen el
+        flujo. Nunca lanza.
+        """
+        driver = getattr(self, "driver", None)
+        script = getattr(driver, "execute_script", None)
+        if not callable(script):
+            return
+        fin = self._ahora() + self._REFRESH_READY_TIMEOUT
+        while True:
+            try:
+                estado = script("return document.readyState")
+            except Exception:
+                return
+            if str(estado or "").strip().lower() in ("complete", "interactive"):
+                return
+            if self._ahora() >= fin:
+                return
+            try:
+                time.sleep(self._REFRESH_READY_POLL)
+            except Exception:
+                return
+
+    def _recuperar_entrada_refresh(self, timeout_total: float) -> str:
+        """UNA navegacion tolerante a /home; mapea el resultado. Nunca lanza.
+
+        Se usa cuando la URL no esta en X / es la pagina de error de Chrome
+        (el driver nunca cargo la app) o cuando el refresh dejo un
+        interstitial de X: se reutiliza `navegar_tolerante`, que ya absorbe
+        ambos con get/refrescos acotados. Sin bucles: se llama UNA vez por
+        entrada.
+        """
+        try:
+            resultado = self.navegar_tolerante(
+                f"{self.base_url}/home",
+                timeout_total=max(1.0, min(float(timeout_total), 20.0)),
+            )
+        except Exception as e:
+            self.ultimo_error = f"{type(e).__name__}: {e}"
+            logger.debug(
+                f"refrescar entrada: navegacion de recuperacion fallo para "
+                f"{self.usuario}: {self.ultimo_error}"
+            )
+            try:
+                duro = self._es_error_driver_duro(e)
+            except Exception:
+                duro = False
+            return "driver" if duro else "error"
+        estado = self._mapear_estado_refresh(resultado)
+        # `navegar_tolerante` no conoce "anti_bot": si la pagina quedo "ok"
+        # pero es el challenge de Cloudflare, se reporta como tal.
+        if estado == "ok":
+            try:
+                if self.es_pagina_anti_bot():
+                    return "anti_bot"
+            except Exception:
+                pass
+        return estado
+
+    def refrescar_pagina_rapido(self, timeout: float = 3.0) -> str:
+        """Refresh de ENTRADA a la cuenta: COMO MAXIMO 2 refrescos reales.
+
+        Cuando se ENTRA a una cuenta (cambio de cuenta en la pestaña
+        persistente del motor y primera entrada de la campaña LOCAL) las
+        cookies se inyectan por CDP SIN navegar. La pagina puede quedar
+        desactualizada o a medio cargar; aqui se hacen hasta
+        `REFRESH_ENTRADA_MAX` refrescos (default 2) y se espera ACTIVA
+        (poll 0.1s, tope ~1.0s) a que `document.readyState` este listo.
+
+        Reglas de corte (velocidad / sin recuperaciones extra en X):
+          - Despues de CADA refresh se detecta anti-bot y el estado de pagina.
+            Si queda `login` (incluye onboarding) o `anti_bot` se CORTA de
+            inmediato: no se hace el siguiente refresh ni recuperacion.
+          - Si tras los N refrescos el estado es `ok` => "ok".
+          - Si sigue `error`/interstitial => "error" SIN navegacion de
+            recuperacion (nunca se superan los N refrescos en X normal).
+          - La navegacion tolerante (`navegar_tolerante`) solo se usa si al
+            entrar NO se esta en X (`chrome://`, `about:blank`, dominio ajeno)
+            o hay pagina de error de Chrome; ahi si hace su get/recuperacion
+            acotada.
+
+        Configuracion:
+          - `REFRESH_AL_ENTRAR` (default 1): `0/false/no/off` lo apaga y
+            devuelve "skip" SIN tocar el navegador (comportamiento historico).
+          - `REFRESH_ENTRADA_MAX` (default 2; clamp 0..4): numero MAXIMO de
+            `driver.refresh()` en X. `0` = ninguno (solo se evalua el estado).
+          - `REFRESH_ENTRADA_TIMEOUT` (default 3.0s; clamp 1.5..10): tope del
+            refresh/get. El parametro `timeout` es el default si la env falta.
+
+        Devuelve (y guarda en `self.ultimo_refresh`):
+          - "ok":      pagina usable.
+          - "login":   X pide login/onboarding (sesion caida; deja
+                       `ultimo_error`).
+          - "anti_bot": challenge Cloudflare/reto anti-bot.
+          - "error":   sigue la pagina de error tras los N refrescos (sin
+                       recuperacion adicional).
+          - "driver":  driver muerto/inservible (`esta_vivo` False, error duro).
+          - "skip":    desactivado por env o driver de pruebas sin API suficiente.
+
+        Presupuesto sano: 2 * (timeout 3s + ~1s de readyState) + detecciones,
+        sin recuperaciones extra. Funciona igual con Chrome visible
+        (`modo_local=True`) y headless; NUNCA consulta proxies (en modo local no
+        aplican y en el resto el upstream ya se cambio antes de inyectar las
+        cookies).
+        """
+        t_inicio = self._ahora()
+
+        def _final(estado: str, detalle: str = "") -> str:
+            try:
+                self.ultimo_refresh = estado
+            except Exception:
+                pass
+            try:
+                logger.debug(
+                    f"perf @{self.usuario}: refrescar entrada -> {estado} "
+                    f"en {self._ahora() - t_inicio:.2f}s"
+                    + (f" ({detalle})" if detalle else "")
+                )
+            except Exception:
+                pass
+            return estado
+
+        # Apagado explicito: ni refresh, ni get, ni lecturas del driver (el
+        # comportamiento debe ser EXACTAMENTE el historico).
+        if not _env_activo("REFRESH_AL_ENTRAR", True):
+            return _final("skip")
+
+        try:
+            tope = float(timeout)
+        except (TypeError, ValueError):
+            tope = 3.0
+        tope = _env_float_seg("REFRESH_ENTRADA_TIMEOUT", tope)
+        try:
+            tope = float(tope)
+        except (TypeError, ValueError):
+            tope = 3.0
+        tope = max(1.5, min(10.0, tope))
+
+        max_refresh = _env_int("REFRESH_ENTRADA_MAX", 2)
+        max_refresh = max(0, min(4, max_refresh))
+
+        driver = getattr(self, "driver", None)
+        if driver is None:
+            return _final("driver")
+
+        try:
+            vivo = bool(self.esta_vivo())
+        except Exception:
+            vivo = False
+        if not vivo:
+            # Distinguir un driver MUERTO de un fake de tests sin
+            # `current_url`: el fake no debe romper `cambiar_cuenta`.
+            try:
+                _ = driver.current_url
+            except AttributeError:
+                return _final("skip")
+            except Exception as e:
+                self.ultimo_error = f"{type(e).__name__}: {e}"
+                return _final("driver")
+            return _final("driver")
+
+        try:
+            url_actual = str(driver.current_url or "")
+        except AttributeError:
+            return _final("skip")
+        except Exception as e:
+            self.ultimo_error = f"{type(e).__name__}: {e}"
+            return _final("driver")
+
+        url_lower = url_actual.lower()
+        en_x = ("x.com" in url_lower) or ("twitter.com" in url_lower)
+        try:
+            error_chrome = bool(self.es_pagina_error_chrome())
+        except Exception:
+            error_chrome = False
+
+        # Nunca cargo X (`chrome://`, `about:blank`), pagina de error de
+        # Chrome o un dominio ajeno: UNA navegacion tolerante a /home. Este es
+        # el UNICO camino con get/recuperacion; en X normal no se usa.
+        if not en_x or error_chrome:
+            if not callable(getattr(driver, "get", None)):
+                return _final("skip")
+            return _final(
+                self._recuperar_entrada_refresh(min(tope + 7.0, 20.0)),
+                "recuperacion de navegacion (fuera de X / error de Chrome)",
+            )
+
+        # Ya esta en X: hasta `max_refresh` refrescos con el page_load_timeout
+        # acotado (se restaura siempre). TimeoutException y WebDriverException
+        # transitorias se toleran; los fallos DUROS de driver -> "driver".
+        refresh = getattr(driver, "refresh", None)
+        if not callable(refresh):
+            # Fakes/legado sin `refresh`: no romper `cambiar_cuenta`.
+            return _final("skip")
+
+        # `REFRESH_ENTRADA_MAX=0`: ni un refresh, pero se reporta el estado
+        # actual (util para diagnostico y para no navegar de mas).
+        if max_refresh <= 0:
+            return _final(self._estado_refresh_actual(), "sin refrescos (env)")
+
+        estado_ultimo = "error"
+        for intento in range(1, max_refresh + 1):
+            try:
+                with _page_load_timeout_acotado(driver, tope):
+                    refresh()
+            except TimeoutException:
+                try:
+                    detalle = self._diagnostico_pagina()
+                except Exception:
+                    detalle = "<sin diagnostico>"
+                logger.debug(
+                    f"refrescar entrada: refresh {intento}/{max_refresh} "
+                    f"lento/timed out para {self.usuario} ({detalle})"
+                )
+            except Exception as e:
+                try:
+                    duro = self._es_error_driver_duro(e)
+                except Exception:
+                    duro = False
+                if duro:
+                    self.ultimo_error = f"{type(e).__name__}: {e}"
+                    logger.debug(
+                        f"refrescar entrada: driver roto para {self.usuario}: "
+                        f"{self.ultimo_error}"
+                    )
+                    return _final("driver", f"refresh {intento}/{max_refresh}")
+                logger.debug(
+                    f"refrescar entrada: refresh {intento}/{max_refresh} con "
+                    f"error transitorio para {self.usuario}: "
+                    f"{type(e).__name__}: {e}"
+                )
+
+            # Espera activa y corta (~1s) y deteccion INMEDIATA tras CADA
+            # refresh: login/onboarding y anti-bot cortan sin gastar el 2º.
+            self._esperar_ready_state_refresh()
+            estado_ultimo = self._estado_refresh_actual()
+            if estado_ultimo in ("login", "anti_bot", "driver"):
+                return _final(estado_ultimo, f"refresh {intento}/{max_refresh}")
+
+        if estado_ultimo == "ok":
+            return _final("ok", f"{max_refresh} refrescos")
+
+        # Interstitial de X ("something went wrong") que no se curo: se
+        # devuelve "error" SIN navegacion de recuperacion (para no pasar de
+        # los N refrescos configurados).
+        if not self.ultimo_error:
+            self.ultimo_error = (
+                f"pagina de error de X tras {max_refresh} refresco(s); "
+                "sin recuperacion adicional"
+            )
+        return _final("error", f"{max_refresh} refrescos")
+
+    def _estado_refresh_actual(self) -> str:
+        """Clasifica la pagina para el refresh de entrada: anti_bot/login/ok/error.
+
+        Se ejecuta DESPUES de cada refresh. `login` deja `ultimo_error` con el
+        mensaje de sesion expirada (incluye onboarding). Nunca lanza.
+        """
+        try:
+            if self.es_pagina_anti_bot():
+                if not self.ultimo_error:
+                    self.ultimo_error = (
+                        "X pidió verificación anti-bot (Cloudflare); "
+                        "sesión no confirmada"
+                    )
+                return "anti_bot"
+        except Exception:
+            pass
+        try:
+            estado = self._estado_pagina()
+        except Exception:
+            return "error"
+        if estado == "login":
+            if not self.ultimo_error:
+                try:
+                    self.ultimo_error = self._error_sesion_navegacion(
+                        f"{self.base_url}/home"
+                    )
+                except Exception:
+                    self.ultimo_error = "sesión de X expirada o inválida"
+            return "login"
+        return estado
 
     def _revivir_sesion_cdp(self) -> bool:
         """Fallback UNICO tras detectar muro de login con `_sesion_cdp`.
@@ -2095,6 +2827,178 @@ class TwitterBot:
                 handles.add(valor)
         return handles
 
+    def _obtener_enlace_toast(self) -> str:
+        """Link del post recien publicado que trae el toast visible de X.
+
+        Es la ruta MAS BARATA (0 navegaciones): el toast "Your post was sent /
+        Tu post fue enviado" suele incluir el enlace "View/Ver" al post recien
+        creado. Se leen `[data-testid='toast']` y `[role='alert']` (visibles) y
+        sus anclas `a[href*='/status/']`; solo se acepta un handle PROPIO
+        (`_handles_propios`) y se limpian query string/fragmento. Devuelve "" si
+        no hay driver, toast o link usable. Nunca lanza (robusto a fakes).
+        """
+        if not self.driver:
+            return ""
+        propios = self._handles_propios()
+        if not propios:
+            return ""
+
+        def _link_propio(href) -> str:
+            href = str(href or "").strip()
+            if not href:
+                return ""
+            if href.startswith("/"):
+                href = f"{getattr(self, 'base_url', 'https://x.com')}{href}"
+            m = self._RE_URL_STATUS.match(href)
+            if not m:
+                return ""
+            if m.group(1).lstrip("@").lower() not in propios:
+                return ""
+            return href.split("?")[0].split("#")[0].rstrip("/")
+
+        for sel in ("[data-testid='toast']", "[role='alert']"):
+            try:
+                elementos = self.driver.find_elements(By.CSS_SELECTOR, sel)
+            except Exception:
+                continue
+            for elem in (elementos or []):
+                try:
+                    visible = elem.is_displayed()
+                except Exception:
+                    visible = True
+                if not visible:
+                    continue
+                # El propio toast puede ser un enlace, o contener la ancla.
+                try:
+                    propio = _link_propio(elem.get_attribute("href"))
+                except Exception:
+                    propio = ""
+                if propio:
+                    return propio
+                try:
+                    enlaces = elem.find_elements(
+                        By.CSS_SELECTOR, "a[href*='/status/']"
+                    )
+                except Exception:
+                    continue
+                for enlace in (enlaces or []):
+                    try:
+                        propio = _link_propio(enlace.get_attribute("href"))
+                    except Exception:
+                        continue
+                    if propio:
+                        return propio
+        return ""
+
+    # El toast de exito de X (ES/EN). Se exige antes de pulsar "View/Ver":
+    # asi nunca se hace clic en un toast ajeno (error, aviso, etc.).
+    _FRASES_TOAST_EXITO = (
+        "your post was sent",
+        "your reply was sent",
+        "tu post fue enviado",
+        "tu post se envió",
+        "tu post se envio",
+        "tu publicación fue enviada",
+        "tu publicacion fue enviada",
+        "tu respuesta fue enviada",
+        "tweet publicado",
+    )
+    _ETIQUETAS_VER = (
+        "view",
+        "ver",
+        "ver post",
+        "ver publicación",
+        "ver publicacion",
+        "see post",
+    )
+
+    def _obtener_enlace_toast_click(self, timeout: float = 2.0) -> str:
+        """Respaldo RAPIDO si el toast trae "View/Ver" como BOTON (sin `href`).
+
+        X pinta el "View" del toast como `div[role='button']` en algunas
+        versiones, no como `<a href>`: `_obtener_enlace_toast()` no puede leer
+        el link. Aqui se pulsa ese "View/Ver" (solo si el toast es de EXITO) y
+        se toma la URL del post desde `driver.current_url` (navegacion directa
+        al post, ~0.5-1.5s; NUNCA visita el perfil). Devuelve "" si no hay
+        toast/boton, si el clic no navega o si la URL no es de la propia
+        cuenta. Nunca lanza.
+
+        Se usa DESPUES de `_obtener_enlace_toast()` y antes del timeline/perfil.
+        Ojo: navega a la publicacion nueva; no llamarlo antes de acciones que
+        deban ocurrir en la pagina actual (p. ej. el like al ancla de una cita).
+        """
+        if not self.driver:
+            return ""
+        propios = self._handles_propios()
+        if not propios:
+            return ""
+        try:
+            fin = self._ahora() + max(0.2, float(timeout))
+        except (TypeError, ValueError):
+            fin = self._ahora() + 2.0
+
+        for sel in ("[data-testid='toast']", "[role='alert']"):
+            try:
+                elementos = self.driver.find_elements(By.CSS_SELECTOR, sel)
+            except Exception:
+                continue
+            for elem in (elementos or []):
+                try:
+                    if not elem.is_displayed():
+                        continue
+                except Exception:
+                    continue
+                try:
+                    texto_toast = (elem.text or "").lower()
+                except Exception:
+                    texto_toast = ""
+                if not any(
+                    frase in texto_toast for frase in self._FRASES_TOAST_EXITO
+                ):
+                    continue
+                boton = None
+                try:
+                    descendientes = elem.find_elements(By.CSS_SELECTOR, "*")
+                except Exception:
+                    descendientes = []
+                for hijo in (descendientes or [])[:80]:
+                    try:
+                        if not hijo.is_displayed():
+                            continue
+                        etiqueta = " ".join((hijo.text or "").split()).lower()
+                    except Exception:
+                        continue
+                    if etiqueta in self._ETIQUETAS_VER:
+                        boton = hijo
+                        break
+                if boton is None:
+                    continue
+                try:
+                    self.driver.execute_script(
+                        "var el = arguments[0];"
+                        "var btn = (el.closest && el.closest("
+                        "\"[role='button'],button,a\")) || el;"
+                        "btn.click();",
+                        boton,
+                    )
+                except Exception:
+                    continue
+                # Espera corta a que la SPA cambie la URL al post nuevo.
+                while self._ahora() < fin:
+                    try:
+                        actual = str(self.driver.current_url or "")
+                    except Exception:
+                        actual = ""
+                    m = self._RE_URL_STATUS.match(actual)
+                    if m and m.group(1).lstrip("@").lower() in propios:
+                        return actual.split("?")[0].split("#")[0].rstrip("/")
+                    try:
+                        time.sleep(0.15)
+                    except Exception:
+                        break
+                return ""
+        return ""
+
     def _obtener_enlace_reciente_timeline(
         self, texto_publicado: str = "", timeout: float = 3.0
     ) -> Optional[str]:
@@ -2163,14 +3067,10 @@ class TwitterBot:
 
     def _obtener_ultimo_enlace(self, usuario: str) -> Optional[str]:
         try:
-            try:
-                self.driver.get(f"{self.base_url}/{usuario}")
-            except TimeoutException:
-                # Carga lenta (proxy intermitente): el HTML suele seguir
-                # llegando; las esperas explicitas de elementos deciden.
-                logger.warning(
-                    f"Carga lenta de {self.base_url}/{usuario}; sigo con esperas explicitas"
-                )
+            # Navegacion ACOTADA y tolerante: si la pestana cae en la pagina de
+            # error de Chrome/Google, `_get_acotado` reintenta UNA vez solo; se
+            # mantiene el contrato (URL del ultimo post o None).
+            self._get_acotado(f"{self.base_url}/{usuario}")
             # La espera fija de 4s se cambio por: esperar a que exista el
             # articulo (hasta 5s) + una pausa corta para que el timeline pinte
             # la publicacion recien hecha.
@@ -2359,6 +3259,7 @@ class TwitterBot:
         contenido: str,
         imagen_path: Optional[str] = None,
         buscar_url: bool = True,
+        buscar_url_perfil: bool = True,
     ) -> Optional[str]:
         """Publica un tweet y devuelve la URL del post recien publicado.
 
@@ -2369,9 +3270,13 @@ class TwitterBot:
         `buscar_url=False` omite buscar la URL (cuesta datos de proxy por cada
         post): para campanas masivas basta la verificacion real de la
         publicacion. En ese caso `ultima_url_publicada` queda vacia y se
-        devuelve `True`. Con `buscar_url=True` se intenta PRIMERO la ruta rapida
-        (`_obtener_enlace_reciente_timeline`, sin navegar) y, si no hay link, se
-        visita el perfil (`_obtener_ultimo_enlace`).
+        devuelve `True`. Con `buscar_url=True` el orden es: link del TOAST
+        (0 navegaciones, justo tras verificar) -> ruta rapida del timeline
+        (`_obtener_enlace_reciente_timeline`, sin navegar) -> perfil
+        (`_obtener_ultimo_enlace`) SOLO si `buscar_url_perfil` es True.
+        `buscar_url_perfil=False` (kwarg al final, default True = historico)
+        NUNCA visita el perfil: si toast/timeline no dan link, devuelve `True`
+        con `ultima_url_publicada=""`.
         """
         if not self.driver:
             if not self.login_con_cookies():
@@ -2447,7 +3352,7 @@ class TwitterBot:
             logger.debug(
                 f"pausa humana antes de publicar @{self.usuario} (1.8-3.5s)"
             )
-            time.sleep(random.uniform(1.8, 3.5))
+            self._pausa_humana()
 
             # Esperar a que el boton "Post" se HABILITE: X lo mantiene
             # deshabilitado hasta que el editor registra el texto. Si en 10s no
@@ -2475,7 +3380,16 @@ class TwitterBot:
                     pass
                 return None
             t_confirmado = self._ahora()
-            
+
+            # Link del TOAST: la ruta mas barata (0 navegaciones). Se captura
+            # INMEDIATAMENTE tras verificar porque el toast "Your post was
+            # sent" desaparece en ~2-3s (antes de `_pausa_visible`). Si X pinto
+            # "View/Ver" como boton (sin href), se pulsa (~1s) y se lee la URL
+            # del post desde el navegador: NUNCA se visita el perfil.
+            url_toast = self._obtener_enlace_toast() if buscar_url else ""
+            if buscar_url and not url_toast:
+                url_toast = self._obtener_enlace_toast_click()
+
             logger.info(f"Tweet publicado por {self.usuario}")
             logger.info(
                 f"perf @{self.usuario}: compose={t_compose - t_inicio:.1f}s "
@@ -2485,10 +3399,9 @@ class TwitterBot:
             )
             
             # 5 segundos de vista a la pantalla para confirmacion visual.
-            # En headless (Railway) no hay pantalla que mirar: omitir la espera.
-            if not settings.headless:
-                logger.info("Dejando 5s la pantalla visible para confirmacion visual...")
-                time.sleep(5)
+            # `_pausa_visible` no duerme en headless y en modo local la recorta
+            # a <=1.5s.
+            self._pausa_visible(5.0)
             
             if not buscar_url:
                 # Activaciones masivas: visitar el perfil solo para conocer la
@@ -2500,12 +3413,24 @@ class TwitterBot:
                 self.ultima_url_publicada = ""
                 return True
 
-            # Ruta RAPIDA (~1-3s): el post recien publicado suele estar en los
-            # primeros articulos del timeline actual (X aterriza en /home o
-            # /compose) y no hace falta navegar. Solo si falla se visita el
-            # perfil (`_obtener_ultimo_enlace`, ~5-10s).
-            url = self._obtener_enlace_reciente_timeline(contenido)
+            # Orden barato: toast -> timeline actual (sin navegar) -> perfil.
+            # El perfil (~5-10s + datos de proxy) SOLO si `buscar_url_perfil`.
+            url = url_toast
             if not url:
+                # En la pagina del compositor NO hay timeline que escanear:
+                # esperar ahi 1.2s por un articulo que no existe es tiempo
+                # regalado (el toast ya se intento arriba).
+                try:
+                    en_compositor = "/compose" in (
+                        self.driver.current_url or ""
+                    ).lower()
+                except Exception:
+                    en_compositor = False
+                if not en_compositor:
+                    url = self._obtener_enlace_reciente_timeline(
+                        contenido, timeout=1.2
+                    )
+            if not url and buscar_url_perfil:
                 url = self._obtener_ultimo_enlace(self.usuario)
             self.ultima_url_publicada = url or ""
             return url or True   # True como fallback truthy si no se pudo obtener la URL
@@ -2846,10 +3771,9 @@ class TwitterBot:
             logger.info(f"Hilo publicado por {self.usuario}: {len(tweets)} tweets")
             
             # 5 segundos de vista a la pantalla para confirmacion visual.
-            # En headless (Railway) no hay pantalla que mirar: omitir la espera.
-            if not settings.headless:
-                logger.info("Dejando 5s la pantalla visible para confirmacion visual...")
-                time.sleep(5)
+            # `_pausa_visible` no duerme en headless y en modo local la recorta
+            # a <=1.5s.
+            self._pausa_visible(5.0)
             
             url = self._obtener_ultimo_enlace(self.usuario)
             self.ultima_url_publicada = url or ""
@@ -3025,19 +3949,123 @@ class TwitterBot:
     # proxy sin cambiar el resultado).
     _PRESUPUESTO_COMPOSITOR = 38.0
 
-    def _hay_muro_login(self) -> bool:
-        """True si X pidio login en la pagina actual (sesion caida).
+    # Onboarding / creacion de cuenta: pantallas en las que la sesion NO es
+    # valida (X pide telefono, fecha de nacimiento o crear cuenta). La
+    # deteccion por TEXTO solo corre en X y con un formulario de onboarding
+    # VISIBLE, para no dar falsos positivos en tweets.
+    _FRAGMENTOS_ONBOARDING_URL = (
+        "/i/jf/onboarding",
+        "/i/flow/signup",
+        "/i/flow/login",
+        "/i/flow/consent",
+    )
+    _SELECTOR_FORM_ONBOARDING = (
+        "input[type='tel'], input[name='phone'], input[name='phone_number'],"
+        " input[autocomplete='tel'],"
+        " input[data-testid='ocfEnterTextTextInput'],"
+        " select[data-testid='ocfSelectTextInput'],"
+        " input[name='dateOfBirth'], select[name='dateOfBirth']"
+    )
+    _FRASES_ONBOARDING = (
+        "introduce tu numero de telefono",
+        "agrega un numero de telefono",
+        "add phone number",
+        "introduce tu numero",
+        "crea tu cuenta",
+        "create account",
+        "registrate",
+        "sign up",
+        "fecha de nacimiento",
+        "date of birth",
+    )
 
-        Detecta por URL (`login`, `/i/flow`, `account/access`) y por
+    @staticmethod
+    def _normalizar_texto_deteccion(texto: str) -> str:
+        """Minusculas, sin acentos y con espacios colapsados (para frases).
+
+        Permite comparar "Introduce tu número de teléfono" con la version sin
+        acentos. Nunca lanza.
+        """
+        try:
+            base = unicodedata.normalize("NFKD", str(texto or ""))
+            base = "".join(c for c in base if not unicodedata.combining(c))
+            return " ".join(base.lower().split())
+        except Exception:
+            return str(texto or "").lower()
+
+    def _texto_visible_pagina(self) -> str:
+        """Texto VISIBLE de la pagina (`body.innerText`), barato vs page_source.
+
+        `page_source` serializa varios MB y se leia en cada deteccion; aqui se
+        pide solo el texto renderizado, y unicamente cuando ya se detecto un
+        formulario de onboarding. Si el driver no expone `execute_script` se
+        cae a `page_source`. Nunca lanza.
+        """
+        driver = getattr(self, "driver", None)
+        if driver is None:
+            return ""
+        script = getattr(driver, "execute_script", None)
+        if callable(script):
+            try:
+                return str(
+                    script(
+                        "return document.body ? (document.body.innerText || '') : ''"
+                    )
+                    or ""
+                )
+            except Exception:
+                return ""
+        try:
+            return str(driver.page_source or "")
+        except Exception:
+            return ""
+
+    def _hay_formulario_onboarding(self) -> bool:
+        """True si hay un input/select de onboarding VISIBLE (telefono, fecha).
+
+        Una sola busqueda CSS combinada (barata) en vez de 8 roundtrips. Nunca
+        lanza.
+        """
+        driver = getattr(self, "driver", None)
+        if driver is None:
+            return False
+        try:
+            elementos = driver.find_elements(
+                By.CSS_SELECTOR, self._SELECTOR_FORM_ONBOARDING
+            )
+        except Exception:
+            return False
+        for elem in elementos or []:
+            try:
+                if elem.is_displayed():
+                    return True
+            except Exception:
+                continue
+        return False
+
+    def _hay_muro_login(self) -> bool:
+        """True si X pidio login/onboarding en la pagina actual (sesion caida).
+
+        Detecta por URL (`login`, `/i/flow`, `/i/jf/onboarding`,
+        `/i/flow/signup`, `/i/flow/consent`, `account/access`) y por
         formularios VISIBLES de login (username, loginButton,
-        ocfEnterTextTextInput, password). Nunca lanza: si el driver esta
-        muerto devuelve False y las esperas del flujo deciden.
+        ocfEnterTextTextInput, password).
+
+        Onboarding por TEXTO: solo si estamos en X y hay un formulario de
+        onboarding visible (telefono/fecha de nacimiento) se busca en el texto
+        VISIBLE frases como "Introduce tu número de teléfono", "Crea tu
+        cuenta", "Add phone number", "Date of birth"... Asi un tweet que
+        mencione esas frases NO se confunde con una sesion invalida. Nunca
+        lanza: si el driver esta muerto devuelve False y las esperas del flujo
+        deciden.
         """
         try:
             url = (self.driver.current_url or "").lower()
         except Exception:
             url = ""
         if any(frag in url for frag in ("login", "/i/flow", "account/access")):
+            return True
+        if any(frag in url for frag in self._FRAGMENTOS_ONBOARDING_URL):
             return True
 
         for sel in (
@@ -3052,7 +4080,16 @@ class TwitterBot:
                         return True
             except Exception:
                 continue
-        return False
+
+        # Onboarding por texto: SOLO en X y con un formulario/pantalla de
+        # onboarding visible (sin formulario, un tweet con "Create account"
+        # no debe marcar la sesion como caida).
+        if not (("x.com" in url) or ("twitter.com" in url)):
+            return False
+        if not self._hay_formulario_onboarding():
+            return False
+        texto = self._normalizar_texto_deteccion(self._texto_visible_pagina())
+        return any(frase in texto for frase in self._FRASES_ONBOARDING)
 
     def _frase_error_pagina(self) -> str:
         """Primera frase de error visible en la pagina ('' si no hay).
@@ -3072,8 +4109,9 @@ class TwitterBot:
     def _diagnostico_pagina(self) -> str:
         """Diagnostico legible de la pagina actual para logs/errores.
 
-        Formato: `url=<...> title=<...> login=<bool> error=<frase>`. Nunca
-        lanza: si el driver esta muerto devuelve lo que pueda.
+        Formato: `url=<...> title=<...> login=<bool> error=<frase>
+        chrome_error=<bool>`. Nunca lanza: si el driver esta muerto devuelve lo
+        que pueda.
         """
         try:
             url = self.driver.current_url or ""
@@ -3091,7 +4129,14 @@ class TwitterBot:
             error = self._frase_error_pagina()
         except Exception:
             error = ""
-        return f"url={url} title={title} login={bool(login)} error={error}"
+        try:
+            chrome_error = self.es_pagina_error_chrome()
+        except Exception:
+            chrome_error = False
+        return (
+            f"url={url} title={title} login={bool(login)} error={error} "
+            f"chrome_error={bool(chrome_error)}"
+        )
 
     def _url_en_x(self) -> bool:
         """True si la ventana actual esta navegando en x.com/twitter.com.
@@ -3143,13 +4188,9 @@ class TwitterBot:
             return
         if self._enfocar_ventana_x():
             return
-        try:
-            self.driver.get(url)
-        except TimeoutException:
-            logger.warning(
-                f"Carga lenta de {url} (reintento de navegacion); sigo con "
-                f"esperas explicitas"
-            )
+        # `_get_acotado` tolera carga lenta y, si la pestana cae en la pagina
+        # de error de Chrome/Google, reintenta UNA navegacion sin intervencion.
+        self._get_acotado(url)
         time.sleep(0.3)
         if not self._url_en_x():
             raise Exception(
@@ -3169,8 +4210,12 @@ class TwitterBot:
         que hace hasta DOS refrescos acotados (P1: el interstitial generico a
         veces necesita un segundo) dentro de un presupuesto de ~15s; si
         persiste, el llamador falla rapido con el detalle correspondiente.
-        Para el challenge anti-bot hace UN SOLO refresh corto (nunca el
-        adicional): es lo que puede limpiar Cloudflare.
+        Para la pagina de error de CHROME/Google (`chrome-error://chromewebdata`,
+        "No se puede acceder a este sitio", ERR_CONNECTION_*...) tambien delega
+        en `navegar_tolerante`, que primero hace UN `driver.get(url)` completo
+        (un refresh sobre la pagina de error del navegador no siempre
+        re-navega). Para el challenge anti-bot hace UN SOLO refresh corto (nunca
+        el adicional): es lo que puede limpiar Cloudflare.
 
         Devuelve:
           - "ok":       pagina usable (no habia interstitial o el refresh la arreglo).
@@ -3184,6 +4229,7 @@ class TwitterBot:
         try:
             anti_bot = self.es_pagina_anti_bot()
             error = self._es_pagina_error_x()
+            error_chrome = self.es_pagina_error_chrome() if error else False
         except Exception:
             return "ok"
         if not anti_bot and not error:
@@ -3191,7 +4237,7 @@ class TwitterBot:
 
         logger.warning(
             f"interstitial en {url} "
-            f"({'anti-bot (1 refresh)' if anti_bot else 'pagina de error de X (hasta 2 refrescos)'}); "
+            f"({'anti-bot (1 refresh)' if anti_bot else 'pagina de error (get + hasta 2 refrescos)'}); "
             f"refresh tolerante antes de esperar el boton"
         )
 
@@ -3207,6 +4253,16 @@ class TwitterBot:
             if self.es_pagina_anti_bot():
                 return "anti-bot"
             return "error" if self._es_pagina_error_x() else "ok"
+
+        # Pagina de error de CHROME/Google: aunque la URL no sea de x.com NO es
+        # "tab crashed"; `navegar_tolerante` hace UN `driver.get(url)` completo
+        # (un refresh sobre chrome-error:// a veces no re-navega) y luego hasta
+        # DOS refrescos acotados. Se recupera sin intervencion humana.
+        if error_chrome:
+            resultado = self.navegar_tolerante(url, timeout_total=20.0)
+            if self.es_pagina_anti_bot():
+                return "anti-bot"
+            return resultado
 
         # El "error" puede venir de un `chrome://`/`about:blank` donde el get
         # NUNCA navego (tab crashed): eso no es el interstitial de X. UN
@@ -3678,12 +4734,48 @@ try {
         SIEMPRE (context manager con finally). El `TimeoutException` de carga
         lenta se tolera: la pagina suele seguir cargando y las esperas
         explicitas de elementos deciden.
+
+        Si tras el get la pestana quedo en la pagina de error de Chrome/Google
+        (`chrome-error://chromewebdata`, "No se puede acceder a este sitio",
+        ERR_CONNECTION_*...), hace UN segundo intento de `driver.get(url)` con
+        una espera corta (`_esperar_documento_listo(2)`), sin bucles. Los
+        errores DUROS de driver (`InvalidSessionId`, `NoSuchDriver`...) se
+        siguen propagando para que el motor descarte la pestana.
         """
-        with _page_load_timeout_acotado(self.driver, timeout_max):
+
+        def _intentar() -> None:
             try:
                 self.driver.get(url)
             except TimeoutException:
                 logger.warning(f"Carga lenta de {url}; sigo con esperas explicitas")
+            except WebDriverException as e:
+                # Error de RED/TUNEL de Chrome (`net::ERR_CONNECTION_*`,
+                # `ERR_INTERNET_DISCONNECTED`, proxy caido...): la pestana
+                # queda en la pagina de error y el reintento de abajo la
+                # recupera. Los errores DUROS (driver muerto) si se propagan.
+                if self._es_error_driver_duro(e):
+                    raise
+                logger.warning(
+                    f"Carga con error de red/tunel en {url} "
+                    f"({type(e).__name__}); se revisa la pagina"
+                )
+
+        with _page_load_timeout_acotado(self.driver, timeout_max):
+            _intentar()
+            try:
+                reintentar = self.es_pagina_error_chrome()
+            except Exception:
+                reintentar = False
+            if reintentar:
+                logger.warning(
+                    f"pagina de error de Chrome en {url}; "
+                    "UN reintento de navegacion"
+                )
+                _intentar()
+                try:
+                    self._esperar_documento_listo(2)
+                except Exception:
+                    pass
 
     def _verificar_anti_bot_compositor(self) -> None:
         """Lanza el fallo claro si la pagina actual es un challenge anti-bot.
@@ -3817,18 +4909,39 @@ try {
 
             for intento in (1, 2):
                 if intento == 2:
-                    logger.warning(
-                        f"ruta {ruta} con pagina de error; refresh corto y "
-                        f"segundo intento"
-                    )
-                    self._refresh_corto()
-                    # El refresh pudo caer en un challenge anti-bot.
+                    # La pagina de error de CHROME/Google ("No se puede acceder
+                    # a este sitio") no siempre se cura con `refresh`: se
+                    # re-navega la RUTA completa (auto, sin intervencion).
+                    try:
+                        error_chrome_ruta = self.es_pagina_error_chrome()
+                    except Exception:
+                        error_chrome_ruta = False
+                    if error_chrome_ruta:
+                        logger.warning(
+                            f"ruta {ruta} con pagina de error de Chrome; "
+                            "re-navegando la ruta y segundo intento"
+                        )
+                        self._get_acotado(f"{self.base_url}{ruta}")
+                        self._esperar_documento_listo(
+                            timeout=min(2, max(0.2, restante()))
+                        )
+                    else:
+                        logger.warning(
+                            f"ruta {ruta} con pagina de error; refresh corto y "
+                            f"segundo intento"
+                        )
+                        self._refresh_corto()
+                    # El refresh/get pudo caer en un challenge anti-bot.
                     self._verificar_anti_bot_compositor()
-                # Deteccion temprana de la pagina de error de X: no tiene
-                # sentido agotar el timeout del editor si X ya sirvio
-                # "something went wrong" y no hay ningun editor visible.
+                # Deteccion temprana de la pagina de error (X o Chrome/Google):
+                # no tiene sentido agotar el timeout del editor si ya hay una
+                # pagina de error y no hay ningun editor visible.
+                try:
+                    error_chrome_temprano = self.es_pagina_error_chrome()
+                except Exception:
+                    error_chrome_temprano = False
                 if (
-                    self._frase_error_pagina()
+                    (error_chrome_temprano or self._frase_error_pagina())
                     and self._primer_editor_visible() is None
                 ):
                     if intento == 1 and restante() > 1.0:
@@ -4129,12 +5242,10 @@ try {
 
         t_inicio = self._ahora()
         try:
-            try:
-                self.driver.get(url)
-            except TimeoutException:
-                # Carga lenta (proxy intermitente): la pagina suele seguir
-                # cargando; las esperas explicitas de elementos deciden.
-                logger.warning(f"Carga lenta de {url}; sigo con esperas explicitas")
+            # Navegacion acotada/tolerante: si la pestana cae en la pagina de
+            # error de Chrome/Google, reintenta UNA navegacion completa sin
+            # intervencion humana; `_recuperar_interstitial` remata el resto.
+            self._get_acotado(url)
             time.sleep(0.3)
 
             # Interstitial/anti-bot tras el get: UN refresh tolerante y fallo
@@ -4167,12 +5278,7 @@ try {
                 # Sesion CDP invalida: UN fallback a login lento y UN reintento
                 # de la navegacion (misma semantica que el resto de flujos).
                 if self._sesion_cdp and self._revivir_sesion_cdp():
-                    try:
-                        self.driver.get(url)
-                    except TimeoutException:
-                        logger.warning(
-                            f"Carga lenta de {url} tras login; sigo con esperas explicitas"
-                        )
+                    self._get_acotado(url)
                     time.sleep(0.3)
                 if self._hay_muro_login():
                     self.ultimo_error = (
@@ -4223,6 +5329,18 @@ try {
                     logger.warning(
                         f"Refresh del tweet ancla fallo ({type(e).__name__}: {e})"
                     )
+                # El PROPIO refresh puede caer en la pagina de error de
+                # Chrome/Google ("al recargar"): se re-navega UNA vez (sin
+                # intervencion humana) antes de volver a esperar el boton.
+                try:
+                    if self.es_pagina_error_chrome():
+                        logger.warning(
+                            "el refresh del tweet ancla cayo en la pagina de "
+                            "error de Chrome; renavegando una vez"
+                        )
+                        self._get_acotado(url)
+                except Exception:
+                    pass
                 self._esperar_article_tweet(timeout=10)
                 reply_btn = self._buscar_boton_responder(timeout=8)
                 if reply_btn is None:
@@ -4269,7 +5387,7 @@ try {
             logger.debug(
                 f"pausa humana antes de publicar la respuesta @{self.usuario} (1.8-3.5s)"
             )
-            time.sleep(random.uniform(1.8, 3.5))
+            self._pausa_humana()
 
             # No clicar a ciegas: X mantiene el boton Responder deshabilitado
             # hasta que el editor registra el texto. Si no se habilita, el
@@ -4301,10 +5419,9 @@ try {
             logger.info(f"Respuesta publicada por {self.usuario}")
 
             # 3s de vista a la pantalla para confirmacion visual (patron del bot).
-            # En headless (Railway) no hay pantalla que mirar: omitir la espera.
-            if not settings.headless:
-                logger.info("Dejando 3s la pantalla visible para confirmacion visual...")
-                time.sleep(3)
+            # `_pausa_visible` no duerme en headless y en modo local la recorta
+            # a <=1.5s.
+            self._pausa_visible(3.0)
 
             url_respuesta = self._obtener_url_respuesta(url)
             # La URL de la RESPUESTA queda tambien en `ultima_url_publicada`
@@ -5351,17 +6468,31 @@ try {
         mensaje_cita: str = None,
         es_calentamiento: bool = False,
         dar_like: bool = False,
-        imagen_path: Optional[str] = None
+        imagen_path: Optional[str] = None,
+        buscar_url: bool = True,
+        buscar_url_perfil: bool = True,
     ) -> dict:
         """Hace RT (simple o con cita) de las URLs recibidas.
 
         Para la distribucion horaria se usa con UNA sola URL: hace exactamente
         un RT y devuelve `{"exitos": 1, "urls": []}` (el RT simple NO crea una
         publicacion propia, asi que no genera link; la tabla lo etiqueta).
-        En las CITAS si se intenta capturar la URL del post de la cita (ruta
-        rapida del timeline y, si falla, el perfil); si no se puede, `urls`
-        queda sin esa entrada. Con varias URLs mantiene el recorrido secuencial
-        en el mismo navegador.
+        En las CITAS si se intenta capturar la URL del post de la cita en orden
+        de coste: toast (0 navegaciones) -> ruta rapida del timeline y, solo si
+        `buscar_url_perfil` es True, el perfil; si no se puede, `urls` queda sin
+        esa entrada. Con varias URLs mantiene el recorrido secuencial en el
+        mismo navegador.
+
+        `buscar_url=False` (default True) omite esa busqueda en las CITAS: no
+        se lee el toast ni se llama `_obtener_enlace_reciente_timeline`/
+        `_obtener_ultimo_enlace` (pueden visitar el perfil y costar 5-10s por
+        cita). El exito se decide igual (verificacion real de la publicacion),
+        `urls` queda sin la entrada de la cita y `ultima_url_publicada` vacia.
+        Con True el comportamiento es el historico.
+
+        `buscar_url_perfil=False` (kwarg al final, default True = historico)
+        NUNCA visita el perfil en las citas: si toast/timeline no dan link, la
+        cita se cuenta como exitosa con `urls` sin esa entrada.
 
         Verifica cada publicacion REALMENTE (estado `unretweet` en RT simple y
         `_verificar_publicacion()` en citas) antes de contar el exito, por lo
@@ -5375,13 +6506,12 @@ try {
 
         t_inicio = self._ahora()
         for url in targets:
+            url_publicada_toast = ""
             try:
-                try:
-                    self.driver.get(url)
-                except TimeoutException:
-                    # Carga lenta (proxy intermitente): la pagina suele seguir
-                    # cargando; las esperas explicitas de elementos deciden.
-                    logger.warning(f"Carga lenta de {url}; sigo con esperas explicitas")
+                # Navegacion acotada/tolerante: absorbe la carga lenta y, si
+                # cae en la pagina de error de Chrome/Google, reintenta UNA
+                # navegacion completa sin intervencion humana.
+                self._get_acotado(url)
                 time.sleep(0.3)
 
                 # Interstitial real (logs de Railway): un get atascado deja la
@@ -5408,12 +6538,7 @@ try {
                     # Sesion CDP invalida: UN fallback a login lento y UN
                     # reintento de la navegacion (misma semantica que el resto).
                     if self._revivir_sesion_cdp():
-                        try:
-                            self.driver.get(url)
-                        except TimeoutException:
-                            logger.warning(
-                                f"Carga lenta de {url} tras login; sigo con esperas explicitas"
-                            )
+                        self._get_acotado(url)
                         time.sleep(0.3)
                     if self._hay_muro_login():
                         self.ultimo_error = (
@@ -5481,6 +6606,18 @@ try {
                             logger.warning(
                                 f"Refresh lento de {url}; sigo con esperas explicitas"
                             )
+                        # Si el refresh cae en la pagina de error de
+                        # Chrome/Google ("al recargar"), re-navegar UNA vez
+                        # (auto-recuperacion) antes de volver a esperar.
+                        try:
+                            if self.es_pagina_error_chrome():
+                                logger.warning(
+                                    "el refresh del tweet cayo en la pagina de "
+                                    "error de Chrome; renavegando una vez"
+                                )
+                                self._get_acotado(url)
+                        except Exception:
+                            pass
                         rt_btn = None
                         try:
                             rt_btn = WebDriverWait(self.driver, 8).until(
@@ -5529,7 +6666,7 @@ try {
                     logger.debug(
                         f"pausa humana antes de publicar la cita @{self.usuario} (1.8-3.5s)"
                     )
-                    time.sleep(random.uniform(1.8, 3.5))
+                    self._pausa_humana()
 
                     publicar_btn = self._buscar_boton_post()
                     self.driver.execute_script("arguments[0].click();", publicar_btn)
@@ -5537,6 +6674,17 @@ try {
                     # Verificacion real: no contar exito solo por hacer clic.
                     if not self._verificar_publicacion():
                         raise Exception("X no confirmo la publicacion de la cita")
+                    # Link del toast: ruta mas barata y aun visible justo aqui
+                    # (solo si se va a buscar la URL; con buscar_url=False el
+                    # flujo queda exactamente como antes). Si el toast NO trae
+                    # href pero si el boton "View/Ver", se pulsa ahora (no hay
+                    # like pendiente sobre el ancla) para leer la URL del post.
+                    if buscar_url:
+                        url_publicada_toast = self._obtener_enlace_toast()
+                        if not url_publicada_toast and not dar_like:
+                            url_publicada_toast = (
+                                self._obtener_enlace_toast_click()
+                            )
                 else:
                     rt_option = WebDriverWait(self.driver, 5).until(
                         EC.element_to_be_clickable((By.CSS_SELECTOR, "[data-testid='retweetConfirm']"))
@@ -5560,22 +6708,52 @@ try {
                         logger.warning(
                             f"No se pudo confirmar el like (el RT sigue contando): {url}"
                         )
+                    # El like YA se dio sobre el ancla: recien ahora es seguro
+                    # pulsar "View/Ver" del toast (navega al post de la cita).
+                    if (
+                        mensaje_cita
+                        and buscar_url
+                        and not url_publicada_toast
+                    ):
+                        url_publicada_toast = self._obtener_enlace_toast_click()
                 
                 resultados["exitos"] += 1
                 logger.info(f"RT exitoso: {url}")
                 
                 if mensaje_cita:
-                    # Cita: intentar la URL del POST DE LA CITA por la ruta
-                    # rapida (timeline actual, sin navegar) y, solo si falla,
-                    # por el perfil.
-                    url_publicada = self._obtener_enlace_reciente_timeline(
-                        mensaje
-                    )
-                    if not url_publicada:
-                        url_publicada = self._obtener_ultimo_enlace(self.usuario)
-                    if url_publicada:
-                        resultados["urls"].append(url_publicada)
-                        self.ultima_url_publicada = url_publicada
+                    if buscar_url:
+                        # Cita: toast (0 navegaciones) -> ruta rapida del
+                        # timeline actual y, solo si `buscar_url_perfil`, el
+                        # perfil (~5-10s). Con `buscar_url_perfil=False` jamas
+                        # se navega al perfil.
+                        url_publicada = url_publicada_toast
+                        if not url_publicada:
+                            # Tras citar seguimos en la pagina del tweet ancla
+                            # (/status/...), que NO es el timeline propio: no
+                            # se pierde 1.5s escaneando articulos que no
+                            # incluyen la cita recien publicada.
+                            try:
+                                en_ancla = "/status/" in (
+                                    self.driver.current_url or ""
+                                ).lower()
+                            except Exception:
+                                en_ancla = False
+                            if not en_ancla:
+                                url_publicada = (
+                                    self._obtener_enlace_reciente_timeline(
+                                        mensaje, timeout=1.5
+                                    )
+                                )
+                        if not url_publicada and buscar_url_perfil:
+                            url_publicada = self._obtener_ultimo_enlace(self.usuario)
+                        if url_publicada:
+                            resultados["urls"].append(url_publicada)
+                            self.ultima_url_publicada = url_publicada
+                    else:
+                        # Campaña LOCAL: buscar el link visita el perfil y cuesta
+                        # 5-10s por cita. La verificacion real ya confirmo la
+                        # publicacion; `urls` queda sin la entrada de la cita.
+                        self.ultima_url_publicada = ""
                 else:
                     # El RT simple no genera un post propio: sin URL de
                     # publicacion (antes se enlazaba el perfil de la cuenta).

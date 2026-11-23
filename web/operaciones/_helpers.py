@@ -8,9 +8,64 @@ from core.registro import registrar_accion
 from loguru import logger
 
 
-def guardar_imagen_subida(archivo, prefijo: str = "subida") -> str | None:
+def _comprimir_imagen_subida(datos: bytes, temp_dir: str, prefijo: str) -> str | None:
+    """Comprime PNG/JPG/WEBP a JPEG <=1600px y devuelve la ruta absoluta.
+
+    Devuelve None si no aplica (GIF/animada, Pillow no disponible, error) o si
+    el JPEG resultante NO pesa menos que el original: en ambos casos el
+    llamador guarda el original tal cual. Nunca lanza."""
+    import os
+    from io import BytesIO
+
+    try:
+        from PIL import Image, ImageOps
+
+        with Image.open(BytesIO(datos)) as imagen:
+            if getattr(imagen, "is_animated", False):
+                return None
+            imagen.load()
+            # Respeta la orientacion EXIF (fotos de celular) antes de perderla
+            # al guardar como JPEG sin metadatos.
+            imagen = ImageOps.exif_transpose(imagen) or imagen
+            tiene_alfa = imagen.mode in ("RGBA", "LA") or (
+                imagen.mode == "P" and "transparency" in imagen.info
+            )
+            imagen.thumbnail((1600, 1600))
+            if tiene_alfa:
+                rgba = imagen.convert("RGBA")
+                fondo = Image.new("RGB", rgba.size, (255, 255, 255))
+                fondo.paste(rgba, mask=rgba.split()[-1])
+                imagen = fondo
+            else:
+                imagen = imagen.convert("RGB")
+            buffer = BytesIO()
+            imagen.save(buffer, format="JPEG", quality=85, optimize=True)
+        comprimido = buffer.getvalue()
+    except Exception as e:  # noqa: BLE001
+        logger.debug(f"Compresión de imagen omitida: {e}")
+        return None
+    if not comprimido or len(comprimido) >= len(datos):
+        return None
+    salida = os.path.join(temp_dir, f"{prefijo}_{os.getpid()}.jpg")
+    try:
+        with open(salida, "wb") as f:
+            f.write(comprimido)
+    except Exception as e:  # noqa: BLE001
+        logger.error(f"Error guardando imagen comprimida: {e}")
+        return None
+    return salida
+
+
+def guardar_imagen_subida(
+    archivo, prefijo: str = "subida", comprimir: bool = True
+) -> str | None:
     """Guarda una imagen subida/pegada en data/temp y devuelve su ruta absoluta.
-    Acepta un objeto UploadedFile de Streamlit o bytes."""
+    Acepta un objeto UploadedFile de Streamlit o bytes.
+
+    Con `comprimir=True` (default) reduce PNG/JPG/JPEG/WEBP a JPEG <=1600px
+    (calidad 85) para ahorrar datos del proxy al publicar. GIF (para no romper
+    la animación), fallos de Pillow y resultados que no pesen menos se guardan
+    tal cual. Nunca lanza: devuelve None si no se pudo guardar."""
     import os
     from core.config import resolver_ruta
 
@@ -31,12 +86,16 @@ def guardar_imagen_subida(archivo, prefijo: str = "subida") -> str | None:
             ext = ".png"
             data = archivo
 
+        crudo = data if isinstance(data, bytes) else bytes(data)
+
+        if comprimir and ext != ".gif":
+            ruta = _comprimir_imagen_subida(crudo, temp_dir, prefijo)
+            if ruta:
+                return ruta
+
         salida = os.path.join(temp_dir, f"{prefijo}_{os.getpid()}{ext}")
         with open(salida, "wb") as f:
-            if isinstance(data, bytes):
-                f.write(data)
-            else:
-                f.write(bytes(data))
+            f.write(crudo)
         return salida
     except Exception as e:
         logger.error(f"Error guardando imagen subida: {e}")
@@ -307,6 +366,57 @@ def aviso_pausadas(pausadas) -> None:
     texto = texto_pausadas(total)
     if texto:
         st.caption(texto)
+
+
+# Aviso de cuentas en el cajon de verificacion humana (`core.verificacion`):
+# la activacion ya las salta, pero el operador debe saberlo y gestionarlas.
+MENSAJE_VERIFICACION = (
+    "🚦 {n} cuenta(s) en verificación se saltan automáticamente. "
+    "Gestiónalas en Cuentas → 🚦 Verificación."
+)
+
+MENSAJE_VERIFICACION_CORTO = (
+    "🚦 {n} cuenta(s) en verificación se saltan automáticamente."
+)
+
+
+def texto_verificacion(total, corto: bool = False) -> str:
+    """Texto unico del aviso de verificacion ('' si no hay pendientes)."""
+    try:
+        n = int(total or 0)
+    except Exception:
+        n = 0
+    if n <= 0:
+        return ""
+    plantilla = MENSAJE_VERIFICACION_CORTO if corto else MENSAJE_VERIFICACION
+    return plantilla.format(n=n)
+
+
+def contar_verificacion_pendiente() -> int:
+    """Pendientes de verificacion en la BD (0 si `core.verificacion` falla).
+
+    Import perezoso a proposito: la pagina sigue cargando aunque el core
+    desplegado todavia no traiga el modulo."""
+    try:
+        from core.verificacion import contar_pendientes
+
+        return int(contar_pendientes() or 0)
+    except Exception:
+        return 0
+
+
+def aviso_verificacion(corto: bool = False) -> int:
+    """Caption unico con las cuentas que la activacion se salta (0 = nada).
+
+    Devuelve el numero mostrado (0 si no hay pendientes o falla el core)."""
+    total = contar_verificacion_pendiente()
+    texto = texto_verificacion(total, corto=corto)
+    if texto:
+        try:
+            st.caption(texto)
+        except Exception:
+            pass
+    return total
 
 
 def _pausa_entre_cuentas(pausa_entre) -> None:

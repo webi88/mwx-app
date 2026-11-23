@@ -70,6 +70,43 @@ def _sesion_aleatoria(longitud: int = 8) -> str:
     return "".join(random.choices(string.ascii_letters + string.digits, k=longitud))
 
 
+def _proxy_para_log(texto) -> str:
+    """Version SEGURA de un proxy para logs: oculta usuario y password.
+
+    Conserva esquema/host/puerto (util para diagnosticar) y reemplaza las
+    credenciales por `***:***`; tambien redacta `_session-XXX`. Nunca lanza y,
+    si no puede reconocer el formato, devuelve un texto generico en vez de la
+    cadena cruda (para no filtrar secretos).
+    """
+    try:
+        crudo = str(texto or "").strip()
+        if not crudo:
+            return "(vacio)"
+        s = re.sub(r"_session-[A-Za-z0-9]+", "_session-***", crudo)
+        if "@" in s:
+            creds, host_port = s.rsplit("@", 1)
+            esquema = ""
+            if "://" in creds:
+                esquema, creds = creds.split("://", 1)
+                esquema += "://"
+            if ":" in creds:
+                return f"{esquema}***:***@{host_port}"
+            return f"{esquema}***@{host_port}"
+        if "://" in s:
+            esquema, resto = s.split("://", 1)
+            host_port = resto.split("/", 1)[0]
+            if re.match(r"^[^:\s]+:\d+$", host_port):
+                return f"{esquema}://{host_port}"
+            return f"{esquema}://(host oculto)"
+        if s.count(":") == 3:
+            # Formato `host:port:user:pass`: se conservan host y puerto.
+            host, puerto, _, _ = s.split(":", 3)
+            return f"{host}:{puerto}:***:***"
+        return "(proxy oculto)"
+    except Exception:
+        return "(proxy oculto)"
+
+
 class ProxyManager:
     """Gestiona proxies residenciales/moviles (Smartproxy e IPRoyal).
 
@@ -149,7 +186,7 @@ class ProxyManager:
             if s != original:
                 logger.warning(
                     "Proxy con credenciales repetidas colapsado: "
-                    f"{original!r} -> {s!r}"
+                    f"{_proxy_para_log(original)} -> {_proxy_para_log(s)}"
                 )
         except Exception:
             return original
@@ -465,7 +502,7 @@ class ProxyManager:
         proxy_base = self.normalizar(proxy_base) or proxy_base
         info = self.analizar(proxy_base)
         if not info:
-            logger.error(f"Proxy base invalido: {proxy_base}")
+            logger.error(f"Proxy base invalido: {_proxy_para_log(proxy_base)}")
             return {}
         os.makedirs(self.dir_paises, exist_ok=True)
         resultado = {}
@@ -811,10 +848,33 @@ class ProxyManager:
         s = self._colapsar_repeticiones(s)
 
         if not self.analizar(s):
-            logger.warning(f"Proxy ignorado (formato invalido): {linea}")
+            logger.warning(
+                f"Proxy ignorado (formato invalido): {_proxy_para_log(linea)}"
+            )
             return None
 
         return s
+
+    def normalizar_guardado(self, proxy: str) -> str:
+        """Version LIMPIA (colapsada) de un proxy ya guardado en `Cuenta.proxy`.
+
+        Solo elimina los segmentos de credenciales duplicados consecutivos
+        (`_area-XX_life-NN`, `_country-XX__lifetime-NNm`, `-country-XX`) que
+        dejan algunos proveedores/bases. NO valida ni reformatea el proxy (no
+        agrega esquema, no reordena `host:port:user:pass`) y NUNCA toca
+        `_session-XXX`. Devuelve "" si el proxy viene vacio y nunca lanza.
+
+        El llamador (pre-vuelo de la campana) puede persistir el resultado tal
+        cual en `Cuenta.proxy`; en el peor caso, si no hay nada que colapsar,
+        devuelve el mismo texto.
+        """
+        try:
+            texto = (proxy or "").strip()
+            if not texto:
+                return ""
+            return self._colapsar_repeticiones(texto)
+        except Exception:
+            return proxy or ""
 
     def analizar(self, proxy: str) -> Optional[dict]:
         """Devuelve {scheme, host, port, user, password} o None."""
@@ -897,7 +957,9 @@ class ProxyManager:
         proxy = self._colapsar_repeticiones(proxy)
         info = self.analizar(proxy)
         if not info:
-            logger.warning(f"Proxy invalido, no se aplicara: {proxy}")
+            logger.warning(
+                f"Proxy invalido, no se aplicara: {_proxy_para_log(proxy)}"
+            )
             if not dinamico:
                 return None
             # Dinamico: Chrome SIEMPRE debe salir por el forwarder local para

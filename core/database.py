@@ -1,19 +1,48 @@
 from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker, DeclarativeBase
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Generator
+import sys
 
 from loguru import logger
-from core.config import settings, resolver_ruta
+from core.config import DATA_DIR, settings, resolver_ruta
+
+
+def _url_sqlite_por_defecto() -> str:
+    """SQLite de ESCRITURA bajo DATA_DIR (usado por el ejecutable congelado).
+
+    En desarrollo equivale a `sqlite:///data/gestor_redes.db` porque DATA_DIR
+    es la raiz del proyecto."""
+    ruta = Path(DATA_DIR) / "data" / "gestor_redes.db"
+    return f"sqlite:///{ruta}"
+
+
+def resolver_url_base_datos(url: str = "") -> str:
+    """Normaliza DATABASE_URL.
+
+    - Vacia: en el ejecutable congelado usa ``DATA_DIR/data/gestor_redes.db``;
+      en desarrollo se conserva la cadena vacia (comportamiento historico).
+    - SQLite relativa (``sqlite:///data/...``): se convierte a ruta ABSOLUTA
+      con `resolver_ruta` (en congelado resuelve bajo DATA_DIR).
+    - PostgreSQL/Supabase y rutas SQLite absolutas: se devuelven intactas.
+    """
+    valor = (url or "").strip()
+    if not valor:
+        if getattr(sys, "frozen", False):
+            return _url_sqlite_por_defecto()
+        return valor
+    if valor.startswith("sqlite:///") and not valor.startswith("sqlite:////"):
+        relativa = valor.replace("sqlite:///", "", 1)
+        return f"sqlite:///{resolver_ruta(relativa)}"
+    return valor
+
 
 # DATABASE_URL acepta:
 #   - SQLite local:   sqlite:///data/gestor_redes.db
 #   - PostgreSQL:     postgresql://user:pass@host:5432/dbname
 #                     (Supabase; añade "sslmode=require" opcional en la URL)
-_database_url = settings.database_url
-if _database_url.startswith("sqlite:///") and not _database_url.startswith("sqlite:////"):
-    _relative = _database_url.replace("sqlite:///", "", 1)
-    _database_url = f"sqlite:///{resolver_ruta(_relative)}"
+_database_url = resolver_url_base_datos(settings.database_url)
 
 _ES_SQLITE = "sqlite" in _database_url
 
@@ -157,6 +186,11 @@ NUEVAS_COLUMNAS_CUENTAS = {
     "cookies_json": "TEXT",
     "status": "VARCHAR(20) DEFAULT 'imported'",
     "last_checked": "DATETIME",
+    # "Cajon" de verificacion humana (ver core/verificacion.py).
+    "verificacion_pendiente": "BOOLEAN DEFAULT FALSE",
+    "verificacion_motivo": "VARCHAR(300) DEFAULT ''",
+    "verificacion_origen": "VARCHAR(30) DEFAULT ''",
+    "verificacion_fecha": "DATETIME",
 }
 
 

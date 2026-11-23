@@ -7,7 +7,7 @@ Verifica (sin Chrome y sin Streamlit runtime) que:
   - No quedan lineas ocultas ni branches de despacho huerfanos: cada modulo
     importado por el dispatch existe en disco y todo prefijo despachado tiene
     una operacion visible.
-  - `web/operaciones/cuentas.py` agrupa sus 16 pestanas en 3 modos (sin
+  - `web/operaciones/cuentas.py` agrupa sus 19 pestanas en 3 modos (sin
     perder ni repetir ninguna) y `TABS` sigue completo.
   - El bloque multimedia huerfano del sidebar se elimino: la operacion
     Multimedia y su boton generador viven en `web/operaciones/multimedia.py`.
@@ -1053,6 +1053,15 @@ def _app_test_por_roles() -> tuple[bool, str, dict]:
 
 
 def run(check):
+    # Las pestanas que renderizan el inventario leen columnas nuevas
+    # (`verificacion_*`): asegura la migracion antes de los AppTest.
+    try:
+        from core.database import init_db
+
+        init_db()
+    except Exception:
+        pass
+
     from web.operaciones.activacion_masiva import (
         ORDEN_ROLES,
         _navegadores_default,
@@ -1095,9 +1104,9 @@ def run(check):
 
     fuente_app = (RAIZ / "web" / "app.py").read_text(encoding="utf-8")
     check(
-        "navegacion: quedan 16 operaciones visibles y sin lineas comentadas "
-        "de ocultamiento",
-        len(opciones) == 16
+        "navegacion: quedan 17 operaciones base visibles y sin lineas "
+        "comentadas de ocultamiento",
+        len(opciones) == 17
         and "OCULTO" not in fuente_app
         and not any(
             linea.strip().startswith('# "') for linea in fuente_app.splitlines()
@@ -1144,15 +1153,35 @@ def run(check):
         and _modo_de_tab("pestana-inexistente") in MODOS_TABS,
     )
 
+    # ---------------- Pestana Verificacion: cajon de verificacion ----------
+    check(
+        "cuentas verificacion: TABS la ubica entre Estado y Eliminar",
+        TABS.index("🚦 Verificación") == TABS.index("⏸️ Estado") + 1
+        and TABS.index("🗑️ Eliminar")
+        == TABS.index("🚦 Verificación") + 1,
+    )
+    check(
+        "cuentas verificacion: el modo Cuentas la ubica entre Estado y Eliminar",
+        MODOS_TABS["🗂️ Cuentas"].index("🚦 Verificación")
+        == MODOS_TABS["🗂️ Cuentas"].index("⏸️ Estado") + 1
+        and MODOS_TABS["🗂️ Cuentas"].index("🗑️ Eliminar")
+        == MODOS_TABS["🗂️ Cuentas"].index("🚦 Verificación") + 1,
+    )
+    paginas_render = _paginas_render_cuentas()
+    check(
+        "cuentas verificacion: render() la mapea a _tab_verificacion",
+        paginas_render.get("🚦 Verificación") == "_tab_verificacion",
+    )
+
     # ---------------- Pestana Eliminar: borrado definitivo por lista --------
     check(
         "cuentas eliminar: TABS la ubica despues de Estado",
-        TABS.index("🗑️ Eliminar") == TABS.index("⏸️ Estado") + 1,
+        TABS.index("🗑️ Eliminar") == TABS.index("⏸️ Estado") + 2,
     )
     check(
         "cuentas eliminar: el modo Cuentas la ubica despues de Estado",
         MODOS_TABS["🗂️ Cuentas"].index("🗑️ Eliminar")
-        == MODOS_TABS["🗂️ Cuentas"].index("⏸️ Estado") + 1,
+        == MODOS_TABS["🗂️ Cuentas"].index("⏸️ Estado") + 2,
     )
     paginas_render = _paginas_render_cuentas()
     check(

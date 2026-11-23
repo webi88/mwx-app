@@ -20,9 +20,20 @@ data/portadas/
 data/backups/
 data/campanas/
 data/reportes/change/
+data/reportes/
+data/releases/
 data/clientes/
 data/clientes_bot.json
 *.db-shm
 *.db-wal
 .DS_Store
 Thumbs.db
+
+# MWX APP (desktop)
+data/mwx_machine.json
+data/mwx_sesion.json
+data/mwx_recordar.json
+data/logs/mwx_app.log
+build/
+dist/
+.venv-mwx/

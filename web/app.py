@@ -46,6 +46,7 @@ OPCIONES = [
     "⚡ RTS / Activaciones",
     "🎯 Activación Masiva",
     "✍️ Actividad",
+    "🖥️ Local (flota)",
     "❤️ Influencia: Likes",
     "🚩 Reportar Posts",
     "🚨 Alertas",
@@ -57,7 +58,10 @@ OPCIONES = [
     "📈 Monitor: Actividad",
 ]
 
-OPCIONES_ADMIN = ["👑 Admin: Usuarios"]
+OPCIONES_ADMIN = [
+    "👑 Admin: Usuarios",
+    "📲 MWX APP: Usuarios y Acceso",
+]
 OPCIONES_CREAR = ["🗂️ Cuentas: Perfiles, Secciones & Nombres"]
 
 # Navegación en 2 niveles (categoría -> operación): evita mostrar ~20 botones
@@ -81,6 +85,7 @@ CATEGORIAS = [
             "⚡ RTS / Activaciones",
             "🎯 Activación Masiva",
             "✍️ Actividad",
+            "🖥️ Local (flota)",
             "❤️ Influencia: Likes",
             "🚩 Reportar Posts",
         ],
@@ -100,6 +105,7 @@ CATEGORIAS = [
         [
             "📊 Reportes",
             "📈 Monitor: Actividad",
+            "📲 MWX APP: Usuarios y Acceso",
             "🗂️ Cuentas: Perfiles, Secciones & Nombres",
             "👑 Admin: Usuarios",
         ],
@@ -347,6 +353,9 @@ def main():
     elif seleccion.startswith("🎯"):
         from web.operaciones.activacion_masiva import render
         render(usuario)
+    elif seleccion.startswith("🖥️"):
+        from web.operaciones.local import render
+        render(usuario)
     elif seleccion.startswith("🚨"):
         from web.operaciones.alertas import render
         render(usuario)
@@ -381,6 +390,9 @@ def main():
         render(usuario)
     elif seleccion.startswith("📈"):
         from web.operaciones.monitor import render
+        render(usuario)
+    elif seleccion.startswith("📲"):
+        from web.operaciones.mwx_app import render
         render(usuario)
     elif seleccion.startswith("🖼️"):
         from web.operaciones.multimedia import render

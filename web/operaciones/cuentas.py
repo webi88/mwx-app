@@ -13,6 +13,7 @@ import json
 import os
 import re
 import threading
+import unicodedata
 
 import streamlit as st
 
@@ -57,6 +58,7 @@ TABS = [
     "🎨 Perfiles",
     "🏷️ Nombres",
     "⏸️ Estado",
+    "🚦 Verificación",
     "🗑️ Eliminar",
     "🏅 Tiers",
     "📷 Fotos",
@@ -69,7 +71,7 @@ TABS = [
     "📤 Exportar",
 ]
 
-# Agrupación de las 17 pestañas en 3 MODOS (radio superior). Reduce el ruido
+# Agrupación de las 19 pestañas en 3 MODOS (radio superior). Reduce el ruido
 # visual sin quitar ninguna pestaña: cada una aparece en UN solo modo y `TABS`
 # (exportado, lo usa web/app.py para validar ?tab=) se conserva intacto.
 MODOS_TABS = {
@@ -78,6 +80,7 @@ MODOS_TABS = {
         "🔎 Validar",
         "🔑 Login y cookies",
         "⏸️ Estado",
+        "🚦 Verificación",
         "🗑️ Eliminar",
         "🏅 Tiers",
         "📋 Inventario",
@@ -573,6 +576,20 @@ def _listar_cuentas(status_filtro: str = OPCION_TODAS, seccion_filtro=None) -> l
                         # campo no existe en una BD vieja.
                         "pausada_activacion": bool(
                             getattr(c, "pausada_activacion", False)
+                        ),
+                        # Cajon de verificacion humana (core.verificacion).
+                        # Tolerante con BDs viejas sin las columnas nuevas.
+                        "verificacion_pendiente": bool(
+                            getattr(c, "verificacion_pendiente", False)
+                        ),
+                        "verificacion_motivo": (
+                            getattr(c, "verificacion_motivo", "") or ""
+                        ),
+                        "verificacion_origen": (
+                            getattr(c, "verificacion_origen", "") or ""
+                        ),
+                        "verificacion_fecha": _fmt_fecha(
+                            getattr(c, "verificacion_fecha", None)
                         ),
                     }
                 )
@@ -2803,6 +2820,315 @@ def _nombre_archivo_seguro(nombre) -> str:
     return limpio.strip("._") or "cuenta"
 
 
+# ===================== CAJÓN DE VERIFICACIÓN HUMANA =====================
+
+# Señales (sin tildes, en minúsculas) de que X pidió intervención humana:
+# login, captcha/anti-bot de Cloudflare o el onboarding de teléfono.
+SENALES_VERIFICACION_HUMANA = (
+    "anti-bot",
+    "antibot",
+    "cloudflare",
+    "captcha",
+    "challenge",
+    "login",
+    "iniciar sesion",
+    "inicia sesion",
+    "sesion expirada",
+    "session expired",
+    "onboarding",
+    "muro de login",
+    "verificacion",
+)
+
+
+def _normalizar_texto(valor) -> str:
+    """Texto en minúsculas y sin tildes (para comparar motivos). Nunca lanza."""
+    try:
+        texto = str(valor or "").strip().lower()
+    except Exception:
+        return ""
+    try:
+        return "".join(
+            caracter
+            for caracter in unicodedata.normalize("NFKD", texto)
+            if not unicodedata.combining(caracter)
+        )
+    except Exception:
+        return texto
+
+
+def _es_motivo_verificacion_humana(motivo) -> bool:
+    """True si el motivo apunta a login/captcha/onboarding (requiere persona)."""
+    texto = _normalizar_texto(motivo)
+    if not texto:
+        return False
+    return any(senal in texto for senal in SENALES_VERIFICACION_HUMANA)
+
+
+def _fecha_legible(valor) -> str:
+    """Fecha ISO (o datetime) acortada a 'YYYY-MM-DD HH:MM'."""
+    texto = str(valor or "").strip()
+    if not texto:
+        return ""
+    if hasattr(valor, "strftime"):
+        return valor.strftime("%Y-%m-%d %H:%M")
+    return texto[:16].replace("T", " ")
+
+
+def _validar_y_reactivar(usuarios) -> dict:
+    """Valida (httpx) las cuentas dadas y reactiva SOLO las que siguen activas.
+
+    Devuelve `{"revisadas", "reactivadas", "no_activas", "errores"}`:
+      - `reactivadas`: usuarios con estado `active` que salieron del cajón.
+      - `no_activas`: pares (usuario, estado) que NO se tocan (expired,
+        suspended, limited, error...). La verificación se conserva.
+    Una excepción por cuenta se anota en `errores` y el bucle continúa.
+    Nunca lanza."""
+    resumen = {
+        "revisadas": 0,
+        "reactivadas": [],
+        "no_activas": [],
+        "errores": [],
+    }
+    try:
+        lista = [str(u).strip() for u in (usuarios or []) if str(u).strip()]
+    except Exception:
+        lista = []
+    if not lista:
+        return resumen
+    try:
+        from core.verificacion import marcar_verificada
+        from plataformas.twitter.session_validator import validar_cuenta
+    except Exception as e:
+        resumen["errores"].append(f"validador no disponible: {e}")
+        return resumen
+
+    for usuario in lista:
+        resumen["revisadas"] += 1
+        try:
+            with get_db_session() as db:
+                cuenta = (
+                    db.query(Cuenta)
+                    .filter(
+                        Cuenta.usuario == usuario,
+                        Cuenta.plataforma == "twitter",
+                    )
+                    .first()
+                )
+            if cuenta is None:
+                resumen["errores"].append(f"@{usuario}: no existe en la BD")
+                continue
+            estado = str(validar_cuenta(cuenta) or "").strip() or "desconocido"
+            if estado == "active":
+                marcar_verificada(usuario)
+                resumen["reactivadas"].append(usuario)
+            else:
+                resumen["no_activas"].append((usuario, estado))
+        except Exception as e:
+            resumen["errores"].append(f"@{usuario}: {e}")
+    return resumen
+
+
+def _mostrar_resumen_validacion(resumen) -> None:
+    """Pinta el resumen de `_validar_y_reactivar` (sin romper si viene raro)."""
+    if not isinstance(resumen, dict):
+        return
+    reactivadas = list(resumen.get("reactivadas") or [])
+    no_activas = list(resumen.get("no_activas") or [])
+    errores = list(resumen.get("errores") or [])
+    if reactivadas:
+        st.success(
+            f"✅ {len(reactivadas)} cuenta(s) activas y reactivadas: "
+            + ", ".join(f"@{usuario}" for usuario in reactivadas)
+        )
+    if no_activas:
+        detalle = ", ".join(f"@{usuario} ({estado})" for usuario, estado in no_activas)
+        st.warning(
+            f"⚠️ {len(no_activas)} cuenta(s) NO se reactivaron porque su "
+            f"sesión no está `active`: {detalle}. Siguen en el cajón."
+        )
+    if errores:
+        st.error("Errores al validar: " + "; ".join(str(e) for e in errores[:5]))
+    if not reactivadas and not no_activas and not errores:
+        st.info("No se validó ninguna cuenta.")
+
+
+def _tab_verificacion():
+    """Cajón de cuentas que piden verificación humana (login/captcha/onboarding).
+
+    La activación ya las excluye; aquí el operador las revisa desde su celular
+    y las reactiva. Import perezoso de `core.verificacion` para que la página
+    cargue aunque la versión desplegada aún no tenga esa capa."""
+    st.markdown("### 🚦 Cajón de verificación")
+    st.caption(
+        "Cuando una cuenta pide verificación humana (login/captcha/onboarding), "
+        "la activación la guarda aquí y salta a la siguiente. Verifícala desde "
+        "tu celular y luego reactívala."
+    )
+    try:
+        from core.verificacion import (
+            contar_pendientes,
+            listar_pendientes,
+            marcar_pendiente,
+            marcar_verificada,
+        )
+    except Exception as e:
+        st.warning(f"La capa de verificación no está disponible: {e}")
+        return
+
+    pendientes = []
+    try:
+        pendientes = listar_pendientes(limite=1000) or []
+    except Exception:
+        pendientes = []
+    # Tolerante a una version futura/vieja que devuelva algo raro.
+    pendientes = [p for p in pendientes if isinstance(p, dict)]
+    try:
+        total = int(contar_pendientes() or 0)
+    except Exception:
+        total = len(pendientes)
+
+    humanos = sum(
+        1
+        for p in pendientes
+        if _es_motivo_verificacion_humana(p.get("motivo", ""))
+    )
+    fechas = [str(p.get("fecha") or "") for p in pendientes if p.get("fecha")]
+    mas_antigua = _fecha_legible(min(fechas)) if fechas else ""
+
+    col_total, col_humanos, col_antigua = st.columns(3)
+    col_total.metric("🚦 Pendientes", total)
+    col_humanos.metric("🔐 Login / anti-bot", humanos)
+    col_antigua.metric("🕓 Más antigua", mas_antigua or "—")
+
+    opciones = []
+    if not pendientes:
+        st.info(
+            "No hay cuentas pendientes de verificación: toda la flota puede "
+            "usarse en las campañas."
+        )
+    else:
+        tabla = [
+            {
+                "usuario": p.get("usuario", ""),
+                "motivo": _abreviar(p.get("motivo", ""), 70),
+                "detectada": _fecha_legible(p.get("fecha", "")),
+                "origen": p.get("origen", ""),
+                "tier": _etiqueta_tier_badge(p.get("tier_calidad", "")),
+                "sección": etiqueta_seccion(
+                    normalizar_seccion(p.get("seccion", ""))
+                ),
+            }
+            for p in pendientes
+        ]
+        st.dataframe(tabla, use_container_width=True)
+
+        opciones = [
+            p.get("usuario", "") for p in pendientes if p.get("usuario")
+        ]
+        seleccion = st.multiselect(
+            "Cuentas a reactivar (deja marcadas solo las que ya verificaste)",
+            opciones,
+            default=opciones,
+            key="verif_selector",
+        )
+
+        col_marcar, col_validar = st.columns(2)
+        with col_marcar:
+            if st.button(
+                "✅ Marcar como verificadas y reactivar",
+                type="primary",
+                use_container_width=True,
+                key="btn_verif_marcar",
+            ):
+                if not seleccion:
+                    st.warning("Selecciona al menos una cuenta.")
+                else:
+                    reactivadas = 0
+                    for usuario in seleccion:
+                        try:
+                            if marcar_verificada(usuario):
+                                reactivadas += 1
+                        except Exception:
+                            continue
+                    _listar_cuentas.clear()
+                    _flash(
+                        "Cuentas reactivadas tras verificación: "
+                        f"{reactivadas} de {len(seleccion)}."
+                    )
+                    st.rerun()
+        with col_validar:
+            if st.button(
+                "🔎 Validar sesión y reactivar",
+                use_container_width=True,
+                key="btn_verif_validar",
+            ):
+                if not seleccion:
+                    st.warning("Selecciona al menos una cuenta.")
+                else:
+                    with st.spinner(
+                        "Validando sesiones con httpx (puede tardar un poco)…"
+                    ):
+                        resumen = _validar_y_reactivar(seleccion)
+                    _listar_cuentas.clear()
+                    _mostrar_resumen_validacion(resumen)
+
+        st.markdown("#### 📱 Lista para copiar al celular")
+        st.code("\n".join(opciones), language="text")
+
+    with st.expander("🕓 Mover una cuenta al cajón manualmente", expanded=False):
+        st.caption(
+            "Útil cuando ves un reto en X desde otro dispositivo: mueve la "
+            "cuenta al cajón para que la activación no la use mientras la "
+            "verificas."
+        )
+        cuentas = [
+            fila
+            for fila in _listar_cuentas(OPCION_TODAS)
+            if fila.get("usuario") and not fila.get("verificacion_pendiente")
+        ]
+        if not cuentas:
+            st.caption("No hay cuentas fuera del cajón.")
+        else:
+            mapa = {_etiqueta_cuenta(fila): fila["usuario"] for fila in cuentas}
+            elegidas = st.multiselect(
+                "Cuentas a mover al cajón",
+                list(mapa),
+                key="verif_manual_selector",
+            )
+            motivo_manual = st.text_input(
+                "Motivo (lo verás en la tabla de pendientes)",
+                value="verificación manual",
+                key="verif_manual_motivo",
+            )
+            if st.button(
+                "🕓 Marcar como pendiente",
+                key="btn_verif_manual",
+            ):
+                if not elegidas:
+                    st.warning("Selecciona al menos una cuenta.")
+                else:
+                    movidas = 0
+                    for etiqueta in elegidas:
+                        usuario = mapa.get(etiqueta, "")
+                        if not usuario:
+                            continue
+                        try:
+                            if marcar_pendiente(
+                                usuario,
+                                motivo=motivo_manual,
+                                origen="manual",
+                            ):
+                                movidas += 1
+                        except Exception:
+                            continue
+                    _listar_cuentas.clear()
+                    _flash(
+                        f"Cuentas movidas al cajón de verificación: {movidas}."
+                    )
+                    st.rerun()
+
+
 def _tab_estado():
     st.markdown("### ⏸️ Estado de las cuentas (desactivar / reactivar)")
     st.caption(
@@ -2925,6 +3251,7 @@ def _tab_estado():
             "usuario": f["usuario"],
             "activa": "Sí" if f.get("activa") else "No",
             "pausa": _etiqueta_pausa(f),
+            "verificación": "🚦" if f.get("verificacion_pendiente") else "",
             "status": f["status"],
             "sección": f["seccion_etiqueta"],
             "tipo": f["tipo_etiqueta"],
@@ -5167,6 +5494,9 @@ def _tab_inventario():
                 "handle_propuesto": f["handle_propuesto"],
                 "activa": "Sí" if f.get("activa") else "No",
                 "pausa": _etiqueta_pausa(f),
+                "Verificación": (
+                    "🚦 Pendiente" if f.get("verificacion_pendiente") else ""
+                ),
                 "avatar": "Sí" if f.get("avatar") else "No",
                 "portada": "Sí" if f.get("banner") else "No",
                 "status": f["status"],
@@ -5307,6 +5637,7 @@ def render(usuario):
         "🎨 Perfiles": _tab_perfiles,
         "🏷️ Nombres": _tab_nombres,
         "⏸️ Estado": _tab_estado,
+        "🚦 Verificación": _tab_verificacion,
         "🗑️ Eliminar": _tab_eliminar,
         "🏅 Tiers": _tab_tiers,
         "📷 Fotos": _tab_fotos,

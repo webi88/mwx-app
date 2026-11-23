@@ -109,6 +109,186 @@ REGLA_MAX_100 = (
 _REGLA_MAX_100 = REGLA_MAX_100
 
 
+# --------------------------------------------------------------------------- #
+# DIVERSIDAD ANTI-REPETICION: angulos narrativos y bloque de prompt.
+#
+# El pedido del dueño es que NINGUNA publicacion (post y sobre todo el RETWEET
+# CON CITA) salga casi igual a otra: cada texto debe leerse como de una persona
+# distinta. El prompt asigna un ANGULO distinto por slot y prohibe repetir
+# frases/estructuras/parafrasis. El filtro determinista vive en
+# ``ia/generador_contenido.py`` (similitud_textos / elegir_textos_diversos).
+# --------------------------------------------------------------------------- #
+ANGULOS_VARIACION = (
+    "directo y seco",
+    "pregunta retórica",
+    "anécdota en primera persona",
+    "contraste antes/después",
+    "recomendación",
+    "advertencia",
+    "empatía",
+    "urgencia",
+    "resumen en una frase",
+    "reflexión",
+    "diálogo con el lector",
+    "cierre contundente",
+    "comparación",
+    "humor ligero",
+    "causa y efecto",
+    "síntesis en dos frases",
+)
+
+
+def _angulos_para(cantidad: int = 0, angulos=None) -> list:
+    """Lista de angulos (uno por texto) a partir de ``angulos`` o del catalogo.
+
+    - ``angulos`` puede ser una lista/tupla/string; se normaliza y se cicla
+      hasta cubrir ``cantidad``.
+    - Sin ``angulos`` se usan ``ANGULOS_VARIACION`` en orden, ciclando.
+    - ``cantidad <= 0`` devuelve la lista completa de ``angulos`` (o el
+      catalogo) para poder mostrarla en el prompt. Nunca lanza.
+    """
+    base: list = []
+    if angulos:
+        if isinstance(angulos, str):
+            base = [angulos]
+        else:
+            try:
+                base = [str(a).strip() for a in angulos if str(a or "").strip()]
+            except TypeError:
+                base = [str(angulos)]
+    if not base:
+        base = list(ANGULOS_VARIACION)
+    try:
+        n = int(cantidad)
+    except (TypeError, ValueError):
+        n = 0
+    if n <= 0:
+        return base
+    return [base[i % len(base)] for i in range(n)]
+
+
+def _recortar_evitar(evitar, max_items: int = 20, max_chars: int = 2500) -> list:
+    """Normaliza ``evitar`` a lineas cortas para el bloque "NO REPITAS".
+
+    Tolera None, un string suelto o cualquier iterable; descarta vacios,
+    recorta cada texto para no inflar el prompt y respeta los topes de
+    ``max_items`` / ``max_chars``. Nunca lanza.
+    """
+    if evitar is None:
+        return []
+    if isinstance(evitar, str):
+        candidatos = [evitar]
+    else:
+        try:
+            candidatos = list(evitar)
+        except TypeError:
+            candidatos = [evitar]
+    lineas: list = []
+    total = 0
+    for item in candidatos:
+        if item is None:
+            continue
+        texto = " ".join(str(item).split())
+        if not texto:
+            continue
+        if len(texto) > 300:
+            texto = texto[:297].rstrip() + "..."
+        if total + len(texto) > max_chars:
+            break
+        lineas.append(texto)
+        total += len(texto)
+        if len(lineas) >= max_items:
+            break
+    return lineas
+
+
+def bloque_diversidad(
+    cantidad: int = 0,
+    evitar=None,
+    tipo: str = "cita",
+    angulos=None,
+) -> str:
+    """Bloque de prompt con la regla OBLIGATORIA de diversidad anti-repetida.
+
+    Exige un angulo narrativo distinto por texto, apertura/estructura/cierre
+    distintos, prohibe repetir frases de 4+ palabras y prohibe parafrasear o
+    reformular cualquier otro texto de la lista (o los de ``evitar``). Sirve
+    igual para citas, posts y comentarios; el llamador decide el ``tipo`` para
+    anadir la nota de hashtags (posts) o la de spam-safe (comentarios).
+
+    - ``cantidad`` numero exacto de textos pedidos (si es >0 se listan los
+      angulos "texto N -> angulo ...").
+    - ``evitar`` iterable de textos ya usados que NO deben reutilizarse.
+    - ``tipo``: "cita"/"post"/"comentario" (texto libre, solo matiza la nota).
+    - ``angulos`` lista opcional (para lotes: conserva el angulo del slot).
+
+    Devuelve el bloque listo para concatenar (con saltos de linea). Nunca lanza.
+    """
+    try:
+        tipo_norm = str(tipo or "cita").strip().lower()
+        try:
+            n = int(cantidad)
+        except (TypeError, ValueError):
+            n = 0
+        asignados = _angulos_para(n, angulos)
+        if n > 0:
+            encabezado = (
+                f"- Genera EXACTAMENTE {n} textos y asigna a CADA UNO un "
+                "ÁNGULO NARRATIVO DISTINTO de la lista. Cada elemento de la "
+                "respuesta corresponde al ángulo N de su número (texto 1 -> "
+                "ángulo 1, texto 2 -> ángulo 2, ...)."
+            )
+        else:
+            encabezado = (
+                "- Genera TODOS los textos pedidos y asigna a CADA UNO un "
+                "ÁNGULO NARRATIVO DISTINTO de la lista."
+            )
+        lineas = [
+            "REGLA DE DIVERSIDAD OBLIGATORIA (ANTI-REPETICION):",
+            encabezado,
+        ]
+        if n > 0:
+            for i, angulo in enumerate(asignados[:n], 1):
+                lineas.append(f"- Texto {i} | ángulo obligatorio: {angulo}.")
+        else:
+            lineas.append(
+                "- Ángulos disponibles (uno distinto por texto): "
+                + "; ".join(asignados) + "."
+            )
+        lineas.extend([
+            "- PROHIBIDO repetir frases de 4+ palabras (cuatro o más palabras) "
+            "entre los textos, aunque cambien una o dos palabras.",
+            "- PROHIBIDO parafrasear, reformular o reutilizar la estructura de "
+            "otro texto de la lista: cada texto se lee como de una persona "
+            "distinta.",
+            "- Cada texto debe tener APERTURA, DESARROLLO, RITMO y CIERRE "
+            "DISTINTOS: no empieces dos textos con la misma palabra ni con la "
+            "misma formula, y no cierres dos textos igual.",
+            "- PROHIBIDO copiar el texto base o el contexto tal cual: usa "
+            "palabras propias y un orden propio.",
+        ])
+        if tipo_norm.startswith(("post", "hashtag")):
+            lineas.append(
+                "- En los POSTS el hashtag pedido sigue integrado EN MEDIO del "
+                "texto (nunca al final); la diversidad aplica al cuerpo."
+            )
+        elif tipo_norm.startswith(("coment", "resp")):
+            lineas.append(
+                "- Los COMENTARIOS/RESPUESTAS no llevan hashtags, links ni "
+                "@menciones: la diversidad aplica al texto conversacional."
+            )
+        usados = _recortar_evitar(evitar)
+        if usados:
+            lineas.append(
+                "- TEXTOS YA USADOS / NO REPITAS (PROHIBIDO reutilizarlos o "
+                "reformularlos, ni siquiera cambiando el orden):"
+            )
+            lineas.extend(f"  * {texto}" for texto in usados)
+        return "\n" + "\n".join(lineas) + "\n"
+    except Exception:
+        return ""
+
+
 def _reglas_registro(registro: str = "", incluir_limite: bool = True) -> str:
     """Bloque de reglas de registro listo para concatenar (con saltos de linea).
 
@@ -1219,6 +1399,8 @@ def get_prompt_comentario(
     tema: str = "",
     personalidad: str = "",
     tweet_ancla_texto: str = "",
+    angulos=None,
+    evitar=None,
 ) -> str:
     """Prompt para COMENTARIOS/RESPUESTAS breves y conversacionales.
 
@@ -1252,6 +1434,9 @@ def get_prompt_comentario(
         "mantiene Titulo/Descripcion/Conclusion pero MUY cortos).\n"
         + bloque_tweet_ancla(tweet_ancla_texto)
         + _bloque_tema_personalidad(tema, personalidad)
+        + bloque_diversidad(
+            cantidad, evitar=evitar, tipo="comentario", angulos=angulos
+        )
         + _reglas_formato(cantidad, max_chars=200, estructura=False, hashtags=False)
         + bloque_estilo_perfil(perfil, comentario=True)
     )
@@ -1267,6 +1452,9 @@ def get_prompt_hashtags(
     personalidad: str = "",
     perfil: str = "",
     todos: bool = False,
+    angulos=None,
+    evitar=None,
+    limite: int = 100,
 ) -> str:
     """Prompt de POST ORIGINAL con hashtag(s) obligatorios.
 
@@ -1279,14 +1467,38 @@ def get_prompt_hashtags(
 
     ``todos`` (kwarg nuevo AL FINAL, default False): para el modo ACTIVIDAD
     pide a la IA que incluya TODOS los hashtags de la lista en cada texto
-    cuando quepan en el maximo de 100 caracteres (si no caben, la mayor
-    cantidad posible). Default False = prompt anterior identico.
+    cuando quepan en el maximo permitido (si no caben, la mayor cantidad
+    posible). Default False = prompt anterior identico.
+
+    ``limite`` (kwarg nuevo AL FINAL, default 100): maximo de caracteres del
+    texto final. Con 100 (default) el prompt es BYTE A BYTE el historico
+    (``REGLA_MAX_100`` y "100 caracteres"); las campanas masivas no cambian.
+    Otro valor (20..280) solo ajusta la regla de oro y las lineas de extension
+    (modo LOCAL, hasta el maximo de X). Se normaliza a [20, 280].
+
+    ``angulos`` / ``evitar`` (antes de ``limite``): el bloque
+    ``bloque_diversidad`` asigna un angulo distinto por texto y prohibe
+    reutilizar/reformular los textos de ``evitar``. Sin esos kwargs el prompt
+    sigue exigiendo diversidad con el catalogo ``ANGULOS_VARIACION``.
     """
+    try:
+        limite = max(20, min(280, int(limite)))
+    except (TypeError, ValueError):
+        limite = 100
+    regla_oro = (
+        REGLA_MAX_100
+        if limite == 100
+        else (
+            "REGLA DE ORO: EL TEXTO FINAL DEBE TENER UN MÁXIMO ESTRICTO DE "
+            f"{limite} CARACTERES EN TOTAL, INCLUYENDO HASHTAGS Y ESPACIOS. "
+            "SÉ MUY BREVE Y DIRECTO."
+        )
+    )
     prompt = (
         _base_narrativa(narrativa, entrenamiento)
         + (_reglas_trasfondo() if narrativa else "")
         + _reglas_registro(registro, incluir_limite=False)
-        + f"\n{REGLA_MAX_100}\n"
+        + f"\n{regla_oro}\n"
         + "\nTIPO DE CONTENIDO: POST ORIGINAL CON HASHTAG.\n"
         "TAREA: redactar publicaciones ORIGINALES con opinion propia sobre el "
         "CONTEXTO indicado.\n"
@@ -1308,7 +1520,7 @@ def get_prompt_hashtags(
         "estuviera.\n"
         "- PROHIBIDO dejar el hashtag al final del texto: nunca al final ni "
         "como cierre ni en una lista aparte.\n"
-        "- EXTENSION: MÁXIMO ESTRICTO de 100 caracteres por texto "
+        f"- EXTENSION: MÁXIMO ESTRICTO de {limite} caracteres por texto "
         "(incluyendo hashtags y espacios). El texto debe quedar COMPLETO y con "
         "sentido (incluida su frase de cierre), nunca cortado a la mitad.\n"
         + _bloque_tema_personalidad("", personalidad)
@@ -1329,8 +1541,8 @@ def get_prompt_hashtags(
         if todos:
             prompt += (
                 "- OBLIGATORIO: incluye TODOS los hashtags de la lista en CADA "
-                "texto siempre que quepan en el máximo de 100 caracteres; si "
-                "no caben, usa la mayor cantidad posible.\n"
+                f"texto siempre que quepan en el máximo de {limite} caracteres; "
+                "si no caben, usa la mayor cantidad posible.\n"
             )
     if contexto:
         prompt += (
@@ -1339,7 +1551,10 @@ def get_prompt_hashtags(
             "debes copiar su redacción):\n"
             f"{contexto}"
         )
-    prompt += _reglas_formato(cantidad, max_chars=100)
+    prompt += bloque_diversidad(
+        cantidad, evitar=evitar, tipo="post", angulos=angulos
+    )
+    prompt += _reglas_formato(cantidad, max_chars=limite)
     prompt += bloque_estilo_perfil(perfil)
     return prompt
 

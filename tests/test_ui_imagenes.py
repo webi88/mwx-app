@@ -68,6 +68,17 @@ class _GuardarImagenEspia:
         return f"C:/tmp/imagenes/{prefijo}_{nombre}"
 
 
+class _ArchivoBytesFalso:
+    """UploadedFile simulado con bytes reales (`name` + `getbuffer`)."""
+
+    def __init__(self, nombre: str, datos: bytes):
+        self.name = nombre
+        self._datos = datos
+
+    def getbuffer(self):
+        return self._datos
+
+
 class _MotorRolesFake:
     """Motor con `**kwargs`: soporta `imagenes` y captura los kwargs."""
 
@@ -791,7 +802,105 @@ def run(check):
         ascii(sorted(directo_viejo[0])) if directo_viejo else "sin capturas",
     )
 
-    # ---------------- 7) Limpieza final ----------------
+    # ---------------- 7) Compresion en `guardar_imagen_subida` ----------------
+    import random
+    import tempfile
+    from io import BytesIO
+
+    from PIL import Image
+
+    import core.config as core_config
+    from web.operaciones._helpers import guardar_imagen_subida
+
+    original_resolver = core_config.resolver_ruta
+    with tempfile.TemporaryDirectory() as temp_dir:
+        core_config.resolver_ruta = (
+            lambda ruta: temp_dir
+            if str(ruta).replace("\\", "/").endswith("data/temp")
+            else original_resolver(ruta)
+        )
+        try:
+            # PNG grande (ruido): se comprime a .jpg y pesa menos.
+            azar = random.Random(1234)
+            pixeles = bytes(azar.randrange(256) for _ in range(900 * 900 * 3))
+            buffer_png = BytesIO()
+            Image.frombytes("RGB", (900, 900), pixeles).save(
+                buffer_png, format="PNG"
+            )
+            png_grande = buffer_png.getvalue()
+            ruta_png = guardar_imagen_subida(
+                _ArchivoBytesFalso("grande.png", png_grande),
+                prefijo="test_comp",
+            )
+            datos_png = (
+                Path(ruta_png).read_bytes() if ruta_png else b""
+            )
+            check(
+                "imagenes compresion: PNG grande -> .jpg mas pequeno",
+                bool(ruta_png)
+                and ruta_png.lower().endswith(".jpg")
+                and Path(ruta_png).is_absolute()
+                and 0 < len(datos_png) < len(png_grande),
+                f"ruta={ruta_png} origen={len(png_grande)} "
+                f"destino={len(datos_png)}",
+            )
+
+            # GIF: se conserva byte a byte y con su extension.
+            frames = [
+                Image.new("RGB", (40, 40), color).convert("P")
+                for color in ((255, 0, 0), (0, 0, 255))
+            ]
+            buffer_gif = BytesIO()
+            frames[0].save(
+                buffer_gif,
+                format="GIF",
+                save_all=True,
+                append_images=frames[1:],
+                duration=100,
+                loop=0,
+            )
+            gif = buffer_gif.getvalue()
+            ruta_gif = guardar_imagen_subida(
+                _ArchivoBytesFalso("animado.gif", gif), prefijo="test_gif"
+            )
+            check(
+                "imagenes compresion: GIF se conserva byte a byte",
+                bool(ruta_gif)
+                and ruta_gif.lower().endswith(".gif")
+                and Path(ruta_gif).read_bytes() == gif,
+                f"ruta={ruta_gif} bytes={len(gif)}",
+            )
+
+            # Archivo invalido: Pillow falla -> fallback raw (nunca lanza).
+            roto = b"esto no es una imagen"
+            ruta_roto = guardar_imagen_subida(
+                _ArchivoBytesFalso("rota.png", roto), prefijo="test_rota"
+            )
+            check(
+                "imagenes compresion: archivo invalido cae al guardado raw",
+                bool(ruta_roto)
+                and ruta_roto.lower().endswith(".png")
+                and Path(ruta_roto).read_bytes() == roto,
+                f"ruta={ruta_roto}",
+            )
+
+            # `comprimir=False`: comportamiento anterior (sin tocar bytes).
+            ruta_raw = guardar_imagen_subida(
+                _ArchivoBytesFalso("grande.png", png_grande),
+                prefijo="test_raw",
+                comprimir=False,
+            )
+            check(
+                "imagenes compresion: comprimir=False conserva el original",
+                bool(ruta_raw)
+                and ruta_raw.lower().endswith(".png")
+                and Path(ruta_raw).read_bytes() == png_grande,
+                f"ruta={ruta_raw}",
+            )
+        finally:
+            core_config.resolver_ruta = original_resolver
+
+    # ---------------- 8) Limpieza final ----------------
     check(
         "imagenes: el marcador data/.campana_activa quedo limpio",
         not (RAIZ / "data" / ".campana_activa").exists(),

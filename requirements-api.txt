@@ -1,0 +1,11 @@
+# Dependencias del SERVICIO API del MWX APP (Railway).
+# Se instalan SOLO en el servicio `api`; el bot/dashboard usan requirements.txt.
+fastapi>=0.115,<1.0
+uvicorn[standard]>=0.30,<1.0
+httpx==0.28.1
+SQLAlchemy==2.0.35
+pydantic==2.9.2
+pydantic-settings==2.5.2
+python-dotenv==1.0.1
+loguru==0.7.2
+psycopg2-binary>=2.9.9

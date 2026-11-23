@@ -1,0 +1,784 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<title>MWX APP — Manual de administración y guía del usuario</title>
+<style>
+  :root{
+    --ink:#0B1117;
+    --muted:#5E6B77;
+    --teal:#00A9B8;
+    --teal-dark:#007E8A;
+    --violet:#6D4AFF;
+    --soft:#F2F8FA;
+    --line:#DCE6EA;
+    --warn:#FFF6E8;
+    --warn-line:#F0A23A;
+    --tip:#EAF8F5;
+    --tip-line:#22B894;
+    --danger:#C0392B;
+  }
+  @page{ size:A4; margin:17mm 16mm 18mm 16mm; }
+  *{ box-sizing:border-box; -webkit-print-color-adjust:exact; print-color-adjust:exact; }
+  html,body{ margin:0; padding:0; }
+  body{
+    font-family:"Segoe UI", Arial, sans-serif;
+    font-size:10.5pt;
+    line-height:1.55;
+    color:var(--ink);
+    background:#fff;
+  }
+  p{ margin:0 0 3.2mm 0; }
+  strong{ color:#0A3A40; }
+  a{ color:var(--teal-dark); text-decoration:none; }
+  ul,ol{ margin:2mm 0 4mm 0; padding-left:6mm; }
+  li{ margin:1.2mm 0; }
+  small{ font-size:9pt; color:var(--muted); }
+
+  /* ---------- Portada ---------- */
+  .cover{
+    height:245mm;
+    border-radius:8mm;
+    padding:20mm 18mm;
+    color:#fff;
+    background:linear-gradient(135deg,#070B10 0%,#0C1622 52%,#123447 100%);
+    position:relative;
+    overflow:hidden;
+    break-after:page;
+  }
+  .cover:before{
+    content:"";
+    position:absolute; right:-60mm; top:-60mm;
+    width:170mm; height:170mm; border-radius:50%;
+    background:radial-gradient(circle,rgba(0,180,196,.22),rgba(0,180,196,0) 68%);
+  }
+  .cover:after{
+    content:"";
+    position:absolute; left:-50mm; bottom:-70mm;
+    width:170mm; height:170mm; border-radius:50%;
+    background:radial-gradient(circle,rgba(124,92,255,.20),rgba(124,92,255,0) 68%);
+  }
+  .cover-top{ display:flex; align-items:center; justify-content:space-between; position:relative; z-index:2; }
+  .brand-card{
+    width:34mm; height:34mm; border-radius:7mm; background:#fff;
+    display:flex; align-items:center; justify-content:center;
+    box-shadow:0 6mm 18mm rgba(0,0,0,.35);
+  }
+  .brand-card img{ width:27mm; height:27mm; object-fit:contain; }
+  .tag{
+    font-size:8.5pt; letter-spacing:.12em; text-transform:uppercase;
+    border:1px solid rgba(255,255,255,.28); border-radius:20px;
+    padding:2mm 4mm; color:rgba(255,255,255,.82);
+  }
+  .cover-main{ position:relative; z-index:2; margin-top:38mm; }
+  .eyebrow{ font-size:9pt; letter-spacing:.22em; text-transform:uppercase; color:#7FE3EA; margin-bottom:4mm; }
+  .cover h1{ font-size:47pt; line-height:1.02; margin:0 0 5mm 0; letter-spacing:-.02em; }
+  .cover .lead{ font-size:15.5pt; color:#DCE9EF; max-width:150mm; margin-bottom:3mm; }
+  .cover .lead2{ font-size:12pt; color:#A9C2CF; max-width:150mm; }
+  .cover-bottom{ position:absolute; left:18mm; right:18mm; bottom:18mm; z-index:2; }
+  .accent-bar{ height:2.2mm; border-radius:2mm; background:linear-gradient(90deg,#00B4C4,#7C5CFF); margin-bottom:6mm; }
+  .cover-meta{ display:flex; gap:8mm; font-size:9pt; color:#B9CBD5; flex-wrap:wrap; }
+
+  /* ---------- Estructura ---------- */
+  section.page{ break-before:page; padding-bottom:2mm; }
+  .section-head{ display:flex; align-items:flex-start; gap:5mm; margin:0 0 6mm 0; }
+  .section-head .num{
+    width:11mm; height:11mm; border-radius:50%;
+    background:linear-gradient(135deg,var(--teal),var(--violet));
+    color:#fff; font-weight:700; font-size:13pt;
+    display:flex; align-items:center; justify-content:center;
+    flex:0 0 auto; margin-top:1mm;
+  }
+  h1.section-title{ font-size:21pt; margin:0; letter-spacing:-.01em; line-height:1.15; }
+  .section-head p{ margin:1mm 0 0 0; color:var(--muted); font-size:9.5pt; }
+  h2{ font-size:14pt; margin:8mm 0 2.5mm 0; color:#0A3A40; break-after:avoid; }
+  h3{ font-size:11.5pt; margin:5mm 0 1.5mm 0; color:#15333A; break-after:avoid; }
+  .page > h2:first-of-type{ margin-top:2mm; }
+  .lead-box{
+    background:var(--soft); border-left:1.6mm solid var(--teal);
+    border-radius:2mm; padding:4.5mm 5mm; margin:3mm 0 5mm 0;
+  }
+
+  /* ---------- Portada del índice ---------- */
+  .toc{ columns:2; column-gap:12mm; margin-top:4mm; }
+  .toc a{ display:block; color:var(--ink); padding:2.2mm 0; border-bottom:1px dotted #CBD8DD; font-size:10.5pt; }
+  .toc a span{ color:var(--muted); font-size:9pt; }
+  .toc .toc-main{ font-weight:600; }
+  .toc .toc-sub{ padding-left:5mm; font-size:9.5pt; color:var(--muted); }
+
+  /* ---------- Tarjetas y diagrama ---------- */
+  .grid-2{ display:grid; grid-template-columns:1fr 1fr; gap:5mm; margin:4mm 0 5mm 0; }
+  .card{
+    border:1px solid var(--line); border-radius:3mm; padding:5mm;
+    background:#fff; break-inside:avoid;
+  }
+  .card h3{ margin-top:0; }
+  .card .ico{ font-size:16pt; margin-bottom:2mm; }
+  .diagram{
+    display:flex; align-items:stretch; gap:2.5mm; margin:5mm 0 6mm 0;
+    break-inside:avoid;
+  }
+  .node{
+    flex:1; border:1px solid var(--line); border-radius:3mm;
+    padding:4mm 3mm; text-align:center; font-weight:600; font-size:9.5pt;
+    background:var(--soft);
+  }
+  .node small{ display:block; font-weight:400; font-size:8.2pt; margin-top:1mm; }
+  .node.admin{ border-top:1.6mm solid var(--violet); }
+  .node.server{ border-top:1.6mm solid var(--teal); }
+  .node.pc{ border-top:1.6mm solid #2DD4A7; }
+  .node.x{ border-top:1.6mm solid #111; }
+  .arrow{
+    align-self:center; color:var(--teal); font-size:16pt; font-weight:700;
+    flex:0 0 6mm; text-align:center;
+  }
+
+  /* ---------- Pasos ---------- */
+  .steps{ counter-reset:step; margin:3mm 0 4mm 0; }
+  .step{
+    display:flex; gap:4mm; margin:3mm 0; break-inside:avoid;
+  }
+  .step .n{
+    counter-increment:step; flex:0 0 8mm; width:8mm; height:8mm; border-radius:50%;
+    background:#E6F7F8; color:var(--teal-dark); font-weight:700; font-size:9.5pt;
+    display:flex; align-items:center; justify-content:center; margin-top:.4mm;
+  }
+  .step .n:after{ content:counter(step); }
+  .step .body{ flex:1; }
+  .step .body > strong:first-child{ display:block; margin-bottom:.6mm; }
+
+  /* ---------- Tablas ---------- */
+  table.tbl{ width:100%; border-collapse:collapse; margin:3mm 0 5mm 0; font-size:9.4pt; break-inside:avoid; }
+  table.tbl th{
+    background:#0E3B43; color:#fff; text-align:left; padding:2.6mm 3mm; font-weight:600;
+  }
+  table.tbl td{ border-bottom:1px solid var(--line); padding:2.4mm 3mm; vertical-align:top; }
+  table.tbl tr:nth-child(even) td{ background:#F8FBFC; }
+  table.tbl code{ font-size:8.8pt; }
+
+  code, .mono{
+    font-family:Consolas,"Courier New",monospace; font-size:9pt;
+    background:#F1F5F7; border:1px solid #E2EAED; border-radius:1.2mm;
+    padding:.5mm 1.4mm; color:#0C3B42;
+  }
+  pre{
+    font-family:Consolas,"Courier New",monospace; font-size:9pt; line-height:1.5;
+    background:#0B1620; color:#E6EDF3; border-radius:2.5mm; padding:4.5mm 5mm;
+    white-space:pre-wrap; margin:3mm 0 5mm 0; break-inside:avoid;
+  }
+
+  /* ---------- Avisos ---------- */
+  .callout{
+    border-radius:2.5mm; padding:4mm 5mm; margin:4mm 0; break-inside:avoid;
+    border:1px solid var(--line); background:var(--soft); font-size:9.7pt;
+  }
+  .callout > strong:first-child{ display:block; margin-bottom:1mm; }
+  .callout.warn{ background:var(--warn); border-color:var(--warn-line); }
+  .callout.warn > strong:first-child{ color:#8A5200; }
+  .callout.tip{ background:var(--tip); border-color:var(--tip-line); }
+  .callout.tip > strong:first-child{ color:#0A6B55; }
+  .callout.danger{ background:#FDECEA; border-color:#E6A69E; }
+  .callout.danger > strong:first-child{ color:#8E2A20; }
+
+  /* ---------- Capturas ---------- */
+  figure.shot{ margin:4mm 0 5mm 0; break-inside:avoid; text-align:center; }
+  figure.shot img{
+    width:100%; max-width:150mm; border-radius:2.5mm;
+    border:1px solid #B9C9CF; box-shadow:0 3mm 10mm rgba(0,0,0,.12);
+  }
+  figcaption{ font-size:8.7pt; color:var(--muted); margin-top:2mm; }
+
+  /* ---------- Checklist ---------- */
+  .checklist{ list-style:none; padding-left:0; margin:3mm 0 4mm 0; }
+  .checklist li{ padding-left:7mm; position:relative; margin:2mm 0; }
+  .checklist li:before{
+    content:"☐"; position:absolute; left:0; top:-.5mm; color:var(--teal-dark); font-size:12pt;
+  }
+
+  /* ---------- FAQ ---------- */
+  .faq{ border:1px solid var(--line); border-radius:2.5mm; padding:4mm 5mm; margin:3mm 0; break-inside:avoid; }
+  .faq .q{ font-weight:700; color:#0A3A40; margin-bottom:1.2mm; }
+  .faq .a{ color:#26343C; }
+
+  /* ---------- Footer ---------- */
+  .kpi{ display:flex; gap:4mm; margin:4mm 0; }
+  .kpi .box{ flex:1; border:1px solid var(--line); border-radius:2.5mm; padding:3.5mm; text-align:center; }
+  .kpi .box b{ display:block; font-size:16pt; color:var(--teal-dark); }
+  .kpi .box small{ font-size:8.2pt; }
+</style>
+</head>
+<body>
+
+<!-- ================= PORTADA ================= -->
+<section class="cover">
+  <div class="cover-top">
+    <div class="brand-card"><img src="mwx_logo.png" alt="Logo MWX"></div>
+    <div class="tag">Documento interno · v1.0</div>
+  </div>
+  <div class="cover-main">
+    <div class="eyebrow">Manual oficial</div>
+    <h1>MWX APP</h1>
+    <p class="lead">Campañas locales de X con cuentas asignadas por usuario.</p>
+    <p class="lead2">Manual de administración y guía del usuario final</p>
+  </div>
+  <div class="cover-bottom">
+    <div class="accent-bar"></div>
+    <div class="cover-meta">
+      <span>Noviembre de 2026</span>
+      <span>Windows 10/11 · 64 bits</span>
+      <span>https://mwx.app</span>
+    </div>
+  </div>
+</section>
+
+<!-- ================= ÍNDICE ================= -->
+<section class="page">
+  <div class="section-head">
+    <div class="num">•</div>
+    <div>
+      <h1 class="section-title">Contenido</h1>
+      <p>Guía rápida para encontrar cada tema.</p>
+    </div>
+  </div>
+  <div class="toc">
+    <a class="toc-main" href="#que-es">1. Qué es MWX APP</a>
+    <a class="toc-main" href="#arquitectura">2. Cómo funciona</a>
+    <a class="toc-main" href="#flujo">3. Flujo completo</a>
+    <a class="toc-main" href="#admin">4. Manual del administrador</a>
+    <a class="toc-sub" href="#admin-acceso">4.1 Acceso al panel</a>
+    <a class="toc-sub" href="#admin-usuarios">4.2 Crear usuarios</a>
+    <a class="toc-sub" href="#admin-cuentas">4.3 Asignar cuentas</a>
+    <a class="toc-sub" href="#admin-campana">4.4 Configurar la campaña</a>
+    <a class="toc-sub" href="#admin-entrega">4.5 Entregar el ejecutable</a>
+    <a class="toc-sub" href="#admin-cambios">4.6 Actualizar y revocar</a>
+    <a class="toc-sub" href="#admin-buenas">4.7 Buenas prácticas</a>
+    <a class="toc-main" href="#usuario" style="break-before:column">5. Manual del usuario final</a>
+    <a class="toc-sub" href="#usuario-requisitos">5.1 Requisitos</a>
+    <a class="toc-sub" href="#usuario-abrir">5.2 Abrir la aplicación</a>
+    <a class="toc-sub" href="#usuario-login">5.3 Iniciar sesión</a>
+    <a class="toc-sub" href="#usuario-campana">5.4 Pantalla “Tu campaña”</a>
+    <a class="toc-sub" href="#usuario-iniciar">5.5 Iniciar la campaña</a>
+    <a class="toc-sub" href="#usuario-detener">5.6 Detener la campaña</a>
+    <a class="toc-sub" href="#usuario-resultados">5.7 Resultados y enlaces</a>
+    <a class="toc-sub" href="#usuario-problemas">5.8 Problemas comunes</a>
+    <a class="toc-sub" href="#usuario-checklist">5.9 Lista de verificación</a>
+    <a class="toc-main" href="#faq">6. Preguntas frecuentes</a>
+    <a class="toc-main" href="#limites">7. Límites y recomendaciones</a>
+    <a class="toc-main" href="#soporte">8. Soporte y control de versiones</a>
+  </div>
+  <div class="callout tip" style="margin-top:8mm">
+    <strong>Lectura recomendada</strong>
+    Si eres el administrador, lee las secciones 1 a 4 y la 6. Si eres usuario final, con la sección 5 es suficiente.
+  </div>
+</section>
+
+<!-- ================= 1. QUÉ ES ================= -->
+<section class="page" id="que-es">
+  <div class="section-head">
+    <div class="num">1</div>
+    <div>
+      <h1 class="section-title">Qué es MWX APP</h1>
+      <p>Una herramienta de campañas locales con cuentas de X asignadas por persona.</p>
+    </div>
+  </div>
+
+  <p><strong>MWX APP</strong> tiene dos piezas que trabajan juntas: un <strong>panel central</strong> que usa el administrador y una <strong>aplicación de escritorio</strong> que se instala en la computadora de cada persona. El panel decide <em>qué</em> se publica y con <em>qué cuentas</em>; la aplicación de escritorio hace el trabajo real en la máquina del usuario.</p>
+
+  <div class="grid-2">
+    <div class="card">
+      <div class="ico">🖥️</div>
+      <h3>Panel del administrador</h3>
+      <p>Está en <strong>https://mwx.app</strong>. Ahí creas usuarios, asignas cuentas, escribes el hashtag y el contexto, subes imágenes, defines límites y revocas accesos.</p>
+      <p><small>No publica nada por sí solo. Es el centro de control.</small></p>
+    </div>
+    <div class="card">
+      <div class="ico">⚡</div>
+      <h3>Aplicación MWX APP</h3>
+      <p>Es el archivo <strong>MWX APP.exe</strong> que se entrega a cada persona. Abre Chrome en su computadora, entra con sus cuentas y publica desde su propia conexión a internet.</p>
+      <p><small>Solo descarga las cuentas que le asignaste.</small></p>
+    </div>
+  </div>
+
+  <div class="callout">
+    <strong>La regla de oro</strong>
+    El servidor <strong>no abre Chrome ni publica</strong>. Solo guarda usuarios, cuentas y configuración, y entrega la inteligencia artificial. La publicación ocurre en la computadora de cada persona, con su IP y sus recursos.
+  </div>
+
+  <h2>Qué puede hacer</h2>
+  <ul>
+    <li><strong>Publicar posts originales</strong> con hashtag obligatorio en medio del texto e imagen opcional.</li>
+    <li><strong>Retweets con cita</strong> de tweets ancla, con texto distinto por cuenta.</li>
+    <li><strong>Cambiar de cuenta en el mismo Chrome</strong>, sin cerrar el navegador entre una cuenta y otra.</li>
+    <li><strong>Generar textos con IA</strong> respetando el registro y la personalidad de cada cuenta.</li>
+    <li><strong>Respetar límites</strong> de acciones por cuenta, pausas, ventana de tiempo y tope diario.</li>
+    <li><strong>Mostrar progreso en vivo</strong>, detenerse con un botón y entregar un resumen con enlaces.</li>
+  </ul>
+
+  <div class="kpi">
+    <div class="box"><b>1</b><small>ejecutable por persona</small></div>
+    <div class="box"><b>N</b><small>cuentas asignadas</small></div>
+    <div class="box"><b>4</b><small>secciones posibles</small></div>
+    <div class="box"><b>0</b><small>claves de IA en el .exe</small></div>
+  </div>
+</section>
+
+<!-- ================= 2. ARQUITECTURA ================= -->
+<section class="page" id="arquitectura">
+  <div class="section-head">
+    <div class="num">2</div>
+    <div>
+      <h1 class="section-title">Cómo funciona</h1>
+      <p>El recorrido de una campaña, desde tu panel hasta X.</p>
+    </div>
+  </div>
+
+  <div class="diagram">
+    <div class="node admin">TÚ<small>Dashboard mwx.app</small></div>
+    <div class="arrow">→</div>
+    <div class="node server">Servidor<small>Supabase + API Railway</small></div>
+    <div class="arrow">→</div>
+    <div class="node pc">PC de la persona<small>MWX APP.exe + Chrome</small></div>
+    <div class="arrow">→</div>
+    <div class="node x">X<small>publica desde su IP</small></div>
+  </div>
+
+  <h2>Las tres capas</h2>
+
+  <h3>1. Base de datos central (Supabase)</h3>
+  <p>Guarda los usuarios de MWX APP, las cuentas que tiene cada uno, la configuración de su campaña, las imágenes y el historial de accesos. Es la fuente de verdad.</p>
+
+  <h3>2. API central (Railway)</h3>
+  <p>Es la puerta segura entre el .exe y la base de datos. Valida el usuario y la contraseña, entrega solo las cuentas asignadas, sirve las imágenes y hace de puente con OpenAI para que la clave de la IA nunca viaje al cliente.</p>
+
+  <h3>3. Aplicación de escritorio (la PC de la persona)</h3>
+  <p>Recibe su perfil, guarda una copia local, abre Chrome y ejecuta la campaña. Todo el trabajo pesado ocurre aquí: CPU, memoria, internet e IP de esa persona.</p>
+
+  <div class="callout tip">
+    <strong>Ventaja del modo local</strong>
+    Cada persona publica desde su propia red. No comparten la IP del servidor y el trabajo se reparte entre las computadoras. El servidor solo coordina.
+  </div>
+
+  <h2>Qué viaja y qué no</h2>
+  <table class="tbl">
+    <thead><tr><th>Dato</th><th>¿Viaja al .exe?</th><th>Explicación</th></tr></thead>
+    <tbody>
+      <tr><td>Usuario y contraseña de MWX APP</td><td>Sí, al iniciar sesión</td><td>Se validan contra la API por HTTPS.</td></tr>
+      <tr><td>Cuentas asignadas (con sus cookies)</td><td>Sí, solo las suyas</td><td>Se guardan en la SQLite local para que Chrome pueda entrar.</td></tr>
+      <tr><td>Hashtag, contexto, URLs e imágenes</td><td>Sí, como configuración</td><td>El usuario no necesita escribirlos.</td></tr>
+      <tr><td>Clave real de OpenAI</td><td><strong>No</strong></td><td>Se queda en el servidor; el .exe usa un token temporal contra la API.</td></tr>
+      <tr><td>Cuentas de otras personas</td><td><strong>No</strong></td><td>La API solo devuelve las asignadas a ese usuario.</td></tr>
+      <tr><td>Contraseña del panel admin</td><td><strong>No</strong></td><td>El .exe no administra usuarios ni campañas.</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<!-- ================= 3. FLUJO ================= -->
+<section class="page" id="flujo">
+  <div class="section-head">
+    <div class="num">3</div>
+    <div>
+      <h1 class="section-title">Flujo completo</h1>
+      <p>De la configuración en el panel hasta la publicación en X.</p>
+    </div>
+  </div>
+
+  <div class="steps">
+    <div class="step"><div class="n"></div><div class="body"><strong>Tú configuras en el panel</strong> Entras a mwx.app, creas el usuario, le asignas sus cuentas y defines hashtag, contexto, URLs, imágenes y límites.</div></div>
+    <div class="step"><div class="n"></div><div class="body"><strong>Entregas el ejecutable</strong> Le envías la carpeta o el ZIP de MWX APP junto con su usuario y contraseña. El .exe ya incluye la URL del servidor en <code>config.json</code>.</div></div>
+    <div class="step"><div class="n"></div><div class="body"><strong>La persona abre la app e inicia sesión</strong> La API valida sus credenciales y le devuelve únicamente su perfil: sus cuentas y su campaña.</div></div>
+    <div class="step"><div class="n"></div><div class="body"><strong>El .exe sincroniza sus cuentas</strong> Las guarda en la base local de su PC y desactiva cualquier cuenta que no le pertenezca.</div></div>
+    <div class="step"><div class="n"></div><div class="body"><strong>La persona pulsa “Iniciar campaña”</strong> No tiene que escribir nada más. La app abre Chrome visible en su computadora.</div></div>
+    <div class="step"><div class="n"></div><div class="body"><strong>La IA genera los textos</strong> El .exe pide los textos a la API, que usa la clave real de OpenAI. Si la IA falla, el .exe genera variaciones locales para no detenerse.</div></div>
+    <div class="step"><div class="n"></div><div class="body"><strong>Se publica en X</strong> La app entra con cada cuenta, publica el post o el RT con cita, cambia de cuenta en el mismo Chrome y repite según el plan.</div></div>
+    <div class="step"><div class="n"></div><div class="body"><strong>La persona ve el resumen</strong> Al terminar, la app muestra métricas y los enlaces de las publicaciones. Tú puedes revocar o cambiar la configuración para la próxima.</div></div>
+  </div>
+
+  <div class="callout warn">
+    <strong>Importante</strong>
+    Si la computadora se apaga, se cierra la app o se queda sin internet, la campaña se detiene. El servidor no puede continuarla por su cuenta.
+  </div>
+</section>
+
+<!-- ================= 4. ADMIN ================= -->
+<section class="page" id="admin">
+  <div class="section-head">
+    <div class="num">4</div>
+    <div>
+      <h1 class="section-title">Manual del administrador</h1>
+      <p>Todo lo que necesitas para dar acceso y configurar campañas.</p>
+    </div>
+  </div>
+
+  <h2 id="admin-acceso">4.1 Acceso al panel</h2>
+  <div class="steps">
+    <div class="step"><div class="n"></div><div class="body"><strong>Abre el dashboard</strong> Entra a <code>https://mwx.app</code> desde cualquier navegador.</div></div>
+    <div class="step"><div class="n"></div><div class="body"><strong>Inicia sesión como admin</strong> Usa tu usuario administrador del dashboard. <em>No</em> es el mismo usuario de MWX APP que usa la persona final.</div></div>
+    <div class="step"><div class="n"></div><div class="body"><strong>Entra a la operación correcta</strong> Ve a <strong>📊 Datos y cuentas → 📲 MWX APP: Usuarios y Acceso</strong><br>Esta operación solo la ve el rol admin.</div></div>
+  </div>
+
+  <div class="callout danger">
+    <strong>Seguridad</strong>
+    Cambia la contraseña por defecto del dashboard antes de exponerlo. No compartas tu usuario admin con las personas que usan el .exe.
+  </div>
+
+  <h2 id="admin-usuarios">4.2 Crear usuarios</h2>
+  <p>En la pestaña <strong>👥 Usuarios</strong>:</p>
+  <ul>
+    <li><strong>Usuario:</strong> minúsculas, de 3 a 20 caracteres (<code>juan</code>, <code>maria.lopez</code>).</li>
+    <li><strong>Nombre visible:</strong> el saludo que verá la persona en la app.</li>
+    <li><strong>Contraseña:</strong> mínimo 8 caracteres. Se guarda cifrada con PBKDF2; nadie puede leerla desde el panel.</li>
+    <li><strong>Activo:</strong> si lo desactivas, no podrá iniciar sesión.</li>
+  </ul>
+  <p>También puedes <strong>resetear la contraseña</strong>, <strong>revocar sesiones</strong> y <strong>eliminar</strong> al usuario (con confirmación).</p>
+
+  <h2 id="admin-cuentas">4.3 Asignar cuentas</h2>
+  <p>En la pestaña <strong>🔗 Asignar cuentas</strong> eliges al usuario y marcas sus cuentas de X.</p>
+  <ul>
+    <li>Puedes mezclar <strong>varias secciones</strong>: Libertad, Ciudadanía, Institución Privada, Justicia.</li>
+    <li>Filtra por búsqueda, sección, tier o “solo con sesión”.</li>
+    <li>El resumen te dice cuántas cuentas y de qué secciones quedaron.</li>
+    <li>Si una cuenta no tiene sesión válida, la app no podrá publicar con ella; el panel te avisa.</li>
+    <li>El atajo <strong>“Asignar todas las de la sección”</strong> acelera el trabajo.</li>
+  </ul>
+  <div class="callout">
+    <strong>La persona solo verá estas cuentas</strong>
+    La API filtra por usuario. Aunque la base tenga 200 cuentas, su .exe solo descarga las que le asignaste. Si le quitas una, se desactiva en su PC en el siguiente inicio de sesión.
+  </div>
+
+  <h2 id="admin-campana">4.4 Configurar la campaña</h2>
+  <p>En la pestaña <strong>⚙️ Campaña</strong> defines lo que usará el .exe de esa persona.</p>
+
+  <table class="tbl">
+    <thead><tr><th>Campo</th><th>Qué hace</th><th>Recomendación</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Hashtags</strong></td><td>1 a 6 etiquetas. Se garantiza que salgan <strong>en medio</strong> del texto, nunca al final.</td><td>Usa el hashtag exacto que quieres posicionar.</td></tr>
+      <tr><td><strong>Contexto / tema</strong></td><td>De qué debe hablar la IA. Es el tema que tú defines.</td><td>Una o dos frases claras; evita copiar noticias literales.</td></tr>
+      <tr><td><strong>Narrativa / trasfondo</strong></td><td>Noticias o información de fondo <strong>invisible</strong>. La IA la usa como referencia pero tiene prohibido mencionarla.</td><td>Úsala si quieres que la IA “sepa” el contexto sin citarlo.</td></tr>
+      <tr><td><strong>URLs ancla</strong></td><td>Tweets que se van a citar o retuitear. Si está vacío, solo hace posts originales.</td><td>2 a 5 URLs para no parecer spam.</td></tr>
+      <tr><td><strong>Texto base de la cita</strong></td><td>Idea base para los RT con cita; la IA la parafrasea distinto en cada cuenta.</td><td>Una idea corta, no un texto final.</td></tr>
+      <tr><td><strong>Acciones por cuenta</strong></td><td>Cuántas acciones hace cada cuenta en la corrida (1 a 49).</td><td>Empieza bajo (1 a 5) y sube gradualmente.</td></tr>
+      <tr><td><strong>Pausa entre acciones</strong></td><td>Segundos entre una acción y otra de la misma cuenta.</td><td>5 a 30 segundos para cuentas nuevas.</td></tr>
+      <tr><td><strong>Duración</strong></td><td>Ventana máxima de la campaña en minutos.</td><td>15 a 60 minutos para una corrida normal.</td></tr>
+      <tr><td><strong>Límite diario</strong></td><td>Tope de acciones exitosas por cuenta en 24 h.</td><td>49 por defecto; baja para cuentas nuevas.</td></tr>
+      <tr><td><strong>Imágenes</strong></td><td>Se suben aquí; el .exe las descarga y cada publicación lleva una al azar.</td><td>Usa imágenes ligeras y revisa que se vean bien.</td></tr>
+      <tr><td><strong>Permitir ajustes</strong></td><td>Si está apagado, la persona solo pulsa Iniciar. Si lo enciendes, puede ajustar acciones, pausa, ventana e imágenes; <strong>nunca</strong> el hashtag, contexto ni URLs.</td><td>Déjalo apagado para usuarios no técnicos.</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout tip">
+    <strong>Cómo se generan los textos</strong>
+    La IA escribe un texto distinto por cuenta y acción, respetando el registro de cada cuenta (política, activista o ciudadana) y su perfil (formal, ciudadano o popular). El hashtag se inserta en medio. En la app local los textos pueden llegar a <strong>280 caracteres</strong> (el límite de X).
+  </div>
+
+  <h2 id="admin-entrega">4.5 Entregar el ejecutable</h2>
+  <p>El paquete que se entrega es la carpeta <strong>MWX APP</strong> (o el ZIP) que contiene:</p>
+  <pre>MWX APP\
+├── MWX APP.exe          ← la aplicación
+├── config.json          ← URL del servidor (no tocar)
+├── LEEME.txt            ← instrucciones para la persona
+└── _internal\           ← dependencias internas (no borrar)</pre>
+  <div class="callout warn">
+    <strong>No muevas solo el .exe</strong>
+    La aplicación necesita la carpeta <code>_internal</code> y el archivo <code>config.json</code> junto a ella. Entrega la carpeta completa o el ZIP.
+  </div>
+  <p>Entrega también, por un canal privado, el <strong>usuario y la contraseña</strong> de esa persona. No incluyas credenciales dentro del ZIP ni en el mismo mensaje del ejecutable si puedes evitarlo.</p>
+
+  <h2 id="admin-cambios">4.6 Actualizar y revocar</h2>
+  <ul>
+    <li><strong>Cambiar hashtag, contexto, cuentas o imágenes:</strong> guarda los cambios en el panel. La persona los recibe al <strong>volver a abrir la app o iniciar sesión</strong>. La app no se refresca sola mientras está abierta.</li>
+    <li><strong>Una campaña en curso</strong> termina con la configuración con la que empezó; los cambios aplican a la siguiente corrida.</li>
+    <li><strong>Revocar sesiones:</strong> incrementa la versión del token. El acceso deja de servir en el siguiente inicio de sesión o reconexión. Una campaña ya en curso <strong>no se detiene remotamente</strong>; para eso la persona debe pulsar Detener.</li>
+    <li><strong>Desactivar usuario:</strong> impide nuevos inicios de sesión de inmediato.</li>
+    <li><strong>Eliminar usuario:</strong> borra sus asignaciones y configuración (con confirmación).</li>
+  </ul>
+
+  <h2 id="admin-buenas" style="break-before:page">4.7 Buenas prácticas</h2>
+  <ul>
+    <li>Prueba primero con <strong>1 cuenta y 1 acción</strong> antes de lanzar una campaña grande.</li>
+    <li>Usa <strong>2 a 5 tweets ancla</strong>; una sola URL con muchos comentarios puede parecer spam.</li>
+    <li>No satures cuentas nuevas: sube las acciones y el límite diario poco a poco.</li>
+    <li>Verifica que las cuentas tengan <strong>sesión válida</strong> antes de asignarlas.</li>
+    <li>Revisa la pestaña <strong>📊 Actividad / Seguridad</strong> para ver accesos y eventos.</li>
+    <li>Mantén el dashboard con una contraseña fuerte y no compartas tu usuario admin.</li>
+    <li>No entregues la carpeta <code>data/</code> del servidor ni la base de datos.</li>
+  </ul>
+
+  <div class="callout tip">
+    <strong>Checklist rápido del administrador</strong>
+    <ul>
+      <li>Usuario creado, activo y con contraseña entregada.</li>
+      <li>Cuentas asignadas y con sesión válida.</li>
+      <li>Hashtag, contexto, URLs e imágenes configurados.</li>
+      <li>Acciones, pausa, ventana y límite diario definidos.</li>
+      <li>Prueba de 1 cuenta y 1 publicación realizada.</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ================= 5. USUARIO ================= -->
+<section class="page" id="usuario">
+  <div class="section-head">
+    <div class="num">5</div>
+    <div>
+      <h1 class="section-title">Manual del usuario final</h1>
+      <p>Guía sencilla para la persona que usa MWX APP en su computadora.</p>
+    </div>
+  </div>
+
+  <h2 id="usuario-requisitos">5.1 Requisitos</h2>
+  <table class="tbl">
+    <thead><tr><th>Requisito</th><th>Detalle</th></tr></thead>
+    <tbody>
+      <tr><td>Sistema</td><td>Windows 10 u 11, 64 bits.</td></tr>
+      <tr><td>Navegador</td><td>Google Chrome instalado (la app lo usa para publicar).</td></tr>
+      <tr><td>Internet</td><td>Necesario para entrar y para generar los textos. La campaña usa la conexión de la persona.</td></tr>
+      <tr><td>Espacio</td><td>La carpeta de la app pesa aproximadamente 63 MB.</td></tr>
+      <tr><td>Credenciales</td><td>Usuario y contraseña entregados por el administrador.</td></tr>
+    </tbody>
+  </table>
+
+  <h2 id="usuario-abrir">5.2 Abrir la aplicación</h2>
+  <div class="steps">
+    <div class="step"><div class="n"></div><div class="body"><strong>Descomprime la carpeta</strong> Si recibiste un ZIP, extráelo completo. No ejecutes el .exe desde dentro del ZIP.</div></div>
+    <div class="step"><div class="n"></div><div class="body"><strong>Abre “MWX APP.exe”</strong> Haz doble clic. La primera vez puede tardar unos segundos en preparar Chrome.</div></div>
+    <div class="step"><div class="n"></div><div class="body"><strong>Si Windows muestra un aviso azul</strong> Pulsa <em>Más información</em> y luego <em>Ejecutar de todas formas</em>. El .exe aún no está firmado digitalmente.</div></div>
+  </div>
+
+  <h2 id="usuario-login">5.3 Iniciar sesión</h2>
+  <figure class="shot">
+    <img src="mwx_login.png" alt="Pantalla de acceso de MWX APP">
+    <figcaption>Pantalla de acceso. Escribe el usuario y la contraseña que te entregó el administrador.</figcaption>
+  </figure>
+  <ol>
+    <li>Escribe tu <strong>usuario</strong>.</li>
+    <li>Escribe tu <strong>contraseña</strong>.</li>
+    <li>Pulsa <strong>Entrar</strong> o presiona <strong>Enter</strong>.</li>
+    <li>Si marcas <strong>“Recordar mi usuario”</strong>, la próxima vez solo tendrás que escribir la contraseña.</li>
+  </ol>
+  <div class="callout">
+    <strong>Si no puedes entrar</strong>
+    Revisa tu conexión a internet y que hayas escrito exactamente el usuario y la contraseña. Si el problema continúa, contacta a tu administrador.
+  </div>
+
+  <h2 id="usuario-campana">5.4 Pantalla “Tu campaña”</h2>
+  <figure class="shot">
+    <img src="mwx_campana.png" alt="Pantalla Tu campaña de MWX APP">
+    <figcaption>Pantalla “Tu campaña”: cuentas asignadas, hashtags, acciones y botón para iniciar.</figcaption>
+  </figure>
+  <p>Antes de empezar, revisa:</p>
+  <ul>
+    <li><strong>Tus cuentas:</strong> aparecen agrupadas por sección. Si falta alguna, avisa a tu administrador.</li>
+    <li><strong>Hashtags:</strong> los definió tu administrador; no necesitas escribirlos.</li>
+    <li><strong>Publicaciones por cuenta y ventana:</strong> indican cuánto trabajo hará la app y en cuánto tiempo.</li>
+    <li><strong>Estado:</strong> debe decir “Todo listo para comenzar”.</li>
+  </ul>
+
+  <h2 id="usuario-iniciar">5.5 Iniciar la campaña</h2>
+  <div class="steps">
+    <div class="step"><div class="n"></div><div class="body"><strong>Pulsa “▶ Iniciar campaña”</strong> Se abrirá Chrome en tu computadora y empezará a publicar con tus cuentas.</div></div>
+    <div class="step"><div class="n"></div><div class="body"><strong>No cierres la app ni Chrome</strong> La campaña corre en tu computadora. Si cierras la ventana, se detiene.</div></div>
+    <div class="step"><div class="n"></div><div class="body"><strong>Mira el progreso</strong> Verás una barra, el número de publicaciones y los últimos eventos.</div></div>
+  </div>
+  <div class="callout warn">
+    <strong>No apagues la computadora</strong>
+    La campaña no se ejecuta en el servidor: se ejecuta en tu equipo. Si se apaga, se suspende o se queda sin internet, la campaña se detiene.
+  </div>
+
+  <h2 id="usuario-detener">5.6 Detener la campaña</h2>
+  <p>Si necesitas parar antes de que termine, pulsa <strong>⛔ Detener</strong> y confirma. La app termina la acción que esté en curso y se detiene; las acciones que faltaban no se hacen.</p>
+
+  <h2 id="usuario-resultados">5.7 Resultados y enlaces</h2>
+  <p>Al terminar verás un resumen con:</p>
+  <ul>
+    <li>Publicaciones <strong>exitosas</strong>, <strong>fallidas</strong> y <strong>omitidas</strong>.</li>
+    <li>Una tabla con el <strong>usuario</strong>, el <strong>tipo</strong> y el <strong>enlace</strong> de cada publicación.</li>
+    <li>Botones para <strong>copiar los enlaces</strong> y volver a iniciar o cerrar sesión.</li>
+  </ul>
+  <p>Si alguna fila dice “link no capturado”, la publicación sí se hizo pero X no devolvió el enlace a tiempo.</p>
+
+  <div class="callout tip">
+    <strong>Consejos para una campaña estable</strong>
+    <ul>
+      <li>Mantén la computadora despierta y la app abierta durante la campaña.</li>
+      <li>No lances dos campañas a la vez en la misma computadora.</li>
+      <li>Usa entre 2 y 5 tweets ancla para no parecer spam.</li>
+      <li>Revisa los enlaces del resumen al terminar.</li>
+      <li>Si una cuenta falla, avisa a tu administrador para renovar su sesión.</li>
+    </ul>
+  </div>
+
+  <h2 id="usuario-problemas">5.8 Problemas comunes</h2>
+  <table class="tbl">
+    <thead><tr><th>Síntoma</th><th>Causa probable</th><th>Qué hacer</th></tr></thead>
+    <tbody>
+      <tr><td>“Usuario o contraseña incorrectos”</td><td>Datos mal escritos o usuario desactivado.</td><td>Revisa mayúsculas y espacios; pide ayuda a tu administrador.</td></tr>
+      <tr><td>“No hay conexión con el servidor”</td><td>Sin internet o servidor no disponible.</td><td>Revisa tu conexión y vuelve a intentar.</td></tr>
+      <tr><td>“Tu sesión expiró”</td><td>El token de acceso venció o fue revocado.</td><td>Vuelve a iniciar sesión con tu usuario y contraseña.</td></tr>
+      <tr><td>Windows muestra un aviso azul</td><td>El .exe no está firmado.</td><td>Más información → Ejecutar de todas formas.</td></tr>
+      <tr><td>No abre Chrome</td><td>Chrome no está instalado o está dañado.</td><td>Instala Google Chrome y vuelve a intentar.</td></tr>
+      <tr><td>“No tienes cuentas asignadas”</td><td>El administrador aún no te asignó cuentas.</td><td>Contacta a tu administrador.</td></tr>
+      <tr><td>La campaña se detuvo sola</td><td>Se cerró la app, se apagó la PC o falló la red.</td><td>Vuelve a abrir la app e inicia de nuevo.</td></tr>
+      <tr><td>Algunas cuentas fallan</td><td>Sesión de X vencida o cuenta limitada.</td><td>La app las omite; pide al administrador que renueve la sesión.</td></tr>
+    </tbody>
+  </table>
+
+  <h2 id="usuario-checklist">5.9 Lista de verificación</h2>
+  <ul class="checklist">
+    <li>Tengo Chrome instalado y actualizado.</li>
+    <li>Tengo conexión a internet.</li>
+    <li>Descomprimí la carpeta completa y no moví solo el .exe.</li>
+    <li>Escribí mi usuario y contraseña correctamente.</li>
+    <li>Veo mis cuentas y el hashtag en la pantalla “Tu campaña”.</li>
+    <li>No cerraré la app mientras la campaña esté en curso.</li>
+    <li>Sé que puedo detenerla con el botón Detener.</li>
+  </ul>
+
+</section>
+
+<!-- ================= 6. FAQ ================= -->
+<section class="page" id="faq">
+  <div class="section-head">
+    <div class="num">6</div>
+    <div>
+      <h1 class="section-title">Preguntas frecuentes</h1>
+      <p>Las dudas más comunes del administrador y del usuario.</p>
+    </div>
+  </div>
+
+  <div class="faq">
+    <div class="q">¿Yo como admin les mando el hashtag y el contexto?</div>
+    <div class="a">Sí. Los escribes en la pestaña <strong>⚙️ Campaña</strong> de cada usuario. La persona no los escribe: su .exe los recibe al iniciar sesión. No puedes cambiar el hashtag desde la app del usuario; solo tú desde el panel.</div>
+  </div>
+  <div class="faq">
+    <div class="q">¿Dónde se ejecuta realmente la campaña?</div>
+    <div class="a">En la computadora de la persona. El .exe abre Chrome en ese equipo y publica desde su IP. El servidor solo guarda datos, valida el acceso y presta la IA.</div>
+  </div>
+  <div class="faq">
+    <div class="q">¿Puedo iniciar la campaña a distancia desde el panel?</div>
+    <div class="a">No. La persona debe abrir la app y pulsar <strong>Iniciar campaña</strong> en su computadora. El panel sirve para configurar y revocar, no para lanzar el navegador de otra persona.</div>
+  </div>
+  <div class="faq">
+    <div class="q">¿La persona puede cambiar el hashtag o el contexto?</div>
+    <div class="a">No. Aunque actives “Permitir ajustes”, solo puede ajustar acciones, pausa, ventana e imágenes. El hashtag, contexto, URLs y texto base siempre vienen del servidor.</div>
+  </div>
+  <div class="faq">
+    <div class="q">¿Cuándo ve la persona los cambios que hago?</div>
+    <div class="a">La próxima vez que abra la app o vuelva a iniciar sesión. La app no se refresca sola mientras está abierta. Una campaña en curso termina con la configuración anterior.</div>
+  </div>
+  <div class="faq">
+    <div class="q">¿Puedo revocar el acceso a una persona?</div>
+    <div class="a">Sí. En <strong>📊 Actividad / Seguridad</strong> usa <strong>Revocar sesiones</strong> o desactiva al usuario. El token dura 12 horas; al reabrir la app, la persona ya no podrá entrar. Una campaña en curso no se detiene remotamente: para eso debe pulsar Detener.</div>
+  </div>
+  <div class="faq">
+    <div class="q">¿Cuántas cuentas puede tener una persona?</div>
+    <div class="a">Todas las que le asignes, y pueden ser de varias secciones a la vez (Libertad, Ciudadanía, IP, Justicia). El .exe solo descarga las suyas.</div>
+  </div>
+  <div class="faq">
+    <div class="q">¿La clave de OpenAI está dentro del .exe?</div>
+    <div class="a">No. La clave real se queda en el servidor. El .exe usa un token temporal contra la API, y la API es la que habla con OpenAI.</div>
+  </div>
+  <div class="faq">
+    <div class="q">¿Necesita VPN o proxy?</div>
+    <div class="a">No. El modo local está diseñado para salir con la IP de la persona, sin proxies. Eso reparte las publicaciones entre distintas redes.</div>
+  </div>
+  <div class="faq">
+    <div class="q">¿Funciona en Mac o Linux?</div>
+    <div class="a">La versión actual es solo para Windows 10/11 de 64 bits. Requiere Google Chrome instalado.</div>
+  </div>
+  <div class="faq">
+    <div class="q">¿Qué pasa si la persona cierra la app?</div>
+    <div class="a">La campaña se detiene. El progreso y los enlaces quedan en el resumen de esa corrida. Puede volver a abrirla e iniciar de nuevo.</div>
+  </div>
+  <div class="faq">
+    <div class="q">¿Dónde se guardan los datos en la PC?</div>
+    <div class="a">En <code>%LOCALAPPDATA%\MWX APP</code>. Ahí viven la base local, las cookies de las cuentas asignadas y los registros. Si varias personas comparten la misma cuenta de Windows, conviene usar cuentas de Windows separadas.</div>
+  </div>
+</section>
+
+<!-- ================= 7. LÍMITES ================= -->
+<section class="page" id="limites">
+  <div class="section-head">
+    <div class="num">7</div>
+    <div>
+      <h1 class="section-title">Límites y recomendaciones</h1>
+      <p>Para que las campañas sean estables y las cuentas duren.</p>
+    </div>
+  </div>
+
+  <table class="tbl">
+    <thead><tr><th>Tema</th><th>Qué debes saber</th></tr></thead>
+    <tbody>
+      <tr><td>Una PC por persona</td><td>La campaña usa el Chrome, la CPU y la IP de esa persona. Si la PC está apagada, no hay campaña.</td></tr>
+      <tr><td>Tope diario</td><td>Por defecto 49 acciones exitosas por cuenta en 24 h. Cuenta también lo hecho en otras corridas. Bájalo para cuentas nuevas.</td></tr>
+      <tr><td>Anti-spam</td><td>Usa 2 a 5 tweets ancla, pausas de 5 a 30 s y no dispares muchas cuentas nuevas al mismo tiempo.</td></tr>
+      <tr><td>Textos</td><td>La app local permite hasta 280 caracteres; las campañas masivas del dashboard usan 100. El hashtag siempre va en medio.</td></tr>
+      <tr><td>Imágenes</td><td>Si configuras imágenes, cada publicación lleva una al azar. Se descargan desde el servidor a la PC.</td></tr>
+      <tr><td>Configuración</td><td>Los cambios se aplican al reabrir la app, no en caliente. Una campaña en curso no cambia a mitad de camino.</td></tr>
+      <tr><td>Reporte central</td><td>El panel muestra accesos y eventos de campaña, no cada tweet. Los enlaces completos se ven en el resumen de la PC.</td></tr>
+      <tr><td>Firma del .exe</td><td>No está firmado. SmartScreen puede advertir la primera vez. Se puede firmar con un certificado de code signing.</td></tr>
+      <tr><td>Actualizaciones</td><td>Para actualizar la app se entrega una carpeta nueva. Las cuentas y la configuración viven en el servidor, no en el .exe.</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout warn">
+    <strong>Prueba controlada</strong>
+    Antes de lanzar una campaña grande, haz una prueba con 1 cuenta y 1 publicación. Revisa que Chrome abra, que el texto salga bien y que el enlace aparezca en el resumen.
+  </div>
+
+  <div class="callout tip">
+    <strong>Mejoras que se pueden agregar</strong>
+    Copiar la configuración de campaña a varios usuarios a la vez, reporte central de enlaces publicados y un botón de paro remoto. Si las necesitas, se pueden implementar en una siguiente versión.
+  </div>
+</section>
+
+<!-- ================= 8. SOPORTE ================= -->
+<section class="page" id="soporte">
+  <div class="section-head">
+    <div class="num">8</div>
+    <div>
+      <h1 class="section-title">Soporte y control de versiones</h1>
+      <p>Datos para mantener el sistema y pedir ayuda.</p>
+    </div>
+  </div>
+
+  <h2>Datos del sistema</h2>
+  <table class="tbl">
+    <thead><tr><th>Elemento</th><th>Valor</th></tr></thead>
+    <tbody>
+      <tr><td>Panel de administración</td><td><code>https://mwx.app</code></td></tr>
+      <tr><td>API del ejecutable</td><td><code>https://mwx-api-production.up.railway.app</code></td></tr>
+      <tr><td>Paquete del ejecutable</td><td><code>MWX-APP-2026-11-10.zip</code></td></tr>
+      <tr><td>Versión del manual</td><td>1.0 · Noviembre de 2026</td></tr>
+      <tr><td>Plataforma</td><td>Windows 10/11 · 64 bits · Google Chrome</td></tr>
+    </tbody>
+  </table>
+
+  <h2>Checklist de entrega al usuario</h2>
+  <ul class="checklist">
+    <li>Usuario creado y activo en el panel.</li>
+    <li>Cuentas asignadas y con sesión válida.</li>
+    <li>Hashtags, contexto, URLs e imágenes configurados.</li>
+    <li>Acciones, pausa, ventana y límite diario definidos.</li>
+    <li>“Permitir ajustes” según el perfil de la persona.</li>
+    <li>Carpeta o ZIP de MWX APP entregado completo.</li>
+    <li>Usuario y contraseña enviados por un canal privado.</li>
+    <li>Prueba de 1 cuenta y 1 publicación realizada.</li>
+  </ul>
+
+  <div class="callout">
+    <strong>Soporte</strong>
+    Para dudas, cambios de cuentas o problemas de acceso, contacta al administrador del sistema. No compartas tu contraseña ni el contenido de la carpeta <code>data</code> del servidor.
+  </div>
+
+  <div class="callout danger">
+    <strong>Recuerda</strong>
+    El paquete del ejecutable no contiene la flota completa de cuentas ni la base de datos. La persona solo recibe las cuentas que le asignaste. Mantén el dashboard con una contraseña fuerte y revisa periódicamente la pestaña de actividad.
+  </div>
+
+  <p style="margin-top:14mm; text-align:center; color:#8A97A3; font-size:9pt">
+    MWX APP · Manual de administración y guía del usuario · Noviembre de 2026
+  </p>
+</section>
+
+</body>
+</html>

@@ -2,15 +2,108 @@ from pydantic_settings import BaseSettings
 from pydantic import AliasChoices, Field
 from typing import Optional
 import os
+import sys
 from pathlib import Path
 
-PROJECT_ROOT = Path(__file__).parent.parent
+
+# ---------------------------------------------------------------------------
+# Rutas del proyecto vs rutas de datos (MWX APP / PyInstaller)
+# ---------------------------------------------------------------------------
+# En desarrollo (sin congelar) se conserva EXACTAMENTE el comportamiento de
+# siempre: la raiz del proyecto es la carpeta que contiene `core/` y todo
+# (`.env`, SQLite, cookies, perfiles de Chrome, reportes) cuelga de ahi.
+#
+# En el ejecutable (PyInstaller: `sys.frozen`), el codigo y los recursos
+# empaquetados son de SOLO LECTURA (`_MEIPASS` / carpeta del .exe), asi que los
+# datos que se escriben (DB, cookies, perfiles, reportes, logs, .env del
+# usuario) se guardan en `DATA_DIR`: `%LOCALAPPDATA%/MWX APP` en Windows,
+# `~/.mwx_app` en el resto, o lo que diga la variable `MWX_DATA_DIR`.
+APP_CONGELADA = bool(getattr(sys, "frozen", False))
+# Alias publico (documentado) por si otro modulo necesita consultarlo.
+CONGELADO = APP_CONGELADA
+
+
+def _resolver_dir_datos() -> Path:
+    """Carpeta de ESCRITURA del ejecutable (solo se usa si esta congelado)."""
+    personalizado = (os.environ.get("MWX_DATA_DIR") or "").strip()
+    if personalizado:
+        return Path(personalizado).expanduser()
+    if os.name == "nt":
+        base = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA")
+        if base:
+            return Path(base) / "MWX APP"
+        return Path.home() / "AppData" / "Local" / "MWX APP"
+    return Path.home() / ".mwx_app"
+
+
+if APP_CONGELADA:
+    # Carpeta del ejecutable: recursos NO empaquetados (.env, assets propios).
+    APP_DIR = Path(sys.executable).resolve().parent
+    # Recursos empaquetados por PyInstaller (`--add-data`). En onefile es la
+    # carpeta temporal `_MEIPASS`; en onedir puede no existir.
+    _meipass = getattr(sys, "_MEIPASS", None)
+    RESOURCE_DIR = Path(_meipass).resolve() if _meipass else APP_DIR
+    DATA_DIR = _resolver_dir_datos().resolve()
+    # Compatibilidad: los modulos que importan PROJECT_ROOT siguen recibiendo
+    # una raiz valida (la del ejecutable, que es de solo lectura).
+    PROJECT_ROOT = APP_DIR
+    # Crea la raiz de escritura y las carpetas conocidas antes que cualquier
+    # import de la app intente abrir la DB o escribir logs.
+    for _carpeta in (DATA_DIR, DATA_DIR / "data", DATA_DIR / "config", DATA_DIR / "logs"):
+        try:
+            _carpeta.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            # Si una subcarpeta falla no se aborta el arranque: `settings`
+            # volvera a intentar crearla y el error sera visible alli.
+            pass
+    # pydantic-settings lee los .env en orden; si un valor esta en ambos gana
+    # el ULTIMO (el del ejecutable) para permitir overrides junto al .exe.
+    _ENV_FILES = (DATA_DIR / ".env", APP_DIR / ".env")
+else:
+    PROJECT_ROOT = Path(__file__).parent.parent
+    APP_DIR = PROJECT_ROOT
+    RESOURCE_DIR = PROJECT_ROOT
+    # Raiz de ESCRITURA en desarrollo = raiz del proyecto (misma semantica que
+    # `PROJECT_ROOT/data` de siempre).
+    DATA_DIR = PROJECT_ROOT
+    _ENV_FILES = PROJECT_ROOT / ".env"
+
+
+# Prefijos que en el ejecutable viven bajo DATA_DIR (escritura); el resto de
+# rutas son codigo/recursos (solo lectura).
+_PREFIJOS_DATOS = ("data", "config", "logs")
+
+
+def _tiene_prefijo(texto: str, prefijo: str) -> bool:
+    return texto == prefijo or texto.startswith(prefijo + "/")
 
 
 def resolver_ruta(relativa: str) -> str:
-    """Resuelve una ruta relativa al directorio raiz del proyecto,
-    funcione cual sea el directorio de trabajo actual."""
-    return str((PROJECT_ROOT / relativa).resolve())
+    """Resuelve una ruta relativa a una ruta ABSOLUTA.
+
+    Sin congelar: se resuelve contra la raiz del proyecto (comportamiento
+    historico, identico byte a byte).
+
+    Congelado (PyInstaller): `data/`, `config/` y `logs/` se resuelven contra
+    ``DATA_DIR`` (escritura); el resto contra ``RESOURCE_DIR`` (recursos
+    empaquetados) y, si no existe ahi, contra la carpeta del ejecutable.
+    Las rutas absolutas se devuelven tal cual (resueltas).
+    """
+    if not APP_CONGELADA:
+        return str((PROJECT_ROOT / relativa).resolve())
+
+    ruta = Path(relativa)
+    if ruta.is_absolute():
+        return str(ruta.resolve())
+    texto = ruta.as_posix()
+    if any(_tiene_prefijo(texto, prefijo) for prefijo in _PREFIJOS_DATOS):
+        return str((DATA_DIR / relativa).resolve())
+    candidata = RESOURCE_DIR / relativa
+    if not candidata.exists() and APP_DIR != RESOURCE_DIR:
+        candidata_app = APP_DIR / relativa
+        if candidata_app.exists():
+            candidata = candidata_app
+    return str(candidata.resolve())
 
 
 def obtener_chromedriver(version_mayor: Optional[int] = None) -> str:
@@ -21,7 +114,8 @@ def obtener_chromedriver(version_mayor: Optional[int] = None) -> str:
     Si el binario ya existe en data/bin/ no vuelve a descargar nada."""
     import shutil
     nombre = "chromedriver.exe" if os.name == "nt" else "chromedriver"
-    destino = PROJECT_ROOT / "data" / "bin" / nombre
+    # Ruta absoluta: en el .exe `data/` vive bajo DATA_DIR (escritura).
+    destino = Path(resolver_ruta(f"data/bin/{nombre}"))
     if destino.exists():
         return str(destino)
 
@@ -105,6 +199,22 @@ class Settings(BaseSettings):
     
     # OpenAI
     openai_api_key: str = Field(..., env="OPENAI_API_KEY")
+    # Endpoint alternativo (proxy/gateway compatible con OpenAI). pydantic-
+    # settings v2 ignora `env=` en Field: los nombres efectivos son los
+    # `validation_alias` (se aceptan `OPENAI_API_BASE` y `OPENAI_BASE_URL`).
+    openai_api_base: str = Field(
+        default="",
+        env="OPENAI_API_BASE",
+        validation_alias=AliasChoices(
+            "OPENAI_API_BASE", "OPENAI_BASE_URL", "openai_api_base"
+        ),
+    )
+    # URL del API local/remoto del MWX APP (el .exe la recibe por entorno).
+    mwx_api_url: str = Field(
+        default="",
+        env="MWX_API_URL",
+        validation_alias=AliasChoices("MWX_API_URL", "mwx_api_url"),
+    )
     
     # Database
     database_url: str = Field(default="sqlite:///data/gestor_redes.db", env="DATABASE_URL")
@@ -116,8 +226,12 @@ class Settings(BaseSettings):
     log_level: str = Field(default="INFO", env="LOG_LEVEL")
     log_file: str = Field(default="data/logs/gestor_redes.log", env="LOG_FILE")
     
-    # Paths
-    base_dir: Path = Path(__file__).parent.parent
+    # Paths. `base_dir` es la raiz de ESCRITURA: raiz del proyecto en
+    # desarrollo y DATA_DIR en el ejecutable congelado. `data_dir`/`app_dir`
+    # se exponen como str para otros modulos (API / MWX APP).
+    base_dir: Path = DATA_DIR
+    data_dir: str = str(DATA_DIR)
+    app_dir: str = str(APP_DIR)
     cookies_dir: Path = base_dir / "data" / "cookies"
     profiles_dir: Path = base_dir / "data" / "perfiles_chrome"
     reports_dir: Path = base_dir / "data" / "reportes"
@@ -175,6 +289,39 @@ class Settings(BaseSettings):
         default=True,
         env="CUOTAS_DIARIAS_ACTIVO",
         validation_alias="CUOTAS_DIARIAS_ACTIVO",
+    )
+
+    # Campana LOCAL (Chrome visible en la computadora del dueño, sin proxies,
+    # cuentas Tier 1 con sesion): reparte `local_acciones_cuenta` acciones por
+    # cuenta (10 = 5 posts + 5 citas, el limite por hora; se puede subir hasta
+    # 49 = tope diario de X) dentro de una ventana de `local_duracion_min`
+    # minutos, con un tope diario de X propio
+    # (`limite_local_dia`) para no mezclarlo con el tope general de arriba.
+    # 0 = ilimitado. pydantic-settings v2 ignora `env=` en Field: el alias
+    # efectivo es `validation_alias` (se aceptan MAYUSCULAS y el nombre del
+    # campo en minusculas).
+    limite_local_dia: int = Field(
+        default=49,
+        env="LIMITE_LOCAL_DIA",
+        validation_alias=AliasChoices("LIMITE_LOCAL_DIA", "limite_local_dia"),
+    )
+    # 0 = sin límite (solo cuentas Tier 1 con sesión)
+    local_max_cuentas: int = Field(
+        default=0,
+        env="LOCAL_MAX_CUENTAS",
+        validation_alias=AliasChoices("LOCAL_MAX_CUENTAS", "local_max_cuentas"),
+    )
+    local_acciones_cuenta: int = Field(
+        default=10,
+        env="LOCAL_ACCIONES_CUENTA",
+        validation_alias=AliasChoices(
+            "LOCAL_ACCIONES_CUENTA", "local_acciones_cuenta"
+        ),
+    )
+    local_duracion_min: int = Field(
+        default=60,
+        env="LOCAL_DURACION_MIN",
+        validation_alias=AliasChoices("LOCAL_DURACION_MIN", "local_duracion_min"),
     )
 
     # Alertas
@@ -243,18 +390,30 @@ class Settings(BaseSettings):
     smartproxy_session_length: int = Field(default=8, env="SMARTPROXY_SESSION_LENGTH")
 
     class Config:
-        env_file = PROJECT_ROOT / ".env"
+        # Puede ser un Path o una tupla de Paths (pydantic-settings v2 los
+        # lee en orden; si una clave esta en varios gana el ultimo archivo).
+        env_file = _ENV_FILES
         env_file_encoding = "utf-8"
         case_sensitive = False
         extra = "ignore"
 
     def model_post_init(self, __context) -> None:
-        # Create directories if they don't exist
+        # Create directories if they don't exist (siempre bajo DATA_DIR)
         self.cookies_dir.mkdir(parents=True, exist_ok=True)
         self.profiles_dir.mkdir(parents=True, exist_ok=True)
         self.reports_dir.mkdir(parents=True, exist_ok=True)
         self.temp_dir.mkdir(parents=True, exist_ok=True)
         (self.base_dir / "data" / "logs").mkdir(parents=True, exist_ok=True)
+        if APP_CONGELADA:
+            # Carpetas de escritura conocidas del ejecutable.
+            (self.base_dir / "config").mkdir(parents=True, exist_ok=True)
+            (self.base_dir / "logs").mkdir(parents=True, exist_ok=True)
+            try:
+                Path(resolver_ruta(self.log_file)).parent.mkdir(
+                    parents=True, exist_ok=True
+                )
+            except OSError:
+                pass
 
     def proxy_sticky_mx(self, session_id: Optional[str] = None) -> str:
         import string, random

@@ -1,4 +1,16 @@
-from sqlalchemy import Column, Integer, String, Text, Boolean, DateTime, Date, ForeignKey, JSON
+from sqlalchemy import (
+    Column,
+    Integer,
+    String,
+    Text,
+    Boolean,
+    DateTime,
+    Date,
+    ForeignKey,
+    JSON,
+    LargeBinary,
+    UniqueConstraint,
+)
 from sqlalchemy.orm import relationship
 from datetime import datetime, date
 
@@ -111,6 +123,17 @@ class Cuenta(Base):
     user_agent = Column(String(300), default="")
     status = Column(String(20), default="imported")
     last_checked = Column(DateTime, nullable=True)
+    # "Cajon" de verificacion humana: True = la cuenta necesita que una persona
+    # la revise (login, captcha, verificacion de identidad, etc.). Se excluye de
+    # las campanas de activacion hasta que se marque como verificada.
+    # 'verificacion_motivo' explica por que se mando al cajon,
+    # 'verificacion_origen' de donde vino la deteccion (p. ej. "campana",
+    # "scheduler", "manual") y 'verificacion_fecha' cuando se marco.
+    # Ver core/verificacion.py.
+    verificacion_pendiente = Column(Boolean, default=False)
+    verificacion_motivo = Column(String(300), default="")
+    verificacion_origen = Column(String(30), default="")
+    verificacion_fecha = Column(DateTime, nullable=True)
     
     celula = relationship("Celula", back_populates="cuentas")
     cliente = relationship("Cliente", back_populates="cuentas")
@@ -239,3 +262,156 @@ class SesionChange(Base):
     usuario = Column(String(100), unique=True, index=True, nullable=False)
     cookies_json = Column(JSON, nullable=True)
     actualizada = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+# ---------------------------------------------------------------------------
+# Tablas del ejecutable MWX APP (login multi-usuario + configuracion local)
+# ---------------------------------------------------------------------------
+# Son tablas NUEVAS: `Cuenta` no se toca. `Base.metadata.create_all(bind=engine)`
+# dentro de `init_db` (core/database.py, que ya importa `core.models`) las crea
+# solas en SQLite/PostgreSQL, sin migraciones ALTER.
+
+
+class AppUsuario(Base):
+    """Usuario local del MWX APP (login del ejecutable, no Telegram)."""
+
+    __tablename__ = "app_usuario"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    # Se guarda en minusculas desde `core.app_auth` (case-insensitive).
+    username = Column(String(100), unique=True, index=True, nullable=False)
+    # Formato PBKDF2: pbkdf2_sha256$iteraciones$salt_hex$hash_hex
+    password_hash = Column(String(256), default="", nullable=False)
+    nombre = Column(String(150), default="")
+    activo = Column(Boolean, default=True, nullable=False)
+    # Se incrementa al revocar sesiones; el token firmado lleva `tv` y la API
+    # lo compara contra este valor para invalidar tokens anteriores.
+    token_version = Column(Integer, default=0, nullable=False)
+    creado = Column(DateTime, default=datetime.utcnow)
+    ultimo_acceso = Column(DateTime, nullable=True)
+
+
+class AppAsignacion(Base):
+    """Cuentas de la flota asignadas a un usuario del MWX APP."""
+
+    __tablename__ = "app_asignacion"
+    __table_args__ = (
+        UniqueConstraint(
+            "usuario_id", "cuenta_id", name="uq_app_asignacion_usuario_cuenta"
+        ),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    usuario_id = Column(
+        Integer, ForeignKey("app_usuario.id"), nullable=False, index=True
+    )
+    cuenta_id = Column(Integer, ForeignKey("cuentas.id"), nullable=False, index=True)
+
+
+class AppConfig(Base):
+    """Configuracion de campaña LOCAL guardada por usuario (una fila c/u).
+
+    Las listas (`hashtags`, `urls`, `imagenes`) se guardan como Text con JSON
+    serializado; `imagenes` son nombres de archivo (no rutas absolutas)."""
+
+    __tablename__ = "app_config"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    usuario_id = Column(
+        Integer,
+        ForeignKey("app_usuario.id"),
+        unique=True,
+        index=True,
+        nullable=False,
+    )
+    hashtags = Column(Text, default="[]")
+    contexto = Column(Text, default="")
+    narrativa = Column(Text, default="")
+    urls = Column(Text, default="[]")
+    texto_base = Column(Text, default="")
+    acciones_por_cuenta = Column(Integer, default=10)
+    pausa_seg = Column(Integer, default=2)
+    duracion_min = Column(Integer, default=60)
+    limite_dia = Column(Integer, default=49)
+    imagenes = Column(Text, default="[]")
+    permitir_ajustes = Column(Boolean, default=False)
+    actualizado = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class AppImagen(Base):
+    """Imagen de campaña del MWX APP guardada EN LA BASE DE DATOS.
+
+    La API del ejecutable corre en otro contenedor y NO comparte el disco del
+    dashboard, por eso el binario viaja con la fila (`contenido`) en vez de
+    depender de una ruta local. `nombre` es el nombre de archivo saneado (ver
+    `core/app_imagenes.py`); es UNICO por usuario, de modo que volver a subir
+    la misma imagen REEMPLAZA la anterior (UPSERT) sin duplicarla.
+
+    `AppConfig.imagenes` sigue guardando la lista de nombres; esta tabla es la
+    que resuelve el contenido cuando el cliente pide `/v1/imagenes/{nombre}`.
+
+    Nota: la tabla se crea sola con `Base.metadata.create_all` (via `init_db`),
+    por lo que no requiere migracion ALTER en core/database.py."""
+
+    __tablename__ = "app_imagen"
+    __table_args__ = (
+        UniqueConstraint(
+            "usuario_id", "nombre", name="uq_app_imagen_usuario_nombre"
+        ),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    usuario_id = Column(
+        Integer, ForeignKey("app_usuario.id"), nullable=False, index=True
+    )
+    # Nombre de archivo saneado (solo [A-Za-z0-9._-], sin rutas).
+    nombre = Column(String(160), nullable=False)
+    # Bytes de la imagen: LargeBinary -> BLOB en SQLite, BYTEA en PostgreSQL.
+    contenido = Column(LargeBinary, nullable=False)
+    content_type = Column(String(80), default="application/octet-stream")
+    tamano = Column(Integer, default=0)
+    creado = Column(DateTime, default=datetime.utcnow)
+
+    # Relacion informativa (sin cascade destructivo): borrar el usuario NO
+    # borra imagenes automaticamente; la FK lo impide o quedan huerfanas segun
+    # el motor, igual que el resto de tablas App*.
+    usuario = relationship("AppUsuario")
+
+
+class AppEvento(Base):
+    """Auditoria opcional de eventos del MWX APP (login, campaña, errores)."""
+
+    __tablename__ = "app_evento"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    usuario_id = Column(
+        Integer, ForeignKey("app_usuario.id"), nullable=True, index=True
+    )
+    tipo = Column(String(50), default="")
+    detalle = Column(Text, default="")
+    fecha = Column(DateTime, default=datetime.utcnow, index=True)
+
+
+class AppRelease(Base):
+    """Paquete ZIP publicado del ejecutable MWX APP (descarga + actualización).
+
+    `contenido` guarda el ZIP completo (LargeBinary -> BLOB en SQLite, BYTEA en
+    PostgreSQL) para que el ejecutable y el dashboard puedan descargarlo aunque
+    no compartan disco. `version` es UNIQUE: publicar la misma versión otra vez
+    la REEMPLAZA (UPSERT) en vez de duplicarla. Las notas se recortan a 4000
+    caracteres al publicar (ver core/app_releases.py).
+
+    Nota: la tabla se crea sola con `Base.metadata.create_all` (via `init_db`),
+    por lo que no requiere migracion ALTER en core/database.py."""
+
+    __tablename__ = "app_releases"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    version = Column(String(50), unique=True, nullable=False, index=True)
+    obligatorio = Column(Boolean, default=True)
+    notas = Column(Text, default="")
+    filename = Column(String(200), default="")
+    sha256 = Column(String(64), default="")
+    tamano = Column(Integer, default=0)
+    contenido = Column(LargeBinary, nullable=True)
+    fecha = Column(DateTime, default=datetime.utcnow)

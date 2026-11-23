@@ -156,6 +156,41 @@ def generar_pool_variaciones(base: str, cantidad: int, n_hashtags: int = 2,
     return pool
 
 
+def generar_pool_variaciones_diversas(
+    base: str,
+    cantidad: int,
+    registro: str = "",
+    perfil: str = "",
+    hashtags=None,
+    evitar=None,
+    limite: int = 100,
+    semilla=None,
+) -> list[str]:
+    """Wrapper publico del generador local diverso de ``ia`` (import perezoso).
+
+    Misma firma/defaults que
+    ``ia.generador_contenido.generar_variaciones_locales_diversas``: reordena
+    ideas, cambia conectores/aperturas/cierres y respeta registro/perfil y
+    hashtags. Se expone aqui para no acoplar los llamadores de activaciones al
+    modulo de IA. Nunca lanza: si el import falla devuelve [].
+    """
+    try:
+        from ia.generador_contenido import generar_variaciones_locales_diversas
+        return generar_variaciones_locales_diversas(
+            base,
+            cantidad,
+            registro=registro,
+            perfil=perfil,
+            hashtags=hashtags,
+            evitar=evitar,
+            limite=limite,
+            semilla=semilla,
+        )
+    except Exception as e:
+        logger.error(f"Error en generador local diverso: {e}")
+        return []
+
+
 def generar_pool_variaciones_openai(
     base: str,
     cantidad: int,
@@ -164,6 +199,8 @@ def generar_pool_variaciones_openai(
     registro: str = "",
     perfil: str = "",
     hashtags=None,
+    evitar=None,
+    limite: int = 100,
 ) -> list[str]:
     """Genera 'cantidad' variaciones unicas de una cita usando OpenAI.
 
@@ -177,41 +214,116 @@ def generar_pool_variaciones_openai(
 
     `hashtags` (lista o string, con o sin '#') solo afecta al FALLBACK local:
     si no es None, el fallback usa ESTRICTAMENTE esos hashtags (subconjunto
-    aleatorio) en vez de los globales; con [] no agrega ninguno. Los textos
-    que devuelve OpenAI no se modifican aqui.
+    aleatorio); con [] no agrega ninguno. Los textos que devuelve OpenAI no se
+    modifican aqui.
 
-    Si OpenAI no devuelve suficiente variedad, rellena el faltante con el
-    fallback basado en sinonimos. Si aun asi falta, agrega variantes con
-    sufijo numerado. Devuelve exactamente 'cantidad' strings (o tantos como
-    sea humanamente posible). Retrocompatible: con registro/perfil vacios se
-    comporta como antes."""
-    from ia.generador_contenido import GeneradorContenido
-
-    pool = []
-    vistos = set()
-
-    textos_openai = GeneradorContenido().generar_variaciones_masivas(
-        base, cantidad, narrativa, entrenamiento, registro, perfil
+    `evitar` (antes de `limite`): textos de la campana que NO deben
+    reutilizarse; se pasan a la IA como "NO REPITAS" y se filtran por
+    similitud. Si OpenAI no devuelve suficiente variedad, rellena el faltante
+    con el generador LOCAL DIVERSO (estructuras/angulos distintos, no el
+    fallback plano de sinonimos). Ultimo recurso: sufijo numerado. Devuelve
+    exactamente 'cantidad' strings (o tantos como sea humanamente posible).
+    """
+    from ia.generador_contenido import (
+        DIVERSIDAD_UMBRAL_CITA,
+        GeneradorContenido,
+        generar_variaciones_locales_diversas,
+        normalizar_para_comparar,
+        texto_es_suficientemente_distinto,
     )
-    for t in textos_openai:
-        if t and t not in vistos:
-            vistos.add(t)
-            pool.append(t)
 
-    if len(pool) < cantidad:
-        faltante = cantidad - len(pool)
-        fallback = generar_pool_variaciones(
-            base, cantidad=faltante, n_hashtags=2, hashtags=hashtags
+    try:
+        cantidad = int(cantidad)
+    except (TypeError, ValueError):
+        cantidad = 0
+    if cantidad <= 0:
+        return []
+
+    evitar_lista = []
+    if evitar is not None:
+        if isinstance(evitar, str):
+            evitar_lista = [evitar.strip()] if evitar.strip() else []
+        else:
+            try:
+                evitar_lista = [
+                    str(x).strip() for x in evitar if str(x or "").strip()
+                ]
+            except TypeError:
+                evitar_lista = [str(evitar).strip()] if str(evitar).strip() else []
+
+    pool: list[str] = []
+    vistos: set[str] = set()
+    claves: set[str] = set()
+
+    def _agregar(texto) -> bool:
+        t = str(texto or "").strip()
+        if not t:
+            return False
+        clave = normalizar_para_comparar(t)
+        if t in vistos or (clave and clave in claves):
+            return False
+        if not texto_es_suficientemente_distinto(
+            t, evitar_lista + pool, DIVERSIDAD_UMBRAL_CITA
+        ):
+            return False
+        vistos.add(t)
+        if clave:
+            claves.add(clave)
+        pool.append(t)
+        return True
+
+    try:
+        textos_openai = GeneradorContenido().generar_variaciones_masivas(
+            base,
+            cantidad,
+            narrativa,
+            entrenamiento,
+            registro,
+            perfil,
+            evitar=evitar_lista,
+            limite=limite,
         )
-        for t in fallback:
-            if t and t not in vistos:
-                vistos.add(t)
-                pool.append(t)
+    except Exception as e:
+        logger.error(f"Error en variaciones OpenAI: {e}")
+        textos_openai = []
+
+    for t in textos_openai or []:
+        _agregar(t)
+        if len(pool) >= cantidad:
+            break
+
+    # Relleno con el generador LOCAL DIVERSO (nunca el fallback de sinonimos).
+    intentos = 0
+    while len(pool) < cantidad and intentos < 12:
+        intentos += 1
+        faltante = cantidad - len(pool)
+        try:
+            locales = generar_variaciones_locales_diversas(
+                base,
+                faltante,
+                registro=registro,
+                perfil=perfil,
+                hashtags=hashtags,
+                evitar=evitar_lista + pool,
+                limite=limite,
+                semilla=random.randint(1, 10 ** 9),
+            )
+        except Exception as e:
+            logger.error(f"Error en relleno local diverso: {e}")
+            locales = []
+        if not locales:
+            break
+        antes = len(pool)
+        for t in locales:
+            _agregar(t)
             if len(pool) >= cantidad:
                 break
+        if len(pool) == antes:
+            break
 
+    # Ultimo recurso: sufijo numerado (garantiza el contrato de cantidad).
     sufijo = 1
-    while len(pool) < cantidad:
+    while len(pool) < cantidad and sufijo < cantidad + 50:
         v = f"{base} ({sufijo})"
         sufijo += 1
         if v not in vistos:

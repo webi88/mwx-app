@@ -50,6 +50,22 @@ def _env_activo(nombre: str, default: bool = True) -> bool:
     return str(valor).strip().lower() not in ("0", "false", "no", "off")
 
 
+def _acepta_kwarg(func, nombre: str) -> bool:
+    """True si `func` acepta el kwarg `nombre` (o **kwargs). Nunca lanza.
+
+    Se usa para pasar `buscar_url_perfil` SOLO a bots nuevos: los fakes/bots
+    viejos conservan exactamente su contrato anterior (sin el kwarg).
+    """
+    try:
+        firma = inspect.signature(func)
+    except (TypeError, ValueError):
+        return False
+    for parametro in firma.parameters.values():
+        if parametro.kind is inspect.Parameter.VAR_KEYWORD:
+            return True
+    return nombre in firma.parameters
+
+
 def _env_int(nombre: str, default: int, minimo: int = None,
              maximo: int = None) -> int:
     """Entero de la env `nombre`, acotado a [minimo, maximo].
@@ -315,6 +331,21 @@ _SENALES_SESION_INVALIDA = (
     "se pidio login",
 )
 
+# Mensajes REALES de X cuando la cuenta quedo bloqueada o le exige verificar su
+# identidad. NO son un fallo transitorio de red: la cuenta se omite de la
+# campana y se manda al cajon de verificacion humana (BD), sin desactivarla.
+_SENALES_BLOQUEO_CUENTA = (
+    "your account has locked",
+    "unusual activity",
+    "confirm your identity",
+    "pass a challenge",
+    "account unlocked",
+    "cuenta bloqueada",
+    "actividad inusual",
+    "confirma tu identidad",
+    "verifica tu identidad",
+)
+
 MENSAJE_SESION_INVALIDA = "sesión de X expirada: renueva cookies/login"
 
 
@@ -407,7 +438,7 @@ _SENALES_SESION_CAIDA_POOL = (
     "sin cookies",
     "sin sesion",
     "sin sesión",
-) + _SENALES_ANTI_BOT
+) + _SENALES_ANTI_BOT + _SENALES_BLOQUEO_CUENTA
 
 # Senales de AGOTAMIENTO DE RECURSOS del contenedor (hilos/RAM): si aparecen,
 # abrir MAS Chrome empeora el problema: el motor baja el limite de navegadores
@@ -447,6 +478,21 @@ def _es_error_sesion_invalida(detalle) -> bool:
     except Exception:
         return False
     return any(senal in texto for senal in _SENALES_SESION_INVALIDA)
+
+
+def _es_bloqueo_cuenta(detalle) -> bool:
+    """True si el detalle es un bloqueo/verificacion de identidad de X.
+
+    Mensajes como "Your account has locked", "unusual activity", "confirm
+    your identity", "pass a challenge", "cuenta bloqueada"... indican que la
+    cuenta necesita revision HUMANA: el motor la omite y la manda al cajon de
+    verificacion (sin desactivarla en la BD). Tolera None; nunca lanza.
+    """
+    try:
+        texto = "" if detalle is None else str(detalle).lower()
+    except Exception:
+        return False
+    return any(senal in texto for senal in _SENALES_BLOQUEO_CUENTA)
 
 
 def _detalle_con_sesion(motivo) -> str:
@@ -1235,6 +1281,159 @@ def _variar_protegiendo_hashtags(texto: str) -> str:
         return str(texto or "").strip()
 
 
+def _es_texto_diverso(texto, otros, umbral=None) -> bool:
+    """True si `texto` no es igual ni SIMILAR a ninguno de `otros`.
+
+    Usa el motor deterministico de `ia.generador_contenido`
+    (`texto_es_suficientemente_distinto`, umbral de cita por default). Si el
+    import falla (version vieja) cae a una comparacion exacta normalizada.
+    Nunca lanza.
+    """
+    t = str(texto or "").strip()
+    if not t:
+        return False
+    try:
+        from ia.generador_contenido import (
+            DIVERSIDAD_UMBRAL_CITA,
+            texto_es_suficientemente_distinto,
+        )
+
+        limite = DIVERSIDAD_UMBRAL_CITA if umbral is None else umbral
+        return bool(
+            texto_es_suficientemente_distinto(
+                t, list(otros or []), limite
+            )
+        )
+    except Exception:
+        clave = _clave_texto(t)
+        try:
+            return clave not in {_clave_texto(x) for x in (otros or [])}
+        except Exception:
+            return True
+
+
+def _acotar_cita_100(texto: str, tags: list) -> str:
+    """Ajusta una cita al limite de 100 chars conservando los hashtags pedidos.
+
+    `_garantizar_hashtags_texto` puede insertar el grupo de hashtags DESPUES
+    del corte y dejar el texto en ~105-110 chars; aqui se aplica la garantia
+    final de `ia` (hashtags en medio, cierre de frase, <=100). Sin tags no
+    toca nada (el generador ya respeta el limite). Nunca lanza.
+    """
+    t = str(texto or "").strip()
+    if not t or not tags:
+        return t
+    try:
+        from ia.generador_contenido import garantizar_texto_hashtag
+
+        return garantizar_texto_hashtag(
+            t, list(tags), limite=100, semilla=random.randint(0, 10 ** 9)
+        )
+    except Exception:
+        return t
+
+
+def _cita_local_diversa(cuenta, base: str, tags: list,
+                        evitar: list) -> str:
+    """Genera UNA cita local distinta (sin IA) para `cuenta`.
+
+    Usa el generador local diverso de `ia` (reordena ideas, cambia angulo,
+    apertura, estructura y cierre) respetando registro/perfil y hashtags
+    pedidos. Si no esta disponible, varia el base protegiendo los hashtags.
+    Devuelve "" si no logra nada. Nunca lanza.
+    """
+    tags = list(tags or [])
+    evitar = list(evitar or [])
+    base = str(base or "").strip() or "Lo que está pasando merece atención."
+    try:
+        from activaciones.variaciones import generar_pool_variaciones_diversas
+
+        textos = generar_pool_variaciones_diversas(
+            base,
+            1,
+            registro=normalizar_tipo_cuenta(
+                getattr(cuenta, "tipo_cuenta", "")
+            ),
+            perfil=normalizar_perfil(
+                getattr(cuenta, "perfil_personalidad", "")
+            ),
+            hashtags=tags,
+            evitar=evitar,
+            limite=100,
+        )
+        if isinstance(textos, list) and textos:
+            candidato = str(textos[0] or "").strip()
+            if candidato and _es_texto_diverso(candidato, evitar):
+                return candidato
+    except Exception as e:
+        logger.debug(
+            f"cita local diversa fallo para "
+            f"@{getattr(cuenta, 'usuario', '')}: {e}"
+        )
+    try:
+        alterno = _acotar_cita_100(
+            _garantizar_hashtags_texto(
+                _variar_protegiendo_hashtags(base), tags
+            ),
+            tags,
+        )
+        if alterno and _es_texto_diverso(alterno, evitar):
+            return alterno
+        if alterno:
+            # Ultimo recurso: cierre distinto para no repetir el mismo texto.
+            return f"{alterno} ({random.randint(2, 9999)})"
+    except Exception:
+        pass
+    return ""
+
+
+def _recordar_textos(destino: list, textos, maximo: int = 4000) -> None:
+    """Agrega textos no vacios a `destino` sin duplicados exactos y lo acota.
+
+    Se usa como memoria anti-repeticion de TODA la campana (citas/posts) para
+    que la IA y el fallback local no reutilicen textos de rondas anteriores.
+    Nunca lanza.
+    """
+    if not isinstance(destino, list):
+        return
+    try:
+        existentes = set(destino)
+    except Exception:
+        existentes = set()
+    for texto in (textos or []):
+        t = str(texto or "").strip()
+        if not t or t in existentes:
+            continue
+        destino.append(t)
+        existentes.add(t)
+    try:
+        if len(destino) > int(maximo):
+            del destino[:len(destino) - int(maximo)]
+    except Exception:
+        pass
+
+
+def _recordar_textos_por_rol(textos: dict, roles: dict,
+                             evitar_citas: list,
+                             evitar_posts: list) -> None:
+    """Guarda en la memoria de campana los textos de citas y posts por rol."""
+    if not isinstance(textos, dict):
+        return
+    roles = roles if isinstance(roles, dict) else {}
+    citas, posts = [], []
+    for usuario, texto in textos.items():
+        t = str(texto or "").strip()
+        if not t:
+            continue
+        rol = str(roles.get(usuario, "") or "")
+        if rol == "cita":
+            citas.append(t)
+        elif rol == "hashtags":
+            posts.append(t)
+    _recordar_textos(evitar_citas, citas)
+    _recordar_textos(evitar_posts, posts)
+
+
 def _aplicar_anti_repeticion(asignaciones: dict, usados: dict) -> dict:
     """Evita que una MISMA cuenta repita texto entre rondas de la campana.
 
@@ -1939,6 +2138,9 @@ class MotorActivacion:
         if not isinstance(resumen, dict):
             resumen = {"resultado": resumen}
         resumen.setdefault("omitidas_por_cuota", 0)
+        # CAJON DE VERIFICACION HUMANA: claves SIEMPRE presentes.
+        resumen.setdefault("verificacion_omitidas", 0)
+        resumen.setdefault("verificacion_usuarios", [])
         try:
             resumen["cuotas"] = (
                 self._cuotas.resumen() if self._cuotas is not None else {}
@@ -2014,6 +2216,9 @@ class MotorActivacion:
         # en mantenimiento). Claves SIEMPRE presentes aunque no haya pausadas.
         resumen.setdefault("pausadas_omitidas", 0)
         resumen.setdefault("pausadas_usuarios", [])
+        # Cajon de verificacion humana: mismo trato (SIEMPRE presentes).
+        resumen.setdefault("verificacion_omitidas", 0)
+        resumen.setdefault("verificacion_usuarios", [])
         resumen.setdefault("omitidas_por_cancelacion", 0)
         resumen.setdefault("fase_actual", int(self.progreso.get("fase_actual", 1) or 1))
         try:
@@ -2173,6 +2378,60 @@ class MotorActivacion:
                 f"Activacion: {len(usuarios)} cuenta(s) pausada(s) para "
                 f"activación quedaron fuera (siguen en mantenimiento): "
                 f"{listado}"
+            )
+
+    @staticmethod
+    def _separar_verificacion(cuentas) -> tuple:
+        """(elegibles, usuarios_pendientes_de_verificacion) para activacion.
+
+        Import LOCAL de `core.verificacion` (evita ciclos). Las cuentas del
+        cajon de verificacion humana quedan FUERA de TODO flujo de activacion
+        (se reportan aparte de las pausadas). Nunca lanza: ante el minimo fallo
+        devuelve la lista original sin pendientes reportados.
+        """
+        try:
+            from core.verificacion import (
+                filtrar_para_activacion,
+                pendientes_usuarios,
+            )
+
+            lista = list(cuentas or [])
+            return filtrar_para_activacion(lista), pendientes_usuarios(lista)
+        except Exception:
+            try:
+                return list(cuentas or []), []
+            except Exception:
+                return [], []
+
+    @staticmethod
+    def _anotar_verificacion(resumen, pendientes) -> None:
+        """Vuelca `verificacion_omitidas`/`verificacion_usuarios` (nunca lanza).
+
+        `verificacion_usuarios` sale recortado a 20; `verificacion_omitidas`
+        lleva el total real. Log INFO una vez por campana.
+        """
+        usuarios: list = []
+        try:
+            for usuario in (pendientes or []):
+                texto = str(usuario or "").strip()
+                if texto and texto not in usuarios:
+                    usuarios.append(texto)
+        except Exception:
+            usuarios = []
+        if isinstance(resumen, dict):
+            try:
+                resumen["verificacion_omitidas"] = len(usuarios)
+                resumen["verificacion_usuarios"] = usuarios[:20]
+            except Exception:
+                pass
+        if usuarios:
+            listado = ", ".join(f"@{u}" for u in usuarios[:5])
+            if len(usuarios) > 5:
+                listado += f", +{len(usuarios) - 5} mas"
+            logger.info(
+                f"Activacion: {len(usuarios)} cuenta(s) pendiente(s) de "
+                f"verificación humana quedaron fuera (usa Cuentas > "
+                f"Verificación para revisarlas): {listado}"
             )
 
     def _tier_registrado(self, usuario) -> str:
@@ -2537,17 +2796,17 @@ class MotorActivacion:
 
     def _preparar_reservas(self, reserva_usuarios, principales, secciones=None,
                            solo_con_registro: bool = False,
-                           pausadas_out=None) -> list:
+                           pausadas_out=None, verificacion_out=None) -> list:
         """Carga las cuentas de RESPALDO de la campana (sin abrir navegador).
 
         Acepta usuarios (str, con o sin '@') o Cuentas ya construidas. Filtra
-        activas, con sesion (helpers existentes) y NO pausadas para activacion
-        (una reserva pausada jamas entra a la campana); quita duplicadas y las
-        que ya estan en la campana, respeta `solo_con_registro` y el tope
-        `RESERVA_MAX_CUENTAS` (env, default 50). `pausadas_out` (lista
-        mutable opcional) recibe los usuarios de las reservas pausadas para
-        reportarlos en el resumen. `None`/vacio = comportamiento actual
-        exacto (sin reservas). Nunca lanza.
+        activas, con sesion (helpers existentes), NO pausadas para activacion
+        (una reserva pausada jamas entra a la campana) y NO pendientes de
+        verificacion humana. Quita duplicadas y las que ya estan en la campana,
+        respeta `solo_con_registro` y el tope `RESERVA_MAX_CUENTAS` (env, default
+        50). `pausadas_out`/`verificacion_out` (listas mutables opcionales)
+        reciben los usuarios excluidos para reportarlos en el resumen.
+        `None`/vacio = comportamiento actual exacto (sin reservas). Nunca lanza.
         """
         try:
             if not reserva_usuarios:
@@ -2607,6 +2866,14 @@ class MotorActivacion:
         if pausadas and pausadas_out is not None:
             try:
                 pausadas_out.extend(pausadas)
+            except Exception:
+                pass
+        # VERIFICACION: una cuenta pendiente tampoco es reserva (necesita
+        # revision humana); se reporta por `verificacion_out`.
+        reservas, pendientes_verificacion = self._separar_verificacion(reservas)
+        if pendientes_verificacion and verificacion_out is not None:
+            try:
+                verificacion_out.extend(pendientes_verificacion)
             except Exception:
                 pass
         con_sesion, _sin = _partir_por_sesion(reservas)
@@ -2941,6 +3208,14 @@ class MotorActivacion:
             self._registrar_fallo_transitorio(usuario, detalle)
             return
         self._marcar_sesion_caida(usuario)
+        if not (
+            _es_error_driver_transitorio(detalle)
+            or _es_error_recursos(detalle)
+        ):
+            # Sesion caida REAL (login/onboarding/anti-bot duro/bloqueo de la
+            # cuenta): a la caja de verificacion humana. NUNCA por rechazos de
+            # X ni interstitials transitorios (esos ya salieron arriba).
+            self._marcar_verificacion_pendiente(usuario, detalle)
         if _es_anti_bot_bloqueo(detalle):
             logger.warning(
                 f"X pidió verificación anti-bot; se omite @{usuario} en esta "
@@ -2951,6 +3226,37 @@ class MotorActivacion:
                 f"sesion caida registrada para @{usuario}; se omite en las "
                 f"siguientes rondas"
             )
+
+    def _marcar_verificacion_pendiente(self, usuario, detalle="",
+                                       origen="activacion") -> bool:
+        """Manda la cuenta al cajon de verificacion humana (nunca lanza).
+
+        Import PEREZOSO de `core.verificacion` y try/except total: un fallo de
+        BD jamas puede romper la campana. Devuelve True solo si el backend
+        confirmo el cambio.
+        """
+        try:
+            usuario_txt = str(usuario or "").strip()
+            if not usuario_txt:
+                return False
+            from core.verificacion import marcar_pendiente
+
+            motivo = str(detalle or "")[:300]
+            marcada = bool(
+                marcar_pendiente(usuario_txt, motivo=motivo, origen=origen)
+            )
+            if marcada:
+                logger.warning(
+                    f"@{usuario_txt} enviada al cajón de verificación humana "
+                    f"({motivo[:100] or 'sin detalle'}); no se usará en las "
+                    f"próximas activaciones"
+                )
+            return marcada
+        except Exception as e:
+            logger.debug(
+                f"no se pudo marcar verificacion de @{usuario}: {e}"
+            )
+            return False
 
     def _registrar_fallo_transitorio(self, usuario, detalle="") -> None:
         """Suma un fallo TRANSITORIO de navegacion a la cuenta (nunca lanza).
@@ -3367,7 +3673,8 @@ class MotorActivacion:
     def _asignar_variaciones_cita(self, cuentas: list, texto_base: str,
                                   narrativa: str = "",
                                   entrenamiento: str = "",
-                                  tags: list = None) -> dict:
+                                  tags: list = None,
+                                  evitar=None) -> dict:
         """Asigna a cada cuenta una variacion de cita segun su registro/perfil.
 
         Agrupa `cuentas` por (registro, perfil) -- "politica"/"activista"/
@@ -3380,14 +3687,26 @@ class MotorActivacion:
         publicable ni como base del fallback local. La transformacion por ronda
         (`_narrativa_con_ronda`) la hace el llamador, para no duplicarla.
 
-        Aplica `_garantizar_hashtags_texto` con `tags` y reparte cada pool
-        barajado entre las cuentas de su grupo; las cuentas que no alcancen
-        texto reciben el fallback `_garantizar_hashtags_texto(texto_base,
-        tags)` (comportamiento previo). Nunca lanza: si el pool de un grupo
-        falla, sus cuentas usan el fallback. Devuelve {usuario: texto}.
+        `evitar` (kwarg nuevo AL FINAL): textos ya publicados en la campana
+        (citas de rondas/grupos anteriores). Se pasan a la IA como "NO
+        REPITAS", se filtran por SIMILITUD y, si un pool se queda corto, las
+        cuentas restantes reciben una variacion LOCAL DIVERSA (no el texto base
+        tal cual). Dentro de esta llamada tampoco se repiten textos entre
+        grupos: `evitar` se amplia con cada texto asignado.
+
+        Aplica `_garantizar_hashtags_texto` con `tags`. Nunca lanza: si el pool
+        de un grupo falla, sus cuentas usan el fallback local diverso.
+        Devuelve {usuario: texto}.
         """
         asignaciones: dict = {}
         tags = list(tags or [])
+        try:
+            evitar_lista = [
+                str(x).strip() for x in (evitar or []) if str(x or "").strip()
+            ]
+        except TypeError:
+            evitar_lista = []
+        asignados_ronda: list = []
         grupos: dict = {}
         for cuenta in (cuentas or []):
             try:
@@ -3411,26 +3730,66 @@ class MotorActivacion:
                     registro=registro,
                     perfil=perfil,
                     hashtags=tags,
+                    evitar=evitar_lista + asignados_ronda,
+                )
+            except TypeError:
+                # Backend/IA viejo sin `evitar`: se genera y se filtra abajo.
+                pool = generar_pool_variaciones_openai(
+                    texto_base,
+                    cantidad=len(grupo),
+                    narrativa=narrativa,
+                    entrenamiento=entrenamiento,
+                    registro=registro,
+                    perfil=perfil,
+                    hashtags=tags,
                 )
             except Exception as e:
                 logger.error(
                     f"Activacion: pool de citas fallo para "
                     f"({registro or 'libre'}/{perfil or 'libre'}) "
-                    f"({type(e).__name__}: {e}); se usa el texto base"
+                    f"({type(e).__name__}: {e}); se usa el fallback local"
                 )
                 pool = []
             if not isinstance(pool, list):
                 pool = []
             if tags:
-                pool = [_garantizar_hashtags_texto(t, tags) for t in pool]
+                pool = [
+                    _acotar_cita_100(_garantizar_hashtags_texto(t, tags), tags)
+                    for t in pool
+                ]
             random.shuffle(pool)
-            for i, cuenta in enumerate(grupo):
-                if i < len(pool):
-                    asignaciones[cuenta.usuario] = pool[i]
-                else:
-                    asignaciones[cuenta.usuario] = (
-                        _garantizar_hashtags_texto(texto_base, tags)
+            disponibles = [str(t or "").strip() for t in pool if str(t or "").strip()]
+            for cuenta in grupo:
+                elegido = ""
+                # Consume el pool en orden: si un texto es igual/similar a lo ya
+                # asignado (o a `evitar`), se descarta y se prueba el siguiente.
+                while disponibles:
+                    candidato = disponibles.pop(0)
+                    if _es_texto_diverso(
+                        candidato, evitar_lista + asignados_ronda
+                    ):
+                        elegido = candidato
+                        break
+                if not elegido:
+                    elegido = _cita_local_diversa(
+                        cuenta, texto_base, tags,
+                        evitar_lista + asignados_ronda,
                     )
+                if not elegido:
+                    # Ultimo recurso: el base variado (nunca el base literal).
+                    elegido = _acotar_cita_100(
+                        _garantizar_hashtags_texto(
+                            _variar_protegiendo_hashtags(
+                                texto_base
+                                or "Lo que está pasando merece atención."
+                            ),
+                            tags,
+                        ),
+                        tags,
+                    )
+                asignaciones[cuenta.usuario] = elegido
+                if elegido:
+                    asignados_ronda.append(elegido)
         return asignaciones
 
     def _generar_textos_por_rol(self, grupos_ejec: dict, texto_base: str,
@@ -3439,7 +3798,9 @@ class MotorActivacion:
                                 entrenamiento: str = "",
                                 contexto: str = "",
                                 ronda: int = 1,
-                                ancla_textos: dict = None) -> dict:
+                                ancla_textos: dict = None,
+                                evitar_citas=None,
+                                evitar_posts=None) -> dict:
         """Arma {usuario: texto} para una ronda de la campana por roles.
 
         - "cita": variaciones OpenAI/fallback del texto base con los hashtags
@@ -3479,6 +3840,7 @@ class MotorActivacion:
                 narrativa=narrativa,
                 entrenamiento=entrenamiento,
                 tags=tags,
+                evitar=list(evitar_citas or []),
             ))
 
         cuentas_hashtags = [
@@ -3516,13 +3878,21 @@ class MotorActivacion:
                             getattr(cuenta, "perfil_personalidad", "")
                         ),
                     })
+                kwargs_ia = {
+                    "hashtags": hashtags,
+                    "contexto": (str(contexto or "").strip() or texto_base),
+                    "n_por_cuenta": 1,
+                    "narrativa": narrativa,
+                    "entrenamiento": entrenamiento,
+                }
+                # `evitar` (textos ya usados en la campana) solo si el backend
+                # lo soporta: un fake/version vieja conserva su contrato.
+                if _acepta_kwarg(
+                    generar_textos_hashtags_por_cuenta, "evitar"
+                ):
+                    kwargs_ia["evitar"] = list(evitar_posts or [])
                 resultado_ia = generar_textos_hashtags_por_cuenta(
-                    cuentas_info,
-                    hashtags=hashtags,
-                    contexto=(str(contexto or "").strip() or texto_base),
-                    n_por_cuenta=1,
-                    narrativa=narrativa,
-                    entrenamiento=entrenamiento,
+                    cuentas_info, **kwargs_ia
                 )
                 if not isinstance(resultado_ia, dict):
                     resultado_ia = {}
@@ -4035,8 +4405,9 @@ class MotorActivacion:
     def _capturar_url_post(self) -> bool:
         """True si se debe capturar la URL real de posts/citas (`CAPTURAR_URL_POST`).
 
-        Default 1 (activado): `publicar_tweet`/la cita buscan el link del
-        timeline actual (~1-3s) y solo si falla visitan el perfil (~5-10s).
+        Default 1 (activado): `publicar_tweet`/la cita buscan el link por la
+        ruta rapida (toast de X + timeline actual, ~1-3s, SIN navegar); visitar
+        el perfil (~5-10s) queda para `CAPTURAR_URL_PERFIL=1`.
         `CAPTURAR_URL_POST=0` fuerza `buscar_url=False` (maxima velocidad, sin
         links: la tabla de Reportes mostrara "link no capturado"). Nunca lanza.
         """
@@ -4044,6 +4415,33 @@ class MotorActivacion:
             return _env_activo("CAPTURAR_URL_POST", True)
         except Exception:
             return True
+
+    def _buscar_url_perfil_post(self) -> bool:
+        """True si se permite VISITAR el perfil para sacar el link del post.
+
+        `CAPTURAR_URL_PERFIL` default "0": NO se visita el perfil (la captura
+        se queda en la ruta rapida por toast/timeline, ~1-3s). Con "1" se
+        restaura el comportamiento historico (~5-10s y GB de proxy por accion).
+        Es independiente de `CAPTURAR_URL_POST`: con la captura apagada no se
+        busca link de ninguna forma. Nunca lanza.
+        """
+        try:
+            return _env_activo("CAPTURAR_URL_PERFIL", False)
+        except Exception:
+            return False
+
+    def _kwargs_buscar_url_perfil(self, metodo) -> dict:
+        """`buscar_url_perfil` SOLO si el metodo del bot acepta el kwarg.
+
+        Devuelve `{}` para bots/fakes viejos, de modo que su contrato y sus
+        llamadas quedan identicas a las de antes. Nunca lanza.
+        """
+        try:
+            if _acepta_kwarg(metodo, "buscar_url_perfil"):
+                return {"buscar_url_perfil": self._buscar_url_perfil_post()}
+        except Exception:
+            return {}
+        return {}
 
     # ------------------------------------------------------------------ #
     # IMAGENES OPCIONALES DE LOS POSTS (rol "hashtags")
@@ -4190,6 +4588,7 @@ class MotorActivacion:
                     cuenta.usuario,
                     mensaje_cita=texto,
                     dar_like=dar_like,
+                    **self._kwargs_buscar_url_perfil(bot.solo_retwittear),
                 )
                 ok = res.get("exitos", 0) > 0
                 urls_pub = res.get("urls") or []
@@ -4255,11 +4654,18 @@ class MotorActivacion:
                 return (cuenta.usuario, rol, ok, detalle[:120], url_publicada)
 
             # rol == "hashtags"
+            # Captura rapida: por defecto NO se visita el perfil para el link
+            # (`CAPTURAR_URL_PERFIL=0`). Solo se pasa a bots que acepten el
+            # kwarg nuevo; los fakes/bots viejos mantienen su contrato.
+            kwargs_perfil = self._kwargs_buscar_url_perfil(
+                bot.publicar_tweet
+            )
             if imagen_path:
                 try:
                     res = bot.publicar_tweet(
                         texto, imagen_path=imagen_path,
                         buscar_url=self._capturar_url_post(),
+                        **kwargs_perfil,
                     )
                 except TypeError:
                     # Bot/fake viejo que no acepta `imagen_path`: se publica
@@ -4269,7 +4675,8 @@ class MotorActivacion:
                     )
             else:
                 res = bot.publicar_tweet(
-                    texto, buscar_url=self._capturar_url_post()
+                    texto, buscar_url=self._capturar_url_post(),
+                    **kwargs_perfil,
                 )
             ok = bool(res)
             if isinstance(res, str):
@@ -4331,6 +4738,12 @@ class MotorActivacion:
             # desactivar la cuenta en la BD (aunque el bot haya puesto
             # `cuenta_suspendida=True`).
             self._registrar_rechazo_x(usuario, texto)
+            return False
+        if _es_bloqueo_cuenta(texto):
+            # Bloqueo/verificacion de identidad: NO es una suspension real; la
+            # cuenta se omite y queda en el cajon de verificacion humana
+            # (`_registrar_sesion_caida` hace el marcado).
+            self._registrar_sesion_caida(usuario, texto or "cuenta bloqueada")
             return False
         if _es_anti_bot_detalle(texto):
             if _es_fallo_navegacion_transitorio(texto) and not _es_anti_bot_bloqueo(
@@ -4427,6 +4840,7 @@ class MotorActivacion:
                 cuenta.usuario,
                 mensaje_cita=texto,
                 dar_like=dar_like,
+                **self._kwargs_buscar_url_perfil(bot.solo_retwittear),
             )
             ok = res.get("exitos", 0) > 0
             urls_pub = res.get("urls") or []
@@ -4505,6 +4919,7 @@ class MotorActivacion:
                 cuenta.usuario,
                 mensaje_cita=texto,
                 dar_like=dar_like,
+                **self._kwargs_buscar_url_perfil(bot.solo_retwittear),
             )
 
             ok = res.get("exitos", 0) > 0
@@ -5132,6 +5547,8 @@ class MotorActivacion:
         # cualquier particion (no son fallidas, no abren navegador y no
         # aparecen en sin_sesion/sin_rol); siguen en mantenimiento.
         cuentas, pausadas_omitidas = self._separar_pausadas(cuentas)
+        # VERIFICACION humana: se excluyen igual (con su propio contador).
+        cuentas, verificacion_omitidas = self._separar_verificacion(cuentas)
 
         sin_registro = []
         if solo_con_registro:
@@ -5159,6 +5576,7 @@ class MotorActivacion:
                 "omitidas_por_cuota": 0,
             }
             self._anotar_pausadas(resumen_vacio, pausadas_omitidas)
+            self._anotar_verificacion(resumen_vacio, verificacion_omitidas)
             return self._claves_cuotas(resumen_vacio)
 
         con_sesion, sin_sesion = _partir_por_sesion(cuentas)
@@ -5236,6 +5654,7 @@ class MotorActivacion:
                 f"{resumen_vacio['fallidas']} fallidas de {resumen_vacio['total']} "
                 f"({resumen_vacio['sin_sesion']} sin sesión)"
             )
+            self._anotar_verificacion(resumen_vacio, verificacion_omitidas)
             return self._claves_cuotas(resumen_vacio)
 
         # Con cuentas ejecutables: reservas de respaldo, tiers, cuotas
@@ -5244,6 +5663,7 @@ class MotorActivacion:
             reserva_usuarios, con_sesion, secciones=secciones,
             solo_con_registro=solo_con_registro,
             pausadas_out=pausadas_omitidas,
+            verificacion_out=verificacion_omitidas,
         )
         # Una reserva Tier 3 JAMAS entra a Cita masiva (rol "cita" prohibido:
         # solo RT/likes): se filtra antes de registrar tiers/cuotas/curva.
@@ -5286,6 +5706,10 @@ class MotorActivacion:
             )
 
         tags_pedidos = _normalizar_hashtags(hashtags)
+        # Memoria anti-repeticion de TODA la campana (citas y posts): evita
+        # que dos cuentas/rondas publiquen textos iguales o casi iguales.
+        evitar_citas: list = []
+        evitar_posts: list = []
 
         if repetir:
             resumen = {
@@ -5335,8 +5759,11 @@ class MotorActivacion:
                     narrativa=_narrativa_con_ronda(narrativa, _ronda),
                     entrenamiento=entrenamiento,
                     tags=tags_pedidos,
+                    evitar=evitar_citas,
                 )
-                return _aplicar_anti_repeticion(asignaciones_ronda, usados)
+                finales = _aplicar_anti_repeticion(asignaciones_ronda, usados)
+                _recordar_textos(evitar_citas, finales.values())
+                return finales
 
             def _ejecutar_una_cuenta(cuenta, texto, rol=""):
                 # `ejecutar` siempre hace quote-RT (rol "cita"); se acepta el
@@ -5438,6 +5865,7 @@ class MotorActivacion:
                 f"{resumen['sin_registro']} sin registro)"
             )
             self._anotar_pausadas(resumen, pausadas_omitidas)
+            self._anotar_verificacion(resumen, verificacion_omitidas)
             return self._claves_cuotas(resumen)
 
         # --- Una sola pasada (con curva: DOS etapas secuenciales) ---------- #
@@ -5459,7 +5887,9 @@ class MotorActivacion:
                 narrativa=narrativa,
                 entrenamiento=entrenamiento,
                 tags=tags_pedidos,
+                evitar=evitar_citas,
             )
+            _recordar_textos(evitar_citas, asignaciones.values())
             try:
                 duracion_efectiva = max(1, int(duracion_pasada or 1))
             except Exception:
@@ -5620,6 +6050,7 @@ class MotorActivacion:
             f"{resumen['sin_registro']} sin registro)"
         )
         self._anotar_pausadas(resumen, pausadas_omitidas)
+        self._anotar_verificacion(resumen, verificacion_omitidas)
         return self._claves_cuotas(resumen)
 
     def ejecutar_por_roles(
@@ -5880,6 +6311,8 @@ class MotorActivacion:
         # PAUSA para activacion: se excluyen ANTES de agrupar por rol/sesion
         # (ni sin_rol, ni sin_sesion, ni fallidas; siguen en mantenimiento).
         cuentas, pausadas_omitidas = self._separar_pausadas(cuentas)
+        # VERIFICACION humana: misma exclusion, con su propio contador.
+        cuentas, verificacion_omitidas = self._separar_verificacion(cuentas)
 
         sin_registro = []
         if solo_con_registro:
@@ -6041,6 +6474,7 @@ class MotorActivacion:
                 f"({len(sin_rol_usuarios)} sin rol)"
             )
             self._anotar_pausadas(resumen, pausadas_omitidas)
+            self._anotar_verificacion(resumen, verificacion_omitidas)
             return self._claves_cuotas(resumen)
 
         if sin_sesion:
@@ -6057,6 +6491,7 @@ class MotorActivacion:
                 f"({resumen['sin_rol']} sin rol, {resumen['sin_sesion']} sin sesión)"
             )
             self._anotar_pausadas(resumen, pausadas_omitidas)
+            self._anotar_verificacion(resumen, verificacion_omitidas)
             return self._claves_cuotas(resumen)
 
         rol_por_usuario = {
@@ -6091,6 +6526,7 @@ class MotorActivacion:
             reserva_usuarios, ejecutables, secciones=secciones,
             solo_con_registro=solo_con_registro,
             pausadas_out=pausadas_omitidas,
+            verificacion_out=verificacion_omitidas,
         )
         self._registrar_tiers(list(ejecutables) + list(reservas))
         self._preparar_cuotas(
@@ -6158,6 +6594,11 @@ class MotorActivacion:
         if urls and hay_comentarios:
             ancla_textos = self._obtener_anclas(urls)
 
+        # Memoria anti-repeticion de TODA la campana: citas y posts no pueden
+        # reutilizar (ni parafrasear de cerca) textos de grupos/rondas previos.
+        evitar_citas: list = []
+        evitar_posts: list = []
+
         if repetir:
             usados: dict = {}
             roles_ultimos: dict = {}
@@ -6205,11 +6646,14 @@ class MotorActivacion:
                         contexto=contexto,
                         ronda=_ronda,
                         ancla_textos=ancla_textos,
+                        evitar_citas=evitar_citas,
+                        evitar_posts=evitar_posts,
                     )
-                    return (
-                        _aplicar_anti_repeticion(textos, usados),
-                        roles_ronda,
+                    finales = _aplicar_anti_repeticion(textos, usados)
+                    _recordar_textos_por_rol(
+                        finales, roles_ronda, evitar_citas, evitar_posts
                     )
+                    return (finales, roles_ronda)
                 if usuarios is None:
                     grupos_ronda = grupos_ejec
                 else:
@@ -6249,8 +6693,14 @@ class MotorActivacion:
                     contexto=contexto,
                     ronda=_ronda,
                     ancla_textos=ancla_textos,
+                    evitar_citas=evitar_citas,
+                    evitar_posts=evitar_posts,
                 )
-                return _aplicar_anti_repeticion(textos, usados)
+                finales = _aplicar_anti_repeticion(textos, usados)
+                _recordar_textos_por_rol(
+                    finales, rol_por_usuario, evitar_citas, evitar_posts
+                )
+                return finales
 
             def _ejecutar_una_rol(cuenta, texto, rol=""):
                 rol_efectivo = rol or rol_por_usuario.get(cuenta.usuario, "")
@@ -6382,6 +6832,7 @@ class MotorActivacion:
                 f"{resumen['sin_registro']} sin registro)"
             )
             self._anotar_pausadas(resumen, pausadas_omitidas)
+            self._anotar_verificacion(resumen, verificacion_omitidas)
             return self._claves_cuotas(resumen)
 
         # --- Una sola pasada (con curva: DOS etapas secuenciales) ---------- #
@@ -6438,6 +6889,11 @@ class MotorActivacion:
                 entrenamiento=entrenamiento,
                 contexto=contexto,
                 ancla_textos=ancla_textos,
+                evitar_citas=evitar_citas,
+                evitar_posts=evitar_posts,
+            )
+            _recordar_textos_por_rol(
+                asignaciones, roles_pasada, evitar_citas, evitar_posts
             )
             try:
                 duracion_efectiva = max(1, int(duracion_pasada or 1))
@@ -6607,6 +7063,7 @@ class MotorActivacion:
             f"({resumen['sin_rol']} sin rol, {resumen['sin_sesion']} sin sesión)"
         )
         self._anotar_pausadas(resumen, pausadas_omitidas)
+        self._anotar_verificacion(resumen, verificacion_omitidas)
         return self._claves_cuotas(resumen)
 
     def _ejecutar_campana_una_cuenta(self, cuenta: Cuenta, acciones: list,
@@ -6774,6 +7231,8 @@ class MotorActivacion:
         # fallidas, no abren navegador; siguen en mantenimiento). La seleccion
         # manual tambien se filtra.
         cuentas, pausadas_omitidas = self._separar_pausadas(cuentas)
+        # VERIFICACION humana: misma exclusion, con su propio contador.
+        cuentas, verificacion_omitidas = self._separar_verificacion(cuentas)
 
         base_resumen = {
             "modo": "campana_3_3_3",
@@ -6796,6 +7255,7 @@ class MotorActivacion:
         if not cuentas:
             logger.warning("Campana 3+3+3: no hay cuentas activas de twitter")
             self._anotar_pausadas(base_resumen, pausadas_omitidas)
+            self._anotar_verificacion(base_resumen, verificacion_omitidas)
             return self._claves_cuotas(base_resumen)
 
         con_sesion, sin_sesion = _partir_por_sesion(cuentas)
@@ -6868,6 +7328,7 @@ class MotorActivacion:
                 f"{base_resumen['total_acciones']} ({base_resumen['sin_sesion']} sin sesión)"
             )
             self._anotar_pausadas(base_resumen, pausadas_omitidas)
+            self._anotar_verificacion(base_resumen, verificacion_omitidas)
             return self._claves_cuotas(base_resumen)
 
         # Con cuentas ejecutables: preparar el contador de cuotas horarias
@@ -6992,6 +7453,7 @@ class MotorActivacion:
             f"({base_resumen['sin_sesion']} sin sesión)"
         )
         self._anotar_pausadas(base_resumen, pausadas_omitidas)
+        self._anotar_verificacion(base_resumen, verificacion_omitidas)
         return self._claves_cuotas(base_resumen)
 
     # ------------------------------------------------------------------ #
@@ -7155,6 +7617,8 @@ class MotorActivacion:
         pausadas: list = []
         if not permitir_pausadas:
             cuentas, pausadas = self._separar_pausadas(cuentas)
+        # VERIFICACION humana: SIEMPRE fuera (aunque `permitir_pausadas=True`).
+        cuentas, verificacion_omitidas = self._separar_verificacion(cuentas)
 
         tier_omitidas: list = []
         tier2_omitidas: list = []
@@ -7210,6 +7674,7 @@ class MotorActivacion:
             "tier3_omitidas_usuarios": tier3_omitidas[:20],
         }
         self._anotar_pausadas(resumen, pausadas)
+        self._anotar_verificacion(resumen, verificacion_omitidas)
 
         if not con_sesion or self._cancelado():
             logger.info(

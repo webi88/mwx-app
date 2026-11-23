@@ -30,6 +30,11 @@ COLUMNAS_CUENTAS = (
     ("rol_activacion", "Rol_Activacion"),
     ("tier_calidad", "Tier_Calidad"),
     ("banner_path", "Banner_Portada"),
+    # "Cajon" de verificacion humana (ver core/verificacion.py). Se mantienen
+    # antes de Pausada_Activacion para no alterar el contrato de exportacion
+    # existente (esa columna sigue siendo la ultima de la hoja).
+    ("verificacion_pendiente", "Verificacion_Pendiente"),
+    ("verificacion_motivo", "Verificacion_Motivo"),
     ("pausada_activacion", "Pausada_Activacion"),
 )
 
@@ -37,10 +42,11 @@ COLUMNAS_CUENTAS = (
 def _formatear_valor_cuenta(atributo: str, valor):
     """Da formato al valor de UNA columna de cuenta para Excel/CSV.
 
-    Caso especial: `pausada_activacion` se exporta como "Sí"/"No" (mismo
-    patron que los booleanos de la interfaz). El resto de columnas se exportan
-    tal cual y `None` sigue siendo celda vacia, igual que antes."""
-    if atributo == "pausada_activacion":
+    Casos especiales: `verificacion_pendiente` y `pausada_activacion` se
+    exportan como "Sí"/"No" (mismo patron que los booleanos de la interfaz).
+    El resto de columnas se exportan tal cual y `None` sigue siendo celda
+    vacia, igual que antes."""
+    if atributo in ("pausada_activacion", "verificacion_pendiente"):
         return "Sí" if valor else "No"
     return "" if valor is None else valor
 
