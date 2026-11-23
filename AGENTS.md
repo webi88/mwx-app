@@ -1320,6 +1320,7 @@ python -m bot.main
 - **Baja local con respaldo**: `eliminar_cuentas.py --usuarios "tinnietinka,jerielizmarie3,neriepalma,epyputra" --apply` → 4/4 eliminadas; respaldo `data/backups/eliminacion_cuentas_20261123_074650.json`; BD local queda con 259 cuentas. **No se tocó Supabase** (si existen allí, repetir con `DATABASE_URL`).
 - Verificado: `compileall` global OK; suite **5843/5843** (nuevos: `test_verificacion_core` 83, `test_verificacion_activaciones` 58, `test_verificacion_web` 17, `test_app_releases_core` 80, `test_mwx_updater` 122, `test_mwx_api_release` 25, `test_mwx_releases_web` 14, `test_local_multinavegador` 46 + AppTest).
 - ✅ **Hecho (2026-11-23)**: `MWX APP` 1.1.0 compilado + selftest; release `MWX-APP-1.1.0.zip` publicado en producción como obligatorio; API y dashboard redeployados; `/v1/app/version` y `/v1/app/descargar` verificados. Falta probar el auto-update en un equipo real.
+- **Hotfix (2026-11-23)**: la migración de PostgreSQL omitía TODAS las columnas `DATETIME`, así que `cuentas.verificacion_fecha` nunca se creó en Supabase y el dashboard fallaba (`UndefinedColumn`) al listar cuentas. `core/database.py` ahora mapea `DATETIME -> TIMESTAMP` en PostgreSQL; la columna se agregó en producción (`verificacion_pendiente/motivo/origen/fecha` presentes) y la consulta `db.query(Cuenta)` se verificó contra Supabase. Suite 5843/5843.
 
 ### Pendiente (2026-11-23)
 - Probar el auto-update de `MWX APP` 1.1.0 en un equipo real (el release ya está publicado como obligatorio).

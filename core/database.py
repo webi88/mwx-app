@@ -158,8 +158,8 @@ def _resincronizar_secuencias():
 
 
 # Columnas que se agregan a tablas 'cuentas' ya existentes.
-# Formato: nombre -> tipo SQL (compatible con SQLite; en PostgreSQL se omiten
-# los tipos DATETIME, que no existen en ese motor). Los booleanos usan
+# Formato: nombre -> tipo SQL (compatible con SQLite; en PostgreSQL los tipos
+# DATETIME se mapean a TIMESTAMP). Los booleanos usan
 # "BOOLEAN DEFAULT FALSE": valido en SQLite >= 3.23 (literales TRUE/FALSE) y
 # en PostgreSQL; "BOOLEAN DEFAULT 0" NO es valido en PostgreSQL.
 NUEVAS_COLUMNAS_CUENTAS = {
@@ -288,8 +288,8 @@ def _migrar_columnas():
       Ademas convierte grupo='A' historico a '' (sin grupo) sin tocar otros
       grupos reales (ver _limpiar_grupo_por_defecto).
     - PostgreSQL/Supabase: ALTER TABLE ... ADD COLUMN IF NOT EXISTS (idempotente
-      y tolerante a fallos: solo advierte si algo no se puede aplicar). No se
-      migran tipos DATETIME ('last_checked' ya existe en produccion). Tambien
+      y tolerante a fallos: solo advierte si algo no se puede aplicar). Los
+      tipos DATETIME se mapean a TIMESTAMP (PostgreSQL no tiene DATETIME). Tambien
       limpia grupo='A' -> '' y normaliza las secciones invalidas (p.ej. 'CD'
       -> '') de la misma forma idempotente."""
     from sqlalchemy import text
@@ -310,14 +310,13 @@ def _migrar_columnas():
                     )
                 }
                 for nombre, tipo in nuevas_columnas.items():
-                    if "DATETIME" in tipo.upper():
-                        # En PostgreSQL DATETIME no existe; 'last_checked' ya
-                        # esta en produccion y no se toca.
-                        continue
+                    tipo_pg = (
+                        "TIMESTAMP" if "DATETIME" in tipo.upper() else tipo
+                    )
                     conn.execute(
                         text(
                             f"ALTER TABLE cuentas ADD COLUMN IF NOT EXISTS "
-                            f"{nombre} {tipo}"
+                            f"{nombre} {tipo_pg}"
                         )
                     )
                 if existentes and "seccion" not in existentes:

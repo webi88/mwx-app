@@ -17,6 +17,8 @@
   (obligatorio, 34,238,785 bytes, sha256 `5d13f3d1...`).
 - Railway: API y dashboard redeployados; `/v1/app/version` y
   `/v1/app/descargar` responden 200.
+- Hotfix: migración PostgreSQL `DATETIME -> TIMESTAMP`; `verificacion_fecha`
+  ya existe en Supabase y la consulta ORM de cuentas funciona.
 
 ## Próximo paso único
 - Probar el auto-update 1.1.0 en un equipo real y Local con 2 navegadores.
