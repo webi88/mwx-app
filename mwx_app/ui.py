@@ -7,6 +7,7 @@ grandes, confirmaciones claras y mensajes sin jerga.
 """
 from __future__ import annotations
 
+import json
 import os
 import queue
 import sys
@@ -30,6 +31,38 @@ ANCHO = 900
 ALTO = 700
 MIN_ANCHO = 820
 MIN_ALTO = 650
+
+# Cada cuánto se vuelve a pedir `/v1/perfil` mientras se ve "Tu campaña".
+# El botón "Actualizar" fuerza el mismo refresco al instante.
+SYNC_CAMPANA_MS = 10_000
+
+
+def _firma_perfil(perfil) -> str:
+    """Firma estable de campaña + cuentas asignadas (sin secretos).
+
+    Sirve para detectar si el panel cambió algo y decidir si hay que
+    repintar la pantalla. Solo incluye datos visibles; nunca cookies,
+    tokens ni contraseñas. Nunca lanza.
+    """
+    try:
+        datos = perfil if isinstance(perfil, dict) else {}
+        campana = datos.get("campana") or {}
+        cuentas = sorted(
+            (
+                str(cuenta.get("usuario") or ""),
+                str(cuenta.get("seccion") or ""),
+            )
+            for cuenta in (datos.get("cuentas") or [])
+            if isinstance(cuenta, dict)
+        )
+        return json.dumps(
+            {"campana": campana, "cuentas": cuentas},
+            sort_keys=True,
+            ensure_ascii=False,
+        )
+    except Exception:
+        return ""
+
 
 
 def _formato_tiempo(segundos: float) -> str:
@@ -158,6 +191,12 @@ class MWXApp:
         self._after_cola = None
         self._after_tiempo = None
         self._after_actualizacion = None
+        self._after_sync = None
+        self._sincronizando = False
+        self._sync_firma = ""
+        self._sync_hora = ""
+        self._inicio_pendiente = False
+        self._lbl_sync = None
         self._ventana_actualizacion = None
         self._terminado = False
         self._ventana_ajustes = None
@@ -260,6 +299,13 @@ class MWXApp:
             except tk.TclError:
                 pass
             self._after_tiempo = None
+        if self._after_sync is not None:
+            try:
+                self.root.after_cancel(self._after_sync)
+            except tk.TclError:
+                pass
+            self._after_sync = None
+        self._lbl_sync = None
         for hijo in list(self.contenedor.winfo_children()):
             try:
                 hijo.destroy()
@@ -315,6 +361,32 @@ class MWXApp:
                     pass
                 self._after_tiempo = None
             self.mostrar_fin(carga if isinstance(carga, dict) else {})
+        elif tipo == "perfil_sincronizado":
+            self._sincronizando = False
+            datos = carga if isinstance(carga, dict) else {}
+            perfil = datos.get("perfil")
+            if isinstance(perfil, dict) and perfil:
+                self._aplicar_perfil_actualizado(
+                    perfil,
+                    iniciar=bool(datos.get("iniciar")),
+                    manual=bool(datos.get("manual")),
+                )
+            else:
+                self._inicio_pendiente = False
+                self._programar_sincronizacion()
+        elif tipo == "sync_error":
+            self._sincronizando = False
+            datos = carga if isinstance(carga, dict) else {}
+            self._inicio_pendiente = False
+            mensaje = str(
+                datos.get("error")
+                or "No se pudo actualizar la configuración desde el panel."
+            )
+            if datos.get("manual") or datos.get("iniciar"):
+                self._mensaje_sync(mensaje, error=True)
+            if datos.get("iniciar"):
+                messagebox.showerror("MWX APP", mensaje, parent=self.root)
+            self._programar_sincronizacion()
 
     def _hilo(self, funcion, *args) -> None:
         threading.Thread(target=funcion, args=args, daemon=True).start()
@@ -328,6 +400,10 @@ class MWXApp:
         self.perfil = respuesta
         self.ajustes = {}
         self.imagenes_extra = []
+        self._sync_firma = _firma_perfil(respuesta)
+        self._sync_hora = time.strftime("%H:%M:%S")
+        self._sincronizando = False
+        self._inicio_pendiente = False
         try:
             self._var_password.set("")
         except Exception:
@@ -1017,7 +1093,7 @@ class MWXApp:
             )
         )
 
-    def mostrar_campana(self) -> None:
+    def mostrar_campana(self, aviso: str = "") -> None:
         if not self.perfil:
             self.mostrar_login()
             return
@@ -1057,7 +1133,43 @@ class MWXApp:
             bg=theme.FONDO,
             fg=theme.TEXTO_SEC,
             font=(self.familia, 12),
-        ).pack(anchor="w", padx=44, pady=(0, 16))
+        ).pack(anchor="w", padx=44, pady=(0, 4))
+
+        fila_sync = tk.Frame(self.contenedor, bg=theme.FONDO)
+        fila_sync.pack(fill="x", padx=44, pady=(0, 12))
+        texto_sync = str(aviso or "").strip()
+        if texto_sync:
+            if self._sync_hora:
+                texto_sync += f" · {self._sync_hora}"
+        else:
+            texto_sync = (
+                f"Configuración sincronizada con el panel · "
+                f"{self._sync_hora or 'ahora'}"
+            )
+        if self.ajustes and campana.get("permitir_ajustes"):
+            texto_sync += " · Ajustes locales activos"
+        self._lbl_sync = tk.Label(
+            fila_sync,
+            text=texto_sync,
+            bg=theme.FONDO,
+            fg=theme.TEXTO_SEC,
+            font=(self.familia, 9),
+            anchor="w",
+        )
+        self._lbl_sync.pack(side="left", fill="x", expand=True)
+        tk.Button(
+            fila_sync,
+            text="🔄 Actualizar",
+            command=self._sincronizar_manual,
+            bg=theme.FONDO,
+            fg=theme.TEXTO_SEC,
+            activebackground=theme.FONDO,
+            activeforeground=theme.TEXTO,
+            relief="flat",
+            bd=0,
+            cursor="hand2",
+            font=(self.familia, 9),
+        ).pack(side="right")
 
         tarjeta_cuentas = self._tarjeta(self.contenedor)
         tarjeta_cuentas.pack(fill="x", padx=44, pady=(0, 12))
@@ -1178,6 +1290,8 @@ class MWXApp:
                 font=(self.familia, 10),
             ).pack(pady=(12, 0))
 
+        self._programar_sincronizacion()
+
     def _tarjeta(self, padre: tk.Misc) -> tk.Frame:
         marco = tk.Frame(
             padre,
@@ -1219,6 +1333,171 @@ class MWXApp:
         if imagenes:
             texto += f" · {imagenes} imagen(es)"
         etiqueta.configure(text=texto)
+
+    def _mensaje_sync(self, texto: str, error: bool = False) -> None:
+        etiqueta = getattr(self, "_lbl_sync", None)
+        if etiqueta is None:
+            return
+        try:
+            etiqueta.configure(
+                text=str(texto or ""),
+                fg=theme.ERROR if error else theme.TEXTO_SEC,
+            )
+        except tk.TclError:
+            pass
+
+    def _programar_sincronizacion(self) -> None:
+        if self._after_sync is not None:
+            try:
+                self.root.after_cancel(self._after_sync)
+            except tk.TclError:
+                pass
+            self._after_sync = None
+        if self._cerrando or self.pantalla_actual != "campana" or self._campana_activa:
+            return
+        try:
+            self._after_sync = self.root.after(
+                SYNC_CAMPANA_MS, self._sincronizacion_automatica
+            )
+        except tk.TclError:
+            self._after_sync = None
+
+    def _sincronizacion_automatica(self) -> None:
+        self._after_sync = None
+        if self._cerrando or self.pantalla_actual != "campana" or self._campana_activa:
+            return
+        if self._sincronizando or self._inicio_pendiente:
+            self._programar_sincronizacion()
+            return
+        if self._ventana_ajustes is not None:
+            self._programar_sincronizacion()
+            return
+        self._sincronizar_perfil(manual=False, iniciar=False)
+
+    def _sincronizar_manual(self) -> None:
+        if self._sincronizando:
+            self._mensaje_sync("Actualizando configuración...")
+            return
+        self._sincronizar_perfil(manual=True, iniciar=False)
+
+    def _sincronizar_perfil(
+        self, manual: bool = False, iniciar: bool = False
+    ) -> bool:
+        if self._sincronizando:
+            return False
+        if self.cliente is None or not self.token:
+            mensaje = (
+                "Falta configurar el servidor. Pídele la dirección a tu "
+                "administrador."
+            )
+            self._mensaje_sync(mensaje, error=True)
+            self._inicio_pendiente = False
+            self._programar_sincronizacion()
+            return False
+        self._sincronizando = True
+        if manual or iniciar:
+            self._mensaje_sync("Actualizando configuración desde el panel...")
+        self._hilo(self._worker_sincronizar_perfil, bool(manual), bool(iniciar))
+        return True
+
+    def _worker_sincronizar_perfil(self, manual: bool, iniciar: bool) -> None:
+        """Pide `/v1/perfil` fuera del hilo de Tk y encola el resultado."""
+        token = str(self.token or "")
+        try:
+            perfil = self.cliente.perfil(token) if self.cliente else None
+        except Exception as error:
+            if token and self.token == token:
+                self._cola.put(
+                    (
+                        "sync_error",
+                        {
+                            "manual": bool(manual),
+                            "iniciar": bool(iniciar),
+                            "error": mensaje_amigable(error),
+                        },
+                    )
+                )
+            return
+        if not token or self.token != token:
+            return
+        if not isinstance(perfil, dict) or not perfil:
+            self._cola.put(
+                (
+                    "sync_error",
+                    {
+                        "manual": bool(manual),
+                        "iniciar": bool(iniciar),
+                        "error": (
+                            "El servidor no devolvió la configuración de tu "
+                            "campaña."
+                        ),
+                    },
+                )
+            )
+            return
+        try:
+            store.sincronizar_perfil(perfil)
+        except Exception as error:
+            if self.token == token:
+                self._cola.put(
+                    (
+                        "sync_error",
+                        {
+                            "manual": bool(manual),
+                            "iniciar": bool(iniciar),
+                            "error": (
+                                "No se pudieron actualizar las cuentas locales. "
+                                + mensaje_amigable(error)
+                            ),
+                        },
+                    )
+                )
+            return
+        if self.token != token:
+            return
+        self._cola.put(
+            (
+                "perfil_sincronizado",
+                {
+                    "perfil": perfil,
+                    "manual": bool(manual),
+                    "iniciar": bool(iniciar),
+                },
+            )
+        )
+
+    def _aplicar_perfil_actualizado(
+        self, perfil: dict, iniciar: bool = False, manual: bool = False
+    ) -> None:
+        """Reemplaza el perfil local por el del panel y repinta si cambió."""
+        campana = (perfil or {}).get("campana") or {}
+        if not campana.get("permitir_ajustes"):
+            self.ajustes = {}
+        firma_anterior = self._sync_firma
+        self.perfil = perfil
+        self._sync_firma = _firma_perfil(perfil)
+        self._sync_hora = time.strftime("%H:%M:%S")
+        cambio = bool(firma_anterior) and self._sync_firma != firma_anterior
+        if iniciar:
+            self._inicio_pendiente = False
+            if self.pantalla_actual == "campana":
+                self._iniciar_campana_ahora()
+            return
+        if self.pantalla_actual == "campana":
+            if cambio:
+                self.mostrar_campana(
+                    aviso="Configuración actualizada desde el panel."
+                )
+            else:
+                self._mensaje_sync(
+                    f"Sin cambios · {self._sync_hora}"
+                    + (
+                        " · Ajustes locales activos"
+                        if self.ajustes and campana.get("permitir_ajustes")
+                        else ""
+                    )
+                )
+        self._programar_sincronizacion()
 
     def _abrir_ajustes(self) -> None:
         if self._ventana_ajustes is not None:
@@ -1350,6 +1629,30 @@ class MWXApp:
 
         botones = tk.Frame(marco, bg=theme.FONDO)
         botones.pack(fill="x", pady=(18, 0))
+
+        def usar_config_panel() -> None:
+            self.ajustes = {}
+            self.imagenes_extra = []
+            self._cerrar_ajustes()
+            self.mostrar_campana(
+                aviso="Se aplicó la configuración del panel."
+            )
+
+        tk.Button(
+            botones,
+            text="Usar configuración del panel",
+            command=usar_config_panel,
+            bg=theme.SUPERFICIE,
+            fg=theme.TEXTO_SEC,
+            activebackground=theme.SUPERFICIE_ALT,
+            activeforeground=theme.TEXTO,
+            relief="flat",
+            bd=0,
+            cursor="hand2",
+            font=(self.familia, 9),
+            padx=12,
+            pady=7,
+        ).pack(side="left")
         theme.boton(
             botones,
             "Guardar",
@@ -1400,15 +1703,51 @@ class MWXApp:
     def _iniciar_campana(self) -> None:
         if self._campana_activa or not self.perfil:
             return
+        if self._inicio_pendiente or self._sincronizando:
+            messagebox.showinfo(
+                "MWX APP",
+                "Espera un momento: se está actualizando la configuración.",
+            )
+            return
         if not getattr(self, "_puede_iniciar", True):
             messagebox.showinfo(
                 "MWX APP",
                 "La campaña todavía no está lista. Contacta a tu administrador.",
             )
             return
+        self._inicio_pendiente = True
+        if not self._sincronizar_perfil(manual=True, iniciar=True):
+            self._inicio_pendiente = False
+            messagebox.showinfo(
+                "MWX APP",
+                "No se pudo actualizar la configuración. Revisa tu conexión "
+                "e inténtalo de nuevo.",
+            )
+
+    def _iniciar_campana_ahora(self) -> None:
+        if self._campana_activa or not self.perfil:
+            self._inicio_pendiente = False
+            return
+        campana = runner.config_efectiva(self.perfil, self.ajustes)
+        cuentas = self.perfil.get("cuentas") or []
+        puede = bool(cuentas) and bool(
+            campana["hashtags"]
+            or campana["contexto"]
+            or campana["narrativa"]
+            or campana["urls"]
+        )
+        if not puede:
+            self._inicio_pendiente = False
+            messagebox.showinfo(
+                "MWX APP",
+                "La campaña todavía no está lista. Contacta a tu administrador.",
+            )
+            return
         if not self._verificar_actualizacion_obligatoria():
+            self._inicio_pendiente = False
             return
 
+        self._inicio_pendiente = False
         self.cancelar = threading.Event()
         self._eventos = []
         self._resumen = None
@@ -1880,6 +2219,10 @@ class MWXApp:
         self.ajustes = {}
         self.imagenes_extra = []
         self.cancelar = None
+        self._sincronizando = False
+        self._inicio_pendiente = False
+        self._sync_firma = ""
+        self._sync_hora = ""
         config.borrar_sesion()
         runner.limpiar_token()
         self.mostrar_login()
@@ -1904,7 +2247,11 @@ class MWXApp:
     def detener(self) -> None:
         """Detiene los temporizadores internos (util en tests y al cerrar)."""
         self._cerrando = True
-        for identificador in (self._after_cola, self._after_tiempo):
+        for identificador in (
+            self._after_cola,
+            self._after_tiempo,
+            self._after_sync,
+        ):
             if identificador is None:
                 continue
             try:
@@ -1913,6 +2260,7 @@ class MWXApp:
                 pass
         self._after_cola = None
         self._after_tiempo = None
+        self._after_sync = None
 
     def _registrar_error(self, error: Any = None) -> None:
         try:

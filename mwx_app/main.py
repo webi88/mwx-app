@@ -81,9 +81,9 @@ def _version() -> str:
     try:
         from mwx_app import __version__
 
-        return str(__version__ or "1.1.0")
+        return str(__version__ or "1.1.1")
     except Exception:
-        return "1.1.0"
+        return "1.1.1"
 
 
 def _imprimir_seguro(texto: str) -> None:

@@ -843,6 +843,25 @@ def _test_runner(check, tmp: Path) -> None:
 # UI y entregables
 # ---------------------------------------------------------------------------
 def _test_ui(check) -> None:
+    perfil_firma = {
+        "campana": {"hashtags": ["#Uno"], "contexto": "tema"},
+        "cuentas": [{"usuario": "u1", "auth_token": "secreto-a"}],
+    }
+    perfil_firma_cambio = json.loads(json.dumps(perfil_firma))
+    perfil_firma_cambio["campana"]["hashtags"] = ["#Dos"]
+    perfil_firma_secreto = json.loads(json.dumps(perfil_firma))
+    perfil_firma_secreto["cuentas"][0]["auth_token"] = "secreto-b"
+    check(
+        "sync: la firma detecta cambios de campana",
+        ui._firma_perfil(perfil_firma)
+        != ui._firma_perfil(perfil_firma_cambio),
+    )
+    check(
+        "sync: la firma ignora tokens/cookies de las cuentas",
+        ui._firma_perfil(perfil_firma)
+        == ui._firma_perfil(perfil_firma_secreto),
+    )
+
     tmp = Path(tempfile.mkdtemp(prefix="mwx_ui_"))
     base = tmp / "base"
     datos = tmp / "datos"
@@ -876,6 +895,106 @@ def _test_ui(check) -> None:
                     "ui: valida usuario/contrasena vacios sin lanzar",
                     "usuario" in app._lbl_error.cget("text").lower(),
                 )
+
+                class _ClientePerfil:
+                    def __init__(self, perfil):
+                        self.perfil_datos = perfil
+                        self.llamadas = 0
+
+                    def perfil(self, token):
+                        self.llamadas += 1
+                        return self.perfil_datos
+
+                perfil_ui = {
+                    "usuario": {"username": "operador", "nombre": "Operador"},
+                    "campana": {
+                        "hashtags": ["#Uno"],
+                        "contexto": "tema",
+                        "narrativa": "",
+                        "urls": ["https://x.com/ancla/status/1"],
+                        "texto_base": "",
+                        "acciones_por_cuenta": 5,
+                        "pausa_seg": 2,
+                        "duracion_min": 60,
+                        "limite_dia": 49,
+                        "imagenes": [],
+                        "permitir_ajustes": True,
+                    },
+                    "cuentas": [{"usuario": "u1", "seccion": "CI"}],
+                }
+                app.token = "token-prueba"
+                app.usuario = "operador"
+                app.nombre = "Operador"
+                app.perfil = perfil_ui
+                app._sync_firma = ui._firma_perfil(perfil_ui)
+                app._sync_hora = "12:00:00"
+                app.cliente = _ClientePerfil(perfil_ui)
+                app.mostrar_campana()
+                raiz.update_idletasks()
+                check(
+                    "ui: muestra estado de sincronizacion y boton actualizar",
+                    app._lbl_sync is not None
+                    and "sincronizada" in app._lbl_sync.cget("text").lower(),
+                )
+                check(
+                    "ui: programa el refresco automatico de la campana",
+                    app._after_sync is not None,
+                )
+
+                perfil_nuevo = json.loads(json.dumps(perfil_ui))
+                perfil_nuevo["campana"]["hashtags"] = ["#Nuevo"]
+                app._despachar(
+                    "perfil_sincronizado",
+                    {
+                        "perfil": perfil_nuevo,
+                        "manual": False,
+                        "iniciar": False,
+                    },
+                )
+                raiz.update_idletasks()
+                check(
+                    "ui: el refresco aplica el perfil nuevo y avisa",
+                    app.perfil == perfil_nuevo
+                    and "actualizada" in app._lbl_sync.cget("text").lower(),
+                )
+
+                llamadas = {"iniciada": 0}
+                cliente = _ClientePerfil(perfil_nuevo)
+                app.cliente = cliente
+                app.token = "token-prueba"
+                app.pantalla_actual = "campana"
+                app._puede_iniciar = True
+                app._campana_activa = False
+                app._sincronizando = False
+                app._inicio_pendiente = False
+                app._verificar_actualizacion_obligatoria = lambda: True
+                app._iniciar_campana_ahora = lambda: llamadas.__setitem__(
+                    "iniciada", llamadas["iniciada"] + 1
+                )
+                app._hilo = lambda funcion, *args: funcion(*args)
+                with mock.patch.object(
+                    store,
+                    "sincronizar_perfil",
+                    lambda *args, **kwargs: ["u1"],
+                ):
+                    app._iniciar_campana()
+                    app._procesar_cola()
+                check(
+                    "ui: antes de iniciar pide el perfil al panel",
+                    cliente.llamadas == 1,
+                )
+                check(
+                    "ui: inicia con la configuracion recien bajada",
+                    llamadas["iniciada"] == 1,
+                )
+
+                app._campana_activa = True
+                app._programar_sincronizacion()
+                check(
+                    "ui: no refresca mientras la campana esta en curso",
+                    app._after_sync is None,
+                )
+                app._campana_activa = False
             finally:
                 if app is not None:
                     app.detener()

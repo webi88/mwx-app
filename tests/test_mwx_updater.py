@@ -33,7 +33,7 @@ if str(RAIZ) not in sys.path:
 
 import requests  # noqa: E402
 
-from mwx_app import config, updater  # noqa: E402
+from mwx_app import __version__, config, updater  # noqa: E402
 
 _CLAVES_CONSULTA = {
     "ok",
@@ -117,7 +117,7 @@ def _zip_bytes() -> bytes:
 def _test_version(check) -> None:
     check(
         "updater: version_actual coincide con mwx_app.__version__",
-        updater.version_actual() == "1.1.0",
+        updater.version_actual() == __version__,
         updater.version_actual(),
     )
     casos = [
@@ -171,7 +171,7 @@ def _test_consultar(check) -> None:
         )
 
     with mock.patch.object(updater.requests, "get", _falso_get):
-        datos = updater.consultar("https://api.test/v1/", "1.1.0")
+        datos = updater.consultar("https://api.test/v1/", __version__)
     check(
         "updater.consultar: devuelve el contrato completo",
         set(datos) == _CLAVES_CONSULTA,
@@ -198,7 +198,7 @@ def _test_consultar(check) -> None:
         "updater.consultar: UA MWX-APP/<version> (Windows)",
         llamadas
         and llamadas[0]["headers"].get("User-Agent")
-        == "MWX-APP/1.1.0 (Windows)",
+        == f"MWX-APP/{__version__} (Windows)",
         str(llamadas[0]["headers"]) if llamadas else "",
     )
     check(

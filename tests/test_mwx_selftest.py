@@ -32,6 +32,8 @@ RAIZ = Path(__file__).resolve().parent.parent
 if str(RAIZ) not in sys.path:
     sys.path.insert(0, str(RAIZ))
 
+from mwx_app import __version__  # noqa: E402
+
 _PASSWORD = "clave-selftest-no-real"
 _TOKEN = "token-selftest-no-real"
 _TOTP = "JBSWY3DPEHPK3PXP"
@@ -311,8 +313,8 @@ def run(check) -> None:
         version = _ejecutar([sys.executable, "-m", "mwx_app.main", "--version"], timeout=60)
         check("--version: exit 0", version.returncode == 0)
         check(
-            "--version: imprime MWX APP 1.1.0",
-            "MWX APP" in (version.stdout or "") and "1.1.0" in (version.stdout or ""),
+            "--version: imprime MWX APP " + __version__,
+            "MWX APP" in (version.stdout or "") and __version__ in (version.stdout or ""),
             (version.stdout or "").strip(),
         )
 

@@ -1321,9 +1321,10 @@ python -m bot.main
 - Verificado: `compileall` global OK; suite **5843/5843** (nuevos: `test_verificacion_core` 83, `test_verificacion_activaciones` 58, `test_verificacion_web` 17, `test_app_releases_core` 80, `test_mwx_updater` 122, `test_mwx_api_release` 25, `test_mwx_releases_web` 14, `test_local_multinavegador` 46 + AppTest).
 - ✅ **Hecho (2026-11-23)**: `MWX APP` 1.1.0 compilado + selftest; release `MWX-APP-1.1.0.zip` publicado en producción como obligatorio; API y dashboard redeployados; `/v1/app/version` y `/v1/app/descargar` verificados. Falta probar el auto-update en un equipo real.
 - **Hotfix (2026-11-23)**: la migración de PostgreSQL omitía TODAS las columnas `DATETIME`, así que `cuentas.verificacion_fecha` nunca se creó en Supabase y el dashboard fallaba (`UndefinedColumn`) al listar cuentas. `core/database.py` ahora mapea `DATETIME -> TIMESTAMP` en PostgreSQL; la columna se agregó en producción (`verificacion_pendiente/motivo/origen/fecha` presentes) y la consulta `db.query(Cuenta)` se verificó contra Supabase. Suite 5843/5843.
+- **Refresco de configuración del .exe (1.1.1)**: `mwx_app/ui.py` consulta `GET /v1/perfil` cada 10 s mientras está en «Tu campaña», tiene botón «Actualizar» y hace una sincronización OBLIGATORIA justo antes de iniciar la campaña; si el panel cambió, repinta la pantalla y avisa. «Usar configuración del panel» en Ajustes limpia los overrides locales numéricos. Release `MWX-APP-1.1.1.zip` publicado como obligatorio (34,244,651 bytes, sha256 `621a05d5...`); el 1.1.0 se autoactualiza a 1.1.1 (prueba real del updater). Suite 5851/5851.
 
 ### Pendiente (2026-11-23)
-- Probar el auto-update de `MWX APP` 1.1.0 en un equipo real (el release ya está publicado como obligatorio).
+- Probar el auto-update 1.1.0→1.1.1 en un equipo real y validar que «Tu campaña» se refresca al cambiar el panel.
 - Probar Local con **2 navegadores** y 1-2 cuentas Tier 1 (1 post con imagen + 1 cita), verificar que el contador en vivo sume ambos y que las cuentas no se crucen.
 - Probar el cajón con un bloqueo real: X pide verificación → cuenta aparece en `Cuentas → 🚦 Verificación` → verificarla desde el celular → «Validar sesión y reactivar».
 - Las 4 cuentas dadas de baja siguen en Supabase/Railway si existen; ejecutar `eliminar_cuentas.py --apply` con la `DATABASE_URL` remota (crea su propio respaldo).
