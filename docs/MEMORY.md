@@ -12,14 +12,17 @@
   de cuentas aleatorio en cada ciclo. Defaults de máxima velocidad intactos.
 - Baja local aplicada: tinnietinka, jerielizmarie3, neriepalma, epyputra.
   Respaldo: `data/backups/eliminacion_cuentas_20261123_074650.json`.
-- Suite: 5843/5843. Sin commit.
+- Suite: 5843/5843. Commits `bdbc252` + merge `bb0d327` pusheados a `origin/main`.
+- `MWX APP` 1.1.0 compilado, selftest OK y release publicado en producción
+  (obligatorio, 34,238,785 bytes, sha256 `5d13f3d1...`).
+- Railway: API y dashboard redeployados; `/v1/app/version` y
+  `/v1/app/descargar` responden 200.
 
 ## Próximo paso único
-- Recompilar `MWX APP` 1.1.0, publicar el ZIP en el panel como release
-  obligatoria y probar Local con 2 navegadores y 1–2 cuentas.
+- Probar el auto-update 1.1.0 en un equipo real y Local con 2 navegadores.
 
 ## Pendientes
-- Redeploy Railway (dashboard + API) para releases, updater y verificación.
+- Validar el cajón con un bloqueo real de X y reactivar la cuenta.
 - Las 4 cuentas siguen en Supabase si existen: borrar allí con `DATABASE_URL`.
 - Con máxima velocidad el riesgo de bloqueos de X sigue; no hay evasión ni
   captcha automático: la verificación es manual desde el celular.

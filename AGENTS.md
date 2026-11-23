@@ -1319,10 +1319,10 @@ python -m bot.main
   - `_construir_plan` baraja el orden de cuentas **en cada ronda** (antes se fijaba una vez); la alternancia hashtags/cita por cuenta se conserva. UI Local: "Navegadores simultáneos" 1-3 (default 2), caption de orden aleatorio y métrica `navegadores` en el resumen. Defaults de máxima velocidad intactos (2 s, 49/día).
 - **Baja local con respaldo**: `eliminar_cuentas.py --usuarios "tinnietinka,jerielizmarie3,neriepalma,epyputra" --apply` → 4/4 eliminadas; respaldo `data/backups/eliminacion_cuentas_20261123_074650.json`; BD local queda con 259 cuentas. **No se tocó Supabase** (si existen allí, repetir con `DATABASE_URL`).
 - Verificado: `compileall` global OK; suite **5843/5843** (nuevos: `test_verificacion_core` 83, `test_verificacion_activaciones` 58, `test_verificacion_web` 17, `test_app_releases_core` 80, `test_mwx_updater` 122, `test_mwx_api_release` 25, `test_mwx_releases_web` 14, `test_local_multinavegador` 46 + AppTest).
-- ⚠ **Redeploy/rebuild**: Railway debe redeployar dashboard y API (`app_releases`, endpoints, UI); el .exe debe recompilarse para llevar el updater 1.1.0 y luego publicar su ZIP en el panel como release obligatoria. Con máxima velocidad los bloqueos de X siguen siendo posibles; el cajón evita seguir golpeando la misma cuenta.
+- ✅ **Hecho (2026-11-23)**: `MWX APP` 1.1.0 compilado + selftest; release `MWX-APP-1.1.0.zip` publicado en producción como obligatorio; API y dashboard redeployados; `/v1/app/version` y `/v1/app/descargar` verificados. Falta probar el auto-update en un equipo real.
 
 ### Pendiente (2026-11-23)
-- Recompilar `MWX APP` 1.1.0, publicar `MWX-APP-1.1.0.zip` en «📲 MWX APP → ⬇️ Ejecutable / Actualizaciones» como obligatoria y probar el auto-update en un equipo real.
+- Probar el auto-update de `MWX APP` 1.1.0 en un equipo real (el release ya está publicado como obligatorio).
 - Probar Local con **2 navegadores** y 1-2 cuentas Tier 1 (1 post con imagen + 1 cita), verificar que el contador en vivo sume ambos y que las cuentas no se crucen.
 - Probar el cajón con un bloqueo real: X pide verificación → cuenta aparece en `Cuentas → 🚦 Verificación` → verificarla desde el celular → «Validar sesión y reactivar».
 - Las 4 cuentas dadas de baja siguen en Supabase/Railway si existen; ejecutar `eliminar_cuentas.py --apply` con la `DATABASE_URL` remota (crea su propio respaldo).
