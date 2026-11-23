@@ -36,6 +36,10 @@ MIN_ALTO = 650
 # El botón "Actualizar" fuerza el mismo refresco al instante.
 SYNC_CAMPANA_MS = 10_000
 
+# Cada cuánto se consulta /v1/app/version con la app abierta. Si hay una
+# actualización obligatoria, la ventana aparece sin reiniciar la aplicación.
+UPDATE_CHECK_MS = 20_000
+
 
 def _firma_perfil(perfil) -> str:
     """Firma estable de campaña + cuentas asignadas (sin secretos).
@@ -192,7 +196,10 @@ class MWXApp:
         self._after_tiempo = None
         self._after_actualizacion = None
         self._after_sync = None
+        self._after_version = None
         self._sincronizando = False
+        self._chequeo_version_en_curso = False
+        self._version_pendiente = None
         self._sync_firma = ""
         self._sync_hora = ""
         self._inicio_pendiente = False
@@ -218,6 +225,7 @@ class MWXApp:
             self._reconectar(sesion)
         else:
             self.mostrar_login()
+        self._programar_chequeo_version()
 
     def _configurar_ventana(self) -> None:
         self.root.title("MWX APP")
@@ -361,6 +369,35 @@ class MWXApp:
                     pass
                 self._after_tiempo = None
             self.mostrar_fin(carga if isinstance(carga, dict) else {})
+            datos_version = self._version_pendiente
+            self._version_pendiente = None
+            if datos_version:
+                try:
+                    self.root.after(
+                        1200,
+                        lambda: self._mostrar_version_pendiente(datos_version),
+                    )
+                except tk.TclError:
+                    self._mostrar_version_pendiente(datos_version)
+        elif tipo == "version_consulta":
+            self._chequeo_version_en_curso = False
+            datos = carga if isinstance(carga, dict) else {}
+            if (
+                datos.get("ok")
+                and datos.get("requerida")
+                and datos.get("obligatoria")
+            ):
+                if self._campana_activa:
+                    self._version_pendiente = datos
+                elif (
+                    self._ventana_ajustes is None
+                    and self._ventana_actualizacion is None
+                ):
+                    self._version_pendiente = None
+                    self._dialogo_actualizacion(datos)
+                else:
+                    self._version_pendiente = datos
+            self._programar_chequeo_version()
         elif tipo == "perfil_sincronizado":
             self._sincronizando = False
             datos = carga if isinstance(carga, dict) else {}
@@ -649,6 +686,67 @@ class MWXApp:
             self._registrar_error(error)
         return True
 
+    def _programar_chequeo_version(self) -> None:
+        """Programa el sondeo periódico de `/v1/app/version` (app abierta)."""
+        if self._after_version is not None:
+            try:
+                self.root.after_cancel(self._after_version)
+            except tk.TclError:
+                pass
+            self._after_version = None
+        if self._cerrando or self._terminado:
+            return
+        if not updater.puede_actualizarse():
+            return
+        try:
+            self._after_version = self.root.after(
+                UPDATE_CHECK_MS, self._chequeo_version_periodico
+            )
+        except tk.TclError:
+            self._after_version = None
+
+    def _chequeo_version_periodico(self) -> None:
+        """Consulta la versión sin bloquear el hilo de Tk."""
+        self._after_version = None
+        if self._cerrando or self._terminado:
+            return
+        if not updater.puede_actualizarse():
+            return
+        if (
+            self._chequeo_version_en_curso
+            or self._ventana_actualizacion is not None
+            or self._ventana_ajustes is not None
+        ):
+            self._programar_chequeo_version()
+            return
+        if not str(self.api_url or "").strip():
+            self._programar_chequeo_version()
+            return
+        self._chequeo_version_en_curso = True
+        self._hilo(self._worker_consultar_version)
+
+    def _worker_consultar_version(self) -> None:
+        """Consulta en segundo plano; el resultado se procesa en la cola."""
+        try:
+            datos = updater.consultar(
+                self.api_url, updater.version_actual(), timeout=5
+            )
+        except Exception:
+            datos = {"ok": False}
+        self._cola.put(("version_consulta", datos))
+
+    def _mostrar_version_pendiente(self, datos) -> None:
+        """Muestra la actualización obligatoria que se pospuso por campaña."""
+        if self._terminado or self._ventana_actualizacion is not None:
+            return
+        if (
+            isinstance(datos, dict)
+            and datos.get("ok")
+            and datos.get("requerida")
+        ):
+            self._dialogo_actualizacion(datos)
+        self._programar_chequeo_version()
+
     def _mensaje_actualizacion(self, resultado) -> str:
         error = ""
         if isinstance(resultado, dict):
@@ -697,6 +795,12 @@ class MWXApp:
             except tk.TclError:
                 pass
             self._after_actualizacion = None
+        if self._after_version is not None:
+            try:
+                self.root.after_cancel(self._after_version)
+            except tk.TclError:
+                pass
+            self._after_version = None
         try:
             self.root.destroy()
         except tk.TclError:
@@ -817,10 +921,8 @@ class MWXApp:
             btn_actualizar.configure(state="disabled", text="Reiniciando...")
             if btn_ahora_no is not None:
                 btn_ahora_no.configure(state="disabled")
-            try:
-                self.root.after(700, self._salir_aplicacion)
-            except tk.TclError:
-                self._salir_aplicacion()
+            # Cierra la app YA: el .bat oculto espera a que termine este PID.
+            self._salir_aplicacion()
 
         def revisar() -> None:
             if not ventana.winfo_exists():
@@ -2251,6 +2353,7 @@ class MWXApp:
             self._after_cola,
             self._after_tiempo,
             self._after_sync,
+            self._after_version,
         ):
             if identificador is None:
                 continue

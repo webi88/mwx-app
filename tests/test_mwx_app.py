@@ -44,7 +44,7 @@ if str(RAIZ) not in sys.path:
     sys.path.insert(0, str(RAIZ))
 
 from core.config import settings as _settings_global  # noqa: E402,F401
-from mwx_app import api_client, config, runner, store, ui  # noqa: E402
+from mwx_app import api_client, config, runner, store, ui, updater  # noqa: E402
 from mwx_app.api_client import (  # noqa: E402
     CuentaDesactivadaError,
     CredencialesError,
@@ -995,6 +995,57 @@ def _test_ui(check) -> None:
                     app._after_sync is None,
                 )
                 app._campana_activa = False
+
+                datos_version = {
+                    "ok": True,
+                    "requerida": True,
+                    "obligatoria": True,
+                    "version": "9.9.9",
+                    "notas": "prueba",
+                }
+                dialogos = {"n": 0}
+                app._dialogo_actualizacion = lambda datos: (
+                    dialogos.__setitem__("n", dialogos["n"] + 1) or True
+                )
+                app.api_url = "https://api.test"
+                app._ventana_ajustes = None
+                app._ventana_actualizacion = None
+                app._chequeo_version_en_curso = False
+                app._version_pendiente = None
+                app._hilo = lambda funcion, *args: funcion(*args)
+                with mock.patch.object(
+                    updater, "puede_actualizarse", lambda: True
+                ), mock.patch.object(
+                    updater, "consultar", lambda *args, **kwargs: datos_version
+                ):
+                    app._chequeo_version_periodico()
+                    app._procesar_cola()
+                check(
+                    "ui: actualizacion obligatoria en vivo con la app abierta",
+                    dialogos["n"] == 1,
+                )
+
+                dialogos["n"] = 0
+                app._campana_activa = True
+                with mock.patch.object(
+                    updater, "puede_actualizarse", lambda: True
+                ), mock.patch.object(
+                    updater, "consultar", lambda *args, **kwargs: datos_version
+                ):
+                    app._chequeo_version_periodico()
+                    app._procesar_cola()
+                check(
+                    "ui: durante la campana no interrumpe; queda pendiente",
+                    dialogos["n"] == 0
+                    and app._version_pendiente is not None,
+                )
+                app._campana_activa = False
+                app._mostrar_version_pendiente(app._version_pendiente)
+                app._version_pendiente = None
+                check(
+                    "ui: la actualizacion pendiente se muestra al terminar",
+                    dialogos["n"] == 1,
+                )
             finally:
                 if app is not None:
                     app.detener()

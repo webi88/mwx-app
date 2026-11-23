@@ -481,7 +481,8 @@ def _test_preparar(check) -> None:
             "@echo off",
             "chcp 65001",
             "setlocal",
-            'tasklist /FI "IMAGENAME eq MWX APP.exe"',
+            'set "MWX_PID=',
+            'tasklist /FI "PID eq %MWX_PID%"',
             "ping -n 3 127.0.0.1",
             "robocopy",
             "/E /IS /IT /R:5 /W:2",
@@ -600,9 +601,21 @@ def _test_lanzar(check) -> None:
             str(llamadas[0]["comando"]) if llamadas else "",
         )
         check(
-            "updater.lanzar: desacoplado",
+            "updater.lanzar: sin consola visible (CREATE_NO_WINDOW)",
             llamadas
-            and (os.name != "nt" or (int(llamadas[0].get("creationflags") or 0) & int(getattr(updater.subprocess, "DETACHED_PROCESS", 0))))
+            and (
+                os.name != "nt"
+                or (
+                    int(llamadas[0].get("creationflags") or 0)
+                    & int(
+                        getattr(
+                            updater.subprocess,
+                            "CREATE_NO_WINDOW",
+                            0x08000000,
+                        )
+                    )
+                )
+            )
             and llamadas[0].get("close_fds") is True,
             str(llamadas[0].get("creationflags")) if llamadas else "",
         )

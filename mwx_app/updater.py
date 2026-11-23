@@ -517,16 +517,18 @@ def _contenido_bat(source: Path, app_dir: Path, staging: Path) -> str:
     destino = _bat_escape(app_dir)
     temporal = _bat_escape(staging)
     ejecutable = f"{destino}\\MWX APP.exe"
+    pid_actual = int(os.getpid())
     return (
         "@echo off\r\n"
         "chcp 65001 >nul\r\n"
         "setlocal EnableExtensions\r\n"
+        f'set "MWX_PID={pid_actual}"\r\n'
         "set /a MWX_INTENTOS=0\r\n"
         ":MWX_ESPERAR\r\n"
-        'tasklist /FI "IMAGENAME eq MWX APP.exe" 2>nul | find /I "MWX APP.exe" >nul\r\n'
+        'tasklist /FI "PID eq %MWX_PID%" 2>nul | find /I "MWX APP.exe" >nul\r\n'
         "if errorlevel 1 goto MWX_COPIAR\r\n"
         "set /a MWX_INTENTOS+=1\r\n"
-        "if %MWX_INTENTOS% GEQ 180 goto MWX_COPIAR\r\n"
+        "if %MWX_INTENTOS% GEQ 60 goto MWX_COPIAR\r\n"
         "ping -n 3 127.0.0.1 >nul\r\n"
         "goto MWX_ESPERAR\r\n"
         ":MWX_COPIAR\r\n"
@@ -666,7 +668,7 @@ def preparar(ruta_zip, app_dir="", staging_dir="") -> dict:
 
 
 def lanzar(preparado) -> dict:
-    """Inicia el ``.bat`` en segundo plano (DETACHED) y vuelve enseguida."""
+    """Inicia el ``.bat`` sin ventana de consola y vuelve enseguida."""
     try:
         if not isinstance(preparado, dict):
             return {"ok": False, "error": "datos de actualizacion invalidos"}
@@ -678,9 +680,11 @@ def lanzar(preparado) -> dict:
 
         banderas = 0
         if os.name == "nt":
-            banderas = int(getattr(subprocess, "DETACHED_PROCESS", 0)) | int(
-                getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-            )
+            # CREATE_NO_WINDOW oculta la consola del .bat; el proceso queda
+            # desacoplado del arbol de la app para poder reemplazar el .exe.
+            banderas = int(
+                getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+            ) | int(getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
         comando = ["cmd.exe", "/c", bat] if os.name == "nt" else [bat]
         subprocess.Popen(
             comando,
