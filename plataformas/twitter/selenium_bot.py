@@ -3065,6 +3065,37 @@ class TwitterBot:
             except Exception:
                 return None
 
+    def _enlace_desde_toast(self, timeout: float = 1.5) -> Optional[str]:
+        """Link del post recien publicado desde el toast de X ("View"/"Ver").
+
+        Lee `a[href*='/status/']` dentro del toast visible SIN navegar (barato).
+        Solo acepta enlaces de la PROPIA cuenta. Devuelve la URL sin query o
+        None. Nunca lanza.
+        """
+        try:
+            propios = self._handles_propios()
+            if not self.driver or not propios:
+                return None
+            fin = time.time() + max(0.2, float(timeout))
+            while True:
+                try:
+                    for enlace in self.driver.find_elements(
+                        By.CSS_SELECTOR,
+                        "[data-testid='toast'] a[href*='/status/'], "
+                        "[role='alert'] a[href*='/status/']",
+                    ):
+                        href = str(enlace.get_attribute("href") or "").strip()
+                        m = self._RE_URL_STATUS.match(href)
+                        if m and m.group(1).lstrip("@").lower() in propios:
+                            return href.split("?")[0].split("#")[0].rstrip("/")
+                except Exception:
+                    pass
+                if time.time() >= fin:
+                    return None
+                time.sleep(0.2)
+        except Exception:
+            return None
+
     def _obtener_ultimo_enlace(self, usuario: str) -> Optional[str]:
         try:
             # Navegacion ACOTADA y tolerante: si la pestana cae en la pagina de
@@ -3537,7 +3568,7 @@ class TwitterBot:
                     logger.warning(
                         "renderer sin responder durante la verificacion de publicacion"
                     )
-            time.sleep(1)
+            time.sleep(0.4)
 
         # Diagnostico final antes de devolver False.
         try:
@@ -6474,6 +6505,10 @@ try {
     ) -> dict:
         """Hace RT (simple o con cita) de las URLs recibidas.
 
+        `buscar_url=False` omite la captura del link de la cita (en una cita
+        la ruta rapida del timeline casi nunca la encuentra y el fallback
+        navega al perfil, ~5-10s extra por accion).
+
         Para la distribucion horaria se usa con UNA sola URL: hace exactamente
         un RT y devuelve `{"exitos": 1, "urls": []}` (el RT simple NO crea una
         publicacion propia, asi que no genera link; la tabla lo etiqueta).
@@ -6638,15 +6673,16 @@ try {
                                     motivo or "boton de retweet no encontrado (carga lenta o cambio de interfaz)"
                                 )
                 rt_btn.click()
-                time.sleep(0.3)
-                
+                # `_buscar_opcion_quote`/`retweetConfirm` ya esperan el menu.
+                time.sleep(0.1)
+
                 if mensaje_cita:
                     # Elegir la opcion "Quote" del menu (NO "Retweet") para citar
                     quote_btn = self._buscar_opcion_quote()
                     self.driver.execute_script("arguments[0].click();", quote_btn)
-                    # `_buscar_opcion_quote` espera a que el modal monte su
-                    # editor; la pausa fija de 2s era innecesaria.
-                    time.sleep(random.uniform(0.5, 0.9))
+                    # `_esperar_editor_visible` ya espera a que el modal monte
+                    # su editor; basta una pausa minima.
+                    time.sleep(random.uniform(0.1, 0.25))
                     
                     # P0-D: el modal de cita monta el editor dentro de un
                     # `div[role='dialog']`; sin `preferir_dialogo` se elegia el
@@ -6655,11 +6691,11 @@ try {
                     editor = self._esperar_editor_visible(preferir_dialogo=True)
                     mensaje = self._recortar_para_x(mensaje_cita)
                     self._pegar_texto(editor, mensaje)
-                    time.sleep(0.3)
-                    
+                    time.sleep(0.1)
+
                     if imagen_path and os.path.exists(imagen_path):
                         self._subir_imagen(imagen_path)
-                        time.sleep(0.5)
+                        time.sleep(0.2)
                     
                     # Pausa humana: releer la cita antes de publicarla (solo la
                     # rama de CITA; el RT simple no escribe texto).
@@ -6697,8 +6733,8 @@ try {
                         raise Exception("X no confirmo el RT (sin estado 'unretweet')")
                 
                 # El resultado ya esta verificado (unretweet/toast): no hace
-                # falta dormir 2s antes de cerrar la accion.
-                time.sleep(0.3)
+                # falta dormir antes de cerrar la accion.
+                time.sleep(0.05)
                 
                 if dar_like:
                     # Idempotente: si la cuenta ya tiene like en este tweet NO
@@ -6744,7 +6780,14 @@ try {
                                         mensaje, timeout=1.5
                                     )
                                 )
-                        if not url_publicada and buscar_url_perfil:
+                        if (
+                            not url_publicada
+                            and buscar_url_perfil
+                            and os.environ.get("CITA_URL_PERFIL", "1")
+                            .strip()
+                            .lower()
+                            not in ("0", "false", "no", "off")
+                        ):
                             url_publicada = self._obtener_ultimo_enlace(self.usuario)
                         if url_publicada:
                             resultados["urls"].append(url_publicada)
@@ -6755,11 +6798,11 @@ try {
                         # publicacion; `urls` queda sin la entrada de la cita.
                         self.ultima_url_publicada = ""
                 else:
-                    # El RT simple no genera un post propio: sin URL de
-                    # publicacion (antes se enlazaba el perfil de la cuenta).
+                    # RT simple (no genera post propio) o cita sin captura de
+                    # link: sin URL de publicacion.
                     self.ultima_url_publicada = ""
-                
-                time.sleep(random.uniform(0.4, 1.2))
+
+                time.sleep(random.uniform(0.2, 0.5))
             
             except Exception as e:
                 resultados["fallidos"] += 1
