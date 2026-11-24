@@ -122,6 +122,7 @@ def init_db():
 
     Base.metadata.create_all(bind=engine)
     _migrar_columnas()
+    _migrar_columnas_app_config()
     _resincronizar_secuencias()
 
 
@@ -369,3 +370,51 @@ def _migrar_columnas():
             conn.commit()
     except Exception as e:
         logger.warning(f"Migracion de columnas no aplicada: {e}")
+
+
+# Columna nueva de `app_config` (configuracion de campana del ejecutable MWX).
+APP_CONFIG_NAVEGADORES_SQL = "navegadores INTEGER DEFAULT 1"
+
+
+def _migrar_app_config_sqlite(conn) -> bool:
+    """Agrega `app_config.navegadores` si falta (SQLite). Devuelve si la creo.
+
+    Aislado de la conexion global para poder probarlo con una SQLite temporal.
+    `PRAGMA table_info` de una tabla inexistente devuelve vacio -> no hace nada
+    (en ese caso `create_all` ya la creo antes). Idempotente y sin commit
+    (el llamador decide cuando confirmar)."""
+    from sqlalchemy import text
+
+    columnas = [fila[1] for fila in conn.execute(text("PRAGMA table_info(app_config)"))]
+    if not columnas or "navegadores" in columnas:
+        return False
+    conn.execute(text(f"ALTER TABLE app_config ADD COLUMN {APP_CONFIG_NAVEGADORES_SQL}"))
+    return True
+
+
+def _migrar_columnas_app_config():
+    """Migracion idempotente de `app_config.navegadores` (navegadores 1-3).
+
+    `create_all` NO agrega columnas a tablas que ya existen: en produccion
+    `app_config` ya existe sin esta columna, por eso se agrega con ALTER TABLE.
+    - SQLite: PRAGMA table_info + ALTER TABLE ... ADD COLUMN.
+    - PostgreSQL/Supabase: ALTER TABLE ... ADD COLUMN IF NOT EXISTS.
+    Nunca lanza: cualquier fallo solo se registra como warning."""
+    from sqlalchemy import text
+
+    try:
+        if _ES_SQLITE:
+            with engine.connect() as conn:
+                if _migrar_app_config_sqlite(conn):
+                    logger.info("Migracion: columna 'app_config.navegadores' agregada")
+                conn.commit()
+            return
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    "ALTER TABLE app_config ADD COLUMN IF NOT EXISTS "
+                    f"{APP_CONFIG_NAVEGADORES_SQL}"
+                )
+            )
+    except Exception as e:
+        logger.warning(f"Migracion de app_config no aplicada: {e}")

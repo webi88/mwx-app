@@ -7,24 +7,26 @@
 - Ejecutable: tabla `AppRelease`, `core/app_releases.py`, API pública
   `/v1/app/version` y `/v1/app/descargar`, pestaña superadmin
   `⬇️ Ejecutable / Actualizaciones`, autoactualizador `mwx_app/updater.py`
-  (`__version__ = 1.1.2`) y `empaquetar_mwx.py`.
+  (`__version__ = 1.1.3`) y `empaquetar_mwx.py`.
 - Local: 1–3 Chrome visibles, reparto por cuenta, contadores con lock y orden
   de cuentas aleatorio en cada ciclo. Defaults de máxima velocidad intactos.
 - Baja local aplicada: tinnietinka, jerielizmarie3, neriepalma, epyputra.
   Respaldo: `data/backups/eliminacion_cuentas_20261123_074650.json`.
-- Suite: 5855/5855. Cambios pusheados a `origin/main`.
-- `MWX APP` 1.1.2 compilado, selftest OK y release publicado en producción
-  (obligatorio, 34,246,536 bytes, sha256 `392e6ed5...`). Incluye refresco de
-  configuración cada 10 s, chequeo de versión cada 20 s con la app abierta y
-  updater corregido: consola oculta, espera por PID y cierre inmediato.
+- Suite: 5911/5911. Cambios pusheados a `origin/main`.
+- `MWX APP` 1.1.3 compilado, selftest OK y release publicado en producción
+  (obligatorio, 34,248,202 bytes, sha256 `138381bd...`). Incluye navegadores
+  simultáneos 1-3 por usuario en el panel/Ajustes, refresco de configuración
+  cada 10 s, aviso de actualización cada 20 s con la app abierta y updater
+  corregido (consola oculta, espera por PID, cierre inmediato).
 - Railway: API y dashboard redeployados; `/v1/app/version` y
   `/v1/app/descargar` responden 200.
 - Hotfix: migración PostgreSQL `DATETIME -> TIMESTAMP`; `verificacion_fecha`
   ya existe en Supabase y la consulta ORM de cuentas funciona.
 
 ## Próximo paso único
-- Instalar 1.1.2 manualmente una vez (el updater viejo puede colgarse), luego
-  probar el auto-update de la siguiente versión y Local con 2 navegadores.
+- Si ya tienes 1.1.2, la ventana en vivo debe ofrecer 1.1.3; si estás en
+  1.1.0/1.1.1, instala 1.1.3 manualmente UNA vez. Luego pon 2 navegadores en
+  el panel y prueba Local.
 
 ## Pendientes
 - Validar el cajón con un bloqueo real de X y reactivar la cuenta.

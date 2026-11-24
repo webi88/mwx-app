@@ -219,6 +219,9 @@ def config_efectiva(perfil: dict, ajustes: Optional[dict]) -> dict:
     limite = _entero(
         ajustes.get("limite_dia", campana.get("limite_dia", 49)), 49, 1, 49
     )
+    navegadores = _entero(
+        ajustes.get("navegadores", campana.get("navegadores", 1)), 1, 1, 3
+    )
 
     hashtags = campana.get("hashtags") or []
     if isinstance(hashtags, str):
@@ -247,6 +250,7 @@ def config_efectiva(perfil: dict, ajustes: Optional[dict]) -> dict:
         "texto_base": str(campana.get("texto_base") or ""),
         "urls": [str(url).strip() for url in urls if str(url or "").strip()],
         "imagenes": campana.get("imagenes") or [],
+        "navegadores": navegadores,
     }
 
 
@@ -292,7 +296,8 @@ def ejecutar_campana(
 
     detalle_inicio = (
         f"cuentas={len(usuarios)} acciones_por_cuenta={config['acciones_por_cuenta']} "
-        f"ventana={config['duracion_min']}min imagenes={len(imagenes)}"
+        f"ventana={config['duracion_min']}min imagenes={len(imagenes)} "
+        f"navegadores={config['navegadores']}"
     )
     _evento_async(cliente, token, "campana_inicio", detalle_inicio)
 
@@ -315,6 +320,7 @@ def ejecutar_campana(
             callback=callback,
             pausa_entre_acciones_seg=config["pausa_seg"],
             capturar_url=True,
+            navegadores=config["navegadores"],
         )
         if not isinstance(resumen, dict):
             resumen = {

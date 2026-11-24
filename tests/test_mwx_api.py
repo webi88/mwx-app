@@ -230,11 +230,57 @@ def run(check) -> None:
                         limite_dia=20,
                         imagenes=json.dumps(["foto.jpg"]),
                         permitir_ajustes=True,
+                        navegadores=2,
                     ),
                 ]
             )
 
         import api.main as api_main
+
+        # --- Campana: navegadores (1-3, tolerante a fakes/BD vieja) -------
+        def _config_falsa(**extra):
+            datos = {
+                "hashtags": "[]",
+                "contexto": "",
+                "narrativa": "",
+                "urls": "[]",
+                "texto_base": "",
+                "acciones_por_cuenta": 10,
+                "pausa_seg": 2,
+                "duracion_min": 60,
+                "limite_dia": 49,
+                "imagenes": "[]",
+                "permitir_ajustes": False,
+            }
+            datos.update(extra)
+            return SimpleNamespace(**datos)
+
+        check(
+            "api: _campana_payload sin config -> navegadores 1",
+            api_main._campana_payload(None).get("navegadores") == 1,
+        )
+        check(
+            "api: _campana_payload lee navegadores=2",
+            api_main._campana_payload(_config_falsa(navegadores=2)).get(
+                "navegadores"
+            )
+            == 2,
+        )
+        check(
+            "api: _campana_payload sin atributo -> navegadores 1",
+            api_main._campana_payload(_config_falsa()).get("navegadores") == 1,
+        )
+        check(
+            "api: _campana_payload acota navegadores 0/9 -> 1/3",
+            api_main._campana_payload(_config_falsa(navegadores=0)).get(
+                "navegadores"
+            )
+            == 1
+            and api_main._campana_payload(_config_falsa(navegadores=9)).get(
+                "navegadores"
+            )
+            == 3,
+        )
 
         with TestClient(api_main.app) as cliente:
             # --- Healthcheck (Railway, sin auth) --------------------------
@@ -349,6 +395,7 @@ def run(check) -> None:
                     "limite_dia",
                     "imagenes",
                     "permitir_ajustes",
+                    "navegadores",
                 },
             )
             check(
@@ -358,7 +405,8 @@ def run(check) -> None:
                 and campana.get("pausa_seg") == 3
                 and campana.get("duracion_min") == 45
                 and campana.get("limite_dia") == 20
-                and campana.get("permitir_ajustes") is True,
+                and campana.get("permitir_ajustes") is True
+                and campana.get("navegadores") == 2,
             )
             check(
                 "login: imagenes con url del contrato",
@@ -380,7 +428,8 @@ def run(check) -> None:
                 and campana_default.get("duracion_min") == 60
                 and campana_default.get("limite_dia") == 49
                 and campana_default.get("imagenes") == []
-                and campana_default.get("permitir_ajustes") is False,
+                and campana_default.get("permitir_ajustes") is False
+                and campana_default.get("navegadores") == 1,
             )
 
             with cdb.get_db_session() as db:

@@ -612,6 +612,34 @@ def _capturar_error(funcion) -> str:
 def _test_runner(check, tmp: Path) -> None:
     from core.config import settings
 
+    check(
+        "runner: config_efectiva sin navegadores -> 1",
+        runner.config_efectiva({"campana": {}}, None).get("navegadores") == 1,
+    )
+    check(
+        "runner: config_efectiva lee navegadores=2",
+        runner.config_efectiva(
+            {"campana": {"navegadores": 2}}, None
+        ).get("navegadores")
+        == 2,
+    )
+    check(
+        "runner: config_efectiva permite ajuste de navegadores=3",
+        runner.config_efectiva(
+            {"campana": {"permitir_ajustes": True}},
+            {"navegadores": 3},
+        ).get("navegadores")
+        == 3,
+    )
+    check(
+        "runner: config_efectiva ignora ajustes si no estan permitidos",
+        runner.config_efectiva(
+            {"campana": {"permitir_ajustes": False, "navegadores": 2}},
+            {"navegadores": 3},
+        ).get("navegadores")
+        == 2,
+    )
+
     env_previos = {clave: os.environ.get(clave) for clave in _CLAVES_ENV}
     settings_previos = (
         getattr(settings, "openai_api_key", ""),
@@ -679,6 +707,7 @@ def _test_runner(check, tmp: Path) -> None:
             "pausa_seg": 2,
             "duracion_min": 60,
             "limite_dia": 49,
+            "navegadores": 2,
             "imagenes": [
                 {"nombre": "foto.jpg", "url": "/v1/imagenes/foto.jpg"},
                 {"nombre": "otra.png", "url": "/v1/imagenes/otra.png"},
@@ -748,6 +777,10 @@ def _test_runner(check, tmp: Path) -> None:
         and capturado.get("capturar_url") is True
         and capturado.get("cancelar") is cancelar,
     )
+    check(
+        "runner: pasa navegadores del servidor (2)",
+        capturado.get("navegadores") == 2,
+    )
     rutas = capturado.get("imagenes") or []
     check(
         "runner: descarga imagenes a DATA_DIR/temp",
@@ -785,6 +818,7 @@ def _test_runner(check, tmp: Path) -> None:
 
     capturado.clear()
     perfil["campana"]["permitir_ajustes"] = False
+    perfil["campana"].pop("navegadores", None)
     cliente2 = _ClienteFalso()
     evento_cancelado = __import__("threading").Event()
     evento_cancelado.set()
@@ -827,6 +861,10 @@ def _test_runner(check, tmp: Path) -> None:
         and capturado.get("pausa_entre_acciones_seg") == 2
         and capturado.get("duracion_min") == 60
         and capturado.get("limite_dia") == 49,
+    )
+    check(
+        "runner: sin navegadores en el perfil -> 1",
+        capturado.get("navegadores") == 1,
     )
     check(
         "runner: sin permitir_ajustes ignora imagenes locales",
@@ -919,6 +957,7 @@ def _test_ui(check) -> None:
                         "limite_dia": 49,
                         "imagenes": [],
                         "permitir_ajustes": True,
+                        "navegadores": 2,
                     },
                     "cuentas": [{"usuario": "u1", "seccion": "CI"}],
                 }
@@ -939,6 +978,10 @@ def _test_ui(check) -> None:
                 check(
                     "ui: programa el refresco automatico de la campana",
                     app._after_sync is not None,
+                )
+                check(
+                    "ui: el resumen muestra los navegadores del perfil",
+                    "2 navegadores" in app._lbl_resumen.cget("text"),
                 )
 
                 perfil_nuevo = json.loads(json.dumps(perfil_ui))

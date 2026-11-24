@@ -209,6 +209,7 @@ def _campana_payload(config: Optional[AppConfig]) -> dict:
             "limite_dia": 49,
             "imagenes": [],
             "permitir_ajustes": False,
+            "navegadores": 1,
         }
 
     hashtags = [str(x).strip() for x in _lista_json(config.hashtags) if str(x).strip()]
@@ -231,6 +232,9 @@ def _campana_payload(config: Optional[AppConfig]) -> dict:
         "limite_dia": _entero(config.limite_dia, 49),
         "imagenes": imagenes,
         "permitir_ajustes": bool(config.permitir_ajustes),
+        "navegadores": max(
+            1, min(3, _entero(getattr(config, "navegadores", 1), 1))
+        ),
     }
 
 

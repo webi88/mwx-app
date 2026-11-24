@@ -78,6 +78,7 @@ CONFIG_DEFECTO = {
     "pausa_seg": 2,
     "duracion_min": 60,
     "limite_dia": 49,
+    "navegadores": 1,
     "imagenes": [],
     "permitir_ajustes": False,
 }
@@ -774,6 +775,9 @@ def obtener_config_app(usuario_id) -> dict:
             "pausa_seg": int(fila.pausa_seg or 2),
             "duracion_min": int(fila.duracion_min or 60),
             "limite_dia": int(fila.limite_dia or 49),
+            "navegadores": _entero(
+                getattr(fila, "navegadores", 1), 1, 1, 3
+            ),
             "imagenes": [
                 nombre
                 for nombre in _lista_json(fila.imagenes)
@@ -815,6 +819,7 @@ def guardar_config_app(usuario_id, datos: dict) -> dict:
         "pausa_seg": _entero(datos.get("pausa_seg"), 2, 1, 120),
         "duracion_min": _entero(datos.get("duracion_min"), 60, 10, 240),
         "limite_dia": _entero(datos.get("limite_dia"), 49, 1, 49),
+        "navegadores": _entero(datos.get("navegadores"), 1, 1, 3),
         "imagenes": imagenes,
         "permitir_ajustes": bool(datos.get("permitir_ajustes", False)),
     }
@@ -838,6 +843,7 @@ def guardar_config_app(usuario_id, datos: dict) -> dict:
             fila.pausa_seg = valores["pausa_seg"]
             fila.duracion_min = valores["duracion_min"]
             fila.limite_dia = valores["limite_dia"]
+            fila.navegadores = valores["navegadores"]
             fila.imagenes = json.dumps(valores["imagenes"], ensure_ascii=False)
             fila.permitir_ajustes = valores["permitir_ajustes"]
     except SQLAlchemyError:
@@ -1676,7 +1682,7 @@ def _tab_campana() -> None:
         help="Idea base que se parafrasea de forma distinta en cada cita.",
     )
 
-    col1, col2, col3, col4 = st.columns(4)
+    col1, col2, col3, col4, col5 = st.columns(5)
     with col1:
         acciones = st.number_input(
             "Acciones por cuenta",
@@ -1712,6 +1718,19 @@ def _tab_campana() -> None:
             value=_entero(config.get("limite_dia"), 49, 1, 49),
             step=1,
             key=f"mwx_cfg_{uid}_limite",
+        )
+    with col5:
+        navegadores = st.number_input(
+            "Navegadores simultáneos",
+            min_value=1,
+            max_value=3,
+            value=_entero(config.get("navegadores"), 1, 1, 3),
+            step=1,
+            key=f"mwx_cfg_{uid}_navegadores",
+            help=(
+                "1 = un Chrome; 2-3 = más velocidad entre cuentas, pero más "
+                "RAM/CPU. Sin proxies salen por la misma IP."
+            ),
         )
 
     permitir_ajustes = st.checkbox(
@@ -1811,6 +1830,7 @@ def _tab_campana() -> None:
                 "pausa_seg": pausa,
                 "duracion_min": duracion,
                 "limite_dia": limite,
+                "navegadores": navegadores,
                 "imagenes": nombres,
                 "permitir_ajustes": permitir_ajustes,
             },
@@ -1845,6 +1865,7 @@ def _tab_campana() -> None:
 - **Publicaciones por cuenta:** {int(acciones)}
 - **Ventana:** {int(duracion)} minutos con pausas de {int(pausa)} s
 - **Límite diario:** {int(limite)} acciones por cuenta
+- **Navegadores simultáneos:** {int(navegadores)}
 - **Imágenes:** {len(imagenes_guardadas)}
 - **Puede ajustar valores:** {'sí' if permitir_ajustes else 'no'}
 """.strip()

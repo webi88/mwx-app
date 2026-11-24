@@ -1434,6 +1434,8 @@ class MWXApp:
         )
         if imagenes:
             texto += f" · {imagenes} imagen(es)"
+        if campana.get("navegadores", 1) > 1:
+            texto += f" · {campana['navegadores']} navegadores"
         etiqueta.configure(text=texto)
 
     def _mensaje_sync(self, texto: str, error: bool = False) -> None:
@@ -1671,6 +1673,7 @@ class MWXApp:
         campo("Pausa entre publicaciones (seg)", "pausa_seg", 1, 120)
         campo("Duración máxima (minutos)", "duracion_min", 1, 180)
         campo("Tope diario por cuenta", "limite_dia", 1, 49)
+        campo("Navegadores simultáneos", "navegadores", 1, 3)
 
         imagenes = list(self.imagenes_extra)
         lbl_imagenes = tk.Label(

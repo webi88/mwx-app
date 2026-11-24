@@ -333,6 +333,8 @@ class AppConfig(Base):
     pausa_seg = Column(Integer, default=2)
     duracion_min = Column(Integer, default=60)
     limite_dia = Column(Integer, default=49)
+    # Navegadores Chrome simultaneos de la campana LOCAL (1-3).
+    navegadores = Column(Integer, default=1)
     imagenes = Column(Text, default="[]")
     permitir_ajustes = Column(Boolean, default=False)
     actualizado = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)

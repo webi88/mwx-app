@@ -396,6 +396,11 @@ def _probar_configuracion(check) -> None:
             )
             == ["https://x.com/a/status/1", "http://b.example/2"],
         )
+        check(
+            "config: CONFIG_DEFECTO incluye navegadores=1",
+            mwx_app.CONFIG_DEFECTO.get("navegadores") == 1,
+            str(mwx_app.CONFIG_DEFECTO.get("navegadores")),
+        )
 
         res = mwx_app.guardar_config_app(
             uid,
@@ -409,6 +414,7 @@ def _probar_configuracion(check) -> None:
                 "pausa_seg": 0,
                 "duracion_min": 9999,
                 "limite_dia": 0,
+                "navegadores": 2,
                 "imagenes": ["../evil.png", "foto.png", "foto.png"],
                 "permitir_ajustes": True,
             },
@@ -419,7 +425,8 @@ def _probar_configuracion(check) -> None:
             and res["config"]["acciones_por_cuenta"] == 49
             and res["config"]["pausa_seg"] == 1
             and res["config"]["duracion_min"] == 240
-            and res["config"]["limite_dia"] == 1,
+            and res["config"]["limite_dia"] == 1
+            and res["config"]["navegadores"] == 2,
             str(res.get("error") or res.get("config")),
         )
         check(
@@ -441,7 +448,8 @@ def _probar_configuracion(check) -> None:
             and leida["narrativa"] == "noticia de fondo"
             and leida["texto_base"] == "base de la cita"
             and leida["imagenes"] == ["foto.png"]
-            and leida["permitir_ajustes"] is True,
+            and leida["permitir_ajustes"] is True
+            and leida["navegadores"] == 2,
             str(leida),
         )
 
@@ -461,6 +469,86 @@ def _probar_configuracion(check) -> None:
             mwx_app.guardar_config_app(999999, {"hashtags": "x"}).get("ok") is False
             and _contar(Sesion, AppConfig) == 1,
         )
+
+        # ---- Navegadores: guardado acotado y lectura tolerante ----
+        for valor, esperado in ((2, 2), (0, 1), (9, 3), (None, 1), ("basura", 1)):
+            guardado = mwx_app.guardar_config_app(
+                uid, {"navegadores": valor}
+            )
+            check(
+                f"config: navegadores {valor!r} se guarda como {esperado}",
+                guardado.get("ok") is True
+                and guardado["config"]["navegadores"] == esperado
+                and mwx_app.obtener_config_app(uid)["navegadores"] == esperado,
+                str(guardado.get("error") or guardado.get("config")),
+            )
+
+        class _FilaFake:
+            """Fila AppConfig minima (sin `navegadores` = BD vieja)."""
+
+            hashtags = "[]"
+            contexto = ""
+            narrativa = ""
+            urls = "[]"
+            texto_base = ""
+            acciones_por_cuenta = 10
+            pausa_seg = 2
+            duracion_min = 60
+            limite_dia = 49
+            imagenes = "[]"
+            permitir_ajustes = False
+
+        class _DbFake:
+            def __init__(self, fila):
+                self._fila = fila
+
+            def query(self, *_a, **_k):
+                return self
+
+            def filter(self, *_a, **_k):
+                return self
+
+            def first(self):
+                return self._fila
+
+        @contextmanager
+        def _sesion_con(fila):
+            yield _DbFake(fila)
+
+        original_sesion = mwx_app.obtener_sesion
+        try:
+            fila_con = type(
+                "_FilaConNavegadores", (_FilaFake,), {"navegadores": 2}
+            )()
+            mwx_app.obtener_sesion = lambda: _sesion_con(fila_con)
+            check(
+                "config: obtener_config_app lee navegadores=2",
+                mwx_app.obtener_config_app(uid)["navegadores"] == 2,
+            )
+
+            mwx_app.obtener_sesion = lambda: _sesion_con(_FilaFake())
+            check(
+                "config: fila sin atributo navegadores -> 1 (BD vieja)",
+                mwx_app.obtener_config_app(uid)["navegadores"] == 1,
+            )
+
+            for valor, esperado in (
+                (0, 1),
+                (9, 3),
+                (None, 1),
+                ("x", 1),
+                (-5, 1),
+                (2, 2),
+            ):
+                fila = type("_FilaNav", (_FilaFake,), {"navegadores": valor})()
+                mwx_app.obtener_sesion = lambda f=fila: _sesion_con(f)
+                check(
+                    f"config: navegadores leidos {valor!r} -> {esperado}",
+                    mwx_app.obtener_config_app(uid)["navegadores"] == esperado,
+                )
+        finally:
+            mwx_app.obtener_sesion = original_sesion
+            mwx_app.limpiar_cache_app()
 
         # ---- Imagenes (carpeta temporal) ----
         archivo = _ArchivoFalso("Foto Verano.PNG", b"\x89PNG-falso")
@@ -862,6 +950,7 @@ def _probar_apptest(check) -> None:
                 "contexto": "tema",
                 "urls": "https://x.com/a/status/1",
                 "acciones_por_cuenta": 7,
+                "navegadores": 2,
                 "imagenes": [],
             },
         )
@@ -974,8 +1063,62 @@ def _probar_apptest(check) -> None:
             and f"mwx_cfg_{uid}_pausa" in claves_num
             and f"mwx_cfg_{uid}_duracion" in claves_num
             and f"mwx_cfg_{uid}_limite" in claves_num
+            and f"mwx_cfg_{uid}_navegadores" in claves_num
             and f"mwx_cfg_{uid}_guardar" in claves_botones,
             str(sorted(claves_num)),
+        )
+        check(
+            "apptest: navegadores parte de la config guardada (2)",
+            at.number_input(key=f"mwx_cfg_{uid}_navegadores").value == 2,
+            str(at.number_input(key=f"mwx_cfg_{uid}_navegadores").value),
+        )
+
+        # E2E del boton: cambia navegadores y guarda la config (real).
+        try:
+            at.number_input(key=f"mwx_cfg_{uid}_navegadores").set_value(3).run()
+            at.button(key=f"mwx_cfg_{uid}_guardar").click().run()
+            error_nav = (
+                str(at.exception[0].value)[:200] if at.exception else ""
+            )
+        except Exception as exc:  # pragma: no cover
+            error_nav = f"{type(exc).__name__}: {exc}"
+        check(
+            "apptest: guardar configuracion persiste navegadores=3",
+            not error_nav
+            and mwx_app.obtener_config_app(uid)["navegadores"] == 3
+            and any(
+                "Configuraci" in str(s.value) for s in at.success
+            ),
+            error_nav,
+        )
+
+        # BD vieja / sin fila: el number_input vuelve al default 1.
+        db = Sesion()
+        try:
+            db.query(AppConfig).filter(AppConfig.usuario_id == uid).delete()
+            db.commit()
+        finally:
+            db.close()
+        try:
+            at3 = AppTest.from_function(_app_mwx_admin, default_timeout=60)
+            at3.run()
+            error_at3 = (
+                str(at3.exception[0].value)[:200] if at3.exception else ""
+            )
+            valor_default = (
+                None
+                if error_at3
+                else at3.number_input(
+                    key=f"mwx_cfg_{uid}_navegadores"
+                ).value
+            )
+        except Exception as exc:  # pragma: no cover
+            error_at3 = f"{type(exc).__name__}: {exc}"
+            valor_default = None
+        check(
+            "apptest: sin fila de config, navegadores inicia en 1",
+            not error_at3 and valor_default == 1,
+            error_at3 or str(valor_default),
         )
         check(
             "apptest: actividad/seguridad con revocacion global y URL del API",
