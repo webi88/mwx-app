@@ -1,37 +1,37 @@
 # MEMORY — GestorRedes / MWX APP
 
 ## Estado (2026-11-26)
-- Local multi-navegador: `_partir_plan_por_navegador` ahora intercala las
-  cuentas de cada Chrome (filtra el plan round-robin), mantiene cuentas enteras
-  y balanceadas. El pre-vuelo marca los proxies validados en la cache de x.com
-  (`marcar_proxy_x_validado`) y `sin_imagenes` ya funciona SIN proxy
-  (`CHROME_SIN_IMAGENES=1`) para ahorrar datos.
-- MWX APP 1.1.4: `AppConfig.sin_imagenes` (default True) + migración
-  SQLite/PostgreSQL, checkbox en el panel, `runner` lo pasa a Local y
-  diagnóstico `navegadores_solicitados/usados/aviso` (pocas cuentas, ajustes
-  locales, API/.exe viejos). ZIP generado:
-  `data/releases/MWX-APP-1.1.4.zip` (34,253,279 bytes, sha256 `ce8870a6...`);
-  selftest congelado OK. **NO publicado aún**.
-- JAP (Just Another Panel): `integraciones/jap.py` (balance, catálogo 5,708
-  servicios, presets económico/seguro, costo, orders, status, refill, cancel;
-  key en `data/jap_config.json` gitignored) + página admin
-  `🛒 JAP: Comprar Engagement` (`web/operaciones/jap.py`, solo admin) con
-  catálogo, cotizador de los 18 tweets de @RedAMLOmx, nuevo pedido y pedidos.
-  Saldo real verificado: **$3.5098**. No hay servicios X-México; los
-  comentarios en español usan el 6602 (USA Custom) o nuestras cuentas.
-- Costo económico del lote (18 tweets, 50 likes + 10 RT + 5 comentarios + 500
-  vistas cada uno): **$3.071**; con 100 likes + 20 RT + 5 comentarios + 1000
-  vistas: **$3.364** (cabe en el saldo). Seguro (10186/8861/8555/6602) cuesta
-  ~$5.10 y no cabe sin recargar.
-- Suite: 6,253/6,253. `compileall` global OK. Cambios sin commit.
+- Producción (Railway `mwx-app` / `mwx-api`) redeployada: migración
+  `app_config.sin_imagenes` aplicada en Supabase; ambos servicios SUCCESS.
+  `JAP_API_KEY` configurada en `mwx-app`; página `🛒 JAP` verificada en
+  https://mwx.app con saldo real $3.51 y cotizador de los 18 links.
+- Windows: **MWX APP 1.1.4** publicado como obligatorio en la BD
+  (`sha256 ce8870a6...`, 34,253,279 bytes). `/v1/app/version` y
+  `/v1/app/descargar` responden 200. Incluye `sin_imagenes`, diagnóstico de
+  navegadores y rotación Local.
+- macOS: build **1.1.4 arm64 + Intel** vía GitHub Actions
+  (`.github/workflows/build-mwx-macos.yml`), release GitHub
+  `https://github.com/webi88/mwx-app/releases/tag/macos-1.1.4`
+  (arm64 31.7 MB, intel 33.0 MB). Auto-update **DESACTIVADO** en Mac
+  (actualización manual); config/sesión en `~/.mwx_app`; Chrome detectado en
+  `/Applications/Google Chrome.app/...`.
+- Local: `_partir_plan_por_navegador` intercala cuentas por Chrome (no agota
+  una cuenta completa); proxies prevalidados en caché;
+  `sin_imagenes=True` funciona sin proxy (`CHROME_SIN_IMAGENES=1`).
+- JAP: `integraciones/jap.py` + página admin `🛒 JAP`. Presets económico
+  9013/8860/8413/6601/9011 y seguro 10186/8861/8555/6602/8855. Costo de 18
+  tweets: 50 likes+10 RT+5 comentarios+500 vistas = **$3.071**; 100/20/5/1000
+  = **$3.364**; saldo **$3.5098**. No hay servicios X-México; comentarios en
+  español = 6602 Custom USA o cuentas propias.
+- Suite **6278/6278**; `compileall` global OK. Rama GitHub
+  `macos-build-1.1.4` (NO mergeada a `main`).
 
 ## Próximo paso único
-- Publicar `MWX-APP-1.1.4.zip` desde el panel (o pedir que se publique) y
-  redeployar API + dashboard para que `sin_imagenes` y la página JAP lleguen.
+- Probar el `.app` en una Mac real (clic derecho > Abrir, login, Chrome y una
+  campaña corta) y una compra JAP pequeña real (likes/RT) verificando estado.
 
 ## Pendientes
-- Probar el .exe 1.1.4 en una laptop: 2 navegadores con 2+ cuentas, aviso
-  correcto con 1 cuenta, y `CHROME_SIN_IMAGENES=1` sin romper la subida.
-- Probar JAP con una compra pequeña real (likes/RT) y verificar estado/refill.
-- No hay X-México en JAP; validar que el cliente acepte cuentas USA para
-  comentarios en español.
+- Probar el auto-update de Windows 1.1.3 → 1.1.4 en una laptop.
+- Cambiar `admin/admin` de producción y rotar credenciales (repo público).
+- Mac: si se quiere auto-update, implementar releases por plataforma (hoy es
+  manual).
