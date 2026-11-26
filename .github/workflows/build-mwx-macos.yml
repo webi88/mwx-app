@@ -18,11 +18,13 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: macos-14
+          # macOS 14/13 ya estan retirados de GitHub Actions (2026). Usar los
+          # labels vigentes: macos-15 (arm64) y macos-15-intel (x86_64).
+          - runner: macos-15
             arch: arm64
             artifact: MWX-APP-mac-arm64-1.1.4.zip
             continue_on_error: false
-          - runner: macos-13
+          - runner: macos-15-intel
             arch: intel
             artifact: MWX-APP-mac-intel-1.1.4.zip
             continue_on_error: true
