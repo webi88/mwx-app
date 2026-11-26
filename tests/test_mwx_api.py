@@ -231,6 +231,7 @@ def run(check) -> None:
                         imagenes=json.dumps(["foto.jpg"]),
                         permitir_ajustes=True,
                         navegadores=2,
+                        sin_imagenes=False,
                     ),
                 ]
             )
@@ -280,6 +281,22 @@ def run(check) -> None:
                 "navegadores"
             )
             == 3,
+        )
+        check(
+            "api: _campana_payload sin config -> sin_imagenes True",
+            api_main._campana_payload(None).get("sin_imagenes") is True,
+        )
+        check(
+            "api: _campana_payload sin atributo -> sin_imagenes True",
+            api_main._campana_payload(_config_falsa()).get("sin_imagenes")
+            is True,
+        )
+        check(
+            "api: _campana_payload lee sin_imagenes=False",
+            api_main._campana_payload(
+                _config_falsa(sin_imagenes=False)
+            ).get("sin_imagenes")
+            is False,
         )
 
         with TestClient(api_main.app) as cliente:
@@ -396,6 +413,7 @@ def run(check) -> None:
                     "imagenes",
                     "permitir_ajustes",
                     "navegadores",
+                    "sin_imagenes",
                 },
             )
             check(
@@ -406,7 +424,8 @@ def run(check) -> None:
                 and campana.get("duracion_min") == 45
                 and campana.get("limite_dia") == 20
                 and campana.get("permitir_ajustes") is True
-                and campana.get("navegadores") == 2,
+                and campana.get("navegadores") == 2
+                and campana.get("sin_imagenes") is False,
             )
             check(
                 "login: imagenes con url del contrato",
@@ -429,7 +448,8 @@ def run(check) -> None:
                 and campana_default.get("limite_dia") == 49
                 and campana_default.get("imagenes") == []
                 and campana_default.get("permitir_ajustes") is False
-                and campana_default.get("navegadores") == 1,
+                and campana_default.get("navegadores") == 1
+                and campana_default.get("sin_imagenes") is True,
             )
 
             with cdb.get_db_session() as db:

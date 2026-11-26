@@ -34,13 +34,45 @@ def _congelado() -> bool:
 
 
 def _dir_base() -> Path:
-    """Carpeta donde vive el .exe (o la raiz del repo en desarrollo)."""
+    """Carpeta escribible de configuracion (o la raiz del repo en desarrollo).
+
+    En macOS congelado se usa ``~/.mwx_app`` (misma carpeta que ``DATA_DIR``)
+    porque el ``.app`` va firmado y no se debe escribir dentro del bundle.
+    """
     if _congelado():
+        if sys.platform == "darwin":
+            try:
+                return Path.home() / ".mwx_app"
+            except Exception:
+                return Path("~").expanduser() / ".mwx_app"
         try:
             return Path(sys.executable).resolve().parent
         except Exception:
             return Path.cwd()
     return Path(__file__).resolve().parent.parent
+
+
+def _configs_empaquetados() -> list:
+    """Rutas alternativas de ``config.json`` dentro/junto al ``.app`` (macOS).
+
+    En macOS el ejecutable real vive en ``Contents/MacOS``; el ZIP de
+    distribucion puede traer ``config.json`` en ``Contents/MacOS``, en
+    ``Contents/Resources``, en la raiz del ``.app`` o justo al lado del
+    ``.app``. En desarrollo o en otras plataformas la lista queda vacia
+    (comportamiento historico intacto).
+    """
+    if not _congelado() or sys.platform != "darwin":
+        return []
+    try:
+        ejecutable = Path(sys.executable).resolve()
+    except Exception:
+        return []
+    return [
+        ejecutable.parent / ARCHIVO_CONFIG,
+        ejecutable.parent.parent / "Resources" / ARCHIVO_CONFIG,
+        ejecutable.parent.parent.parent / ARCHIVO_CONFIG,
+        ejecutable.parent.parent.parent.parent / ARCHIVO_CONFIG,
+    ]
 
 
 def ruta_config() -> Path:
@@ -102,6 +134,13 @@ def api_url() -> str:
     )
     if desde_archivo:
         return desde_archivo
+
+    for candidata in _configs_empaquetados():
+        desde_archivo = normalizar_url_api(
+            _leer_json(candidata).get("api_url", "")
+        )
+        if desde_archivo:
+            return desde_archivo
 
     try:
         from core.config import settings

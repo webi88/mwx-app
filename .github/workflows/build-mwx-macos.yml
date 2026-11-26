@@ -1,0 +1,127 @@
+name: Build MWX APP macOS
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - "macos-build*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build macOS (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    continue-on-error: ${{ matrix.continue_on_error }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-14
+            arch: arm64
+            artifact: MWX-APP-mac-arm64-1.1.4.zip
+            continue_on_error: false
+          - runner: macos-13
+            arch: intel
+            artifact: MWX-APP-mac-intel-1.1.4.zip
+            continue_on_error: true
+    steps:
+      - name: Descargar codigo
+        uses: actions/checkout@v4
+
+      - name: Configurar Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Verificar Tkinter
+        run: |
+          python -c "import tkinter; print('Tk version:', tkinter.TkVersion)"
+
+      - name: Instalar dependencias
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-mwx.txt "pyinstaller==6.11.1" "pillow==10.4.0"
+
+      - name: Generar iconos
+        run: |
+          set -euo pipefail
+          if [ ! -f assets/mwx_logo.png ] || [ ! -f assets/mwx_app.ico ]; then
+            python assets/generar_icono.py
+          fi
+          if [ ! -f assets/mwx_app.icns ]; then
+            python - <<'PY'
+          from pathlib import Path
+
+          from PIL import Image
+
+          raiz = Path("assets")
+          imagen = Image.open(raiz / "mwx_logo.png").convert("RGBA")
+          if imagen.size != (1024, 1024):
+              imagen = imagen.resize((1024, 1024), Image.LANCZOS)
+          imagen.save(raiz / "mwx_app.icns", format="ICNS")
+          print("assets/mwx_app.icns generado")
+          PY
+          fi
+
+      - name: Empaquetar con PyInstaller
+        run: python -m PyInstaller --noconfirm --clean mwx_app.spec
+
+      - name: Crear ZIP con ditto
+        run: |
+          set -euo pipefail
+          ARQ="$(uname -m)"
+          CARPETA="dist/MWX-APP-mac-${ARQ}-1.1.4"
+          rm -rf "$CARPETA"
+          mkdir -p "$CARPETA"
+          cp -R "dist/MWX APP.app" "$CARPETA/"
+          if [ -f config.json ]; then
+            cp config.json "$CARPETA/"
+          fi
+          cp LEEME_MAC.txt "$CARPETA/"
+          ditto -c -k --sequesterRsrc --keepParent "$CARPETA" "${{ matrix.artifact }}"
+          ls -lh "${{ matrix.artifact }}"
+
+      - name: Subir artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}
+          if-no-files-found: error
+
+  release:
+    name: Publicar release de macOS
+    needs: build
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Descargar artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Verificar ZIPs
+        run: |
+          set -euo pipefail
+          ls -lh dist
+          compgen -G "dist/*.zip" > /dev/null || { echo "No hay ZIPs para publicar"; exit 1; }
+
+      - name: Crear o actualizar release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: macos-1.1.4
+          name: MWX APP macOS 1.1.4
+          files: dist/*.zip
+          body: |
+            MWX APP 1.1.4 para macOS.
+
+            - Apple Silicon (arm64) e Intel (x86_64), segun el ZIP descargado.
+            - Requiere macOS 11+ y Google Chrome instalado.
+            - La app NO esta firmada ni notarizada: primer arranque con
+              clic derecho > Abrir.
+            - La actualizacion en macOS es MANUAL: descarga el ZIP nuevo y
+              reemplaza MWX APP.app (no se autoactualiza como en Windows).
+            - Los ZIP incluyen config.json y LEEME_MAC.txt; NO incluyen
+              cuentas, cookies, contrasenas ni .env.

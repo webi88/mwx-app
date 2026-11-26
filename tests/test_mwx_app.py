@@ -256,6 +256,94 @@ def _test_config(check, tmp: Path) -> None:
         )
 
 
+def _test_macos(check, tmp: Path) -> None:
+    """Rutas del .app de macOS: `~/.mwx_app` y config.json empaquetado."""
+    datos = tmp / "mac_datos"
+    datos.mkdir(parents=True, exist_ok=True)
+    sin_config = tmp / "mac_sin_config"
+    sin_config.mkdir(parents=True, exist_ok=True)
+
+    with mock.patch.object(config.sys, "frozen", True, create=True), mock.patch.object(
+        config.sys, "platform", "darwin"
+    ), mock.patch.object(config.Path, "home", return_value=tmp):
+        check(
+            "macos: congelado usa ~/.mwx_app como carpeta de configuracion",
+            config._dir_base() == tmp / ".mwx_app",
+            str(config._dir_base()),
+        )
+
+    with mock.patch.object(config.sys, "frozen", False, create=True):
+        check(
+            "macos: en desarrollo _dir_base sigue siendo la raiz del repo",
+            config._dir_base() == RAIZ,
+            str(config._dir_base()),
+        )
+
+    with mock.patch.object(config.sys, "frozen", True, create=True):
+        esperado = Path(sys.executable).resolve().parent
+        check(
+            "macos: fuera de darwin el congelado conserva la carpeta del ejecutable",
+            config._dir_base() == esperado,
+            str(config._dir_base()),
+        )
+
+    app = tmp / "MWX APP.app"
+    macos = app / "Contents" / "MacOS"
+    resources = app / "Contents" / "Resources"
+    macos.mkdir(parents=True, exist_ok=True)
+    resources.mkdir(parents=True, exist_ok=True)
+    ejecutable = macos / "MWX APP"
+    ejecutable.write_text("bin", encoding="utf-8")
+
+    def _escribir(ruta: Path, url: str) -> None:
+        ruta.write_text(json.dumps({"api_url": url}), encoding="utf-8")
+
+    with _entorno(base=sin_config, datos=datos):
+        with mock.patch.object(config.sys, "frozen", True, create=True), mock.patch.object(
+            config.sys, "platform", "darwin"
+        ), mock.patch.object(config.sys, "executable", str(ejecutable)):
+            _escribir(resources / "config.json", "https://resources.test/v1/")
+            check(
+                "macos: api_url lee config.json de Contents/Resources",
+                config.api_url() == "https://resources.test",
+                config.api_url(),
+            )
+            (resources / "config.json").unlink()
+            _escribir(macos / "config.json", "https://macos.test")
+            check(
+                "macos: api_url lee config.json de Contents/MacOS",
+                config.api_url() == "https://macos.test",
+                config.api_url(),
+            )
+            (macos / "config.json").unlink()
+            _escribir(app / "config.json", "https://raiz-app.test")
+            check(
+                "macos: api_url lee config.json en la raiz del .app",
+                config.api_url() == "https://raiz-app.test",
+                config.api_url(),
+            )
+            (app / "config.json").unlink()
+            _escribir(tmp / "config.json", "https://al-lado.test")
+            check(
+                "macos: api_url lee config.json junto al .app",
+                config.api_url() == "https://al-lado.test",
+                config.api_url(),
+            )
+            (tmp / "config.json").unlink()
+
+        with mock.patch.object(config.sys, "frozen", False, create=True), mock.patch.object(
+            config.sys, "platform", "darwin"
+        ), mock.patch.object(config.sys, "executable", str(ejecutable)):
+            from core.config import settings
+
+            with mock.patch.object(settings, "mwx_api_url", ""):
+                check(
+                    "macos: en desarrollo NO lee config.json del .app",
+                    config.api_url() == "",
+                    config.api_url(),
+                )
+
+
 # ---------------------------------------------------------------------------
 # API client
 # ---------------------------------------------------------------------------
@@ -639,6 +727,55 @@ def _test_runner(check, tmp: Path) -> None:
         ).get("navegadores")
         == 2,
     )
+    check(
+        "runner: config_efectiva sin sin_imagenes -> True (ahorra datos)",
+        runner.config_efectiva({"campana": {}}, None).get("sin_imagenes")
+        is True,
+    )
+    check(
+        "runner: config_efectiva lee sin_imagenes=False del panel",
+        runner.config_efectiva(
+            {"campana": {"sin_imagenes": False}}, None
+        ).get("sin_imagenes")
+        is False,
+    )
+    check(
+        "runner: config_efectiva permite ajuste de sin_imagenes",
+        runner.config_efectiva(
+            {"campana": {"permitir_ajustes": True, "sin_imagenes": True}},
+            {"sin_imagenes": False},
+        ).get("sin_imagenes")
+        is False,
+    )
+    check(
+        "runner: config_efectiva ignora sin_imagenes local sin permiso",
+        runner.config_efectiva(
+            {"campana": {"permitir_ajustes": False, "sin_imagenes": False}},
+            {"sin_imagenes": True},
+        ).get("sin_imagenes")
+        is False,
+    )
+    base_origen = runner.config_efectiva(
+        {"campana": {"navegadores": 2}}, None
+    )
+    check(
+        "runner: config_efectiva reporta origen/panel de navegadores",
+        base_origen.get("navegadores_origen") == "panel"
+        and base_origen.get("navegadores_panel") == 2
+        and base_origen.get("sin_imagenes_origen") == "panel",
+        str(base_origen),
+    )
+    con_ajustes = runner.config_efectiva(
+        {"campana": {"permitir_ajustes": True, "navegadores": 2}},
+        {"navegadores": 1},
+    )
+    check(
+        "runner: config_efectiva marca origen ajustes y conserva el panel",
+        con_ajustes.get("navegadores") == 1
+        and con_ajustes.get("navegadores_origen") == "ajustes"
+        and con_ajustes.get("navegadores_panel") == 2,
+        str(con_ajustes),
+    )
 
     env_previos = {clave: os.environ.get(clave) for clave in _CLAVES_ENV}
     settings_previos = (
@@ -679,6 +816,8 @@ def _test_runner(check, tmp: Path) -> None:
             "planificadas": 3,
             "hechas": 3,
             "cancelada": False,
+            "navegadores": 2,
+            "navegadores_usados": 2,
             "eventos": [
                 {
                     "usuario": "uno",
@@ -781,6 +920,27 @@ def _test_runner(check, tmp: Path) -> None:
         "runner: pasa navegadores del servidor (2)",
         capturado.get("navegadores") == 2,
     )
+    check(
+        "runner: pasa sin_imagenes=True por defecto",
+        capturado.get("sin_imagenes") is True,
+    )
+    check(
+        "runner: no visita el perfil ni inyecta proxies",
+        "usar_proxy" not in capturado,
+    )
+    check(
+        "runner: resumen con navegadores usados no genera aviso",
+        resumen.get("navegadores_solicitados") == 2
+        and resumen.get("navegadores_usados") == 2
+        and not resumen.get("navegadores_aviso"),
+        str(
+            (
+                resumen.get("navegadores_solicitados"),
+                resumen.get("navegadores_usados"),
+                resumen.get("navegadores_aviso"),
+            )
+        ),
+    )
     rutas = capturado.get("imagenes") or []
     check(
         "runner: descarga imagenes a DATA_DIR/temp",
@@ -875,6 +1035,122 @@ def _test_runner(check, tmp: Path) -> None:
         capturado.get("cancelar") is evento_cancelado
         and capturado["cancelar"].is_set(),
     )
+
+    # ---- Diagnostico de navegadores (panel vs ejecutable) ----
+    ejecutor_diag_previo = runner.ejecutar_campana_local
+    carpeta_diag_previo = runner._carpeta_imagenes
+    evento_diag_previo = runner._evento_async
+
+    def _correr_diagnostico(perfil_d, ajustes_d, usuarios_d, resumen_d):
+        capturado.clear()
+
+        def ejecutor_diag(**kwargs):
+            capturado.update(kwargs)
+            return dict(resumen_d)
+
+        runner.ejecutar_campana_local = ejecutor_diag
+        runner._carpeta_imagenes = lambda: carpeta
+        runner._evento_async = lambda *args, **kwargs: None
+        return runner.ejecutar_campana(
+            perfil_d,
+            "",
+            "",
+            ajustes=ajustes_d,
+            cliente=None,
+            usuarios=list(usuarios_d),
+        )
+
+    try:
+        base = {"ok": True, "exitosas": 1, "fallidas": 0, "hechas": 1}
+        perfil_ajustes = {
+            "campana": {
+                "permitir_ajustes": True,
+                "navegadores": 3,
+                "sin_imagenes": True,
+            },
+            "cuentas": [],
+        }
+        resumen_ajustes = _correr_diagnostico(
+            perfil_ajustes,
+            {"navegadores": 1, "sin_imagenes": False},
+            ["uno", "dos", "tres"],
+            dict(base, navegadores=1, navegadores_usados=1),
+        )
+        check(
+            "runner: avisa cuando los ajustes locales pisan al panel",
+            "ajustes locales" in str(resumen_ajustes.get("navegadores_aviso"))
+            and "panel dice 3" in str(resumen_ajustes.get("navegadores_aviso")),
+            str(resumen_ajustes.get("navegadores_aviso")),
+        )
+        check(
+            "runner: respeta sin_imagenes de los ajustes locales",
+            capturado.get("sin_imagenes") is False
+            and resumen_ajustes.get("navegadores_solicitados") == 1,
+        )
+
+        perfil_pocas = {"campana": {"navegadores": 2}, "cuentas": []}
+        resumen_pocas = _correr_diagnostico(
+            perfil_pocas,
+            None,
+            ["uno"],
+            dict(base, navegadores=2, navegadores_usados=1),
+        )
+        check(
+            "runner: explica que hay menos cuentas que navegadores",
+            "Solo hay 1 cuenta" in str(resumen_pocas.get("navegadores_aviso"))
+            and "Asigna" in str(resumen_pocas.get("navegadores_aviso")),
+            str(resumen_pocas.get("navegadores_aviso")),
+        )
+
+        resumen_viejo = _correr_diagnostico(
+            {"campana": {"navegadores": 2}, "cuentas": []},
+            None,
+            ["uno", "dos"],
+            dict(base, navegadores=2),
+        )
+        check(
+            "runner: avisa cuando el motor viejo no reporta navegadores",
+            "no reporta navegadores" in str(
+                resumen_viejo.get("navegadores_aviso")
+            )
+            and "actualiza el ejecutable"
+            in str(resumen_viejo.get("navegadores_aviso")),
+            str(resumen_viejo.get("navegadores_aviso")),
+        )
+
+        resumen_cero = _correr_diagnostico(
+            {"campana": {"navegadores": 2}, "cuentas": []},
+            None,
+            ["uno", "dos"],
+            dict(base, navegadores=2, navegadores_usados=0),
+        )
+        check(
+            "runner: avisa cuando no se pudo abrir ningun Chrome",
+            "No se pudo abrir ningún Chrome" in str(
+                resumen_cero.get("navegadores_aviso")
+            ),
+            str(resumen_cero.get("navegadores_aviso")),
+        )
+
+        resumen_error = _correr_diagnostico(
+            {"campana": {"navegadores": 2}, "cuentas": []},
+            None,
+            ["uno", "dos"],
+            {
+                "ok": False,
+                "error": "sin URL de tweet ancla",
+                "navegadores": 2,
+            },
+        )
+        check(
+            "runner: no inventa aviso de motor viejo si fallo antes de correr",
+            not resumen_error.get("navegadores_aviso"),
+            str(resumen_error.get("navegadores_aviso")),
+        )
+    finally:
+        runner.ejecutar_campana_local = ejecutor_diag_previo
+        runner._carpeta_imagenes = carpeta_diag_previo
+        runner._evento_async = evento_diag_previo
 
 
 # ---------------------------------------------------------------------------
@@ -983,6 +1259,21 @@ def _test_ui(check) -> None:
                     "ui: el resumen muestra los navegadores del perfil",
                     "2 navegadores" in app._lbl_resumen.cget("text"),
                 )
+                check(
+                    "ui: el resumen indica imagenes de pagina desactivadas",
+                    "imágenes de página desactivadas"
+                    in app._lbl_resumen.cget("text"),
+                    app._lbl_resumen.cget("text"),
+                )
+                app.ajustes = {"sin_imagenes": False}
+                app._actualizar_resumen_campana()
+                check(
+                    "ui: los ajustes locales muestran imagenes activadas",
+                    "imágenes de página activadas"
+                    in app._lbl_resumen.cget("text"),
+                    app._lbl_resumen.cget("text"),
+                )
+                app.ajustes = {}
 
                 perfil_nuevo = json.loads(json.dumps(perfil_ui))
                 perfil_nuevo["campana"]["hashtags"] = ["#Nuevo"]
@@ -1089,6 +1380,64 @@ def _test_ui(check) -> None:
                     "ui: la actualizacion pendiente se muestra al terminar",
                     dialogos["n"] == 1,
                 )
+
+                app._campana_activa = False
+                app.mostrar_fin(
+                    {
+                        "ok": True,
+                        "exitosas": 1,
+                        "fallidas": 0,
+                        "omitidas": 0,
+                        "hechas": 1,
+                        "cancelada": False,
+                        "navegadores_solicitados": 2,
+                        "navegadores_usados": 1,
+                        "navegadores_aviso": (
+                            "El equipo tiene ajustes locales guardados (1 "
+                            "navegador); el panel dice 2."
+                        ),
+                        "eventos": [],
+                    }
+                )
+                raiz.update_idletasks()
+                textos = []
+
+                def _recolectar_textos(widget):
+                    try:
+                        textos.append(str(widget.cget("text")))
+                    except tk.TclError:
+                        pass
+                    for hijo in widget.winfo_children():
+                        _recolectar_textos(hijo)
+
+                _recolectar_textos(app.contenedor)
+                texto_nav_fin = next(
+                    (
+                        texto
+                        for texto in textos
+                        if "2 configurado(s)" in texto
+                        and "1 usado(s)" in texto
+                    ),
+                    "",
+                )
+                check(
+                    "ui: el fin muestra navegadores configurados y usados",
+                    bool(texto_nav_fin),
+                    texto_nav_fin,
+                )
+                texto_aviso_fin = next(
+                    (
+                        texto
+                        for texto in textos
+                        if "ajustes locales" in texto
+                    ),
+                    "",
+                )
+                check(
+                    "ui: el fin muestra el aviso de navegadores",
+                    bool(texto_aviso_fin),
+                    "aviso mostrado" if texto_aviso_fin else "",
+                )
             finally:
                 if app is not None:
                     app.detener()
@@ -1131,9 +1480,10 @@ def _test_entregables(check) -> None:
     )
     check("main: freeze_support dentro del bloque __main__", llamada_freeze)
     check(
-        "entregables: icono y logo generados",
+        "entregables: icono, logo e icono de macOS generados",
         (RAIZ / "assets" / "mwx_app.ico").is_file()
-        and (RAIZ / "assets" / "mwx_logo.png").is_file(),
+        and (RAIZ / "assets" / "mwx_logo.png").is_file()
+        and (RAIZ / "assets" / "mwx_app.icns").is_file(),
     )
     especificacion = (RAIZ / "mwx_app.spec").read_text(encoding="utf-8")
     requisitos = (RAIZ / "requirements-mwx.txt").read_text(encoding="utf-8")
@@ -1148,10 +1498,12 @@ def _test_entregables(check) -> None:
         "plataformas.twitter.api_http",
     )
     check(
-        "entregables: spec con onedir, icono y exclusiones",
+        "entregables: spec con onedir, icono, BUNDLE macOS y exclusiones",
         "COLLECT(" in especificacion
         and "console=False" in especificacion
         and "mwx_app.ico" in especificacion
+        and "mwx_app.icns" in especificacion
+        and "BUNDLE(" in especificacion
         and all(nombre in especificacion for nombre in excluidos),
     )
     check(
@@ -1173,6 +1525,7 @@ def run(check) -> None:
     tmp = Path(tempfile.mkdtemp(prefix="mwx_app_test_"))
     try:
         _test_config(check, tmp)
+        _test_macos(check, tmp)
         _test_api_client(check)
         _test_store(check, tmp)
         _test_runner(check, tmp)

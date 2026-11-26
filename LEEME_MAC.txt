@@ -1,0 +1,53 @@
+MWX APP para macOS
+==================
+
+Requisitos
+----------
+- macOS 11 o superior (Apple Silicon o Intel, segun el ZIP descargado).
+- Google Chrome instalado (la app lo usa para publicar en X).
+- Conexion a internet para iniciar sesion y ejecutar la campana.
+
+Instalacion
+-----------
+1. Descomprime el ZIP. Veras una carpeta con:
+   - MWX APP.app
+   - config.json (si el administrador lo incluyo)
+   - este archivo LEEME_MAC.txt
+2. Arrastra MWX APP.app a la carpeta Aplicaciones.
+3. Primer arranque: clic derecho sobre MWX APP.app > Abrir (o Abrir en el
+   aviso de seguridad) y confirma. La app NO esta firmada ni notarizada, por
+   eso macOS muestra una advertencia la primera vez.
+
+Configuracion del servidor
+--------------------------
+La app pide la direccion del servidor en pantalla. Tambien puedes crearla a
+mano en un archivo config.json con este contenido:
+
+  {"api_url": "https://mwx-api-production.up.railway.app"}
+
+Se lee, en este orden:
+1. La variable de entorno MWX_API_URL (si existe).
+2. config.json en ~/.mwx_app/config.json.
+3. config.json dentro de MWX APP.app (Contents/MacOS o Contents/Resources),
+   en la raiz del .app o junto a MWX APP.app.
+4. La configuracion del servidor por defecto.
+
+La carpeta ~/.mwx_app/ guarda solo datos de ESTE equipo (sesion, machine_id y
+la configuracion); no contiene cuentas.
+
+Actualizaciones (IMPORTANTE)
+----------------------------
+En macOS la actualizacion es MANUAL: la app NO se autoactualiza y NO descarga
+el ZIP de Windows. Cuando el administrador publique una version nueva:
+
+1. Descarga el ZIP nuevo desde el panel de administracion o desde la pagina
+   de releases del proyecto.
+2. Cierra MWX APP.
+3. Reemplaza la MWX APP.app anterior en Aplicaciones por la nueva.
+4. Conserva tu config.json (o vuelve a escribir la direccion del servidor).
+
+Privacidad
+----------
+El ZIP NO incluye cuentas, cookies, contrasenas ni el archivo .env. La app
+descarga unicamente las cuentas asignadas a tu usuario cuando inicias sesion.
+No compartas el ZIP junto con datos de cuentas.

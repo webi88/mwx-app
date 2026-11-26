@@ -83,6 +83,30 @@ def _entero(valor: Any, defecto: int, minimo: int, maximo: int) -> int:
     return max(minimo, min(maximo, numero))
 
 
+def _booleano(valor: Any, defecto: bool = True) -> bool:
+    """bool tolerante (None -> `defecto`; acepta bool, 0/1 y si/no/true/false)."""
+    if valor is None:
+        return bool(defecto)
+    if isinstance(valor, str):
+        texto = valor.strip().lower()
+        if texto in ("1", "true", "si", "sí", "yes", "on"):
+            return True
+        if texto in ("0", "false", "no", "off", ""):
+            return False
+        return bool(defecto)
+    return bool(valor)
+
+
+def _entero_resumen(resumen: dict, clave: str) -> Optional[int]:
+    """Entero de un campo del resumen del motor (None si no viene)."""
+    if not isinstance(resumen, dict) or clave not in resumen:
+        return None
+    try:
+        return int(resumen.get(clave))
+    except (TypeError, ValueError):
+        return None
+
+
 def _lista_usuarios(usuarios: Any) -> list:
     if usuarios is None:
         return []
@@ -196,6 +220,57 @@ def _evento_async(
     hilo.start()
 
 
+def _diagnostico_navegadores(config: dict, resumen: dict, usuarios: list) -> dict:
+    """Explica por que se usaron menos navegadores que los solicitados."""
+    solicitados = int(config.get("navegadores") or 1)
+    panel = int(config.get("navegadores_panel") or solicitados)
+    origen = str(config.get("navegadores_origen") or "panel")
+    usados = _entero_resumen(resumen, "navegadores_usados")
+    salida: dict = {
+        "navegadores_solicitados": solicitados,
+        "navegadores_aviso": "",
+    }
+    if usados is not None:
+        salida["navegadores_usados"] = usados
+    if solicitados <= 1 and not (origen == "ajustes" and panel > 1):
+        return salida
+    if usados == 0:
+        aviso = (
+            "No se pudo abrir ningún Chrome: revisa Chrome instalado / "
+            "chromedriver / RAM."
+        )
+    elif origen == "ajustes" and solicitados != panel:
+        aviso = (
+            f"El equipo tiene ajustes locales guardados ({solicitados} "
+            f"navegador(es)); el panel dice {panel}. Usa «Usar configuración "
+            "del panel» en Ajustes."
+        )
+    elif usados is None:
+        if str(resumen.get("error") or "").strip():
+            aviso = ""
+        else:
+            aviso = (
+                "La versión del motor no reporta navegadores; actualiza el "
+                "ejecutable."
+            )
+    elif usados < solicitados and len(usuarios) < solicitados:
+        aviso = (
+            f"Solo hay {len(usuarios)} cuenta(s) activa(s) asignada(s); se "
+            "abrirá 1 Chrome por cuenta disponible. Asigna más cuentas al "
+            "usuario."
+        )
+    elif usados < solicitados:
+        aviso = (
+            f"Se solicitaron {solicitados} navegadores pero solo se usaron "
+            f"{usados}. Revisa RAM/CPU o baja los navegadores."
+        )
+    else:
+        aviso = ""
+    if aviso:
+        salida["navegadores_aviso"] = aviso
+    return salida
+
+
 def config_efectiva(perfil: dict, ajustes: Optional[dict]) -> dict:
     campana = (perfil or {}).get("campana") or {}
     permitir = bool(campana.get("permitir_ajustes"))
@@ -219,9 +294,25 @@ def config_efectiva(perfil: dict, ajustes: Optional[dict]) -> dict:
     limite = _entero(
         ajustes.get("limite_dia", campana.get("limite_dia", 49)), 49, 1, 49
     )
-    navegadores = _entero(
-        ajustes.get("navegadores", campana.get("navegadores", 1)), 1, 1, 3
-    )
+    navegadores_panel = _entero(campana.get("navegadores", 1), 1, 1, 3)
+    if "navegadores" in ajustes:
+        navegadores = _entero(
+            ajustes.get("navegadores"), navegadores_panel, 1, 3
+        )
+        navegadores_origen = "ajustes"
+    else:
+        navegadores = navegadores_panel
+        navegadores_origen = "panel"
+
+    sin_imagenes_panel = _booleano(campana.get("sin_imagenes"), True)
+    if "sin_imagenes" in ajustes:
+        sin_imagenes = _booleano(
+            ajustes.get("sin_imagenes"), sin_imagenes_panel
+        )
+        sin_imagenes_origen = "ajustes"
+    else:
+        sin_imagenes = sin_imagenes_panel
+        sin_imagenes_origen = "panel"
 
     hashtags = campana.get("hashtags") or []
     if isinstance(hashtags, str):
@@ -251,6 +342,10 @@ def config_efectiva(perfil: dict, ajustes: Optional[dict]) -> dict:
         "urls": [str(url).strip() for url in urls if str(url or "").strip()],
         "imagenes": campana.get("imagenes") or [],
         "navegadores": navegadores,
+        "navegadores_origen": navegadores_origen,
+        "navegadores_panel": navegadores_panel,
+        "sin_imagenes": sin_imagenes,
+        "sin_imagenes_origen": sin_imagenes_origen,
     }
 
 
@@ -297,7 +392,9 @@ def ejecutar_campana(
     detalle_inicio = (
         f"cuentas={len(usuarios)} acciones_por_cuenta={config['acciones_por_cuenta']} "
         f"ventana={config['duracion_min']}min imagenes={len(imagenes)} "
-        f"navegadores={config['navegadores']}"
+        f"navegadores={config['navegadores']} "
+        f"navegadores_origen={config['navegadores_origen']} "
+        f"sin_imagenes={config['sin_imagenes']}"
     )
     _evento_async(cliente, token, "campana_inicio", detalle_inicio)
 
@@ -321,6 +418,7 @@ def ejecutar_campana(
             pausa_entre_acciones_seg=config["pausa_seg"],
             capturar_url=True,
             navegadores=config["navegadores"],
+            sin_imagenes=config["sin_imagenes"],
         )
         if not isinstance(resumen, dict):
             resumen = {
@@ -340,6 +438,13 @@ def ejecutar_campana(
             "cancelada": False,
             "eventos": [],
         }
+
+    diagnostico = _diagnostico_navegadores(config, resumen, usuarios)
+    resumen["navegadores_solicitados"] = diagnostico["navegadores_solicitados"]
+    if "navegadores_usados" in diagnostico:
+        resumen["navegadores_usados"] = diagnostico["navegadores_usados"]
+    if diagnostico.get("navegadores_aviso"):
+        resumen["navegadores_aviso"] = diagnostico["navegadores_aviso"]
 
     detalle_fin = (
         f"exitosas={resumen.get('exitosas', 0)} "

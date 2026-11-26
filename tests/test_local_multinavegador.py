@@ -114,6 +114,7 @@ class _BotMulti:
         self.posts: list = []
         self.citas: list = []
         self.usuarios_usados: list = []
+        self.secuencia: list = []
         self.cambios: list = []
         self.cerrado = False
         with type(self)._lock_creados:
@@ -150,6 +151,7 @@ class _BotMulti:
     def publicar_tweet(self, texto, imagen_path=None, buscar_url=True,
                        buscar_url_perfil=None):
         self._anotar_usuario()
+        self.secuencia.append(self.usuario)
         self.posts.append({"usuario": self.usuario, "texto": texto})
         url = f"https://x.com/{self.usuario}/status/{len(self.posts)}"
         self.ultima_url_publicada = url
@@ -161,6 +163,7 @@ class _BotMulti:
                         dar_like=False, imagen_path=None, buscar_url=True,
                         buscar_url_perfil=None):
         self._anotar_usuario()
+        self.secuencia.append(self.usuario)
         self.citas.append({"usuario": usuario, "mensaje_cita": mensaje_cita})
         return {"exitos": 1, "fallidos": 0, "urls": []}
 
@@ -214,9 +217,16 @@ def _campana(cuentas, bot_cls, reloj):
         yield registros
 
 
-def _ejecutar(clase, cuentas, navegadores, **kwargs):
+def _ejecutar(clase, cuentas, navegadores, orden_estable=False, **kwargs):
     reloj = _RelojHilos()
-    with _settings(local_max_cuentas=0, limite_local_dia=49, headless=False):
+    extra = []
+    if orden_estable:
+        # Plan round-robin CANONICO (misma ronda en el mismo orden): permite
+        # comprobar de forma determinista que cada cubeta intercala cuentas.
+        extra.append((local_mod.random, "shuffle", lambda _lista: None))
+    with _parches(*extra), _settings(
+        local_max_cuentas=0, limite_local_dia=49, headless=False
+    ):
         with _campana(cuentas, clase, reloj):
             res = local_mod.ejecutar_campana_local(
                 usuarios=[cuenta["usuario"] for cuenta in cuentas],
@@ -295,6 +305,73 @@ def test_particion(check):
                 all(valores == sorted(valores) for valores in por_usuario.values()),
             )
 
+    # Plan ROUND-ROBIN (el que genera `_construir_plan`: ronda 1 de todas las
+    # cuentas, ronda 2...). Al filtrar por cubeta las cuentas deben quedar
+    # INTERCALADAS, no todas las acciones de una cuenta y luego la siguiente.
+    def _plan_round_robin(usuarios, acciones_por_cuenta):
+        plan_rr = []
+        for ronda in range(acciones_por_cuenta):
+            for usuario in usuarios:
+                plan_rr.append(
+                    {
+                        "usuario": usuario,
+                        "rol": "hashtags" if ronda % 2 == 0 else "cita",
+                        "orden": ronda,
+                    }
+                )
+        return plan_rr
+
+    plan_rr = _plan_round_robin(["a", "b", "c", "d"], 3)
+    for n in (2, 3):
+        cubetas = local_mod._partir_plan_por_navegador(plan_rr, n)
+        union = [accion for cubeta in cubetas for accion in cubeta]
+        check(
+            f"RR N={n}: union exacta (sin perder ni duplicar acciones)",
+            len(union) == len(plan_rr)
+            and sorted(id(accion) for accion in union)
+            == sorted(id(accion) for accion in plan_rr),
+            f"({[len(c) for c in cubetas]})",
+        )
+        usuarios_por_cubeta = [
+            {accion["usuario"] for accion in cubeta} for cubeta in cubetas
+        ]
+        check(
+            f"RR N={n}: cada cuenta entera en una sola cubeta",
+            all(
+                not (usuarios_por_cubeta[i] & usuarios_por_cubeta[j])
+                for i in range(n) for j in range(i + 1, n)
+            )
+            and set().union(*usuarios_por_cubeta) == {"a", "b", "c", "d"},
+        )
+        sin_repetidas = True
+        for cubeta in cubetas:
+            if len({accion["usuario"] for accion in cubeta}) < 2:
+                continue
+            for primera, segunda in zip(cubeta, cubeta[1:]):
+                if primera["usuario"] == segunda["usuario"]:
+                    sin_repetidas = False
+        check(
+            f"RR N={n}: con 2+ cuentas por cubeta NO hay dos acciones "
+            "consecutivas de la misma cuenta",
+            sin_repetidas,
+            str([[a["usuario"] for a in cubeta] for cubeta in cubetas]),
+        )
+        for cubeta in cubetas:
+            por_usuario = {}
+            for accion in cubeta:
+                por_usuario.setdefault(accion["usuario"], []).append(
+                    accion["orden"]
+                )
+            check(
+                f"RR N={n}: el orden interno de cada cuenta se conserva",
+                all(valores == sorted(valores) for valores in por_usuario.values()),
+            )
+        check(
+            f"RR N={n}: cubetas equilibradas",
+            max(len(c) for c in cubetas) - min(len(c) for c in cubetas) <= 3,
+            f"({[len(c) for c in cubetas]})",
+        )
+
     vacio = local_mod._partir_plan_por_navegador([], 2)
     check(
         "plan vacio: N listas vacias",
@@ -353,6 +430,7 @@ def test_campana_dos_navegadores(check):
         clase,
         cuentas,
         navegadores=2,
+        orden_estable=True,
         urls=["https://x.com/ancla/status/1"],
         hashtags="#mexico",
         texto_base="texto base",
@@ -382,6 +460,19 @@ def test_campana_dos_navegadores(check):
         "navegadores=2: entre los 2 bots cubren las 4 cuentas",
         set().union(*usuarios_por_bot) == {c["usuario"] for c in cuentas},
         f"({usuarios_por_bot})",
+    )
+    check(
+        "navegadores=2: cada bot ALTERNA sus cuentas (sin 2 seguidas de la "
+        "misma si hay otra disponible)",
+        all(
+            all(
+                primera != segunda
+                for primera, segunda in zip(bot.secuencia, bot.secuencia[1:])
+            )
+            for bot in bots
+            if len(set(bot.secuencia)) > 1
+        ),
+        f"({[bot.secuencia for bot in bots]})",
     )
     check(
         "navegadores=2: resumen reporta N, usados y por_navegador",

@@ -146,6 +146,27 @@ def _test_puede(check) -> None:
         check("updater: en desarrollo no se actualiza", updater.puede_actualizarse() is False)
     with mock.patch.object(updater.sys, "frozen", True, create=True):
         check("updater: congelado puede actualizarse", updater.puede_actualizarse() is True)
+    with mock.patch.object(updater.sys, "frozen", True, create=True), mock.patch.object(
+        updater.sys, "platform", "darwin"
+    ):
+        check(
+            "updater: en macOS congelado NO hay autoactualizacion (manual)",
+            updater.puede_actualizarse() is False,
+        )
+    with mock.patch.object(updater.sys, "frozen", True, create=True), mock.patch.object(
+        updater.sys, "platform", "win32"
+    ):
+        check(
+            "updater: en Windows congelado SI hay autoactualizacion",
+            updater.puede_actualizarse() is True,
+        )
+    with mock.patch.object(updater.sys, "frozen", False, create=True), mock.patch.object(
+        updater.sys, "platform", "darwin"
+    ):
+        check(
+            "updater: en macOS en desarrollo tampoco se actualiza",
+            updater.puede_actualizarse() is False,
+        )
 
 
 # ---------------------------------------------------------------------------

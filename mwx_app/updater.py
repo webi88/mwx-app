@@ -212,8 +212,15 @@ def comparar_versiones(a, b) -> int:
 
 
 def puede_actualizarse() -> bool:
-    """True solo dentro del ejecutable congelado (en desarrollo no aplica)."""
+    """True solo en el ejecutable congelado de Windows.
+
+    En macOS NO hay autoactualizador: la actualizacion es MANUAL (descargar el
+    ZIP nuevo desde el panel/GitHub y reemplazar la app), asi que el gate queda
+    cerrado para no bajar un ZIP de Windows. En desarrollo tampoco aplica.
+    """
     try:
+        if sys.platform == "darwin":
+            return False
         return bool(getattr(sys, "frozen", False))
     except Exception:
         return False

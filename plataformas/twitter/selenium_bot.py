@@ -175,6 +175,20 @@ def _marcar_proxy_x_valido(proxy: str) -> None:
         pass
 
 
+def marcar_proxy_x_validado(proxy: str) -> None:
+    """Marca `proxy` como recien validado contra x.com (API publica).
+
+    Para callers que YA validaron el proxy por su cuenta (p.ej. el pre-vuelo
+    de la campaña LOCAL con `ProxyManager.x_accesible`): evita que el primer
+    `cambiar_cuenta`/publicacion de cada cuenta pague OTRA validacion
+    (0.5-1.5s; hasta ~60s si el proxy rota). Respeta `PROXY_X_CACHE_SEG=0`
+    (no cachea): con la cache apagada la validacion de seguridad se sigue
+    haciendo SIEMPRE (un proxy vencido/407 se detecta cuando el TTL expira o
+    la cache esta desactivada). Nunca lanza.
+    """
+    _marcar_proxy_x_valido(proxy)
+
+
 class TwitterBot:
     # Fallback para instancias creadas sin `__init__` (tests/legado): `__init__`
     # siempre fija el valor por instancia.

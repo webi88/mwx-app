@@ -24,6 +24,10 @@ data/reportes/
 data/releases/
 data/clientes/
 data/clientes_bot.json
+# Just Another Panel: API key local y cache del catalogo (no se commitean)
+data/jap_config.json
+data/jap_services_cache.json
+selftest_mwx.json
 *.db-shm
 *.db-wal
 .DS_Store
@@ -37,3 +41,4 @@ data/logs/mwx_app.log
 build/
 dist/
 .venv-mwx/
+.venv-mwx-mac/

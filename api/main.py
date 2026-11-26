@@ -210,6 +210,7 @@ def _campana_payload(config: Optional[AppConfig]) -> dict:
             "imagenes": [],
             "permitir_ajustes": False,
             "navegadores": 1,
+            "sin_imagenes": True,
         }
 
     hashtags = [str(x).strip() for x in _lista_json(config.hashtags) if str(x).strip()]
@@ -219,6 +220,10 @@ def _campana_payload(config: Optional[AppConfig]) -> dict:
         normalizada = _imagen_payload(item)
         if normalizada:
             imagenes.append(normalizada)
+
+    sin_imagenes = getattr(config, "sin_imagenes", True)
+    if sin_imagenes is None:
+        sin_imagenes = True
 
     return {
         "hashtags": hashtags,
@@ -235,6 +240,7 @@ def _campana_payload(config: Optional[AppConfig]) -> dict:
         "navegadores": max(
             1, min(3, _entero(getattr(config, "navegadores", 1), 1))
         ),
+        "sin_imagenes": bool(sin_imagenes),
     }
 
 

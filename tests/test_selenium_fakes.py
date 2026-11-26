@@ -2833,6 +2833,113 @@ def test_publicar_tweet_ciclo_limpio_una_vez(check):
     )
 
 
+def test_proxy_cache_prevalidado(check):
+    """Pre-vuelo marca el proxy: `cambiar_cuenta` NO revalida x.com (TTL).
+
+    `activaciones/local._asignar_proxies_cuentas` ya valida cada proxy con
+    `ProxyManager.x_accesible` y lo marca con `marcar_proxy_x_validado`; el
+    primer cambio de cada cuenta debe usar la cache. Con
+    `PROXY_X_CACHE_SEG=0` la cache se desactiva y SI se valida (la deteccion
+    de proxies vencidos/407 no se pierde).
+    """
+    import os
+
+    import plataformas.twitter.selenium_bot as modulo
+
+    class _DriverFalso:
+        def __init__(self):
+            self.current_url = "https://x.com/home"
+            self.cdp = []
+
+        def execute_cdp_cmd(self, comando, parametros):
+            self.cdp.append((comando, parametros))
+            return {}
+
+    class _Fwd:
+        def __init__(self):
+            self.upstreams = []
+
+        def cambiar_upstream(self, proxy):
+            self.upstreams.append(proxy)
+
+    class _PMCache:
+        def __init__(self):
+            self.llamadas = []
+
+        def x_accesible(self, proxy, timeout=12):
+            self.llamadas.append(proxy)
+            return True
+
+    proxy_a = "http://user_session-aaa:pass@127.0.0.1:8001"
+    proxy_b = "http://user_session-bbb:pass@127.0.0.1:8002"
+    proxy_por_usuario = {"cache_a": proxy_a, "cache_b": proxy_b}
+
+    def _ejecutar(cache_seg):
+        pm = _PMCache()
+        previo = os.environ.get("PROXY_X_CACHE_SEG")
+        os.environ["PROXY_X_CACHE_SEG"] = str(cache_seg)
+        with modulo._PROXY_X_LOCK:
+            modulo._PROXY_X_VALIDADOS.clear()
+        if cache_seg > 0:
+            # Simula el pre-vuelo: ambos proxies ya validados con x_accesible.
+            modulo.marcar_proxy_x_validado(proxy_a)
+            modulo.marcar_proxy_x_validado(proxy_b)
+        try:
+            with mock.patch.object(modulo, "ProxyManager", lambda: pm), \
+                    mock.patch.object(
+                        TwitterBot,
+                        "_obtener_proxy",
+                        lambda self: proxy_por_usuario.get(self.usuario, ""),
+                    ), mock.patch.object(
+                        TwitterBot, "_obtener_ua_consistente", return_value=""
+                    ), mock.patch.object(
+                        TwitterBot, "preparar_sesion_cdp", return_value=True
+                    ):
+                bot = TwitterBot("cuenta_inicial", modo_local=True)
+                bot._local_con_proxy = True
+                bot._fwd_proxy = _Fwd()
+                bot.driver = _DriverFalso()
+                ok_a = bot.cambiar_cuenta("cache_a", proxy=proxy_a)
+                ok_b = bot.cambiar_cuenta("cache_b", proxy=proxy_b)
+                return bot, ok_a, ok_b, list(pm.llamadas)
+        finally:
+            if previo is None:
+                os.environ.pop("PROXY_X_CACHE_SEG", None)
+            else:
+                os.environ["PROXY_X_CACHE_SEG"] = previo
+            with modulo._PROXY_X_LOCK:
+                modulo._PROXY_X_VALIDADOS.clear()
+
+    bot, ok_a, ok_b, llamadas = _ejecutar(300)
+    check(
+        "proxy cache: 2 cuentas con proxy prevalidado cambian sin error",
+        ok_a is True and ok_b is True,
+        f"({ok_a}, {ok_b}) {bot.ultimo_error}",
+    )
+    check(
+        "proxy cache: con proxy prevalidado NO se llama x_accesible",
+        llamadas == [],
+        str(llamadas),
+    )
+    check(
+        "proxy cache: el upstream se mueve igual (proxy sticky intacto)",
+        bot._fwd_proxy.upstreams == [proxy_a, proxy_b],
+        str(bot._fwd_proxy.upstreams),
+    )
+
+    _bot_off, ok_a_off, ok_b_off, llamadas_off = _ejecutar(0)
+    check(
+        "proxy cache OFF (PROXY_X_CACHE_SEG=0): cambiar_cuenta sigue OK",
+        ok_a_off is True and ok_b_off is True,
+        f"({ok_a_off}, {ok_b_off})",
+    )
+    check(
+        "proxy cache OFF: SI valida x.com (una vez por cuenta)",
+        llamadas_off == [proxy_a, proxy_b],
+        str(llamadas_off),
+    )
+
+
 def run(check):
     """Ejecuta los checks de este archivo con el `check` del runner."""
     with _sin_esperas():
@@ -2869,6 +2976,7 @@ def run(check):
         test_publicar_tweet_sin_perfil(check)
         test_solo_retwittear_cita_ruta_rapida(check)
         test_solo_retwittear_rt_sin_link(check)
+        test_proxy_cache_prevalidado(check)
 
 
 if __name__ == "__main__":

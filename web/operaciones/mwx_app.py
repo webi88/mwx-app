@@ -79,6 +79,7 @@ CONFIG_DEFECTO = {
     "duracion_min": 60,
     "limite_dia": 49,
     "navegadores": 1,
+    "sin_imagenes": True,
     "imagenes": [],
     "permitir_ajustes": False,
 }
@@ -764,6 +765,7 @@ def obtener_config_app(usuario_id) -> dict:
     if fila is None:
         return config
 
+    sin_imagenes_fila = getattr(fila, "sin_imagenes", True)
     config.update(
         {
             "hashtags": _lista_json(fila.hashtags),
@@ -777,6 +779,9 @@ def obtener_config_app(usuario_id) -> dict:
             "limite_dia": int(fila.limite_dia or 49),
             "navegadores": _entero(
                 getattr(fila, "navegadores", 1), 1, 1, 3
+            ),
+            "sin_imagenes": (
+                True if sin_imagenes_fila is None else _bool(sin_imagenes_fila)
             ),
             "imagenes": [
                 nombre
@@ -807,6 +812,7 @@ def guardar_config_app(usuario_id, datos: dict) -> dict:
             imagenes.append(limpio)
     imagenes = imagenes[:MAX_IMAGENES]
 
+    sin_imagenes_dato = datos.get("sin_imagenes", True)
     valores = {
         "hashtags": hashtags,
         "contexto": _texto(datos.get("contexto")),
@@ -820,6 +826,9 @@ def guardar_config_app(usuario_id, datos: dict) -> dict:
         "duracion_min": _entero(datos.get("duracion_min"), 60, 10, 240),
         "limite_dia": _entero(datos.get("limite_dia"), 49, 1, 49),
         "navegadores": _entero(datos.get("navegadores"), 1, 1, 3),
+        "sin_imagenes": (
+            True if sin_imagenes_dato is None else _bool(sin_imagenes_dato)
+        ),
         "imagenes": imagenes,
         "permitir_ajustes": bool(datos.get("permitir_ajustes", False)),
     }
@@ -844,6 +853,7 @@ def guardar_config_app(usuario_id, datos: dict) -> dict:
             fila.duracion_min = valores["duracion_min"]
             fila.limite_dia = valores["limite_dia"]
             fila.navegadores = valores["navegadores"]
+            fila.sin_imagenes = valores["sin_imagenes"]
             fila.imagenes = json.dumps(valores["imagenes"], ensure_ascii=False)
             fila.permitir_ajustes = valores["permitir_ajustes"]
     except SQLAlchemyError:
@@ -1738,6 +1748,15 @@ def _tab_campana() -> None:
         value=bool(config.get("permitir_ajustes", False)),
         key=f"mwx_cfg_{uid}_ajustes",
     )
+    sin_imagenes = st.checkbox(
+        "🖼️ No cargar imágenes en el navegador (ahorra datos)",
+        value=bool(config.get("sin_imagenes", True)),
+        key=f"mwx_cfg_{uid}_sin_imagenes",
+        help=(
+            "Chrome no descarga las imágenes del timeline (menos MB). "
+            "Los posts con imagen que subiste siguen funcionando."
+        ),
+    )
 
     st.markdown("#### 🖼️ Imágenes para los posts")
     archivos = st.file_uploader(
@@ -1831,6 +1850,7 @@ def _tab_campana() -> None:
                 "duracion_min": duracion,
                 "limite_dia": limite,
                 "navegadores": navegadores,
+                "sin_imagenes": sin_imagenes,
                 "imagenes": nombres,
                 "permitir_ajustes": permitir_ajustes,
             },
@@ -1866,10 +1886,33 @@ def _tab_campana() -> None:
 - **Ventana:** {int(duracion)} minutos con pausas de {int(pausa)} s
 - **Límite diario:** {int(limite)} acciones por cuenta
 - **Navegadores simultáneos:** {int(navegadores)}
-- **Imágenes:** {len(imagenes_guardadas)}
+- **Imágenes de página:** {'desactivadas (ahorra datos)' if sin_imagenes else 'activadas'}
+- **Imágenes para publicar:** {len(imagenes_guardadas)}
 - **Puede ajustar valores:** {'sí' if permitir_ajustes else 'no'}
 """.strip()
     )
+    activas_asignadas = sum(
+        1
+        for cuenta_id in asignadas
+        if filas_por_id.get(int(cuenta_id), {}).get("activa")
+    )
+    if int(navegadores) > 1 and permitir_ajustes:
+        st.caption(
+            "Si el equipo guardó ajustes locales (1 navegador), el panel no "
+            "se aplicará hasta que use «Usar configuración del panel»."
+        )
+    if activas_asignadas == 0:
+        st.warning(
+            "Este usuario no tiene cuentas activas asignadas; el ejecutable "
+            "no podrá abrir ningún navegador. Asigna al menos 1 cuenta."
+        )
+    elif activas_asignadas < int(navegadores):
+        st.warning(
+            f"Este usuario solo tiene {activas_asignadas} cuenta(s) activa(s); "
+            f"con {int(navegadores)} navegadores se abrirá "
+            f"{max(1, min(activas_asignadas, int(navegadores)))}. "
+            "Asigna otra cuenta o baja a 1."
+        )
     if not normalizar_urls(urls_texto):
         st.caption(
             "Sin URLs ancla: el ejecutable solo podrá publicar posts (no "

@@ -37,7 +37,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-from sqlalchemy import Integer, create_engine, text
+from sqlalchemy import Boolean, Integer, create_engine, text
 from sqlalchemy.orm import sessionmaker
 
 # La raiz del repo a sys.path (mismo patron que el resto de tests).
@@ -116,6 +116,31 @@ def _check_modelo(check) -> None:
         hasattr(AppConfig, "navegadores"),
     )
 
+    otra = AppConfig.__table__.c.get("sin_imagenes")
+    check("modelo: AppConfig.sin_imagenes existe", otra is not None)
+    if otra is not None:
+        check(
+            "modelo: sin_imagenes es Boolean",
+            isinstance(otra.type, Boolean),
+            f"tipo={otra.type!r}",
+        )
+        check(
+            "modelo: sin_imagenes default True",
+            otra.default is not None and otra.default.arg is True,
+            f"default={getattr(otra.default, 'arg', None)!r}",
+        )
+        check(
+            "modelo: sin_imagenes va despues de navegadores y antes de imagenes",
+            nombres.index("navegadores")
+            < nombres.index("sin_imagenes")
+            < nombres.index("imagenes"),
+            f"orden={nombres}",
+        )
+        check(
+            "modelo: sin_imagenes es un atributo mapeado del ORM",
+            hasattr(AppConfig, "sin_imagenes"),
+        )
+
 
 def _check_orm_default(tmp: Path, check) -> None:
     engine = _sqlite_temporal(tmp, "orm.db")
@@ -138,6 +163,17 @@ def _check_orm_default(tmp: Path, check) -> None:
             check(
                 "ORM: navegadores acepta 1-3",
                 db.get(AppConfig, fila.id).navegadores == 3,
+            )
+            check(
+                "ORM: sin_imagenes guarda True por defecto",
+                db.get(AppConfig, fila.id).sin_imagenes is True,
+                f"valor={db.get(AppConfig, fila.id).sin_imagenes!r}",
+            )
+            fila.sin_imagenes = False
+            db.commit()
+            check(
+                "ORM: sin_imagenes acepta False",
+                db.get(AppConfig, fila.id).sin_imagenes is False,
             )
         finally:
             db.close()
@@ -183,8 +219,55 @@ def _check_helper_sqlite(tmp: Path, check) -> None:
             "helper: no duplica la columna",
             _columnas(engine).count("navegadores") == 1,
         )
+        check(
+            "helper: agrega sin_imagenes en la misma pasada",
+            "sin_imagenes" in _columnas(engine),
+        )
+        with engine.connect() as conn:
+            valor_img = conn.execute(
+                text("SELECT sin_imagenes FROM app_config WHERE usuario_id = 7")
+            ).scalar()
+        check(
+            "helper: la fila existente queda con sin_imagenes=True",
+            valor_img in (True, 1, "1"),
+            f"valor={valor_img!r}",
+        )
+        check(
+            "helper: sin_imagenes no se duplica",
+            _columnas(engine).count("sin_imagenes") == 1,
+        )
     finally:
         engine.dispose()
+
+    # Caso real de produccion: tabla que YA tiene navegadores pero no
+    # sin_imagenes -> se agrega solo la nueva y no se toca la existente.
+    parcial = _sqlite_temporal(tmp, "parcial.db")
+    try:
+        with parcial.begin() as conn:
+            conn.execute(
+                text(
+                    "CREATE TABLE app_config ("
+                    "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                    "usuario_id INTEGER NOT NULL, "
+                    "navegadores INTEGER DEFAULT 1)"
+                )
+            )
+            conn.execute(
+                text("INSERT INTO app_config (usuario_id) VALUES (9)")
+            )
+        with parcial.begin() as conn:
+            agregada = db_mod._migrar_app_config_sqlite(conn)
+        check(
+            "helper: tabla con navegadores solo agrega sin_imagenes",
+            agregada is True
+            and "sin_imagenes" in _columnas(parcial)
+            and _columnas(parcial).count("navegadores") == 1,
+        )
+        with parcial.begin() as conn:
+            segunda = db_mod._migrar_app_config_sqlite(conn)
+        check("helper: tabla parcial ya migrada es idempotente", segunda is False)
+    finally:
+        parcial.dispose()
 
     # Tabla inexistente: PRAGMA vacio -> no intenta ALTER y no lanza.
     vacio = _sqlite_temporal(tmp, "sin_tabla.db")
@@ -208,6 +291,10 @@ def _check_migracion_engine(tmp: Path, check) -> None:
         check(
             "migracion: usa el engine global (SQLite) y agrega la columna",
             "navegadores" in _columnas(engine),
+        )
+        check(
+            "migracion: tambien agrega sin_imagenes",
+            "sin_imagenes" in _columnas(engine),
         )
         with engine.connect() as conn:
             valor = conn.execute(
@@ -296,6 +383,14 @@ def _check_ast(check) -> None:
         "AST: PostgreSQL usa ADD COLUMN IF NOT EXISTS",
         "ALTER TABLE app_config ADD COLUMN IF NOT EXISTS" in codigo
         and "APP_CONFIG_NAVEGADORES_SQL" in codigo,
+    )
+    check(
+        "AST: ALTER de sin_imagenes BOOLEAN DEFAULT TRUE",
+        db_mod.APP_CONFIG_SIN_IMAGENES_SQL
+        == "sin_imagenes BOOLEAN DEFAULT TRUE"
+        and "APP_CONFIG_SIN_IMAGENES_SQL" in codigo
+        and "APP_CONFIG_SIN_IMAGENES_SQL"
+        in inspect.getsource(db_mod._migrar_app_config_sqlite),
     )
     check(
         "AST: la migracion esta protegida con try/except y warning",

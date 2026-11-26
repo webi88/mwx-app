@@ -401,6 +401,11 @@ def _probar_configuracion(check) -> None:
             mwx_app.CONFIG_DEFECTO.get("navegadores") == 1,
             str(mwx_app.CONFIG_DEFECTO.get("navegadores")),
         )
+        check(
+            "config: CONFIG_DEFECTO incluye sin_imagenes=True",
+            mwx_app.CONFIG_DEFECTO.get("sin_imagenes") is True,
+            str(mwx_app.CONFIG_DEFECTO.get("sin_imagenes")),
+        )
 
         res = mwx_app.guardar_config_app(
             uid,
@@ -415,6 +420,7 @@ def _probar_configuracion(check) -> None:
                 "duracion_min": 9999,
                 "limite_dia": 0,
                 "navegadores": 2,
+                "sin_imagenes": False,
                 "imagenes": ["../evil.png", "foto.png", "foto.png"],
                 "permitir_ajustes": True,
             },
@@ -426,7 +432,8 @@ def _probar_configuracion(check) -> None:
             and res["config"]["pausa_seg"] == 1
             and res["config"]["duracion_min"] == 240
             and res["config"]["limite_dia"] == 1
-            and res["config"]["navegadores"] == 2,
+            and res["config"]["navegadores"] == 2
+            and res["config"]["sin_imagenes"] is False,
             str(res.get("error") or res.get("config")),
         )
         check(
@@ -449,7 +456,8 @@ def _probar_configuracion(check) -> None:
             and leida["texto_base"] == "base de la cita"
             and leida["imagenes"] == ["foto.png"]
             and leida["permitir_ajustes"] is True
-            and leida["navegadores"] == 2,
+            and leida["navegadores"] == 2
+            and leida["sin_imagenes"] is False,
             str(leida),
         )
 
@@ -482,6 +490,33 @@ def _probar_configuracion(check) -> None:
                 and mwx_app.obtener_config_app(uid)["navegadores"] == esperado,
                 str(guardado.get("error") or guardado.get("config")),
             )
+
+        for valor, esperado in (
+            (False, False),
+            (True, True),
+            (None, True),
+            ("no", False),
+            ("si", True),
+            ("basura", False),
+        ):
+            guardado = mwx_app.guardar_config_app(
+                uid, {"sin_imagenes": valor}
+            )
+            check(
+                f"config: sin_imagenes {valor!r} se guarda como {esperado}",
+                guardado.get("ok") is True
+                and guardado["config"]["sin_imagenes"] is esperado
+                and mwx_app.obtener_config_app(uid)["sin_imagenes"] is esperado,
+                str(guardado.get("error") or guardado.get("config")),
+            )
+
+        guardado = mwx_app.guardar_config_app(uid, {"hashtags": "otro"})
+        check(
+            "config: sin_imagenes ausente en el guardado -> True (default)",
+            guardado["config"]["sin_imagenes"] is True
+            and mwx_app.obtener_config_app(uid)["sin_imagenes"] is True,
+            str(guardado.get("config")),
+        )
 
         class _FilaFake:
             """Fila AppConfig minima (sin `navegadores` = BD vieja)."""
@@ -530,6 +565,19 @@ def _probar_configuracion(check) -> None:
             check(
                 "config: fila sin atributo navegadores -> 1 (BD vieja)",
                 mwx_app.obtener_config_app(uid)["navegadores"] == 1,
+            )
+            check(
+                "config: fila sin atributo sin_imagenes -> True (BD vieja)",
+                mwx_app.obtener_config_app(uid)["sin_imagenes"] is True,
+            )
+
+            fila_img = type(
+                "_FilaSinImagenes", (_FilaFake,), {"sin_imagenes": False}
+            )()
+            mwx_app.obtener_sesion = lambda: _sesion_con(fila_img)
+            check(
+                "config: obtener_config_app lee sin_imagenes=False",
+                mwx_app.obtener_config_app(uid)["sin_imagenes"] is False,
             )
 
             for valor, esperado in (
@@ -882,7 +930,7 @@ def _probar_navegacion(check) -> None:
         "navegacion: aparece en UNA sola categoria y es Datos y cuentas",
         [nombre for nombre, ops in categorias if op in ops]
         == ["📊 Datos y cuentas"],
-        str([nombre for nombre, ops in categorias if op in ops]),
+        "una categoria",
     )
     check(
         "navegacion: el dispatch importa web.operaciones.mwx_app",
@@ -890,9 +938,9 @@ def _probar_navegacion(check) -> None:
         and (RAIZ / "web" / "operaciones" / "mwx_app.py").is_file(),
     )
     check(
-        "navegacion: existe la rama startswith del prefijo 📲",
+        "navegacion: existe la rama startswith de la operacion",
         "📲" in _prefijos_despacho_app(),
-        str(sorted(_prefijos_despacho_app())),
+        f"({len(_prefijos_despacho_app())} prefijos)",
     )
 
 
@@ -952,6 +1000,7 @@ def _probar_apptest(check) -> None:
                 "acciones_por_cuenta": 7,
                 "navegadores": 2,
                 "imagenes": [],
+                "permitir_ajustes": True,
             },
         )
         mwx_app.registrar_evento_app(uid, "login", "evento de prueba")
@@ -1064,6 +1113,7 @@ def _probar_apptest(check) -> None:
             and f"mwx_cfg_{uid}_duracion" in claves_num
             and f"mwx_cfg_{uid}_limite" in claves_num
             and f"mwx_cfg_{uid}_navegadores" in claves_num
+            and f"mwx_cfg_{uid}_sin_imagenes" in claves_check
             and f"mwx_cfg_{uid}_guardar" in claves_botones,
             str(sorted(claves_num)),
         )
@@ -1072,10 +1122,35 @@ def _probar_apptest(check) -> None:
             at.number_input(key=f"mwx_cfg_{uid}_navegadores").value == 2,
             str(at.number_input(key=f"mwx_cfg_{uid}_navegadores").value),
         )
+        check(
+            "apptest: sin_imagenes inicia activado (ahorra datos)",
+            at.checkbox(key=f"mwx_cfg_{uid}_sin_imagenes").value is True,
+            str(at.checkbox(key=f"mwx_cfg_{uid}_sin_imagenes").value),
+        )
+        check(
+            "apptest: avisa que hay menos cuentas activas que navegadores",
+            any("solo tiene 1" in str(w.value) for w in at.warning),
+            str([str(w.value) for w in at.warning]),
+        )
+        check(
+            "apptest: avisa de los ajustes locales que pisan al panel",
+            any("ajustes locales" in str(w.value) for w in at.caption),
+            str([str(w.value) for w in at.caption]),
+        )
+        check(
+            "apptest: la vista previa muestra imagenes de pagina desactivadas",
+            any(
+                "Imágenes de página" in str(m.value)
+                and "desactivadas" in str(m.value)
+                for m in at.markdown
+            ),
+            "vista previa encontrada",
+        )
 
-        # E2E del boton: cambia navegadores y guarda la config (real).
+        # E2E del boton: cambia navegadores/imagenes y guarda la config (real).
         try:
             at.number_input(key=f"mwx_cfg_{uid}_navegadores").set_value(3).run()
+            at.checkbox(key=f"mwx_cfg_{uid}_sin_imagenes").set_value(False).run()
             at.button(key=f"mwx_cfg_{uid}_guardar").click().run()
             error_nav = (
                 str(at.exception[0].value)[:200] if at.exception else ""
@@ -1089,6 +1164,12 @@ def _probar_apptest(check) -> None:
             and any(
                 "Configuraci" in str(s.value) for s in at.success
             ),
+            error_nav,
+        )
+        check(
+            "apptest: guardar configuracion persiste sin_imagenes=False",
+            not error_nav
+            and mwx_app.obtener_config_app(uid)["sin_imagenes"] is False,
             error_nav,
         )
 
@@ -1112,13 +1193,26 @@ def _probar_apptest(check) -> None:
                     key=f"mwx_cfg_{uid}_navegadores"
                 ).value
             )
+            valor_imagenes_default = (
+                None
+                if error_at3
+                else at3.checkbox(
+                    key=f"mwx_cfg_{uid}_sin_imagenes"
+                ).value
+            )
         except Exception as exc:  # pragma: no cover
             error_at3 = f"{type(exc).__name__}: {exc}"
             valor_default = None
+            valor_imagenes_default = None
         check(
             "apptest: sin fila de config, navegadores inicia en 1",
             not error_at3 and valor_default == 1,
             error_at3 or str(valor_default),
+        )
+        check(
+            "apptest: sin fila de config, sin_imagenes inicia activado",
+            not error_at3 and valor_imagenes_default is True,
+            error_at3 or str(valor_imagenes_default),
         )
         check(
             "apptest: actividad/seguridad con revocacion global y URL del API",

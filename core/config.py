@@ -165,9 +165,14 @@ def _headless_por_defecto() -> bool:
 
 def detectar_chrome_version() -> Optional[int]:
     """Devuelve la version mayor de Chrome instalada (ej. 151 -> 151).
-    Usa el registro de Windows en Windows, y el binario en Linux/macOS."""
+
+    Windows: registro. macOS: primero los binarios dentro de las .app
+    (`/Applications/Google Chrome.app/...` y Chromium) y despues los comandos
+    del PATH. Linux: comandos del PATH. Nunca lanza: ante cualquier error
+    devuelve None.
+    """
     try:
-        if os.name == "nt":
+        if os.name == "nt" and sys.platform != "darwin":
             import winreg
             try:
                 key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Google\Chrome\BLBeacon")
@@ -179,15 +184,32 @@ def detectar_chrome_version() -> Optional[int]:
                 val, _ = winreg.QueryValueEx(key, "version")
                 winreg.CloseKey(key)
                 return int(val.split(".")[0])
-        else:
-            import subprocess
-            for cmd in (["google-chrome", "--version"], ["chromium", "--version"], ["chromium-browser", "--version"]):
-                try:
-                    out = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
-                    version = (out.stdout or out.stderr).strip()
-                    return int(version.split()[2].split(".")[0])
-                except Exception:
-                    continue
+        import subprocess
+        comandos = []
+        if sys.platform == "darwin":
+            # En macOS Chrome no esta en el PATH: vive dentro de la .app.
+            comandos.extend([
+                ["/Applications/Google Chrome.app/Contents/MacOS/Google Chrome", "--version"],
+                ["/Applications/Chromium.app/Contents/MacOS/Chromium", "--version"],
+            ])
+        # Linux (y respaldo en macOS): binarios del PATH.
+        comandos.extend([
+            ["google-chrome", "--version"],
+            ["chromium", "--version"],
+            ["chromium-browser", "--version"],
+        ])
+        for cmd in comandos:
+            try:
+                out = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+                salida = (out.stdout or out.stderr or "").strip()
+                # Salidas reales: "Google Chrome 153.0.0.0" (3 tokens) o
+                # "Chromium 140.0.6742.0" (2 tokens); se toma el primer token
+                # numerico con puntos en ambos casos.
+                for parte in salida.split():
+                    if "." in parte and parte.split(".")[0].isdigit():
+                        return int(parte.split(".")[0])
+            except Exception:
+                continue
     except Exception:
         pass
     return None
@@ -216,6 +238,15 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("MWX_API_URL", "mwx_api_url"),
     )
     
+    # Just Another Panel (JAP) API v2: panel de servicios (likes, RT, views,
+    # comentarios, seguidores) para X/Twitter. La key tambien puede vivir en
+    # data/jap_config.json (la escribe integraciones.jap.guardar_api_key).
+    jap_api_key: str = Field(
+        default="",
+        env="JAP_API_KEY",
+        validation_alias=AliasChoices("JAP_API_KEY", "jap_api_key"),
+    )
+
     # Database
     database_url: str = Field(default="sqlite:///data/gestor_redes.db", env="DATABASE_URL")
     

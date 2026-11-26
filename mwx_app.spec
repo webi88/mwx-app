@@ -4,15 +4,22 @@
 Uso:
     pyinstaller --noconfirm --clean mwx_app.spec
 
-Genera ``dist/MWX APP/MWX APP.exe``. El .exe NO incluye cuentas ni .env:
-solo el codigo, el icono y el logo. La configuracion del servidor se entrega
-como ``config.json`` junto al ejecutable.
+En Windows/Linux genera ``dist/MWX APP/MWX APP.exe``; en macOS envuelve el
+resultado en ``dist/MWX APP.app`` (icono ``.icns``, sin firma). La app NO
+incluye cuentas ni .env: solo el codigo, el icono y el logo. La configuracion
+del servidor se entrega como ``config.json`` junto a la app.
 """
 import os
+import sys
 
 from PyInstaller.utils.hooks import collect_submodules
 
 RAIZ = os.path.abspath(globals().get("SPECPATH") or os.getcwd())
+
+if sys.platform == "darwin":
+    ICONO = os.path.join(RAIZ, "assets", "mwx_app.icns")
+else:
+    ICONO = os.path.join(RAIZ, "assets", "mwx_app.ico")
 
 EXCLUIR = [
     "streamlit",
@@ -106,7 +113,7 @@ a = Analysis(
     pathex=[RAIZ],
     binaries=[],
     datas=[
-        (os.path.join(RAIZ, "assets", "mwx_app.ico"), "assets"),
+        (ICONO, "assets"),
         (os.path.join(RAIZ, "assets", "mwx_logo.png"), "assets"),
     ],
     hiddenimports=OCULTOS,
@@ -136,7 +143,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=os.path.join(RAIZ, "assets", "mwx_app.ico"),
+    icon=ICONO,
 )
 
 coll = COLLECT(
@@ -148,3 +155,19 @@ coll = COLLECT(
     upx_exclude=[],
     name="MWX APP",
 )
+
+if sys.platform == "darwin":
+    app = BUNDLE(
+        coll,
+        name="MWX APP.app",
+        icon=ICONO,
+        bundle_identifier="com.mwgroupp.mwxapp",
+        info_plist={
+            "CFBundleName": "MWX APP",
+            "CFBundleDisplayName": "MWX APP",
+            "CFBundleShortVersionString": "1.1.4",
+            "CFBundleVersion": "1.1.4",
+            "NSHighResolutionCapable": True,
+            "LSMinimumSystemVersion": "11.0",
+        },
+    )

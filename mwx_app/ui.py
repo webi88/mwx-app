@@ -272,7 +272,13 @@ class MWXApp:
             carpetas.append(Path(meipass) / "assets")
         carpetas.append(Path(__file__).resolve().parent.parent / "assets")
         try:
-            carpetas.append(Path(sys.executable).resolve().parent / "assets")
+            ejecutable = Path(sys.executable).resolve()
+            carpetas.append(ejecutable.parent / "assets")
+            if sys.platform == "darwin":
+                carpetas.append(
+                    ejecutable.parent.parent / "Resources" / "assets"
+                )
+                carpetas.append(ejecutable.parent.parent.parent / "assets")
         except Exception:
             pass
 
@@ -1436,6 +1442,11 @@ class MWXApp:
             texto += f" · {imagenes} imagen(es)"
         if campana.get("navegadores", 1) > 1:
             texto += f" · {campana['navegadores']} navegadores"
+        texto += (
+            " · imágenes de página desactivadas"
+            if campana.get("sin_imagenes", True)
+            else " · imágenes de página activadas"
+        )
         etiqueta.configure(text=texto)
 
     def _mensaje_sync(self, texto: str, error: bool = False) -> None:
@@ -1675,6 +1686,24 @@ class MWXApp:
         campo("Tope diario por cuenta", "limite_dia", 1, 49)
         campo("Navegadores simultáneos", "navegadores", 1, 3)
 
+        variable_sin_imagenes = tk.BooleanVar(
+            value=bool(campana.get("sin_imagenes", True))
+        )
+        fila_imagenes = tk.Frame(marco, bg=theme.FONDO)
+        fila_imagenes.pack(fill="x", pady=5)
+        tk.Checkbutton(
+            fila_imagenes,
+            text="No cargar imágenes de la página (ahorra datos)",
+            variable=variable_sin_imagenes,
+            bg=theme.FONDO,
+            fg=theme.TEXTO,
+            activebackground=theme.FONDO,
+            activeforeground=theme.TEXTO,
+            selectcolor=theme.SUPERFICIE_ALT,
+            font=(self.familia, 10),
+            anchor="w",
+        ).pack(side="left")
+
         imagenes = list(self.imagenes_extra)
         lbl_imagenes = tk.Label(
             marco,
@@ -1728,6 +1757,7 @@ class MWXApp:
                     )
                     return
             self.ajustes = valores
+            self.ajustes["sin_imagenes"] = bool(variable_sin_imagenes.get())
             self.imagenes_extra = list(imagenes)
             self._cerrar_ajustes()
             self._actualizar_resumen_campana()
@@ -2136,6 +2166,39 @@ class MWXApp:
             wraplength=780,
             justify="left",
         ).pack(anchor="w", pady=(4, 16))
+
+        solicitados_nav = resumen.get("navegadores_solicitados")
+        usados_nav = resumen.get("navegadores_usados")
+        if solicitados_nav is not None and usados_nav is not None:
+            try:
+                texto_nav = (
+                    f"Navegadores: {int(solicitados_nav)} configurado(s) · "
+                    f"{int(usados_nav)} usado(s)"
+                )
+            except (TypeError, ValueError):
+                texto_nav = ""
+            if texto_nav:
+                tk.Label(
+                    centro,
+                    text=texto_nav,
+                    bg=theme.FONDO,
+                    fg=theme.TEXTO_SEC,
+                    font=(self.familia, 10),
+                ).pack(anchor="w", pady=(0, 8))
+
+        aviso_navegadores = str(resumen.get("navegadores_aviso") or "").strip()
+        if aviso_navegadores:
+            tk.Label(
+                centro,
+                text=f"⚠️ {aviso_navegadores}",
+                bg=theme.SUPERFICIE_ALT,
+                fg="#F59E0B",
+                font=(self.familia, 10, "bold"),
+                wraplength=780,
+                justify="left",
+                padx=12,
+                pady=8,
+            ).pack(fill="x", pady=(0, 12))
 
         metricas = tk.Frame(centro, bg=theme.FONDO)
         metricas.pack(fill="x", pady=(0, 14))

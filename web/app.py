@@ -61,6 +61,7 @@ OPCIONES = [
 OPCIONES_ADMIN = [
     "👑 Admin: Usuarios",
     "📲 MWX APP: Usuarios y Acceso",
+    "🛒 JAP: Comprar Engagement",
 ]
 OPCIONES_CREAR = ["🗂️ Cuentas: Perfiles, Secciones & Nombres"]
 
@@ -106,6 +107,7 @@ CATEGORIAS = [
             "📊 Reportes",
             "📈 Monitor: Actividad",
             "📲 MWX APP: Usuarios y Acceso",
+            "🛒 JAP: Comprar Engagement",
             "🗂️ Cuentas: Perfiles, Secciones & Nombres",
             "👑 Admin: Usuarios",
         ],
@@ -393,6 +395,10 @@ def main():
         render(usuario)
     elif seleccion.startswith("📲"):
         from web.operaciones.mwx_app import render
+        render(usuario)
+    elif seleccion.startswith("🛒"):
+        # SOLO admin: los pedidos gastan saldo real de JAP.
+        from web.operaciones.jap import render
         render(usuario)
     elif seleccion.startswith("🖼️"):
         from web.operaciones.multimedia import render

@@ -29,6 +29,7 @@ import activaciones.variaciones as variaciones_mod  # noqa: E402
 import core.database as database_mod  # noqa: E402
 import core.registro as registro_mod  # noqa: E402
 import ia.generador_contenido as generador_mod  # noqa: E402
+import plataformas.twitter.selenium_bot as selenium_mod  # noqa: E402
 import utils.proxies as proxies_mod  # noqa: E402
 from core.config import settings  # noqa: E402
 from ia.generador_contenido import validar_texto_hashtag  # noqa: E402
@@ -2025,6 +2026,35 @@ def run(check):
         f"(commits={sesion_falsa.commits}, invalidos={invalidos})",
     )
 
+    # El pre-vuelo ya valido con `x_accesible`: debe dejar el proxy marcado en
+    # la cache del bot para que el primer `cambiar_cuenta` no lo revalide.
+    try:
+        previo_ttl = os.environ.get("PROXY_X_CACHE_SEG")
+        os.environ["PROXY_X_CACHE_SEG"] = "300"
+        cache_previa = dict(selenium_mod._PROXY_X_VALIDADOS)
+        selenium_mod._PROXY_X_VALIDADOS.clear()
+        cuentas_marca = {
+            "m_valida": _CuentaFalsaProxy("m_valida", "http://bueno:8080"),
+        }
+        sesion_marca = _SesionFalsa(cuentas_marca)
+        with _parches(
+            (database_mod, "get_db_session", lambda: sesion_marca),
+            (proxies_mod, "ProxyManager", lambda: _ProxyManagerFalso()),
+        ):
+            local_mod._asignar_proxies_cuentas(["m_valida"], "mexico")
+        check(
+            "proxies: el pre-vuelo marca el validado en la cache de x.com",
+            selenium_mod._proxy_x_valido_reciente("http://bueno:8080"),
+            str(selenium_mod._PROXY_X_VALIDADOS),
+        )
+    finally:
+        if previo_ttl is None:
+            os.environ.pop("PROXY_X_CACHE_SEG", None)
+        else:
+            os.environ["PROXY_X_CACHE_SEG"] = previo_ttl
+        selenium_mod._PROXY_X_VALIDADOS.clear()
+        selenium_mod._PROXY_X_VALIDADOS.update(cache_previa)
+
     class _ProxyManagerVacio(_ProxyManagerFalso):
         def cargar_por_pais(self, pais):
             return []
@@ -2141,3 +2171,53 @@ def run(check):
             and bot_hist.env_en_driver.get("TWITTER_SIN_PROXY") == "1",
             str(bot_hist.driver_args),
         )
+
+    # ------------------------------------------------------------------
+    # Ahorro de datos: `sin_imagenes` manda AUNQUE no haya proxy
+    # ------------------------------------------------------------------
+    for etiqueta, con_proxy, sin_imagenes_kw, esperado in (
+        ("sin proxy + True", False, True, "1"),
+        ("sin proxy + False", False, False, "0"),
+        ("sin proxy + None (historico)", False, None, "0"),
+        ("con proxy + True", True, True, "1"),
+        ("con proxy + False", True, False, "0"),
+        ("con proxy + None (historico)", True, None, "1"),
+    ):
+        clase_img = _clase_bot()
+        parches_img = []
+        if con_proxy:
+            parches_img.append(
+                (local_mod, "_asignar_proxies_cuentas", _asignar_dos_proxies)
+            )
+        with _settings(
+            local_max_cuentas=5, limite_local_dia=49, headless=False
+        ), _parches(*parches_img), _campana(
+            [_cuenta("img_env")], bot_cls=clase_img
+        ):
+            local_mod.ejecutar_campana_local(
+                usuarios=["img_env"],
+                hashtags="#mexico",
+                acciones_por_cuenta=1,
+                duracion_min=1,
+                usar_proxy=con_proxy,
+                sin_imagenes=sin_imagenes_kw,
+            )
+        obtenido = clase_img.creados[0].env_en_driver.get(
+            "CHROME_SIN_IMAGENES"
+        )
+        check(
+            f"sin_imagenes: {etiqueta} -> CHROME_SIN_IMAGENES={esperado}",
+            obtenido == esperado,
+            f"({obtenido})",
+        )
+
+
+if __name__ == "__main__":
+    # Ejecucion suelta: `python tests/test_local_campana.py`.
+    sys.path.insert(0, str(RAIZ / "tests"))
+    from run_tests import check as _check
+
+    run(_check)
+    import run_tests
+
+    sys.exit(0 if not run_tests._FALLOS else 1)

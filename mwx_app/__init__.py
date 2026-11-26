@@ -6,4 +6,4 @@ que entrega la API `api/`. Este paquete SOLO contiene la capa de escritorio
 (Tkinter), el cliente HTTP, la sincronizacion local y el orquestador.
 """
 
-__version__ = "1.1.3"
+__version__ = "1.1.4"

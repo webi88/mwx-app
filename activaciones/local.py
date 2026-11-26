@@ -593,6 +593,16 @@ def _construir_plan(selected, roles, acciones_por_cuenta, usados, limite, urls) 
             if ronda < len(plan_por_cuenta[usuario])
         ]
         random.shuffle(orden_ronda)
+        # Evita que la MISMA cuenta quede en el borde de dos rondas seguidas
+        # (ultima accion de la ronda N = primera de la N+1). Al filtrar por
+        # navegador eso se veria como dos acciones consecutivas de la misma
+        # cuenta aunque otra este disponible.
+        if (
+            plan
+            and len(orden_ronda) > 1
+            and str(orden_ronda[0]) == str(plan[-1].get("usuario") or "")
+        ):
+            orden_ronda = orden_ronda[1:] + orden_ronda[:1]
         for usuario in orden_ronda:
             plan.append(plan_por_cuenta[usuario][ronda])
     return {
@@ -606,12 +616,19 @@ def _construir_plan(selected, roles, acciones_por_cuenta, usados, limite, urls) 
 def _partir_plan_por_navegador(plan, navegadores) -> list:
     """Reparte el plan en N cubetas SIN partir cuentas entre navegadores.
 
-    - Cada `usuario` queda ENTERO en una sola cubeta (se agrupan sus acciones
-      conservando el orden interno del plan).
-    - Los grupos se barajan y se reparten con greedy al navegador con menos
-      acciones para equilibrar la carga.
+    - Cada `usuario` queda ENTERO en una sola cubeta (ninguna cuenta se parte
+      entre dos navegadores).
+    - El reparto de CUENTAS se hace barajando los grupos y con greedy al
+      navegador con menos acciones (cubetas equilibradas).
+    - Cada cubeta se construye FILTRANDO el plan original en su orden: como
+      `_construir_plan` genera un plan round-robin (ronda 1 de todas las
+      cuentas, ronda 2...), al filtrar por cubeta las cuentas que le tocaron a
+      cada navegador se INTERCALAN solas. Antes se concatenaban los grupos y
+      cada Chrome publicaba TODAS las acciones de una cuenta antes de pasar a
+      la siguiente.
     - Devuelve SIEMPRE N listas; la union es exactamente `plan` (sin perder ni
-      duplicar acciones). `navegadores <= 1` devuelve `[list(plan)]`.
+      duplicar acciones) y el orden interno de cada cuenta se conserva.
+      `navegadores <= 1` devuelve `[list(plan)]`.
     Nunca lanza.
     """
     try:
@@ -642,19 +659,33 @@ def _partir_plan_por_navegador(plan, navegadores) -> list:
     except Exception:
         return [list(acciones_plan)] + [[] for _ in range(n - 1)]
 
-    # 2) Barajar los grupos (no ser determinista) y repartir greedy.
+    # 2) Barajar los grupos de CUENTAS y repartir greedy (equilibrio).
     try:
         random.shuffle(grupos)
     except Exception:
         pass
-    cubetas: list = [[] for _ in range(n)]
+    asignacion: list = [[] for _ in range(n)]
     cargas = [0] * n
     for grupo in grupos:
         minimo = min(cargas)
         candidatos = [i for i, carga in enumerate(cargas) if carga == minimo]
         destino = random.choice(candidatos) if len(candidatos) > 1 else candidatos[0]
-        cubetas[destino].extend(grupo)
+        asignacion[destino].append(str(grupo[0].get("usuario") or ""))
         cargas[destino] += len(grupo)
+
+    # 3) Construir cada cubeta FILTRANDO el plan original en su orden: al ser
+    # round-robin, las cuentas de la cubeta quedan intercaladas (no una
+    # detras de otra).
+    cubetas: list = []
+    for usuarios_cubeta in asignacion:
+        conjunto = set(usuarios_cubeta)
+        cubetas.append(
+            [
+                accion
+                for accion in acciones_plan
+                if str(accion.get("usuario") or "") in conjunto
+            ]
+        )
     return cubetas
 
 
@@ -1107,7 +1138,9 @@ def _asignar_proxies_cuentas(usuarios, pais: str = "mexico"):
     * Reutiliza ``Cuenta.proxy`` si sigue alcanzando x.com (stickiness entre
       corridas); si no (credenciales vencidas => 407) toma el siguiente
       candidato NO usado y lo valida con ``x_accesible`` (12s). El valido se
-      persiste en ``Cuenta.proxy`` (commit por cuenta).
+      persiste en ``Cuenta.proxy`` (commit por cuenta) y se marca en la cache
+      de x.com del bot (``marcar_proxy_x_validado``): el primer
+      ``cambiar_cuenta`` de cada cuenta no repite el sondeo.
     * Si un candidato falla se prueba el siguiente (50 por pais).
 
     Devuelve ``(proxy_por_usuario, invalidos, error)``. ``error`` solo viene
@@ -1139,6 +1172,23 @@ def _asignar_proxies_cuentas(usuarios, pais: str = "mexico"):
     def _clave(proxy) -> str:
         return str(proxy or "").strip().lower()
 
+    def _marcar_validado(proxy) -> None:
+        """Marca el proxy en la cache de x.com del bot (best-effort).
+
+        Import perezoso para no acoplar `activaciones` con Selenium. Si el
+        backend no expone la funcion (version vieja) o falla, se ignora: el
+        primer `cambiar_cuenta` validara como antes. Respeta
+        `PROXY_X_CACHE_SEG=0`.
+        """
+        try:
+            from plataformas.twitter.selenium_bot import (
+                marcar_proxy_x_validado,
+            )
+
+            marcar_proxy_x_validado(proxy)
+        except Exception:
+            pass
+
     usados: set = set()
     indice_candidato = 0
     try:
@@ -1169,6 +1219,9 @@ def _asignar_proxies_cuentas(usuarios, pais: str = "mexico"):
                 if actual and pm.x_accesible(actual, timeout=12):
                     proxy_por_usuario[usuario] = actual
                     usados.add(_clave(actual))
+                    # Ya se valido aqui: marcarlo evita que el primer
+                    # `cambiar_cuenta` de la cuenta repita el sondeo.
+                    _marcar_validado(actual)
                     if cuenta is not None and (cuenta.proxy or "") != actual:
                         cuenta.proxy = actual
                         try:
@@ -1195,6 +1248,9 @@ def _asignar_proxies_cuentas(usuarios, pais: str = "mexico"):
                     continue
                 usados.add(_clave(asignado))
                 proxy_por_usuario[usuario] = asignado
+                # Valido recien comprobado con `x_accesible`: cachear evita
+                # la revalidacion en el primer cambio de cuenta.
+                _marcar_validado(asignado)
                 if cuenta is not None and (cuenta.proxy or "") != asignado:
                     cuenta.proxy = asignado
                     try:
@@ -1838,8 +1894,10 @@ def ejecutar_campana_local(
       caliente. Si NO hay ningun proxy valido la campana aborta SIN abrir
       Chrome (no hay fallback silencioso a IP directa).
     * ``proxies_pais`` ("mexico"): pais de ``data/proxies/<pais>.txt``.
-    * ``sin_imagenes`` (None): con proxy, True/"auto" pide
-      ``CHROME_SIN_IMAGENES=1``; False prioriza calidad (``0``).
+    * ``sin_imagenes`` (None): manda INDEPENDIENTE de ``usar_proxy``. True pide
+      ``CHROME_SIN_IMAGENES=1`` (aunque no haya proxy: ahorro de datos); False
+      prioriza calidad (``0``); None conserva el historico (``1`` con proxy y
+      ``0`` sin proxy). No afecta la subida de imagenes (``_subir_imagen``).
     * ``esperar_captcha_seg`` (0): modo asistido de Cloudflare; si una accion
       falla por anti-bot se avisa por callback (``tipo="espera_captcha"``) y se
       espera a que el humano lo resuelva en el Chrome visible para reintentar
@@ -1918,12 +1976,17 @@ def ejecutar_campana_local(
     env_campana = dict(_ENV_LOCAL)
     if usar_proxy:
         env_campana["TWITTER_SIN_PROXY"] = "0"
-        env_campana["CHROME_SIN_IMAGENES"] = (
-            "0" if sin_imagenes is False else "1"
-        )
     else:
         env_campana["TWITTER_SIN_PROXY"] = "1"
+    # `sin_imagenes` manda INDEPENDIENTE de `usar_proxy` (ahorro de datos):
+    #   True  -> 1 (aunque no haya proxy); False -> 0;
+    #   None  -> historico: 1 con proxy, 0 sin proxy.
+    if sin_imagenes is True:
+        env_campana["CHROME_SIN_IMAGENES"] = "1"
+    elif sin_imagenes is False:
         env_campana["CHROME_SIN_IMAGENES"] = "0"
+    else:
+        env_campana["CHROME_SIN_IMAGENES"] = "1" if usar_proxy else "0"
 
     if not urls_lista and not (hashtags_texto or contexto_texto or narrativa_texto):
         resumen["ok"] = False

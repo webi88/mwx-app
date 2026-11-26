@@ -372,31 +372,44 @@ def _migrar_columnas():
         logger.warning(f"Migracion de columnas no aplicada: {e}")
 
 
-# Columna nueva de `app_config` (configuracion de campana del ejecutable MWX).
+# Columnas nuevas de `app_config` (configuracion de campana del ejecutable MWX).
 APP_CONFIG_NAVEGADORES_SQL = "navegadores INTEGER DEFAULT 1"
+APP_CONFIG_SIN_IMAGENES_SQL = "sin_imagenes BOOLEAN DEFAULT TRUE"
 
 
 def _migrar_app_config_sqlite(conn) -> bool:
-    """Agrega `app_config.navegadores` si falta (SQLite). Devuelve si la creo.
+    """Agrega las columnas nuevas de `app_config` que falten (SQLite).
 
-    Aislado de la conexion global para poder probarlo con una SQLite temporal.
-    `PRAGMA table_info` de una tabla inexistente devuelve vacio -> no hace nada
-    (en ese caso `create_all` ya la creo antes). Idempotente y sin commit
-    (el llamador decide cuando confirmar)."""
+    Devuelve True si creo al menos una columna. Aislado de la conexion global
+    para poder probarlo con una SQLite temporal. `PRAGMA table_info` de una
+    tabla inexistente devuelve vacio -> no hace nada (en ese caso `create_all`
+    ya la creo antes). Idempotente y sin commit (el llamador decide cuando
+    confirmar)."""
     from sqlalchemy import text
 
     columnas = [fila[1] for fila in conn.execute(text("PRAGMA table_info(app_config)"))]
-    if not columnas or "navegadores" in columnas:
+    if not columnas:
         return False
-    conn.execute(text(f"ALTER TABLE app_config ADD COLUMN {APP_CONFIG_NAVEGADORES_SQL}"))
-    return True
+    agregada = False
+    if "navegadores" not in columnas:
+        conn.execute(
+            text(f"ALTER TABLE app_config ADD COLUMN {APP_CONFIG_NAVEGADORES_SQL}")
+        )
+        agregada = True
+    if "sin_imagenes" not in columnas:
+        conn.execute(
+            text(f"ALTER TABLE app_config ADD COLUMN {APP_CONFIG_SIN_IMAGENES_SQL}")
+        )
+        agregada = True
+    return agregada
 
 
 def _migrar_columnas_app_config():
-    """Migracion idempotente de `app_config.navegadores` (navegadores 1-3).
+    """Migracion idempotente de las columnas nuevas de `app_config`.
 
     `create_all` NO agrega columnas a tablas que ya existen: en produccion
-    `app_config` ya existe sin esta columna, por eso se agrega con ALTER TABLE.
+    `app_config` ya existe sin estas columnas, por eso se agregan con ALTER
+    TABLE.
     - SQLite: PRAGMA table_info + ALTER TABLE ... ADD COLUMN.
     - PostgreSQL/Supabase: ALTER TABLE ... ADD COLUMN IF NOT EXISTS.
     Nunca lanza: cualquier fallo solo se registra como warning."""
@@ -406,15 +419,21 @@ def _migrar_columnas_app_config():
         if _ES_SQLITE:
             with engine.connect() as conn:
                 if _migrar_app_config_sqlite(conn):
-                    logger.info("Migracion: columna 'app_config.navegadores' agregada")
+                    logger.info(
+                        "Migracion: columnas faltantes de 'app_config' agregadas"
+                    )
                 conn.commit()
             return
         with engine.begin() as conn:
-            conn.execute(
-                text(
-                    "ALTER TABLE app_config ADD COLUMN IF NOT EXISTS "
-                    f"{APP_CONFIG_NAVEGADORES_SQL}"
+            for definicion in (
+                APP_CONFIG_NAVEGADORES_SQL,
+                APP_CONFIG_SIN_IMAGENES_SQL,
+            ):
+                conn.execute(
+                    text(
+                        "ALTER TABLE app_config ADD COLUMN IF NOT EXISTS "
+                        f"{definicion}"
+                    )
                 )
-            )
     except Exception as e:
         logger.warning(f"Migracion de app_config no aplicada: {e}")
