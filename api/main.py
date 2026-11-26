@@ -6,6 +6,11 @@ Contrato ``/v1`` consumido por el cliente desktop:
 - ``GET  /health``               healthcheck público de Railway (sin auth)
 - ``GET  /v1/app/version``       último release de la app (metadatos, sin contenido)
 - ``GET  /v1/app/descargar``     ZIP del release (público, para autoactualizarse)
+
+Releases por plataforma sin migración de esquema: la ``version`` lleva el
+sufijo (Windows ``1.1.4``; macOS ``1.1.4-mac-arm64`` / ``1.1.4-mac-intel``).
+Los clientes Windows NO envían ``plataforma`` (default ``windows``); los Mac
+envían ``?plataforma=mac-arm64`` o ``mac-intel``.
 - ``POST /v1/login``            credenciales -> token HMAC + campaña + cuentas
 - ``GET  /v1/perfil``           mismo payload sin contraseñas (token Bearer)
 - ``POST /v1/estado``           comprueba que el token/usuario siguen vigentes
@@ -183,6 +188,17 @@ def _entero(valor: Any, defecto: int) -> int:
         return defecto
 
 
+def _normalizar_plataforma(plataforma: Any) -> str:
+    """Normaliza el query param ``plataforma`` (``mac_arm64`` -> ``mac-arm64``).
+
+    Minúsculas, sin espacios y con ``-`` como separador. Vacío -> ``windows``
+    (el .exe Windows nunca envía el parámetro). ``all`` se conserva para pedir
+    el último release global. Nunca lanza.
+    """
+    texto = _texto(plataforma).strip().lower().replace("_", "-").replace(" ", "")
+    return texto or "windows"
+
+
 def _imagen_payload(item: Any) -> Optional[dict]:
     """Normaliza una imagen de `AppConfig.imagenes` al contrato de respuesta."""
     if isinstance(item, dict):
@@ -336,15 +352,20 @@ def health():
 
 
 @app.get("/v1/app/version")
-def app_version(db=Depends(get_db)):
+def app_version(plataforma: str = "windows", db=Depends(get_db)):
     """Último release publicado del ejecutable (público, sin Bearer).
 
+    Query param ``plataforma`` (default ``windows``): los clientes Windows NO
+    envían el parámetro; macOS envía ``mac-arm64`` o ``mac-intel`` (también se
+    acepta ``mac`` y ``mac_arm64``/``mac_intel``). ``all`` devuelve el último
+    global.
+
     Responde metadatos SIN cargar el ``contenido`` del ZIP (que puede pesar
-    decenas de MB). Si no hay releases devuelve 200
+    decenas de MB). Si no hay releases de esa plataforma devuelve 200
     ``{"ok": True, "disponible": False, "version": ""}``. El cliente compara
     ``version`` con la suya para decidir si debe actualizarse antes del login.
     """
-    datos = app_releases.ultimo_release()
+    datos = app_releases.ultimo_release(_normalizar_plataforma(plataforma))
     if not datos.get("disponible"):
         return {"ok": True, "disponible": False, "version": ""}
     return {
@@ -361,15 +382,29 @@ def app_version(db=Depends(get_db)):
 
 
 @app.get("/v1/app/descargar")
-def app_descargar(version: str = "", db=Depends(get_db)):
+def app_descargar(
+    version: str = "",
+    plataforma: str = "windows",
+    db=Depends(get_db),
+):
     """Descarga el ZIP de un release (público, sin Bearer).
 
-    ``?version=`` vacío devuelve el release más reciente. Responde 200 con
-    ``application/zip`` y ``Content-Disposition: attachment``; 404 uniforme
-    ``{"ok": false, "error": "actualización no disponible"}`` si no existe.
-    Nunca registra los bytes del paquete.
+    ``?version=`` vacío devuelve el release más reciente DE ``plataforma``
+    (default ``windows``: el .exe Windows no envía el parámetro; macOS envía
+    ``mac-arm64``/``mac-intel``). Una ``version`` explícita manda y la
+    plataforma se ignora (la versión ya es única e incluye el sufijo).
+
+    Responde 200 con ``application/zip`` y ``Content-Disposition: attachment``;
+    404 uniforme ``{"ok": false, "error": "actualización no disponible"}`` si no
+    existe. Nunca registra los bytes del paquete.
     """
-    datos = app_releases.leer_release(version)
+    version_txt = _texto(version).strip()
+    if version_txt:
+        datos = app_releases.leer_release(version_txt)
+    else:
+        datos = app_releases.leer_release(
+            "", _normalizar_plataforma(plataforma)
+        )
     contenido = datos.get("contenido") or b""
     if not datos.get("disponible") or not contenido:
         raise HTTPException(

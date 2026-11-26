@@ -12,11 +12,14 @@ Cubre:
         generado, exe recursivo), sha256/tamano, release.json, origen
         inexistente y dist sin exe (no publica).
     (3) `publicar_release`: UPSERT por version, recorte de notas, filename por
-        defecto, validaciones (vacio, no-zip, <1KB) y retencion de 2.
+        defecto, validaciones (vacio, no-zip, <1KB) y retencion de 2 POR
+        PLATAFORMA (publicar Mac no borra Windows).
     (4) `publicar_release_desde_archivo`: version deducida del nombre.
     (5) `ultimo_release` / `leer_release` / `listar_releases` / `borrar_release`
         con fake de sesion; metadatos SIN contenido salvo `leer_release`.
     (6) Tolerancia: BD caida -> dicts/[] conservadores.
+    (7) Plataformas sin migracion de esquema: `plataforma_de_version` y filtros
+        windows / mac-arm64 / mac-intel / mac.
 
 Uso:
     .venv/Scripts/python.exe tests/run_tests.py
@@ -48,6 +51,7 @@ from core.app_releases import (  # noqa: E402
     empaquetar_dist,
     leer_release,
     listar_releases,
+    plataforma_de_version,
     publicar_release,
     publicar_release_desde_archivo,
     ultimo_release,
@@ -145,6 +149,43 @@ def test_version_actual(check):
     check("version_actual: devuelve str", isinstance(actual, str))
     check("version_actual: coincide con mwx_app.__version__", actual == __version__)
     check("version_actual: no esta vacia", bool(actual), actual)
+
+
+# --------------------------------------------------------------------------- #
+# (1b) plataforma_de_version
+# --------------------------------------------------------------------------- #
+def test_plataforma_de_version(check):
+    casos = [
+        # Windows (cualquier version sin "mac", incluido None/no-str)
+        ("1.1.4", "windows"),
+        ("2.0.0", "windows"),
+        ("v1.1.4", "windows"),
+        ("windows-1.1.4", "windows"),
+        ("1.1.4-x64", "windows"),
+        ("", "windows"),
+        (None, "windows"),
+        (123, "windows"),
+        # macOS arm64
+        ("1.1.4-mac-arm64", "mac-arm64"),
+        ("1.1.4_mac_arm64", "mac-arm64"),
+        ("1.1.4-MAC-ARM64", "mac-arm64"),
+        ("macarm64-1.1.4", "mac-arm64"),
+        # macOS Intel
+        ("1.1.4-mac-intel", "mac-intel"),
+        ("1.1.4_mac_intel", "mac-intel"),
+        ("1.1.4-x86_64", "mac-intel"),
+        ("1.1.4-mac-x86_64", "mac-intel"),
+        # macOS generico
+        ("1.1.4-mac", "mac"),
+        ("mac-1.1.4", "mac"),
+    ]
+    for version, esperado in casos:
+        obtenido = plataforma_de_version(version)
+        check(
+            f"plataforma_de_version: {version!r} -> {esperado}",
+            obtenido == esperado,
+            obtenido,
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -409,6 +450,15 @@ def test_consultas(check):
             ultimo.get("sha256") == hashlib.sha256(datos_v2).hexdigest()
             and ultimo.get("tamano") == len(datos_v2),
         )
+        check(
+            "plataformas: sin releases Mac -> disponible False",
+            ultimo_release("mac-arm64").get("disponible") is False,
+        )
+        check(
+            "plataformas: leer_release('', mac) sin Mac -> b''",
+            leer_release("", "mac").get("disponible") is False
+            and leer_release("", "mac").get("contenido") == b"",
+        )
 
         contenido_ultimo = leer_release()
         check(
@@ -456,6 +506,159 @@ def test_consultas(check):
 
 
 # --------------------------------------------------------------------------- #
+# (5b) Plataformas: Windows + mac-arm64 + mac-intel sin migracion de esquema
+# --------------------------------------------------------------------------- #
+def test_plataformas(check):
+    with _base_temporal() as maker:
+        win = _zip_bytes(relleno=2048)
+        arm = _zip_bytes(relleno=3072)
+        intel = _zip_bytes(relleno=4096)
+
+        check(
+            "plataformas: publica windows 1.1.4",
+            publicar_release(win, "1.1.4").get("ok") is True,
+        )
+        check(
+            "plataformas: publica mac-arm64 1.1.4-mac-arm64",
+            publicar_release(arm, "1.1.4-mac-arm64").get("ok") is True,
+        )
+        check(
+            "plataformas: publica mac-intel 1.1.4-mac-intel",
+            publicar_release(intel, "1.1.4-mac-intel").get("ok") is True,
+        )
+        check("plataformas: 3 filas", _conteo(maker) == 3, str(_conteo(maker)))
+
+        # `ultimo_release` filtra por plataforma.
+        win_ultimo = ultimo_release("windows")
+        check(
+            "plataformas: windows sigue en 1.1.4",
+            win_ultimo.get("disponible") is True
+            and win_ultimo.get("version") == "1.1.4",
+            str(win_ultimo.get("version")),
+        )
+        check(
+            "plataformas: ultimo_release no carga contenido",
+            "contenido" not in win_ultimo,
+        )
+        check(
+            "plataformas: mac-arm64 devuelve el suyo",
+            ultimo_release("mac-arm64").get("version") == "1.1.4-mac-arm64",
+            str(ultimo_release("mac-arm64").get("version")),
+        )
+        check(
+            "plataformas: mac-intel devuelve el suyo",
+            ultimo_release("mac-intel").get("version") == "1.1.4-mac-intel",
+            str(ultimo_release("mac-intel").get("version")),
+        )
+        check(
+            "plataformas: mac devuelve el ultimo Mac",
+            ultimo_release("mac").get("version") == "1.1.4-mac-intel",
+            str(ultimo_release("mac").get("version")),
+        )
+        check(
+            "plataformas: sin plataforma = ultimo global",
+            ultimo_release().get("version") == "1.1.4-mac-intel",
+        )
+        check(
+            "plataformas: 'all' = ultimo global",
+            ultimo_release("all").get("version") == "1.1.4-mac-intel",
+        )
+        check(
+            "plataformas: guion bajo en la plataforma",
+            ultimo_release("mac_arm64").get("version") == "1.1.4-mac-arm64",
+        )
+
+        # `leer_release` resuelve la version de la plataforma.
+        arm_leido = leer_release("", "mac-arm64")
+        check(
+            "plataformas: leer_release('', mac-arm64) devuelve el ZIP Mac",
+            arm_leido.get("disponible") is True
+            and arm_leido.get("version") == "1.1.4-mac-arm64"
+            and arm_leido.get("contenido") == arm,
+        )
+        check(
+            "plataformas: leer_release('', windows) devuelve el ZIP Windows",
+            leer_release("", "windows").get("contenido") == win,
+        )
+        check(
+            "plataformas: version explicita manda sobre plataforma",
+            leer_release("1.1.4", "mac-arm64").get("contenido") == win,
+        )
+
+        # `listar_releases` con y sin filtro.
+        todos = listar_releases()
+        check(
+            "plataformas: listar_releases muestra los 3",
+            {r.get("version") for r in todos}
+            == {"1.1.4", "1.1.4-mac-arm64", "1.1.4-mac-intel"},
+            str([r.get("version") for r in todos]),
+        )
+        check(
+            "plataformas: listar_releases windows",
+            [r.get("version") for r in listar_releases(plataforma="windows")]
+            == ["1.1.4"],
+        )
+        check(
+            "plataformas: listar_releases mac (2)",
+            len(listar_releases(plataforma="mac")) == 2,
+        )
+        check(
+            "plataformas: listar_releases mac_arm64 normaliza",
+            [r.get("version") for r in listar_releases(plataforma="mac_arm64")]
+            == ["1.1.4-mac-arm64"],
+        )
+        check(
+            "plataformas: plataforma desconocida cae a windows",
+            [r.get("version") for r in listar_releases(plataforma="linux")]
+            == ["1.1.4"],
+        )
+
+        # Retencion: 2 por plataforma; publicar Windows no toca los Mac.
+        publicar_release(_zip_bytes(relleno=5000), "1.1.5")
+        publicar_release(_zip_bytes(relleno=6000), "1.1.6")
+        check(
+            "retencion: windows conserva sus 2 mas recientes",
+            [r.get("version") for r in listar_releases(plataforma="windows")]
+            == ["1.1.6", "1.1.5"],
+            str([r.get("version") for r in listar_releases(plataforma="windows")]),
+        )
+        check(
+            "retencion: publicar Windows NO borra mac-arm64",
+            ultimo_release("mac-arm64").get("version") == "1.1.4-mac-arm64",
+        )
+        check(
+            "retencion: publicar Windows NO borra mac-intel",
+            ultimo_release("mac-intel").get("version") == "1.1.4-mac-intel",
+        )
+
+        # Publicar 2 Mac arm64 mas: se poda esa plataforma, no Windows.
+        publicar_release(_zip_bytes(relleno=7000), "1.1.5-mac-arm64")
+        publicar_release(_zip_bytes(relleno=8000), "1.1.6-mac-arm64")
+        check(
+            "retencion: mac-arm64 conserva sus 2 mas recientes",
+            [
+                r.get("version")
+                for r in listar_releases(plataforma="mac-arm64")
+            ]
+            == ["1.1.6-mac-arm64", "1.1.5-mac-arm64"],
+        )
+        check(
+            "retencion: publicar Mac NO borra Windows",
+            [r.get("version") for r in listar_releases(plataforma="windows")]
+            == ["1.1.6", "1.1.5"],
+        )
+        check(
+            "retencion: mac-intel intacto tras publicar Mac arm64",
+            ultimo_release("mac-intel").get("version") == "1.1.4-mac-intel",
+        )
+        check(
+            "retencion: 5 filas (2 windows + 2 arm64 + 1 intel)",
+            _conteo(maker) == 5,
+            str(_conteo(maker)),
+        )
+
+
+# --------------------------------------------------------------------------- #
 # (6) Tolerancia: BD caida
 # --------------------------------------------------------------------------- #
 def test_tolerancia(check):
@@ -485,10 +688,12 @@ def test_tolerancia(check):
 def run(check):
     """Ejecuta los checks con el `check` del runner (o del marco local)."""
     test_version_actual(check)
+    test_plataforma_de_version(check)
     test_empaquetar_dist(check)
     test_publicar_release(check)
     test_publicar_desde_archivo(check)
     test_consultas(check)
+    test_plataformas(check)
     test_tolerancia(check)
 
 

@@ -1034,6 +1034,14 @@ def _probar_apptest(check) -> None:
         claves_multi = {w.key for w in at.multiselect}
         claves_botones = {w.key for w in at.button}
         claves_check = {w.key for w in at.checkbox}
+        claves_radio = {w.key for w in at.radio}
+
+        check(
+            "apptest: selector de plataforma del ejecutable (default windows)",
+            "mwx_release_plataforma" in claves_radio
+            and at.radio(key="mwx_release_plataforma").value == "windows",
+            str(sorted(claves_radio)),
+        )
 
         check(
             "apptest: pestana Ejecutable con version, obligatoria y publicar",

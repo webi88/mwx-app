@@ -1,29 +1,34 @@
 # -*- coding: utf-8 -*-
-"""Tests del autoactualizador `mwx_app/updater.py` (sin red ni ejecutar el .bat).
+"""Tests del autoactualizador `mwx_app/updater.py` (sin red ni ejecutar scripts).
 
 Cubre el contrato congelado:
-  - `comparar_versiones` y `version_actual`;
-  - `puede_actualizarse` segun `sys.frozen`;
+  - `comparar_versiones`, `version_actual` y `_plataforma_actual`;
+  - `puede_actualizarse` segun `sys.frozen` y la plataforma (Windows/macOS);
   - `consultar` con `requests.get` simulado (sin release, release nuevo,
-    obligatorio, sin red, JSON roto, HTTP 500 y error del servidor);
+    obligatorio, sin red, JSON roto, HTTP 500, error del servidor y la
+    plataforma windows/mac-arm64/mac-intel);
   - `descargar` con chunks falsos (sha256 bueno/malo, tamano incompleto,
-    cancelacion, 404, destino por defecto y nombre saneado);
-  - `preparar` con ZIPs temporales (exe anidado, ruta traversal, ZIP sin exe,
-    ZIP invalido) verificando el contenido del `.bat`;
-  - `lanzar` con `subprocess.Popen` simulado (nunca ejecuta nada);
+    cancelacion, 404, destino por defecto, nombre saneado y plataforma);
+  - `preparar` con ZIPs temporales (exe anidado, .app de macOS, ruta
+    traversal, ZIP sin exe/app, ZIP invalido) verificando `.bat` y `.sh`;
+  - `lanzar` con `subprocess.Popen` simulado (cmd.exe en Windows, /bin/sh en
+    macOS; nunca ejecuta nada);
   - `actualizar` de punta a punta con responses falsos.
 
-Nunca se toca `data/` real, nunca se abre Chrome y nunca se lanza el .bat.
+Nunca se toca `data/` real, nunca se abre Chrome y nunca se lanza un script.
 """
 from __future__ import annotations
 
 import hashlib
 import io
 import os
+import shutil
+import subprocess
 import sys
 import tempfile
 import threading
 import zipfile
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from unittest import mock
 
@@ -111,6 +116,26 @@ def _zip_bytes() -> bytes:
     return buffer.getvalue()
 
 
+@contextmanager
+def _entorno_mac(maquina="arm64", congelado=None, ejecutable=None):
+    """Simula macOS (sys.platform/os.name/machine) sin una Mac real."""
+    with ExitStack() as pila:
+        pila.enter_context(mock.patch.object(updater.sys, "platform", "darwin"))
+        pila.enter_context(mock.patch.object(updater.os, "name", "posix"))
+        pila.enter_context(
+            mock.patch.object(updater.platform, "machine", lambda: maquina)
+        )
+        if congelado is not None:
+            pila.enter_context(
+                mock.patch.object(updater.sys, "frozen", congelado, create=True)
+            )
+        if ejecutable is not None:
+            pila.enter_context(
+                mock.patch.object(updater.sys, "executable", str(ejecutable))
+            )
+        yield
+
+
 # ---------------------------------------------------------------------------
 # Version / comparacion / gate
 # ---------------------------------------------------------------------------
@@ -140,32 +165,101 @@ def _test_version(check) -> None:
             str(valor),
         )
 
+    for valor, esperado in [
+        ("1.1.4-mac-arm64", "1.1.4"),
+        ("1.1.4-mac-intel", "1.1.4"),
+        ("1.1.4-mac", "1.1.4"),
+        ("1.1.4-MAC-ARM64", "1.1.4"),
+        ("1.1.4-macarm64", "1.1.4"),
+        ("1.1.4", "1.1.4"),
+        ("1.1.4-macchiato", "1.1.4-macchiato"),
+        ("", ""),
+    ]:
+        obtenido = updater._version_base_plataforma(valor)
+        check(
+            f"updater: _version_base_plataforma({valor!r}) == {esperado!r}",
+            obtenido == esperado,
+            repr(obtenido),
+        )
+
+
+def _test_plataforma(check) -> None:
+    casos = [
+        ("arm64", "mac-arm64"),
+        ("aarch64", "mac-arm64"),
+        ("x86_64", "mac-intel"),
+        ("amd64", "mac-intel"),
+    ]
+    for maquina, esperada in casos:
+        with _entorno_mac(maquina):
+            valor = updater._plataforma_actual()
+        check(
+            f"updater._plataforma_actual: mac {maquina} -> {esperada}",
+            valor == esperada,
+            valor,
+        )
+    with mock.patch.object(updater.os, "name", "nt"), mock.patch.object(
+        updater.sys, "platform", "win32"
+    ):
+        check(
+            "updater._plataforma_actual: windows",
+            updater._plataforma_actual() == "windows",
+            updater._plataforma_actual(),
+        )
+    with _entorno_mac("ppc"):
+        check(
+            "updater._plataforma_actual: mac sin arquitectura soportada",
+            updater._plataforma_actual() == "",
+            updater._plataforma_actual(),
+        )
+    with mock.patch.object(updater.os, "name", "posix"), mock.patch.object(
+        updater.sys, "platform", "linux"
+    ):
+        check(
+            "updater._plataforma_actual: linux no soportado",
+            updater._plataforma_actual() == "",
+            updater._plataforma_actual(),
+        )
+
 
 def _test_puede(check) -> None:
     with mock.patch.object(updater.sys, "frozen", False, create=True):
         check("updater: en desarrollo no se actualiza", updater.puede_actualizarse() is False)
     with mock.patch.object(updater.sys, "frozen", True, create=True):
         check("updater: congelado puede actualizarse", updater.puede_actualizarse() is True)
-    with mock.patch.object(updater.sys, "frozen", True, create=True), mock.patch.object(
-        updater.sys, "platform", "darwin"
-    ):
+    with _entorno_mac("arm64", congelado=True):
         check(
-            "updater: en macOS congelado NO hay autoactualizacion (manual)",
+            "updater: en macOS arm64 congelado SI hay autoactualizacion",
+            updater.puede_actualizarse() is True,
+        )
+    with _entorno_mac("x86_64", congelado=True):
+        check(
+            "updater: en macOS Intel congelado SI hay autoactualizacion",
+            updater.puede_actualizarse() is True,
+        )
+    with _entorno_mac("arm64", congelado=False):
+        check(
+            "updater: en macOS en desarrollo no se actualiza",
+            updater.puede_actualizarse() is False,
+        )
+    with _entorno_mac("ppc", congelado=True):
+        check(
+            "updater: en macOS con arquitectura desconocida no se actualiza",
             updater.puede_actualizarse() is False,
         )
     with mock.patch.object(updater.sys, "frozen", True, create=True), mock.patch.object(
-        updater.sys, "platform", "win32"
-    ):
+        updater.os, "name", "posix"
+    ), mock.patch.object(updater.sys, "platform", "linux"):
+        check(
+            "updater: en una plataforma no soportada no se actualiza",
+            updater.puede_actualizarse() is False,
+        )
+    with mock.patch.object(updater.sys, "frozen", True, create=True), mock.patch.object(
+        updater.os, "name", "nt"
+    ), mock.patch.object(updater.sys, "platform", "win32"):
         check(
             "updater: en Windows congelado SI hay autoactualizacion",
             updater.puede_actualizarse() is True,
-        )
-    with mock.patch.object(updater.sys, "frozen", False, create=True), mock.patch.object(
-        updater.sys, "platform", "darwin"
-    ):
-        check(
-            "updater: en macOS en desarrollo tampoco se actualiza",
-            updater.puede_actualizarse() is False,
         )
 
 
@@ -306,6 +400,134 @@ def _test_consultar(check) -> None:
     check(
         "updater.consultar: nunca lanza con api_url None",
         isinstance(updater.consultar(None), dict),
+    )
+
+
+def _test_consultar_plataformas(check) -> None:
+    def _respuesta_version(url, **kwargs):
+        return _Respuesta(
+            datos={
+                "ok": True,
+                "disponible": True,
+                "version": "1.2.0",
+                "obligatorio": True,
+            }
+        )
+
+    for maquina, token in (("arm64", "mac-arm64"), ("x86_64", "mac-intel")):
+        llamadas = []
+
+        def _get(url, **kwargs):
+            llamadas.append({"url": url, **kwargs})
+            return _respuesta_version(url, **kwargs)
+
+        with _entorno_mac(maquina), mock.patch.object(updater.requests, "get", _get):
+            datos = updater.consultar("https://api.test", "1.1.0")
+        check(
+            f"updater.consultar: URL con ?plataforma={token}",
+            llamadas
+            and llamadas[0]["url"]
+            == f"https://api.test/v1/app/version?plataforma={token}",
+            str(llamadas[0]["url"]) if llamadas else "",
+        )
+        check(
+            f"updater.consultar: url_descarga incluye version+{token}",
+            datos.get("url_descarga")
+            == (
+                "https://api.test/v1/app/descargar"
+                f"?version=1.2.0&plataforma={token}"
+            ),
+            str(datos.get("url_descarga")),
+        )
+        check(
+            f"updater.consultar: UA macOS ({token})",
+            llamadas
+            and llamadas[0]["headers"].get("User-Agent")
+            == "MWX-APP/1.1.0 (macOS)",
+            str(llamadas[0]["headers"]) if llamadas else "",
+        )
+
+    llamadas = []
+
+    def _get_win(url, **kwargs):
+        llamadas.append({"url": url, **kwargs})
+        return _respuesta_version(url, **kwargs)
+
+    with mock.patch.object(updater.os, "name", "nt"), mock.patch.object(
+        updater.requests, "get", _get_win
+    ):
+        datos = updater.consultar("https://api.test", "1.1.0")
+    check(
+        "updater.consultar: Windows no agrega plataforma en la URL",
+        llamadas and llamadas[0]["url"] == "https://api.test/v1/app/version",
+        str(llamadas[0]["url"]) if llamadas else "",
+    )
+    check(
+        "updater.consultar: Windows url_descarga sin plataforma",
+        datos.get("url_descarga")
+        == "https://api.test/v1/app/descargar?version=1.2.0",
+        str(datos.get("url_descarga")),
+    )
+
+    llamadas = []
+
+    def _get_explicita(url, **kwargs):
+        llamadas.append({"url": url, **kwargs})
+        return _respuesta_version(url, **kwargs)
+
+    with mock.patch.object(updater.requests, "get", _get_explicita):
+        datos = updater.consultar(
+            "https://api.test", "1.1.0", plataforma="mac-arm64"
+        )
+    check(
+        "updater.consultar: plataforma explicita en la URL",
+        llamadas
+        and llamadas[0]["url"]
+        == "https://api.test/v1/app/version?plataforma=mac-arm64",
+        str(llamadas[0]["url"]) if llamadas else "",
+    )
+    check(
+        "updater.consultar: url_descarga con plataforma explicita",
+        datos.get("url_descarga")
+        == (
+            "https://api.test/v1/app/descargar"
+            "?version=1.2.0&plataforma=mac-arm64"
+        ),
+        str(datos.get("url_descarga")),
+    )
+
+    def _version(remota):
+        def _get(url, **kwargs):
+            return _Respuesta(
+                datos={
+                    "ok": True,
+                    "disponible": True,
+                    "version": remota,
+                    "obligatorio": True,
+                }
+            )
+
+        return _get
+
+    with _entorno_mac("arm64"), mock.patch.object(
+        updater.requests, "get", _version("1.1.4-mac-arm64")
+    ):
+        datos = updater.consultar("https://api.test", "1.1.4")
+    check(
+        "updater.consultar: misma version Mac (con sufijo) no es requerida",
+        datos.get("disponible") is True
+        and datos.get("requerida") is False
+        and datos.get("version") == "1.1.4-mac-arm64",
+        str(datos),
+    )
+    with _entorno_mac("x86_64"), mock.patch.object(
+        updater.requests, "get", _version("1.1.5-mac-intel")
+    ):
+        datos = updater.consultar("https://api.test", "1.1.4")
+    check(
+        "updater.consultar: version Mac nueva si es requerida",
+        datos.get("requerida") is True,
+        str(datos),
     )
 
 
@@ -465,6 +687,80 @@ def _test_descargar(check) -> None:
 
 
 # ---------------------------------------------------------------------------
+# descargar por plataforma
+# ---------------------------------------------------------------------------
+def _test_descargar_plataforma(check) -> None:
+    tmp = Path(tempfile.mkdtemp(prefix="mwx_upd_desc_plataforma_"))
+    try:
+        contenido = b"PK\x03\x04mac"
+        llamadas = []
+
+        def _get(url, **kwargs):
+            llamadas.append({"url": url, **kwargs})
+            return _Respuesta(
+                contenido=contenido,
+                headers={"Content-Length": str(len(contenido))},
+                trozos=[contenido],
+            )
+
+        with mock.patch.object(updater.requests, "get", _get):
+            datos = updater.descargar(
+                "https://api.test",
+                "1.2.0",
+                destino=tmp / "mac.zip",
+                plataforma="mac-arm64",
+            )
+        check(
+            "updater.descargar: params con plataforma explicita",
+            datos.get("ok") is True
+            and llamadas
+            and llamadas[0]["params"]
+            == {"version": "1.2.0", "plataforma": "mac-arm64"},
+            str(llamadas[0]) if llamadas else "",
+        )
+        check(
+            "updater.descargar: UA macOS con plataforma",
+            llamadas
+            and llamadas[0]["headers"].get("User-Agent")
+            == "MWX-APP/1.2.0 (macOS)",
+            str(llamadas[0]["headers"]) if llamadas else "",
+        )
+
+        llamadas.clear()
+        with mock.patch.object(
+            updater, "_plataforma_actual", lambda: "mac-intel"
+        ), mock.patch.object(updater.requests, "get", _get):
+            datos = updater.descargar(
+                "https://api.test", "1.2.0", destino=tmp / "mac2.zip"
+            )
+        check(
+            "updater.descargar: plataforma auto mac-intel en params",
+            datos.get("ok") is True
+            and llamadas
+            and llamadas[0]["params"]
+            == {"version": "1.2.0", "plataforma": "mac-intel"},
+            str(llamadas[0]) if llamadas else "",
+        )
+
+        llamadas.clear()
+        with mock.patch.object(
+            updater, "_plataforma_actual", lambda: "windows"
+        ), mock.patch.object(updater.requests, "get", _get):
+            datos = updater.descargar(
+                "https://api.test", "1.2.0", destino=tmp / "win.zip"
+            )
+        check(
+            "updater.descargar: Windows mantiene solo version en params",
+            datos.get("ok") is True
+            and llamadas
+            and llamadas[0]["params"] == {"version": "1.2.0"},
+            str(llamadas[0]) if llamadas else "",
+        )
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
 # preparar
 # ---------------------------------------------------------------------------
 def _test_preparar(check) -> None:
@@ -598,6 +894,167 @@ def _test_preparar(check) -> None:
 
 
 # ---------------------------------------------------------------------------
+# preparar en macOS
+# ---------------------------------------------------------------------------
+def _test_preparar_mac(check) -> None:
+    tmp = Path(tempfile.mkdtemp(prefix="mwx_upd_preparar_mac_"))
+    try:
+        origen = tmp / "MWX-APP-mac-arm64-1.2.0.zip"
+        with zipfile.ZipFile(origen, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("MWX APP.app/Contents/Info.plist", b"<plist/>")
+            zf.writestr("MWX APP.app/Contents/MacOS/MWX APP", b"bin")
+            zf.writestr("config.json", b"{}")
+            zf.writestr("LEEME_MAC.txt", b"leeme")
+        app_dir = tmp / "Aplicaciones" / "MWX APP.app"
+        app_dir.mkdir(parents=True)
+        staging = tmp / "stage_mac"
+
+        with mock.patch.object(updater.sys, "platform", "darwin"):
+            datos = updater.preparar(
+                str(origen), app_dir=str(app_dir), staging_dir=str(staging)
+            )
+        check(
+            "updater.preparar mac: contrato completo",
+            set(datos) == _CLAVES_PREPARAR,
+            str(set(datos)),
+        )
+        check(
+            "updater.preparar mac: ok True",
+            datos.get("ok") is True,
+            str(datos.get("error")),
+        )
+        source = Path(datos.get("source") or "")
+        check(
+            "updater.preparar mac: source es el .app",
+            source.is_dir()
+            and source.name.lower() == "mwx app.app"
+            and (source / "Contents" / "Info.plist").is_file(),
+            str(source),
+        )
+        check(
+            "updater.preparar mac: app_dir",
+            datos.get("app_dir") == str(app_dir.resolve()),
+            str(datos.get("app_dir")),
+        )
+        guion = Path(datos.get("bat") or "")
+        check(
+            "updater.preparar mac: script .sh existe",
+            guion.name == "actualizar_mwx.sh" and guion.is_file(),
+            str(guion),
+        )
+        crudo = guion.read_bytes() if guion.is_file() else b""
+        check(
+            "updater.preparar mac: .sh UTF-8 sin BOM",
+            not crudo.startswith(b"\xef\xbb\xbf"),
+        )
+        check(
+            "updater.preparar mac: .sh con LF (sin CRLF)",
+            bool(crudo) and b"\r\n" not in crudo,
+        )
+        texto = crudo.decode("utf-8", "ignore")
+        for fragmento in (
+            "ditto",
+            "kill -0",
+            "xattr -dr",
+            "BACKUP",
+            "Library/Logs/MWX APP",
+            '$HOME/Applications/MWX APP.app',
+            'open "$FINAL"',
+            'open "$DESTINO"',
+        ):
+            check(
+                f"updater.preparar mac: .sh contiene {fragmento!r}",
+                fragmento in texto,
+            )
+        check(
+            "updater.preparar mac: .sh usa PID/ORIGEN/DESTINO",
+            '"$1"' in texto
+            and '"$2"' in texto
+            and '"$3"' in texto,
+        )
+
+        bash = shutil.which("bash")
+        if bash:
+            proceso = subprocess.run(
+                [bash, "-n", str(guion).replace("\\", "/")],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            check(
+                "updater.preparar mac: bash -n valida el script",
+                proceso.returncode == 0
+                and not (proceso.stderr or "").strip(),
+                (proceso.stderr or "").strip(),
+            )
+        else:
+            check(
+                "updater.preparar mac: .sh no vacio (sin bash)",
+                len(texto) > 300,
+            )
+
+        origen_min = tmp / "MWX-APP-mac-intel-1.2.0.zip"
+        with zipfile.ZipFile(origen_min, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("mwx app.app/Contents/Info.plist", b"<plist/>")
+        with mock.patch.object(updater.sys, "platform", "darwin"):
+            datos = updater.preparar(
+                str(origen_min),
+                app_dir=str(app_dir),
+                staging_dir=str(tmp / "stage_mac_min"),
+            )
+        check(
+            "updater.preparar mac: busca MWX APP.app case-insensitive",
+            datos.get("ok") is True
+            and Path(datos.get("source") or "").name.lower() == "mwx app.app",
+            str(datos.get("source")),
+        )
+
+        solo_exe = _crear_zip(tmp / "MWX-APP-mac-1.3.0.zip", {})
+        staging_exe = tmp / "stage_mac_exe" / "stage"
+        with mock.patch.object(updater.sys, "platform", "darwin"):
+            datos = updater.preparar(
+                str(solo_exe),
+                app_dir=str(app_dir),
+                staging_dir=str(staging_exe),
+            )
+        check(
+            "updater.preparar mac: ZIP de Windows no se instala en macOS",
+            datos.get("ok") is False
+            and "MWX APP.app" in str(datos.get("error"))
+            and "Windows" in str(datos.get("error")),
+            str(datos.get("error")),
+        )
+        check(
+            "updater.preparar mac: ZIP de Windows no escribe .sh",
+            not (tmp / "stage_mac_exe" / "actualizar_mwx.sh").exists(),
+        )
+
+        ejecutable = (
+            tmp
+            / "Aplicaciones"
+            / "MWX APP.app"
+            / "Contents"
+            / "MacOS"
+            / "MWX APP"
+        )
+        with mock.patch.object(updater.sys, "platform", "darwin"), mock.patch.object(
+            updater.sys, "executable", str(ejecutable)
+        ):
+            datos = updater.preparar(
+                str(origen), staging_dir=str(tmp / "stage_mac_defecto")
+            )
+        check(
+            "updater.preparar mac: app_dir por defecto es la raiz del .app",
+            datos.get("ok") is True
+            and datos.get("app_dir")
+            == str((tmp / "Aplicaciones" / "MWX APP.app").resolve()),
+            str(datos.get("app_dir")),
+        )
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
 # lanzar
 # ---------------------------------------------------------------------------
 def _test_lanzar(check) -> None:
@@ -621,6 +1078,12 @@ def _test_lanzar(check) -> None:
             llamadas and str(bat) in llamadas[0]["comando"],
             str(llamadas[0]["comando"]) if llamadas else "",
         )
+        if os.name == "nt":
+            check(
+                "updater.lanzar: en Windows usa cmd.exe /c",
+                llamadas and llamadas[0]["comando"][0:2] == ["cmd.exe", "/c"],
+                str(llamadas[0]["comando"]) if llamadas else "",
+            )
         check(
             "updater.lanzar: sin consola visible (CREATE_NO_WINDOW)",
             llamadas
@@ -660,6 +1123,143 @@ def _test_lanzar(check) -> None:
     finally:
         import shutil
 
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# lanzar en macOS
+# ---------------------------------------------------------------------------
+def _test_lanzar_mac(check) -> None:
+    tmp = Path(tempfile.mkdtemp(prefix="mwx_upd_lanzar_mac_"))
+    try:
+        guion = tmp / "actualizar_mwx.sh"
+        guion.write_bytes(b"#!/bin/sh\n")
+        origen = tmp / "MWX APP.app"
+        (origen / "Contents").mkdir(parents=True)
+        destino = tmp / "Aplicaciones" / "MWX APP.app"
+        llamadas = []
+
+        def _popen(comando, **kwargs):
+            llamadas.append({"comando": comando, **kwargs})
+            return object()
+
+        with mock.patch.object(updater.sys, "platform", "darwin"), mock.patch.object(
+            updater.subprocess, "Popen", _popen
+        ):
+            datos = updater.lanzar(
+                {
+                    "ok": True,
+                    "bat": str(guion),
+                    "source": str(origen),
+                    "app_dir": str(destino),
+                }
+            )
+        check("updater.lanzar mac: contrato", set(datos) == {"ok", "error"})
+        check(
+            "updater.lanzar mac: ok True",
+            datos.get("ok") is True,
+            str(datos.get("error")),
+        )
+        check(
+            "updater.lanzar mac: /bin/sh con PID/source/app_dir",
+            llamadas
+            and llamadas[0]["comando"]
+            == [
+                "/bin/sh",
+                str(guion),
+                str(os.getpid()),
+                str(origen),
+                str(destino),
+            ],
+            str(llamadas[0]["comando"]) if llamadas else "",
+        )
+        check(
+            "updater.lanzar mac: sesion nueva y desacoplada",
+            llamadas
+            and llamadas[0].get("start_new_session") is True
+            and llamadas[0].get("close_fds") is True,
+            str(llamadas[0]) if llamadas else "",
+        )
+        check(
+            "updater.lanzar mac: sin salida a consola",
+            llamadas
+            and llamadas[0].get("stdin") == updater.subprocess.DEVNULL
+            and llamadas[0].get("stdout") == updater.subprocess.DEVNULL
+            and llamadas[0].get("stderr") == updater.subprocess.DEVNULL,
+        )
+
+        llamadas.clear()
+        with mock.patch.object(updater.sys, "platform", "darwin"), mock.patch.object(
+            updater.subprocess, "Popen", _popen
+        ):
+            datos = updater.lanzar(
+                {
+                    "ok": True,
+                    "bat": str(guion),
+                    "staging": str(tmp),
+                    "app_dir": str(destino),
+                }
+            )
+        check(
+            "updater.lanzar mac: deriva source del staging (flujo actualizar)",
+            datos.get("ok") is True
+            and llamadas
+            and llamadas[0]["comando"][3] == str(origen.resolve()),
+            str(llamadas[0]["comando"]) if llamadas else "",
+        )
+
+        llamadas.clear()
+        with mock.patch.object(updater.sys, "platform", "darwin"), mock.patch.object(
+            updater.subprocess, "Popen", _popen
+        ):
+            datos = updater.lanzar(
+                {
+                    "ok": True,
+                    "bat": str(guion),
+                    "app_dir": str(destino),
+                }
+            )
+        check(
+            "updater.lanzar mac: sin source ni staging falla",
+            datos.get("ok") is False
+            and not llamadas
+            and bool(datos.get("error")),
+            str(datos.get("error")),
+        )
+
+        with mock.patch.object(updater.sys, "platform", "darwin"):
+            datos = updater.lanzar(
+                {
+                    "ok": True,
+                    "bat": str(tmp / "no_existe.sh"),
+                    "source": str(origen),
+                    "app_dir": str(destino),
+                }
+            )
+        check(
+            "updater.lanzar mac: script inexistente ok False",
+            datos.get("ok") is False,
+        )
+
+        def _popen_error(*args, **kwargs):
+            raise OSError("no se pudo")
+
+        with mock.patch.object(updater.sys, "platform", "darwin"), mock.patch.object(
+            updater.subprocess, "Popen", _popen_error
+        ):
+            datos = updater.lanzar(
+                {
+                    "ok": True,
+                    "bat": str(guion),
+                    "source": str(origen),
+                    "app_dir": str(destino),
+                }
+            )
+        check(
+            "updater.lanzar mac: error de Popen ok False",
+            datos.get("ok") is False,
+        )
+    finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
 
@@ -772,11 +1372,16 @@ def _test_actualizar(check) -> None:
 # ---------------------------------------------------------------------------
 def run(check) -> None:
     _test_version(check)
+    _test_plataforma(check)
     _test_puede(check)
     _test_consultar(check)
+    _test_consultar_plataformas(check)
     _test_descargar(check)
+    _test_descargar_plataforma(check)
     _test_preparar(check)
+    _test_preparar_mac(check)
     _test_lanzar(check)
+    _test_lanzar_mac(check)
     _test_actualizar(check)
 
 

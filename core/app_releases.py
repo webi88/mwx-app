@@ -14,8 +14,13 @@ Reglas de esta capa (mismo estilo defensivo que `core/app_imagenes.py`):
   `empaquetar_dist` usan SELECT sin la columna `contenido` (evita cargar el ZIP
   completo de ~34 MB); solo `leer_release` lo carga.
 - **UPSERT por version**: publicar una version existente la REEMPLAZA.
+- **Plataformas sin migracion de esquema**: la columna `version` es UNIQUE y
+  lleva el sufijo de la plataforma (`1.1.4` = Windows, `1.1.4-mac-arm64`,
+  `1.1.4-mac-intel`). `plataforma_de_version` deduce la plataforma del texto.
 - **Retencion**: al publicar se conservan solo los 2 releases mas recientes por
-  `id` (nunca se borra el recien publicado).
+  `id` DE CADA PLATAFORMA (windows, mac-arm64, mac-intel, mac); publicar un Mac
+  nunca borra el release vigente de Windows (nunca se borra el recien
+  publicado).
 - Solo SQLAlchemy + stdlib (sin FastAPI, sin Streamlit). `AppRelease` y
   `get_db_session` se importan DENTRO de las funciones (sin ciclos).
 
@@ -25,9 +30,10 @@ API PUBLICA (nombres y firmas CONGELADOS):
     empaquetar_dist(origen="dist/MWX APP", destino="data/releases", version="") -> dict
     publicar_release(contenido, version, obligatorio=True, notas="", filename="") -> dict
     publicar_release_desde_archivo(ruta, version="", obligatorio=True, notas="") -> dict
-    ultimo_release() -> dict
-    leer_release(version="") -> dict
-    listar_releases(limite=5) -> list[dict]
+    plataforma_de_version(version) -> str
+    ultimo_release(plataforma="") -> dict
+    leer_release(version="", plataforma="") -> dict
+    listar_releases(limite=5, plataforma="") -> list[dict]
     borrar_release(version) -> dict
 """
 from __future__ import annotations
@@ -48,6 +54,7 @@ __all__ = [
     "empaquetar_dist",
     "publicar_release",
     "publicar_release_desde_archivo",
+    "plataforma_de_version",
     "ultimo_release",
     "leer_release",
     "listar_releases",
@@ -179,6 +186,78 @@ def _es_zip(datos: bytes) -> bool:
         return zipfile.is_zipfile(io.BytesIO(datos))
     except Exception:
         return False
+
+
+# ---------------------------------------------------------------------------
+# Plataformas (sin migracion de esquema: el sufijo de `version` la define)
+# ---------------------------------------------------------------------------
+def plataforma_de_version(version) -> str:
+    """Plataforma de un release segun su `version` (Windows por defecto).
+
+    - Contiene `mac-arm64` / `mac_arm64` (o `macarm64`) -> `"mac-arm64"`.
+    - Contiene `mac-intel` / `mac_intel` / `x86_64` -> `"mac-intel"`.
+    - Cualquier otro texto con `mac` -> `"mac"`.
+    - Resto (incluido None, "" o no-str) -> `"windows"`.
+
+    Nunca lanza."""
+    try:
+        texto = _texto(version).lower().replace(" ", "")
+    except Exception:
+        return "windows"
+    if not texto:
+        return "windows"
+    compacto = texto.replace("_", "-")
+    if "mac-arm64" in compacto or "macarm64" in compacto:
+        return "mac-arm64"
+    if (
+        "mac-intel" in compacto
+        or "macintel" in compacto
+        or "x86_64" in texto
+        or "x86-64" in compacto
+    ):
+        return "mac-intel"
+    if "mac" in compacto:
+        return "mac"
+    return "windows"
+
+
+def _normalizar_plataforma(plataforma) -> str:
+    """Normaliza el filtro: "" (todas) o windows/mac-arm64/mac-intel/mac.
+
+    Acepta `_` como separador (`mac_arm64` -> `mac-arm64`) y aliases
+    `all`/`todas`/`todos` que equivalen a "" (sin filtro). Un valor no
+    reconocido cae a "windows" (comportamiento historico: cualquier version sin
+    `mac` es Windows). Nunca lanza."""
+    texto = _texto(plataforma).lower().replace(" ", "")
+    if texto in ("", "all", "todas", "todos"):
+        return ""
+    return plataforma_de_version(texto)
+
+
+def _condicion_plataforma(AppRelease, plataforma):
+    """Condicion SQLAlchemy para filtrar releases por plataforma.
+
+    Devuelve None cuando no hay filtro (""/"all"). Nunca lanza."""
+    clave = _normalizar_plataforma(plataforma)
+    if clave == "":
+        return None
+
+    from sqlalchemy import not_, or_
+
+    if clave == "windows":
+        return not_(AppRelease.version.ilike("%mac%"))
+    if clave == "mac-arm64":
+        return or_(
+            AppRelease.version.ilike("%mac-arm64%"),
+            AppRelease.version.ilike("%mac_arm64%"),
+        )
+    if clave == "mac-intel":
+        return or_(
+            AppRelease.version.ilike("%mac-intel%"),
+            AppRelease.version.ilike("%mac_intel%"),
+            AppRelease.version.ilike("%x86%"),
+        )
+    return AppRelease.version.ilike("%mac%")
 
 
 # ---------------------------------------------------------------------------
@@ -353,7 +432,9 @@ def publicar_release(
     - Calcula sha256/tamano, recorta `notas` a 4000 y `filename` a 200
       (`MWX-APP-<version>.zip` si viene vacio).
     - Si la version ya existe la reemplaza (mismo `id`); al final conserva solo
-      los 2 releases mas recientes por `id` (nunca borra el recien publicado).
+      los 2 releases mas recientes por `id` DE CADA PLATAFORMA (windows,
+      mac-arm64, mac-intel, mac) y nunca borra el recien publicado. Publicar un
+      Mac no afecta al release vigente de Windows.
 
     Devuelve `{"ok","version","sha256","tamano","error"}`. Nunca lanza."""
     version_txt = _texto(version)[:50]
@@ -433,15 +514,26 @@ def publicar_release(
             db.flush()  # asigna/confirma el id antes de podar
             nuevo_id = getattr(fila, "id", None)
 
-            # Retencion: 2 releases mas recientes por id, jamas el nuevo.
-            ids = [
-                int(valor[0])
-                for valor in db.execute(
-                    select(AppRelease.id).order_by(AppRelease.id.desc())
-                ).all()
-                if valor and valor[0] is not None
-            ]
-            conservar = set(ids[:2])
+            # Retencion: 2 releases mas recientes por id DE CADA PLATAFORMA,
+            # jamas el nuevo. Se agrupa por el sufijo de `version`
+            # (`plataforma_de_version`); publicar Mac no borra Windows.
+            filas = db.execute(
+                select(AppRelease.id, AppRelease.version).order_by(
+                    AppRelease.id.desc()
+                )
+            ).all()
+            vistos = {}
+            ids = []
+            conservar = set()
+            for valor in filas:
+                if not valor or valor[0] is None:
+                    continue
+                identificador = int(valor[0])
+                ids.append(identificador)
+                clave = plataforma_de_version(valor[1])
+                vistos[clave] = vistos.get(clave, 0) + 1
+                if vistos[clave] <= 2:
+                    conservar.add(identificador)
             if nuevo_id is not None:
                 conservar.add(int(nuevo_id))
             borrar = [identificador for identificador in ids if identificador not in conservar]
@@ -505,23 +597,30 @@ def publicar_release_desde_archivo(
 # ---------------------------------------------------------------------------
 # Consulta y borrado (metadatos SIN contenido salvo `leer_release`)
 # ---------------------------------------------------------------------------
-def ultimo_release() -> dict:
-    """Metadatos del release mas reciente (SIN `contenido`).
+def ultimo_release(plataforma="") -> dict:
+    """Metadatos del release mas reciente de `plataforma` (SIN `contenido`).
+
+    - `plataforma` vacio o "all" -> el mas reciente global (comportamiento
+      historico).
+    - "windows" -> ultimo `version` SIN "mac" (case-insensitive).
+    - "mac-arm64" -> ultimo `version` con `%mac-arm64%` (o `%mac_arm64%`).
+    - "mac-intel" -> ultimo `version` con `%mac-intel%` (o `%mac_intel%`).
+    - "mac" -> ultimo `version` con `%mac%`.
 
     Claves: `disponible, version, obligatorio, notas, sha256, tamano, filename,
-    fecha` (fecha ISO o ""). Sin releases o ante error -> `{"disponible":
-    False}`. Nunca lanza."""
+    fecha` (fecha ISO o ""). Sin releases de esa plataforma o ante error ->
+    `{"disponible": False}`. Nunca lanza."""
     try:
         from sqlalchemy import select
 
         from core.database import get_db_session  # import local (sin ciclos)
         from core.models import AppRelease
 
-        stmt = (
-            select(*_columnas_meta(AppRelease))
-            .order_by(AppRelease.id.desc())
-            .limit(1)
-        )
+        stmt = select(*_columnas_meta(AppRelease))
+        condicion = _condicion_plataforma(AppRelease, plataforma)
+        if condicion is not None:
+            stmt = stmt.where(condicion)
+        stmt = stmt.order_by(AppRelease.id.desc()).limit(1)
         with get_db_session() as db:
             fila = db.execute(stmt).first()
         if fila is None:
@@ -531,8 +630,13 @@ def ultimo_release() -> dict:
         return {"disponible": False}
 
 
-def leer_release(version="") -> dict:
+def leer_release(version="", plataforma="") -> dict:
     """Metadatos + `contenido` (bytes) del release pedido o del mas reciente.
+
+    - `version` vacia -> resuelve primero `ultimo_release(plataforma)` y lee esa
+      version (asi Mac y Windows bajan SU propio ZIP).
+    - `version` explicita -> se ignora `plataforma` y se lee esa version (ya es
+      unica y contiene el sufijo).
 
     Si no existe devuelve `{"disponible": False, "contenido": b""}`. Nunca
     lanza."""
@@ -542,11 +646,19 @@ def leer_release(version="") -> dict:
         from core.database import get_db_session  # import local (sin ciclos)
         from core.models import AppRelease
 
+        version_txt = _texto(version)
+        if not version_txt:
+            ultimo = ultimo_release(plataforma)
+            if not ultimo.get("disponible"):
+                return {"disponible": False, "contenido": b""}
+            version_txt = _texto(ultimo.get("version"))
+        if not version_txt:
+            return {"disponible": False, "contenido": b""}
+
         with get_db_session() as db:
-            stmt = select(AppRelease)
-            version_txt = _texto(version)
-            if version_txt:
-                stmt = stmt.where(AppRelease.version == version_txt)
+            stmt = select(AppRelease).where(
+                AppRelease.version == version_txt
+            )
             fila = (
                 db.execute(stmt.order_by(AppRelease.id.desc()).limit(1))
                 .scalars()
@@ -570,9 +682,11 @@ def leer_release(version="") -> dict:
         return {"disponible": False, "contenido": b""}
 
 
-def listar_releases(limite=5) -> list:
+def listar_releases(limite=5, plataforma="") -> list:
     """Ultimos releases (metadatos SIN contenido), del mas nuevo al mas viejo.
 
+    `plataforma` vacio = todos (comportamiento historico); con un valor usa la
+    misma regla de `ultimo_release` (windows / mac-arm64 / mac-intel / mac).
     `limite` default 5 (si viene invalido o <= 0 se usa 5). Ante cualquier
     error devuelve []. Nunca lanza."""
     try:
@@ -588,11 +702,11 @@ def listar_releases(limite=5) -> list:
         if tope <= 0:
             tope = 5
 
-        stmt = (
-            select(*_columnas_meta(AppRelease))
-            .order_by(AppRelease.id.desc())
-            .limit(tope)
-        )
+        stmt = select(*_columnas_meta(AppRelease))
+        condicion = _condicion_plataforma(AppRelease, plataforma)
+        if condicion is not None:
+            stmt = stmt.where(condicion)
+        stmt = stmt.order_by(AppRelease.id.desc()).limit(tope)
         with get_db_session() as db:
             filas = db.execute(stmt).all()
         return [_fila_meta(fila) for fila in filas]

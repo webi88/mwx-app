@@ -13,8 +13,9 @@ Pestanas:
   2. 🔗 Asignar cuentas: multiselect de la flota de X con filtros + resumen.
   3. ⚙️ Campana: hashtags, contexto, narrativa, URLs, imagenes y topes.
   4. 📊 Actividad / Seguridad: ultimos eventos, URL del API y acciones masivas.
-  5. ⬇️ Ejecutable / Actualizaciones: descarga del ZIP publicado y publicacion
-     de una actualizacion remota (obligatoria u opcional) en `app_releases`.
+  5. ⬇️ Ejecutable / Actualizaciones: descarga del ZIP publicado por
+     plataforma (Windows / macOS arm64 / macOS Intel) y publicación de una
+     actualización remota (obligatoria u opcional) en `app_releases`.
 
 Reglas de seguridad:
   - NUNCA se muestran hashes ni contrasenas (la tabla solo expone metadatos).
@@ -2088,26 +2089,140 @@ def _tab_seguridad() -> None:
 
 # ============================ EJECUTABLE / ACTUALIZACIONES ============================
 
+# Releases por plataforma: la API filtra por el sufijo de `version`
+# (`1.1.4` = Windows, `1.1.4-mac-arm64` / `1.1.4-mac-intel` = macOS).
+PLATAFORMAS_RELEASE = {
+    "windows": "Windows (.exe)",
+    "mac-arm64": "macOS Apple Silicon (arm64)",
+    "mac-intel": "macOS Intel (x86_64)",
+}
+
+
+def _etiqueta_plataforma(plataforma: str) -> str:
+    """Etiqueta legible de una clave de plataforma de release."""
+    clave = _texto(plataforma)
+    if clave in PLATAFORMAS_RELEASE:
+        return PLATAFORMAS_RELEASE[clave]
+    if clave in ("mac", "macos"):
+        return "macOS (genérico)"
+    return clave or PLATAFORMAS_RELEASE["windows"]
+
+
+def _plataforma_desde_texto(texto: str) -> str:
+    """Clave de plataforma detectada en una version/filename ("" si no hay)."""
+    valor = _texto(texto).lower()
+    if "mac-arm64" in valor:
+        return "mac-arm64"
+    if "mac-intel" in valor:
+        return "mac-intel"
+    if "windows" in valor or "win64" in valor or "win32" in valor:
+        return "windows"
+    if "mac" in valor:
+        return "mac"
+    return ""
+
+
+def _plataforma_de_version_segura(version: str) -> str:
+    """Plataforma legible de una version (core si existe; fallback local)."""
+    texto = _texto(version)
+    try:
+        from core.app_releases import plataforma_de_version
+
+        etiqueta = _texto(plataforma_de_version(texto))
+        if etiqueta:
+            return _etiqueta_plataforma(etiqueta)
+    except Exception:
+        pass
+    clave = _plataforma_desde_texto(texto) or "windows"
+    return _etiqueta_plataforma(clave)
+
+
+def _version_default_plataforma(plataforma: str, version_base: str) -> str:
+    """Version por defecto del release segun la plataforma elegida."""
+    base = _texto(version_base)
+    if not base:
+        return ""
+    if plataforma == "mac-arm64":
+        sufijo = "-mac-arm64"
+    elif plataforma == "mac-intel":
+        sufijo = "-mac-intel"
+    else:
+        return base
+    return base if sufijo in base else f"{base}{sufijo}"
+
+
+def _validar_nombre_plataforma(nombre: str, plataforma: str) -> str:
+    """Aviso si el nombre del ZIP no cuadra con la plataforma; "" si cuadra."""
+    nombre_txt = _texto(nombre)
+    if not nombre_txt:
+        return ""
+    detectada = _plataforma_desde_texto(nombre_txt)
+    if plataforma in ("mac-arm64", "mac-intel"):
+        if detectada == plataforma:
+            return ""
+        return (
+            f"El archivo «{nombre_txt}» no parece de "
+            f"{_etiqueta_plataforma(plataforma)}. El nombre debe incluir "
+            f"«{plataforma}» (p. ej. MWX-APP-{plataforma}.zip) para no subir "
+            "el ZIP de otra plataforma."
+        )
+    if detectada in ("mac-arm64", "mac-intel", "mac"):
+        return (
+            f"El archivo «{nombre_txt}» parece de macOS, pero elegiste "
+            "Windows. Cambia la plataforma del ejecutable o sube el ZIP de "
+            "Windows."
+        )
+    return ""
+
+
+def _validar_version_plataforma(version: str, plataforma: str) -> str:
+    """Aviso si la version no lleva el sufijo de la plataforma; "" si cuadra."""
+    version_txt = _texto(version)
+    if not version_txt:
+        return ""
+    detectada = _plataforma_desde_texto(version_txt)
+    if plataforma in ("mac-arm64", "mac-intel"):
+        if detectada == plataforma:
+            return ""
+        return (
+            f"La versión «{version_txt}» no corresponde a "
+            f"{_etiqueta_plataforma(plataforma)}: debe incluir "
+            f"«-{plataforma}» (p. ej. 1.1.4-{plataforma})."
+        )
+    if detectada in ("mac-arm64", "mac-intel", "mac"):
+        return (
+            f"La versión «{version_txt}» parece de macOS, pero elegiste "
+            "Windows. Cambia la plataforma o usa una versión sin sufijo mac."
+        )
+    return ""
+
 
 @st.cache_data(ttl=15, show_spinner=False)
-def _cache_ultimo_release() -> dict:
-    """Metadatos del ultimo release (cache 15s). Nunca lanza."""
+def _cache_ultimo_release(plataforma: str = "") -> dict:
+    """Ultimo release de la plataforma (cache por plataforma, 15s). Nunca lanza."""
     try:
         from core.app_releases import ultimo_release
 
-        datos = ultimo_release()
+        try:
+            datos = ultimo_release(plataforma)
+        except (TypeError, AttributeError):
+            # Version vieja de core.app_releases: sin filtro por plataforma.
+            datos = ultimo_release()
         return datos if isinstance(datos, dict) else {"disponible": False}
     except Exception:
         return {"disponible": False}
 
 
 @st.cache_data(ttl=15, show_spinner=False)
-def _cache_listar_releases(limite: int = 5) -> list:
-    """Ultimos releases SIN contenido (cache 15s). Nunca lanza."""
+def _cache_listar_releases(limite: int = 10, plataforma: str = "") -> list:
+    """Ultimos releases SIN contenido (cache por plataforma, 15s). Nunca lanza."""
     try:
         from core.app_releases import listar_releases
 
-        datos = listar_releases(limite)
+        try:
+            datos = listar_releases(limite, plataforma)
+        except (TypeError, AttributeError):
+            datos = listar_releases(limite)
         return list(datos) if isinstance(datos, list) else []
     except Exception:
         return []
@@ -2150,14 +2265,17 @@ def _mb(tamano) -> str:
 def _tab_ejecutable() -> None:
     """Descarga del ejecutable MWX APP + publicacion de actualizaciones.
 
-    La descarga usa el ultimo release de la BD (`app_releases`) y, si no hay
-    ninguno, permite empaquetar `dist/MWX APP` en local (en Railway esa carpeta
-    no existe: alli hay que subir el ZIP). Ninguna accion de empaquetado o
-    publicacion se ejecuta al renderizar: solo al pulsar los botones."""
+    Los releases se separan por plataforma (Windows / macOS) usando el sufijo
+    de `version`; descarga, publicacion y tabla usan la plataforma elegida.
+    Si no hay release, Windows permite empaquetar `dist/MWX APP` en local (en
+    Railway esa carpeta no existe: alli hay que subir el ZIP). Ninguna accion
+    de empaquetado o publicacion se ejecuta al renderizar: solo al pulsar los
+    botones."""
     st.markdown("### ⬇️ Ejecutable / Actualizaciones")
     st.caption(
         "El ZIP se guarda en la base de datos (`app_releases`) para que la API "
-        "lo sirva y los .exe se actualicen solos al abrirlos."
+        "lo sirva y cada app se actualice sola al abrirse. Windows y macOS se "
+        "publican por separado."
     )
     try:
         from core.app_releases import (
@@ -2171,9 +2289,32 @@ def _tab_ejecutable() -> None:
 
     _mostrar_flash("mwx_release_flash")
 
+    plataforma = st.radio(
+        "Plataforma del ejecutable",
+        options=list(PLATAFORMAS_RELEASE.keys()),
+        format_func=_etiqueta_plataforma,
+        index=0,
+        horizontal=True,
+        key="mwx_release_plataforma",
+    )
+    plataforma = _texto(plataforma) or "windows"
+    if plataforma not in PLATAFORMAS_RELEASE:
+        plataforma = "windows"
+    etiqueta_plataforma = _etiqueta_plataforma(plataforma)
+
+    # Version por defecto de ESTA plataforma; al cambiar de plataforma se
+    # actualiza el default (la edicion manual se conserva entre reruns).
+    version_default = _version_default_plataforma(plataforma, version_actual())
+    if (
+        st.session_state.get("mwx_release_plataforma_prev") != plataforma
+        or "mwx_release_version" not in st.session_state
+    ):
+        st.session_state["mwx_release_version"] = version_default
+    st.session_state["mwx_release_plataforma_prev"] = plataforma
+
     # ---------------- Descargar el ejecutable ----------------
-    st.markdown("#### 📦 Descargar el ejecutable")
-    ultimo = _cache_ultimo_release()
+    st.markdown(f"#### 📦 Descargar el ejecutable · {etiqueta_plataforma}")
+    ultimo = _cache_ultimo_release(plataforma)
     disponible = bool(isinstance(ultimo, dict) and ultimo.get("disponible"))
     if disponible:
         version = _texto(ultimo.get("version")) or "(sin versión)"
@@ -2208,7 +2349,7 @@ def _tab_ejecutable() -> None:
             st.warning(
                 "El release está registrado pero su contenido no se pudo leer."
             )
-    else:
+    elif plataforma == "windows":
         try:
             ruta_dist = _texto(resolver_ruta("dist/MWX APP"))
         except Exception:
@@ -2216,8 +2357,8 @@ def _tab_ejecutable() -> None:
         existe_dist = bool(ruta_dist) and os.path.isdir(ruta_dist)
         if existe_dist:
             st.info(
-                "No hay release publicado en la BD, pero existe la carpeta "
-                f"`{ruta_dist}`. Puedes empaquetarla y descargar el ZIP."
+                "Todavía no hay release para Windows. Existe la carpeta "
+                f"`{ruta_dist}`: puedes empaquetarla y descargar el ZIP."
             )
             if st.button(
                 "📦 Empaquetar dist/MWX APP",
@@ -2258,24 +2399,41 @@ def _tab_ejecutable() -> None:
             )
         else:
             st.info(
-                "No hay ningún release publicado ni la carpeta `dist/MWX APP`. "
-                "Compila el ejecutable con `build_mwx.bat` y publica el ZIP en "
-                "la sección de abajo."
+                "Todavía no hay release para Windows. Compila el ejecutable "
+                "con `build_mwx.bat` y publica el ZIP en la sección de abajo."
             )
+    else:
+        st.info(
+            f"Todavía no hay release para {etiqueta_plataforma}. El ZIP de "
+            "macOS se genera con GitHub Actions (build-mwx-macos) y se sube en "
+            "la sección de abajo."
+        )
+
+    if plataforma in ("mac-arm64", "mac-intel"):
+        st.caption(
+            "macOS: el .app no está firmado; primer arranque con clic derecho > "
+            "Abrir. La actualización remota de Mac usará este mismo release."
+        )
 
     st.markdown("---")
 
     # ---------------- Publicar actualización remota ----------------
     st.markdown("#### 🚀 Publicar actualización remota (autoactualización forzada)")
     st.caption(
-        "Se conservan solo los 2 releases más recientes. Si marcas la "
-        "actualización como obligatoria, el .exe se bloquea hasta actualizar."
+        "Windows y Mac se publican por separado (cada plataforma tiene su "
+        "propia actualización) y se conservan solo los 2 releases más "
+        "recientes por plataforma. Si marcas la actualización como "
+        "obligatoria, la app se bloquea hasta actualizar."
     )
     subido = st.file_uploader(
-        "Paquete ZIP del ejecutable",
+        f"Paquete ZIP del ejecutable · {etiqueta_plataforma}",
         type=["zip"],
         key="mwx_release_zip",
-        help="Máximo 150 MB. Compílalo con build_mwx.bat.",
+        help=(
+            "Máximo 150 MB. Windows: build_mwx.bat. macOS: ZIP generado por "
+            "GitHub Actions; el nombre debe incluir «mac-arm64» o «mac-intel» "
+            "para validar la plataforma."
+        ),
     )
     if subido is not None:
         try:
@@ -2290,9 +2448,12 @@ def _tab_ejecutable() -> None:
             st.caption(f"Archivo cargado: {_mb(tamano_subido)}.")
     version_nueva = st.text_input(
         "Versión del release",
-        value=version_actual(),
         key="mwx_release_version",
-        help="Ej. 1.0.1. Si ya existe, se reemplaza.",
+        help=(
+            "Windows: 1.1.4 · macOS: 1.1.4-mac-arm64 / 1.1.4-mac-intel. "
+            "Se actualiza al cambiar de plataforma; puedes editarla. Si ya "
+            "existe, se reemplaza."
+        ),
     )
     obligatorio = st.checkbox(
         "Actualización obligatoria (bloquea la app hasta actualizar)",
@@ -2310,8 +2471,15 @@ def _tab_ejecutable() -> None:
         type="primary",
         key="mwx_release_publicar",
     ):
+        nombre_subido = _texto(getattr(subido, "name", ""))
+        aviso_archivo = _validar_nombre_plataforma(nombre_subido, plataforma)
+        aviso_version = _validar_version_plataforma(version_nueva, plataforma)
         if subido is None:
             st.warning("Adjunta un ZIP del ejecutable.")
+        elif aviso_archivo:
+            st.warning(aviso_archivo)
+        elif aviso_version:
+            st.warning(aviso_version)
         elif not str(version_nueva or "").strip():
             st.warning("Escribe una versión para el release.")
         else:
@@ -2321,21 +2489,25 @@ def _tab_ejecutable() -> None:
                 contenido = b""
                 st.error(f"No se pudo leer el archivo subido: {e}")
             if contenido:
+                argumentos = {}
+                if nombre_subido:
+                    argumentos["filename"] = nombre_subido
                 resultado = publicar_release(
                     contenido,
                     str(version_nueva).strip(),
                     bool(obligatorio),
                     str(notas or ""),
+                    **argumentos,
                 )
                 if resultado.get("ok"):
                     st.success(
-                        "Actualización publicada: "
+                        f"Actualización publicada para {etiqueta_plataforma}: "
                         f"v{resultado.get('version')} · "
                         f"{_mb(resultado.get('tamano')) or '—'} · "
                         f"sha256 {str(resultado.get('sha256'))[:12]}…"
                     )
                     st.warning(
-                        "Los .exe se actualizarán solos al abrirlos"
+                        "Las apps se actualizarán solas al abrirlas"
                         + (
                             " (obligatoria: la app queda bloqueada hasta "
                             "actualizar)."
@@ -2350,17 +2522,23 @@ def _tab_ejecutable() -> None:
                         or "No se pudo publicar la actualización."
                     )
 
-    releases = _cache_listar_releases(5)
+    releases = _cache_listar_releases(10)
     if releases:
-        st.markdown("##### 🗂️ Releases publicados (máx. 2 en retención)")
+        st.markdown(
+            "##### 🗂️ Releases publicados (máx. 2 por plataforma)"
+        )
         st.dataframe(
             [
                 {
                     "versión": _texto(r.get("version")),
+                    "Plataforma": _plataforma_de_version_segura(
+                        r.get("version")
+                    ),
                     "obligatoria": "Sí" if r.get("obligatorio") else "No",
                     "tamaño": _mb(r.get("tamano")) or "—",
                     "fecha": _texto(r.get("fecha"))[:16],
                     "sha256": _texto(r.get("sha256"))[:12],
+                    "filename": _texto(r.get("filename")) or "—",
                 }
                 for r in releases
             ],
