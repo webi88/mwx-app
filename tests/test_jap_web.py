@@ -412,6 +412,35 @@ def _tabla_con_columnas(at, columnas):
     return None
 
 
+def _minimos_number_inputs(fuente: str) -> dict:
+    """Mapa `key -> min_value` de los `st.number_input` de la pagina (AST)."""
+    minimos = {}
+    try:
+        arbol = ast.parse(fuente)
+    except SyntaxError:
+        return minimos
+    for nodo in ast.walk(arbol):
+        if not (
+            isinstance(nodo, ast.Call)
+            and isinstance(nodo.func, ast.Attribute)
+            and nodo.func.attr == "number_input"
+        ):
+            continue
+        clave = None
+        minimo = None
+        for palabra in nodo.keywords:
+            if palabra.arg == "key" and isinstance(palabra.value, ast.Constant):
+                clave = str(palabra.value.value)
+            elif (
+                palabra.arg == "min_value"
+                and isinstance(palabra.value, ast.Constant)
+            ):
+                minimo = palabra.value.value
+        if clave:
+            minimos[clave] = minimo
+    return minimos
+
+
 def _metricas(at) -> dict:
     return {str(m.label): str(m.value) for m in at.metric}
 
@@ -604,6 +633,20 @@ def run(check):
     fuente_pagina = (RAIZ / "web" / "operaciones" / "jap.py").read_text(
         encoding="utf-8"
     )
+    minimos = _minimos_number_inputs(fuente_pagina)
+    claves_minimo_cero = (
+        "jap_quote_likes",
+        "jap_quote_rts",
+        "jap_quote_comments",
+        "jap_quote_views",
+        "jap_quote_followers",
+        "jap_buy_cantidad",
+    )
+    check(
+        "jap: sin minimo de pedido (0 = no comprar en todos los campos)",
+        all(minimos.get(clave) == 0 for clave in claves_minimo_cero),
+        str({clave: minimos.get(clave) for clave in claves_minimo_cero}),
+    )
     check(
         "jap: la pagina importa integraciones.jap de forma perezosa (dentro "
         "de _cliente)",
@@ -680,6 +723,24 @@ def run(check):
         "jap: _calcular_lote calcula un total > 0 por link",
         len(filas) == 2 and total > 0 and not avisos,
         f"(total={total:.6f}, avisos={avisos})",
+    )
+
+    with mock.patch.object(jap_mod, "calcular_costo", _fake_costo):
+        filas_cero, avisos_cero = pagina._calcular_lote(
+            pagina.LINKS_REDAMLO[:2],
+            {"likes": 0, "retweets": 0, "comments": 0, "views": 0},
+            {
+                "likes": {"id": 9013},
+                "retweets": {"id": 8860},
+                "comments": {"id": 6601},
+                "views": {"id": 8413},
+            },
+        )
+    total_cero = sum(fila["Total $"] for fila in filas_cero)
+    check(
+        "jap: _calcular_lote con 0 en todo no cobra ni avisa (sin minimo)",
+        len(filas_cero) == 2 and total_cero == 0 and not avisos_cero,
+        f"(total={total_cero}, avisos={avisos_cero})",
     )
 
     # ---------------- (3) AppTest con backend mockeado ----------------

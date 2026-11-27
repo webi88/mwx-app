@@ -906,39 +906,50 @@ def _tab_cotizador(disponible: bool):
     personalizados = bool(str(texto_comentarios or "").strip())
 
     st.markdown("**Cantidades por tweet** (JAP cobra por 1,000 unidades):")
+    st.caption(
+        "Pon **0** en lo que NO quieras comprar (likes, RT, comentarios, "
+        "vistas o seguidores). Si pones un valor mayor a 0, JAP exige el "
+        "mínimo de ese servicio."
+    )
     c1, c2, c3, c4, c5 = st.columns(5)
     with c1:
         likes = st.number_input(
             "👍 Likes",
-            min_value=10,
+            min_value=0,
             value=50,
             step=10,
             key="jap_quote_likes",
+            help="0 = no pedir likes.",
         )
     with c2:
         retweets = st.number_input(
             "🔁 Retweets",
-            min_value=10,
+            min_value=0,
             value=10,
             step=10,
             key="jap_quote_rts",
+            help="0 = no pedir retweets.",
         )
     with c3:
         comentarios = st.number_input(
             "💬 Comentarios",
-            min_value=5,
+            min_value=0,
             value=5,
             step=5,
             key="jap_quote_comments",
-            help="Mínimo real de JAP para estos servicios: 5 por pedido.",
+            help=(
+                "0 = no pedir comentarios. Si compras, JAP exige mínimo 5 "
+                "por pedido."
+            ),
         )
     with c4:
         vistas = st.number_input(
             "👁️ Vistas",
-            min_value=5,
+            min_value=0,
             value=500,
             step=100,
             key="jap_quote_views",
+            help="0 = no pedir vistas.",
         )
     with c5:
         seguidores = st.number_input(
@@ -947,7 +958,10 @@ def _tab_cotizador(disponible: bool):
             value=0,
             step=10,
             key="jap_quote_followers",
-            help="Se piden una sola vez al perfil (mínimo 10 si aplica).",
+            help=(
+                "0 = no pedir seguidores. Se piden una sola vez al perfil "
+                "(mínimo 10 si compras)."
+            ),
         )
 
     perfil = st.text_input(
@@ -982,7 +996,7 @@ def _tab_cotizador(disponible: bool):
             f"{'$%.4f/1K' % rate if rate is not None else 'precio no disponible'}"
         )
 
-    if personalizados:
+    if personalizados and int(comentarios) > 0:
         st.caption(
             f"Se usarán {len([l for l in str(texto_comentarios).splitlines() if l.strip()])} "
             f"comentario(s) personalizado(s) con el servicio {sid_comentarios}. "
@@ -1192,12 +1206,15 @@ def _tab_nuevo_pedido(disponible: bool):
     )
     cantidad = st.number_input(
         "Cantidad",
-        min_value=1,
+        min_value=0,
         value=50,
         step=10,
         key="jap_buy_cantidad",
-        help=f"Mín {_a_int(servicio.get('min')) or 0} · "
-        f"Máx {_a_int(servicio.get('max')) or 0}",
+        help=(
+            f"0 = no comprar. Si compras: mín "
+            f"{_a_int(servicio.get('min')) or 0} · máx "
+            f"{_a_int(servicio.get('max')) or 0}"
+        ),
     )
 
     comentarios = ""
@@ -1209,11 +1226,17 @@ def _tab_nuevo_pedido(disponible: bool):
             placeholder="Comentario 1\nComentario 2\n...",
         )
         lineas = len([l for l in str(comentarios).splitlines() if l.strip()])
-        st.caption(
-            f"Necesitas al menos {int(cantidad)} línea(s) para este servicio "
-            f"Custom Comments (llevas {lineas}). Las cuentas son USA aunque el "
-            "texto sea en español."
-        )
+        if int(cantidad) > 0:
+            st.caption(
+                f"Necesitas al menos {int(cantidad)} línea(s) para este "
+                f"servicio Custom Comments (llevas {lineas}). Las cuentas son "
+                "USA aunque el texto sea en español."
+            )
+        else:
+            st.caption(
+                "Cantidad 0: no se usará este servicio de comentarios. Las "
+                "cuentas son USA aunque el texto sea en español."
+            )
 
     costo, error_costo = _cotizar(servicio_id, int(cantidad))
     balance = _balance()
@@ -1252,9 +1275,15 @@ def _tab_nuevo_pedido(disponible: bool):
         "Confirmo que este pedido gasta saldo real de JAP",
         key="jap_buy_confirmo",
     )
+    if int(cantidad) <= 0:
+        st.info(
+            "Cantidad 0: no se creará ningún pedido. Elige una cantidad "
+            "mayor a 0 si quieres comprar este servicio."
+        )
     puede_comprar = bool(
         disponible
         and servicio_id
+        and int(cantidad) > 0
         and str(link or "").strip()
         and not error_costo
         and confirmo
