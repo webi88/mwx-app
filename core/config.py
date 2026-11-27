@@ -247,6 +247,46 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("JAP_API_KEY", "jap_api_key"),
     )
 
+    # Google Sheets / Drive: reporte con link para el cliente usando una
+    # cuenta de servicio. La credencial se toma en este orden:
+    #   GOOGLE_SERVICE_ACCOUNT_B64  -> JSON en base64 (recomendado Railway)
+    #   GOOGLE_SERVICE_ACCOUNT_JSON -> JSON crudo (una linea)
+    #   GOOGLE_SERVICE_ACCOUNT_FILE -> ruta al JSON
+    #   data/google_service_account.json -> archivo local (lo guarda el panel)
+    #   GOOGLE_APPLICATION_CREDENTIALS   -> ruta estandar (ultimo fallback)
+    # pydantic-settings v2 ignora el kwarg `env=` de Field: el alias efectivo
+    # es `validation_alias` (se aceptan MAYUSCULAS y el nombre del campo).
+    google_service_account_b64: str = Field(
+        default="",
+        validation_alias=AliasChoices(
+            "GOOGLE_SERVICE_ACCOUNT_B64", "google_service_account_b64"
+        ),
+    )
+    google_service_account_json: str = Field(
+        default="",
+        validation_alias=AliasChoices(
+            "GOOGLE_SERVICE_ACCOUNT_JSON", "google_service_account_json"
+        ),
+    )
+    google_service_account_file: str = Field(
+        default="",
+        validation_alias=AliasChoices(
+            "GOOGLE_SERVICE_ACCOUNT_FILE", "google_service_account_file"
+        ),
+    )
+    google_sheets_share_email: str = Field(
+        default="",
+        validation_alias=AliasChoices(
+            "GOOGLE_SHEETS_SHARE_EMAIL", "google_sheets_share_email"
+        ),
+    )
+    google_sheets_publico: bool = Field(
+        default=True,
+        validation_alias=AliasChoices(
+            "GOOGLE_SHEETS_PUBLICO", "google_sheets_publico"
+        ),
+    )
+
     # Database
     database_url: str = Field(default="sqlite:///data/gestor_redes.db", env="DATABASE_URL")
     

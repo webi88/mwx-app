@@ -20,6 +20,11 @@ curl-cffi==0.7.4
 # AI - OpenAI
 openai==0.28.0
 
+# Google Sheets / Drive (reportes al cliente). Ya venian como dependencias
+# transitivas de google-generativeai; se fijan aqui para el deploy.
+google-api-python-client==2.198.0
+google-auth==2.56.3
+
 # HTTP & Web
 requests==2.32.3
 httpx==0.28.1

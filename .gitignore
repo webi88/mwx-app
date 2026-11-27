@@ -27,6 +27,8 @@ data/clientes_bot.json
 # Just Another Panel: API key local y cache del catalogo (no se commitean)
 data/jap_config.json
 data/jap_services_cache.json
+# Cuenta de servicio de Google (reportes en Sheets): credenciales privadas
+data/google_service_account.json
 selftest_mwx.json
 *.db-shm
 *.db-wal

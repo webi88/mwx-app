@@ -29,15 +29,28 @@ Pestanas
    calcula el costo por link con presets Economico/Seguro, avisa si el saldo
    de JAP no alcanza y permite comprar el lote desde el propio cotizador
    (checkbox de confirmacion obligatorio; 0 = no comprar ese tipo).
-3. "📦 Pedidos": consulta estados, refill y cancelacion con confirmacion.
+3. "📦 Pedidos": consulta estados, refill y cancelacion con confirmacion,
+   lista los lotes guardados y ofrece el reporte para el cliente (HTML/CSV o
+   un Google Sheet con link) mas un reporte manual para reconstruir una
+   compra anterior. La conexion de Google Sheets (`core.google_sheets`,
+   opcional) se configura desde el expander "🔗 Conectar Google Sheets"; si
+   no hay credenciales la pagina avisa y no llama a la API.
 
 Los pedidos del lote se crean SECUENCIALMENTE desde el boton de compra: si uno
 falla, los demas continuan. Nada se envia solo por renderizar la pagina.
+
+Cada lote se persiste en ``core.jap_historial`` (import perezoso; si el modulo
+no esta disponible la compra funciona igual y solo se pierde el historial).
+Los reportes descargables NO incluyen proveedor, costos, saldo, API key, IDs
+de servicio ni presets: son documentos para el cliente final.
 
 Pruebas: ``tests/test_jap_web.py`` (AppTest + mocks, sin red real).
 """
 from __future__ import annotations
 
+import csv
+import html as html_lib
+import io
 import re
 import time
 import unicodedata
@@ -80,12 +93,27 @@ CLAVE_CATALOGO = "jap_catalogo_cache"
 CLAVE_BALANCE = "jap_balance_cache"
 CLAVE_ESTADOS = "jap_estados_consulta"
 CLAVE_LOTE_RESULTADOS = "jap_lote_resultados"
+CLAVE_LOTE_AVISO = "jap_lote_aviso"
+CLAVE_SHEET_URL = "jap_sheet_url_"
+CLAVE_SHEET_GUARDADO = "jap_gs_guardado_email"
 
 TTL_CATALOGO_SEG = 3600
 TTL_BALANCE_SEG = 120
 MAX_FILAS_CATALOGO = 300
 MAX_PEDIDOS_LOTE = 100
 MAX_PEDIDOS_SESION = 50
+MAX_LOTES_REPORTE = 10
+
+_ETIQUETAS_REPORTE = {
+    "likes": "Me gusta",
+    "retweets": "Retweets",
+    "comments": "Comentarios",
+    "views": "Vistas",
+    "followers": "Seguidores",
+    "impressions": "Impresiones",
+    "mentions": "Menciones",
+    "follow": "Seguidores",
+}
 
 PLATAFORMAS = [
     ("X / Twitter", "x"),
@@ -250,6 +278,400 @@ def _parsear_ids(texto) -> list:
         vistos.add(numero)
         ids.append(numero)
     return ids
+
+
+# ---------------------------------------------------------------------------
+# Historial de lotes y reportes para el cliente
+# ---------------------------------------------------------------------------
+# El modulo `core.jap_historial` es opcional. Se importa de forma perezosa y
+# la pagina funciona igual si no esta disponible (solo no persiste el lote).
+def _historial():
+    try:
+        from core import jap_historial as historial
+
+        return historial
+    except Exception:
+        return None
+
+
+def _a_texto(valor) -> str:
+    if isinstance(valor, bytes):
+        try:
+            return valor.decode("utf-8", errors="replace")
+        except Exception:
+            return ""
+    return str(valor or "")
+
+
+def _nuevo_lote_id_local() -> str:
+    return datetime.now().strftime("LOTE-%Y%m%d-%H%M%S")
+
+
+def _nuevo_lote_id() -> str:
+    """Folio del lote: `core.jap_historial.nuevo_lote_id` o fallback local."""
+    historial = _historial()
+    if historial is not None:
+        funcion = getattr(historial, "nuevo_lote_id", None)
+        if callable(funcion):
+            try:
+                folio = str(funcion() or "").strip()
+                if folio:
+                    return folio
+            except Exception:
+                pass
+    return _nuevo_lote_id_local()
+
+
+def _nombre_reporte(folio: str, formato: str) -> str:
+    """Nombre de descarga `reporte-<folio>.html`/`.csv` (sin rutas raras)."""
+    extension = "csv" if str(formato).lower() == "csv" else "html"
+    limpio = re.sub(r"[^A-Za-z0-9._-]+", "-", str(folio or "")).strip(".-")
+    return f"reporte-{limpio or 'lote'}.{extension}"
+
+
+def _etiqueta_tipo_reporte(tipo) -> str:
+    clave = str(tipo or "").strip().lower()
+    if clave in _ETIQUETAS_REPORTE:
+        return _ETIQUETAS_REPORTE[clave]
+    return clave.replace("_", " ").capitalize() or "Acción"
+
+
+def _es_pedido_exitoso(pedido: dict) -> bool:
+    if "ok" in pedido:
+        return bool(pedido.get("ok"))
+    if "exito" in pedido:
+        return bool(pedido.get("exito"))
+    estado = str(pedido.get("estado") or "").strip().lower()
+    if estado:
+        return estado in ("exito", "exitoso", "ok", "completed", "completado")
+    return True
+
+
+def _pedidos_para_reporte(pedidos) -> list:
+    """Solo acciones exitosas (un pedido manual sin `ok` cuenta como exitoso)."""
+    return [
+        pedido
+        for pedido in (pedidos or [])
+        if isinstance(pedido, dict) and _es_pedido_exitoso(pedido)
+    ]
+
+
+_CSS_REPORTE = """
+body { margin: 0; padding: 32px; background: #f7f9fc; color: #1f2937;
+       font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif; }
+.hoja { max-width: 880px; margin: 0 auto; background: #ffffff; border-radius: 14px;
+        box-shadow: 0 8px 24px rgba(15, 23, 42, .08); padding: 40px 44px; }
+.marca { border-bottom: 4px solid #1DA1F2; padding-bottom: 18px; margin-bottom: 24px; }
+.marca h1 { margin: 0; font-size: 28px; letter-spacing: .5px; }
+.marca p { margin: 6px 0 0; color: #64748b; font-size: 15px; }
+.datos { margin: 0 0 24px; padding: 0; list-style: none; font-size: 14px; }
+.datos li { margin: 6px 0; }
+.datos strong { color: #0f172a; }
+table { width: 100%; border-collapse: collapse; font-size: 14px; }
+th { text-align: left; background: #eff6ff; color: #0f172a; padding: 12px; }
+td { padding: 11px 12px; border-top: 1px solid #e2e8f0; word-break: break-word; }
+tr:nth-child(even) td { background: #f8fafc; }
+.pie { margin-top: 28px; padding-top: 16px; border-top: 1px solid #e2e8f0;
+       color: #64748b; font-size: 12px; }
+.vacio { padding: 18px; color: #64748b; font-size: 14px; }
+"""
+
+
+def _reporte_html_local(
+    pedidos,
+    fecha="",
+    cliente="",
+    campana="",
+    folio="",
+    notas="",
+) -> str:
+    """HTML de respaldo si `core.jap_historial` no esta disponible.
+
+    Solo usa tipo/link/cantidad de cada pedido: no incluye costos, IDs ni
+    datos internos.
+    """
+    filas = []
+    for pedido in _pedidos_para_reporte(pedidos):
+        tipo = html_lib.escape(_etiqueta_tipo_reporte(pedido.get("tipo")))
+        link = html_lib.escape(str(pedido.get("link") or ""))
+        cantidad = html_lib.escape(str(pedido.get("cantidad") or ""))
+        filas.append(
+            f"<tr><td>{tipo}</td><td>{link or '—'}</td>"
+            f"<td>{cantidad or '—'}</td></tr>"
+        )
+    cuerpo = "\n".join(filas) or (
+        '<tr><td colspan="3" class="vacio">Sin acciones registradas.</td></tr>'
+    )
+    datos = []
+    if folio:
+        datos.append(f"<li><strong>Folio:</strong> {html_lib.escape(str(folio))}</li>")
+    if fecha:
+        datos.append(f"<li><strong>Fecha:</strong> {html_lib.escape(str(fecha))}</li>")
+    if cliente:
+        datos.append(
+            f"<li><strong>Cliente:</strong> {html_lib.escape(str(cliente))}</li>"
+        )
+    if campana:
+        datos.append(
+            f"<li><strong>Campaña:</strong> {html_lib.escape(str(campana))}</li>"
+        )
+    if notas:
+        datos.append(
+            f"<li><strong>Notas:</strong> {html_lib.escape(str(notas))}</li>"
+        )
+    bloque_datos = (
+        f'<ul class="datos">{"".join(datos)}</ul>' if datos else ""
+    )
+    return (
+        "<!DOCTYPE html>\n"
+        '<html lang="es">\n<head>\n<meta charset="utf-8">\n'
+        "<title>Reporte de acciones realizadas</title>\n"
+        f"<style>{_CSS_REPORTE}</style>\n"
+        "</head>\n<body>\n"
+        '<div class="hoja">\n'
+        '<div class="marca">\n'
+        "<h1>MW Group</h1>\n"
+        "<p>Reporte de acciones realizadas</p>\n"
+        "</div>\n"
+        f"{bloque_datos}\n"
+        "<table>\n<thead><tr><th>Tipo de acción</th>"
+        "<th>Publicación</th><th>Cantidad</th></tr></thead>\n"
+        f"<tbody>\n{cuerpo}\n</tbody>\n</table>\n"
+        '<div class="pie">Reporte generado por MW Group.</div>\n'
+        "</div>\n</body>\n</html>\n"
+    )
+
+
+def _reporte_csv_local(
+    pedidos,
+    fecha="",
+    cliente="",
+    campana="",
+    folio="",
+    notas="",
+) -> str:
+    """CSV de respaldo (solo acciones exitosas, sin datos internos)."""
+    buffer = io.StringIO()
+    escritor = csv.writer(buffer, lineterminator="\n")
+    if cliente:
+        escritor.writerow(["Cliente", cliente])
+    if campana:
+        escritor.writerow(["Campaña", campana])
+    if folio:
+        escritor.writerow(["Folio", folio])
+    if fecha:
+        escritor.writerow(["Fecha", fecha])
+    if notas:
+        escritor.writerow(["Notas", notas])
+    if cliente or campana or folio or fecha or notas:
+        escritor.writerow([])
+    escritor.writerow(["Tipo", "Publicación", "Cantidad"])
+    for pedido in _pedidos_para_reporte(pedidos):
+        escritor.writerow(
+            [
+                _etiqueta_tipo_reporte(pedido.get("tipo")),
+                str(pedido.get("link") or ""),
+                pedido.get("cantidad") or "",
+            ]
+        )
+    return "\ufeff" + buffer.getvalue()
+
+
+def _contenido_reporte(
+    pedidos,
+    formato="html",
+    *,
+    fecha="",
+    cliente="",
+    campana="",
+    folio="",
+    notas="",
+) -> str:
+    """Genera el reporte con `core.jap_historial` (si existe) o el respaldo."""
+    formato = "csv" if str(formato).lower() == "csv" else "html"
+    pedidos = [p for p in (pedidos or []) if isinstance(p, dict)]
+    historial = _historial()
+    if historial is not None:
+        nombre = (
+            "construir_reporte_csv"
+            if formato == "csv"
+            else "construir_reporte_html"
+        )
+        funcion = getattr(historial, nombre, None)
+        if callable(funcion):
+            try:
+                contenido = funcion(
+                    pedidos,
+                    fecha=fecha,
+                    cliente=cliente,
+                    campana=campana,
+                    folio=folio,
+                    notas=notas,
+                )
+                if isinstance(contenido, (str, bytes)):
+                    texto = _a_texto(contenido)
+                    if texto.strip():
+                        return texto
+            except Exception:
+                pass
+    if formato == "csv":
+        return _reporte_csv_local(
+            pedidos,
+            fecha=fecha,
+            cliente=cliente,
+            campana=campana,
+            folio=folio,
+            notas=notas,
+        )
+    return _reporte_html_local(
+        pedidos,
+        fecha=fecha,
+        cliente=cliente,
+        campana=campana,
+        folio=folio,
+        notas=notas,
+    )
+
+
+def _reporte_lote_contenido(
+    lote_id,
+    formato,
+    pedidos=None,
+    *,
+    fecha="",
+    cliente="",
+    campana="",
+    notas="",
+    usar_persistido=True,
+) -> tuple:
+    """(contenido, error). Prefiere `generar_reporte_lote` para lotes guardados."""
+    formato = "csv" if str(formato).lower() == "csv" else "html"
+    historial = _historial()
+    error = ""
+    folio = str(lote_id or "").strip()
+    if folio and usar_persistido and historial is not None:
+        funcion = getattr(historial, "generar_reporte_lote", None)
+        if callable(funcion):
+            try:
+                respuesta = funcion(folio, formato)
+                if isinstance(respuesta, dict) and respuesta.get("ok"):
+                    texto = _a_texto(respuesta.get("contenido"))
+                    if texto.strip():
+                        return texto, ""
+                if isinstance(respuesta, dict):
+                    error = str(respuesta.get("error") or "")
+            except Exception as exc:
+                error = str(exc)
+    if pedidos is None and folio and historial is not None:
+        funcion = getattr(historial, "pedidos_de_lote", None)
+        if callable(funcion):
+            try:
+                pedidos = [
+                    p for p in (funcion(folio) or []) if isinstance(p, dict)
+                ]
+            except Exception:
+                pedidos = None
+    if pedidos:
+        return (
+            _contenido_reporte(
+                pedidos,
+                formato,
+                fecha=fecha,
+                cliente=cliente,
+                campana=campana,
+                folio=folio,
+                notas=notas,
+            ),
+            error,
+        )
+    return "", error or "No hay datos del lote para generar el reporte."
+
+
+def _cantidad_resumen(valor) -> int:
+    if isinstance(valor, (list, tuple, set, dict)):
+        return len(valor)
+    numero = _a_int(valor)
+    return numero if numero is not None and numero >= 0 else 0
+
+
+def _fila_resumen_lote(lote: dict) -> dict:
+    """Normaliza un resumen de `listar_lotes` a columnas de la tabla."""
+    folio = (
+        lote.get("lote_id")
+        or lote.get("folio")
+        or lote.get("id")
+        or ""
+    )
+    pedidos = 0
+    for clave in ("pedidos", "total_pedidos", "pedidos_total", "total"):
+        if lote.get(clave) is not None:
+            pedidos = _cantidad_resumen(lote.get(clave))
+            break
+    acciones = 0
+    for clave in ("acciones", "total_acciones", "cantidad", "exitosos"):
+        if lote.get(clave) is not None:
+            acciones = _cantidad_resumen(lote.get(clave))
+            break
+    links = 0
+    for clave in ("links", "total_links", "enlaces"):
+        if lote.get(clave) is not None:
+            links = _cantidad_resumen(lote.get(clave))
+            break
+    return {
+        "Folio": str(folio),
+        "Fecha": str(lote.get("fecha") or lote.get("creado") or ""),
+        "Cliente": str(lote.get("cliente") or ""),
+        "Campaña": str(lote.get("campana") or lote.get("campaña") or ""),
+        "Pedidos": pedidos,
+        "Acciones": acciones,
+        "Links": links,
+    }
+
+
+def _plan_reporte_manual(links, cantidades, perfil="") -> tuple:
+    """Pedidos falsos para reconstruir un reporte (NO crea ordenes).
+
+    Devuelve ``(pedidos, errores)``. Cada pedido es
+    ``{"tipo","link","cantidad","ok": True}``. Las cantidades en 0 se omiten.
+    """
+    enlaces = [str(link).strip() for link in (links or []) if str(link).strip()]
+    datos = cantidades if isinstance(cantidades, dict) else {}
+    cantidades_lote = {
+        tipo: _a_int(datos.get(tipo)) or 0
+        for tipo in ("likes", "retweets", "comments", "views", "followers")
+    }
+    errores = []
+    if not enlaces:
+        errores.append("Pega al menos un link de publicación.")
+    if not any(cantidad > 0 for cantidad in cantidades_lote.values()):
+        errores.append("Indica al menos una cantidad mayor a 0.")
+    if errores:
+        return [], errores
+
+    pedidos = []
+    for tipo in ("likes", "retweets", "comments", "views"):
+        cantidad = max(cantidades_lote[tipo], 0)
+        if cantidad <= 0:
+            continue
+        for enlace in enlaces:
+            pedidos.append(
+                {
+                    "tipo": tipo,
+                    "link": enlace,
+                    "cantidad": cantidad,
+                    "ok": True,
+                }
+            )
+    if cantidades_lote["followers"] > 0:
+        pedidos.append(
+            {
+                "tipo": "followers",
+                "link": str(perfil or "").strip(),
+                "cantidad": cantidades_lote["followers"],
+                "ok": True,
+            }
+        )
+    return pedidos, []
 
 
 def _clave_plataforma(etiqueta: str) -> str:
@@ -1332,6 +1754,21 @@ def _seccion_comprar_lote(
             "falla, los demás continúan."
         )
 
+    st.markdown("**Datos para el reporte del cliente (opcional):**")
+    col_cliente, col_campana = st.columns(2)
+    with col_cliente:
+        cliente = st.text_input(
+            "Cliente (para el reporte)",
+            key="jap_lote_cliente",
+            placeholder="Nombre del cliente",
+        )
+    with col_campana:
+        campana = st.text_input(
+            "Campaña / tema (para el reporte)",
+            key="jap_lote_campana",
+            placeholder="Ej. Lanzamiento de septiembre",
+        )
+
     confirmo = st.checkbox(
         "Confirmo que estos pedidos gastan saldo real de JAP",
         key="jap_lote_confirmo",
@@ -1350,7 +1787,11 @@ def _seccion_comprar_lote(
         type="primary",
         disabled=not puede_comprar,
     ):
-        _comprar_lote(pedidos)
+        _comprar_lote(
+            pedidos,
+            cliente=str(cliente or "").strip(),
+            campana=str(campana or "").strip(),
+        )
 
 
 def _crear_orden_pedido(jap, pedido: dict) -> dict:
@@ -1374,7 +1815,7 @@ def _crear_orden_pedido(jap, pedido: dict) -> dict:
         return {"ok": False, "error": f"Error al crear el pedido: {exc}"}
 
 
-def _comprar_lote(pedidos):
+def _comprar_lote(pedidos, cliente="", campana=""):
     """Compra el lote SECUENCIALMENTE y guarda el resumen en session_state."""
     if st.session_state.get("jap_lote_comprando"):
         return
@@ -1396,6 +1837,9 @@ def _comprar_lote(pedidos):
     if not isinstance(recientes, list):
         recientes = []
     fecha = datetime.now().isoformat(timespec="seconds")
+    lote_id = _nuevo_lote_id()
+    cliente = str(cliente or "").strip()
+    campana = str(campana or "").strip()
     try:
         barra = st.progress(0.0)
         estado = st.empty()
@@ -1451,6 +1895,38 @@ def _comprar_lote(pedidos):
         st.session_state["jap_lote_comprando"] = False
 
     exitosos = sum(1 for r in resultados if r.get("ok"))
+
+    # Persistir el lote para el reporte del cliente. Si el backend de
+    # historial no esta disponible la compra NO se pierde: solo se avisa.
+    historial_ok = False
+    historial_error = ""
+    historial = _historial()
+    guardar = getattr(historial, "guardar_pedidos", None) if historial else None
+    if callable(guardar):
+        try:
+            respuesta = guardar(
+                resultados,
+                lote_id=lote_id,
+                cliente=cliente,
+                campana=campana,
+            )
+            if isinstance(respuesta, dict) and respuesta.get("ok"):
+                historial_ok = True
+                lote_id = str(respuesta.get("lote_id") or lote_id).strip() or lote_id
+            elif isinstance(respuesta, dict):
+                historial_error = str(
+                    respuesta.get("error") or "No se pudo guardar el lote."
+                )
+            else:
+                historial_error = "El historial devolvió una respuesta inesperada."
+        except Exception as exc:
+            historial_error = f"No se pudo guardar el lote: {exc}"
+    else:
+        historial_error = (
+            "El historial de lotes no está disponible en esta versión: la "
+            "compra se realizó, pero el reporte no quedó guardado."
+        )
+
     st.session_state[CLAVE_PEDIDOS] = recientes[:MAX_PEDIDOS_SESION]
     st.session_state[CLAVE_LOTE_RESULTADOS] = {
         "fecha": fecha,
@@ -1458,29 +1934,47 @@ def _comprar_lote(pedidos):
         "exitosos": exitosos,
         "fallidos": len(resultados) - exitosos,
         "pedidos": resultados,
+        "lote_id": lote_id,
+        "cliente": cliente,
+        "campana": campana,
+        "historial_ok": historial_ok,
+        "historial_error": historial_error,
     }
+    if historial_error:
+        st.session_state[CLAVE_LOTE_AVISO] = historial_error
+    else:
+        st.session_state.pop(CLAVE_LOTE_AVISO, None)
     _cache_limpiar(CLAVE_BALANCE)
     st.session_state["jap_lote_limpiar_confirmacion"] = True
     st.rerun()
 
 
 def _mostrar_ultimo_lote():
-    """Resumen persistente del ultimo lote comprado (con boton de limpiar)."""
+    """Resumen persistente del ultimo lote comprado (con reporte descargable)."""
     resultados = st.session_state.get(CLAVE_LOTE_RESULTADOS)
     if not isinstance(resultados, dict):
         return
+    aviso = st.session_state.pop(CLAVE_LOTE_AVISO, "")
+    if aviso:
+        st.warning(str(aviso))
     pedidos = [
         p for p in (resultados.get("pedidos") or []) if isinstance(p, dict)
     ]
     exitosos = _a_int(resultados.get("exitosos")) or 0
     fallidos = _a_int(resultados.get("fallidos")) or 0
     total = _a_float(resultados.get("total_gastado")) or 0.0
+    lote_id = str(resultados.get("lote_id") or "").strip()
+    cliente = str(resultados.get("cliente") or "").strip()
+    campana = str(resultados.get("campana") or "").strip()
+    fecha = str(resultados.get("fecha") or "").strip()
     with st.expander("Último pedido del lote", expanded=False):
         st.markdown(
             f"**{exitosos} exitoso(s) · {fallidos} fallido(s) · "
             f"${total:,.4f} gastados**"
         )
         st.caption(f"Fecha: {resultados.get('fecha') or '—'}")
+        if lote_id:
+            st.caption(f"Folio del reporte: **{lote_id}**")
         if pedidos:
             st.dataframe(
                 [
@@ -1503,6 +1997,64 @@ def _mostrar_ultimo_lote():
                     "Costo": st.column_config.NumberColumn(format="$%.4f"),
                 },
             )
+
+        pedidos_reporte = _pedidos_para_reporte(pedidos)
+        if pedidos_reporte:
+            html, error_html = _reporte_lote_contenido(
+                lote_id,
+                "html",
+                pedidos_reporte,
+                fecha=fecha,
+                cliente=cliente,
+                campana=campana,
+                usar_persistido=bool(resultados.get("historial_ok")),
+            )
+            csv_texto, error_csv = _reporte_lote_contenido(
+                lote_id,
+                "csv",
+                pedidos_reporte,
+                fecha=fecha,
+                cliente=cliente,
+                campana=campana,
+                usar_persistido=bool(resultados.get("historial_ok")),
+            )
+            if html:
+                st.download_button(
+                    "📄 Reporte para el cliente (HTML)",
+                    data=html,
+                    file_name=_nombre_reporte(lote_id or "lote", "html"),
+                    mime="text/html",
+                    key="jap_dl_lote_html",
+                )
+            if csv_texto:
+                st.download_button(
+                    "📊 Reporte (CSV)",
+                    data=csv_texto,
+                    file_name=_nombre_reporte(lote_id or "lote", "csv"),
+                    mime="text/csv",
+                    key="jap_dl_lote_csv",
+                )
+            if error_html or error_csv:
+                st.caption(f"⚠️ {error_html or error_csv}")
+            st.caption(
+                "El reporte para el cliente no incluye proveedor, costos ni "
+                "IDs de servicio."
+            )
+            st.markdown("**Reporte para el cliente (sin proveedor)**")
+            _crear_sheet_cliente(
+                pedidos_reporte,
+                cliente=cliente,
+                campana=campana,
+                folio=lote_id,
+                fecha=fecha,
+                key_prefix="jap_lote_actual",
+            )
+        else:
+            st.caption(
+                "Este lote no tiene pedidos exitosos, así que no hay reporte "
+                "para el cliente."
+            )
+
         if st.button(
             "🧹 Limpiar resumen",
             key="jap_btn_limpiar_lote_resultados",
@@ -1525,9 +2077,585 @@ def _fila_estado(order_id, info: dict) -> dict:
     }
 
 
+def _cargar_links_manual():
+    """on_click: rellena el textarea del reporte manual con los 18 tweets."""
+    try:
+        st.session_state["jap_manual_links"] = "\n".join(LINKS_REDAMLO)
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Google Sheets: reporte con link para el cliente
+# ---------------------------------------------------------------------------
+# `core.google_sheets` es opcional: se importa de forma perezosa y la pagina
+# funciona igual si no esta disponible (solo se muestra el aviso de conectarlo).
+# Las credenciales NUNCA se muestran, registran ni se quedan en
+# `st.session_state` despues de guardarlas.
+def _sheets():
+    """Import perezoso de `core.google_sheets`. None si no esta disponible."""
+    try:
+        from core import google_sheets
+
+        return google_sheets
+    except Exception:
+        return None
+
+
+def _sheets_estado() -> dict:
+    """Estado normalizado de la conexion con Google Sheets (nunca lanza)."""
+    vacio = {"disponible": False, "motivo": "", "fuente": "", "email": ""}
+    modulo = _sheets()
+    if modulo is None:
+        return {
+            **vacio,
+            "motivo": "El módulo core.google_sheets no está disponible en esta "
+            "versión.",
+        }
+    try:
+        estado = modulo.estado()
+    except Exception as exc:
+        return {**vacio, "motivo": f"No se pudo consultar el estado: {exc}"}
+    if not isinstance(estado, dict):
+        return {**vacio, "motivo": "Google Sheets devolvió un estado inesperado."}
+    return {
+        "disponible": bool(estado.get("disponible")),
+        "motivo": str(estado.get("motivo") or ""),
+        "fuente": str(estado.get("fuente") or ""),
+        "email": str(estado.get("email") or ""),
+    }
+
+
+def _sheets_disponible() -> bool:
+    """True solo si el backend confirma que hay credenciales conectadas."""
+    modulo = _sheets()
+    if modulo is None:
+        return False
+    funcion = getattr(modulo, "disponible", None)
+    if callable(funcion):
+        try:
+            return bool(funcion())
+        except Exception:
+            return False
+    return bool(_sheets_estado().get("disponible"))
+
+
+def _seccion_google_sheets():
+    """Expander para conectar la cuenta de servicio de Google Sheets."""
+    estado = _sheets_estado()
+    conectado = bool(estado.get("disponible"))
+    titulo = "🔗 Conectar Google Sheets" + (" ✅" if conectado else "")
+    with st.expander(titulo, expanded=not conectado):
+        guardado_email = st.session_state.pop(CLAVE_SHEET_GUARDADO, None)
+        if guardado_email is not None:
+            texto_guardado = "✅ Credenciales guardadas. Google Sheets quedó conectado"
+            if str(guardado_email or "").strip():
+                texto_guardado += f" · {str(guardado_email).strip()}"
+            st.success(texto_guardado + ".")
+        if conectado:
+            correo = str(estado.get("email") or "").strip()
+            texto = "✅ Google Sheets conectado"
+            if correo:
+                texto += f" · {correo}"
+            st.success(texto)
+            if estado.get("fuente"):
+                st.caption(f"Credenciales: {estado.get('fuente')}")
+        else:
+            motivo = str(estado.get("motivo") or "").strip()
+            st.warning(
+                "Google Sheets no está conectado todavía."
+                + (f" {motivo}" if motivo else "")
+            )
+        st.markdown(
+            "**Cómo conectarlo (una sola vez):**\n"
+            "1. Crea una **cuenta de servicio** en Google Cloud.\n"
+            "2. Habilita la **Google Sheets API** y la **Google Drive API**.\n"
+            "3. Descarga el **JSON** de la cuenta de servicio.\n"
+            "4. En Railway define `GOOGLE_SERVICE_ACCOUNT_B64` con el "
+            "**base64** del JSON, o pega/suelta el JSON aquí para guardarlo "
+            "localmente en `data/google_service_account.json`."
+        )
+        # El JSON se limpia del session_state en el rerun posterior a guardar
+        # (antes de instanciar los widgets). NUNCA se muestra ni se registra.
+        if st.session_state.pop("jap_gs_limpiar_json", False):
+            version_anterior = int(
+                st.session_state.get("jap_gs_file_version") or 0
+            )
+            try:
+                st.session_state["jap_gs_json_input"] = ""
+            except Exception:
+                pass
+            try:
+                # El uploader no permite asignar su valor, pero si borrarlo
+                # antes de instanciar el widget nuevo: el JSON no queda en
+                # session_state despues de guardarlo.
+                st.session_state.pop(
+                    f"jap_gs_json_file_{version_anterior}", None
+                )
+            except Exception:
+                pass
+            try:
+                st.session_state["jap_gs_file_version"] = version_anterior + 1
+            except Exception:
+                pass
+        version = int(st.session_state.get("jap_gs_file_version") or 0)
+        archivo = st.file_uploader(
+            "Suelta aquí el JSON de la cuenta de servicio",
+            type=["json"],
+            key=f"jap_gs_json_file_{version}",
+        )
+        pegado = st.text_input(
+            "…o pega el JSON completo",
+            type="password",
+            key="jap_gs_json_input",
+            placeholder='{"type": "service_account", "project_id": "..."}',
+        )
+        contenido = ""
+        if archivo is not None:
+            try:
+                contenido = archivo.getvalue().decode("utf-8", errors="replace")
+            except Exception:
+                contenido = ""
+        elif str(pegado or "").strip():
+            contenido = str(pegado)
+        col_guardar, col_probar = st.columns(2)
+        with col_guardar:
+            guardar = st.button(
+                "Guardar credenciales", key="jap_gs_btn_guardar"
+            )
+        with col_probar:
+            probar = st.button("Probar conexión", key="jap_gs_btn_probar")
+        if guardar:
+            modulo = _sheets()
+            if modulo is None:
+                st.error(
+                    "El módulo de Google Sheets no está disponible en esta "
+                    "versión."
+                )
+            elif not contenido.strip():
+                st.warning("Pega o arrastra el JSON de la cuenta de servicio.")
+            else:
+                try:
+                    resultado = modulo.guardar_credenciales_json(contenido)
+                except Exception as exc:
+                    resultado = {"ok": False, "error": str(exc)}
+                if isinstance(resultado, dict) and resultado.get("ok"):
+                    st.session_state["jap_gs_limpiar_json"] = True
+                    st.session_state[CLAVE_SHEET_GUARDADO] = str(
+                        resultado.get("email") or ""
+                    )
+                    st.rerun()
+                else:
+                    error = (
+                        resultado.get("error")
+                        if isinstance(resultado, dict)
+                        else ""
+                    ) or "No se pudieron guardar las credenciales."
+                    st.error(str(error))
+        if probar:
+            prueba = _sheets_estado()
+            if prueba.get("disponible"):
+                correo = str(prueba.get("email") or "").strip()
+                texto = "✅ Conexión con Google Sheets OK"
+                if correo:
+                    texto += f" · {correo}"
+                st.success(texto)
+            else:
+                motivo = str(prueba.get("motivo") or "").strip()
+                st.warning(
+                    "Sin conexión con Google Sheets."
+                    + (f" {motivo}" if motivo else "")
+                )
+
+
+def _clave_sheet(key_prefix: str) -> str:
+    """Clave estable de session_state/botones para un reporte concreto."""
+    limpio = re.sub(
+        r"[^A-Za-z0-9_-]+", "-", str(key_prefix or "reporte")
+    ).strip("-")
+    return f"{CLAVE_SHEET_URL}{limpio or 'reporte'}"
+
+
+def _pedidos_lote(folio) -> list:
+    """Pedidos persistidos de un lote (vacio si el historial no responde)."""
+    historial = _historial()
+    funcion = getattr(historial, "pedidos_de_lote", None) if historial else None
+    if not callable(funcion):
+        return []
+    try:
+        return [p for p in (funcion(folio) or []) if isinstance(p, dict)]
+    except Exception:
+        return []
+
+
+def _crear_sheet_cliente(
+    pedidos,
+    cliente="",
+    campana="",
+    folio="",
+    fecha="",
+    key_prefix="jap_sheet",
+):
+    """Boton para crear el Google Sheet del cliente y mostrar el link.
+
+    Solo usa los pedidos ya existentes: NO crea ordenes en JAP ni llama al
+    proveedor. Si Google Sheets no esta conectado muestra el aviso y no
+    llama a la API.
+    """
+    pedidos_ok = _pedidos_para_reporte(
+        [p for p in (pedidos or []) if isinstance(p, dict)]
+    )
+    if not pedidos_ok:
+        st.caption("No hay acciones exitosas para incluir en el Google Sheet.")
+        return
+    if not _sheets_disponible():
+        st.caption(
+            "Conecta Google Sheets en la pestaña Pedidos para crear el link."
+        )
+        return
+
+    clave_url = _clave_sheet(key_prefix)
+    clave_boton = f"{clave_url}_btn"
+    st.caption("Reporte para el cliente (sin proveedor).")
+    correo = st.text_input(
+        "Correo para compartir (opcional)",
+        key=f"{clave_url}_email",
+        placeholder="jefe@empresa.com",
+        help="Si lo indicas, el Sheet también se comparte con ese correo.",
+    )
+    publico = st.checkbox(
+        "Cualquiera con el enlace puede ver",
+        value=True,
+        key=f"{clave_url}_publico",
+    )
+    sin_permiso = not publico and not str(correo or "").strip()
+    if sin_permiso:
+        st.error(
+            "Indica un correo o deja marcado «Cualquiera con el enlace puede "
+            "ver» para poder compartir el Sheet."
+        )
+    if st.button(
+        "📗 Crear Google Sheet y copiar link",
+        key=clave_boton,
+        disabled=sin_permiso,
+    ):
+        modulo = _sheets()
+        respuesta = {"ok": False, "error": "Google Sheets no está disponible."}
+        if modulo is not None:
+            try:
+                with st.spinner("Creando el Google Sheet…"):
+                    respuesta = modulo.crear_sheet_reporte(
+                        pedidos_ok,
+                        cliente=str(cliente or "").strip(),
+                        campana=str(campana or "").strip(),
+                        fecha=str(fecha or "").strip(),
+                        folio=str(folio or "").strip(),
+                        compartir_publico=bool(publico),
+                        email=str(correo or "").strip(),
+                    )
+            except Exception as exc:
+                respuesta = {"ok": False, "error": str(exc)}
+        url = ""
+        if isinstance(respuesta, dict) and respuesta.get("ok"):
+            url = str(respuesta.get("url") or "").strip()
+        if url:
+            st.session_state[clave_url] = url
+        else:
+            error = (
+                respuesta.get("error") if isinstance(respuesta, dict) else ""
+            ) or "No se pudo crear el Google Sheet."
+            st.error(str(error))
+    url = str(st.session_state.get(clave_url) or "").strip()
+    if url:
+        st.success("Google Sheet creado")
+        try:
+            st.link_button("🔗 Abrir Google Sheet", url)
+        except Exception:
+            pass
+        st.code(url)
+        st.caption("Envía este link a tu jefe; ya tiene permisos de lectura.")
+
+
+def _seccion_reportes_cliente():
+    """Lotes persistidos y descarga del reporte para el cliente."""
+    st.markdown("### 📄 Reportes para el cliente")
+    st.caption(
+        "Descarga el reporte de un lote guardado o crea un Google Sheet con "
+        "link. El reporte (archivo o Sheet) no incluye proveedor, costos ni "
+        "IDs de servicio: está pensado para el cliente final."
+    )
+    _seccion_google_sheets()
+    historial = _historial()
+    funcion = getattr(historial, "listar_lotes", None) if historial else None
+    if not callable(funcion):
+        st.info(
+            "El historial de lotes no está disponible en esta versión. "
+            "Puedes reconstruir una compra anterior con el reporte manual "
+            "de abajo."
+        )
+        return
+    try:
+        lotes = funcion(limite=MAX_LOTES_REPORTE)
+    except TypeError:
+        try:
+            lotes = funcion(MAX_LOTES_REPORTE)
+        except Exception:
+            lotes = []
+    except Exception:
+        lotes = []
+    lotes = [lote for lote in (lotes or []) if isinstance(lote, dict)]
+    if not lotes:
+        st.info(
+            "Todavía no hay lotes guardados. Compra un lote en «🧮 Cotizador» "
+            "o reconstruye una compra anterior con el reporte manual de abajo."
+        )
+        return
+
+    filas = [_fila_resumen_lote(lote) for lote in lotes]
+    st.dataframe(filas, hide_index=True, use_container_width=True)
+
+    opciones = []
+    mapa = {}
+    mapa_filas = {}
+    for indice, lote in enumerate(lotes):
+        fila = _fila_resumen_lote(lote)
+        folio = str(fila.get("Folio") or "").strip()
+        if not folio:
+            continue
+        etiqueta = f"{folio} · {fila.get('Fecha') or 'sin fecha'}"
+        cliente = str(fila.get("Cliente") or "").strip()
+        if cliente:
+            etiqueta += f" · {cliente}"
+        if etiqueta in mapa:
+            etiqueta = f"{etiqueta} ({indice + 1})"
+        mapa[etiqueta] = folio
+        mapa_filas[etiqueta] = fila
+        opciones.append(etiqueta)
+    if not opciones:
+        st.warning("Los lotes guardados no tienen folio: no se puede descargar.")
+        return
+
+    seleccion = st.selectbox(
+        "Lote para el reporte",
+        opciones,
+        key="jap_reporte_lote_sel",
+    )
+    folio = mapa.get(seleccion) or ""
+    html, error_html = _reporte_lote_contenido(folio, "html")
+    csv_texto, error_csv = _reporte_lote_contenido(folio, "csv")
+    if html:
+        st.download_button(
+            "📄 Reporte para el cliente (HTML)",
+            data=html,
+            file_name=_nombre_reporte(folio, "html"),
+            mime="text/html",
+            key="jap_dl_lote_guardado_html",
+        )
+    if csv_texto:
+        st.download_button(
+            "📊 Reporte (CSV)",
+            data=csv_texto,
+            file_name=_nombre_reporte(folio, "csv"),
+            mime="text/csv",
+            key="jap_dl_lote_guardado_csv",
+        )
+    if not html and not csv_texto:
+        st.warning(
+            error_html
+            or error_csv
+            or "No se pudo generar el reporte de este lote."
+        )
+    elif error_html or error_csv:
+        st.caption(f"⚠️ {error_html or error_csv}")
+    st.caption(
+        "El reporte para el cliente no incluye proveedor, costos ni IDs de "
+        "servicio."
+    )
+    fila_lote = mapa_filas.get(seleccion) or {}
+    pedidos_lote = _pedidos_lote(folio)
+    if pedidos_lote:
+        st.markdown("**Reporte para el cliente (sin proveedor)**")
+        _crear_sheet_cliente(
+            pedidos_lote,
+            cliente=str(fila_lote.get("Cliente") or ""),
+            campana=str(fila_lote.get("Campaña") or ""),
+            folio=folio,
+            fecha=str(fila_lote.get("Fecha") or ""),
+            key_prefix=f"jap_lote_{folio}",
+        )
+
+
+def _seccion_reporte_manual():
+    """Expander para reconstruir el reporte de una compra anterior."""
+    with st.expander(
+        "🧾 Reporte manual (para una compra anterior)", expanded=False
+    ):
+        st.caption(
+            "Reconstruye el reporte de una compra ya realizada. No crea "
+            "pedidos, no gasta saldo y no requiere confirmación."
+        )
+        fecha = st.date_input(
+            "Fecha del reporte",
+            key="jap_manual_fecha",
+        )
+        col_cliente, col_campana = st.columns(2)
+        with col_cliente:
+            cliente = st.text_input(
+                "Cliente",
+                key="jap_manual_cliente",
+                placeholder="Nombre del cliente",
+            )
+        with col_campana:
+            campana = st.text_input(
+                "Campaña / tema",
+                key="jap_manual_campana",
+                placeholder="Ej. Lanzamiento de septiembre",
+            )
+
+        st.button(
+            "📥 Cargar los 18 tweets de @RedAMLOmx",
+            key="jap_manual_btn_18",
+            on_click=_cargar_links_manual,
+        )
+        texto_links = st.text_area(
+            "Links (uno por línea)",
+            key="jap_manual_links",
+            height=150,
+            placeholder="https://x.com/usuario/status/123...",
+        )
+        links = _normalizar_links(texto_links)
+        if links:
+            st.caption(f"✅ {len(links)} link(s) válido(s).")
+        else:
+            st.info(
+                "Pega los links de las publicaciones o carga los 18 de "
+                "@RedAMLOmx."
+            )
+
+        st.markdown("**Cantidades por publicación** (0 = no incluir):")
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            likes = st.number_input(
+                "👍 Likes",
+                min_value=0,
+                value=50,
+                step=10,
+                key="jap_manual_likes",
+            )
+        with c2:
+            retweets = st.number_input(
+                "🔁 Retweets",
+                min_value=0,
+                value=10,
+                step=10,
+                key="jap_manual_rts",
+            )
+        with c3:
+            comentarios = st.number_input(
+                "💬 Comentarios",
+                min_value=0,
+                value=5,
+                step=5,
+                key="jap_manual_comments",
+            )
+        with c4:
+            vistas = st.number_input(
+                "👁️ Vistas",
+                min_value=0,
+                value=500,
+                step=100,
+                key="jap_manual_views",
+            )
+        col_seguidores, col_perfil = st.columns([1, 3])
+        with col_seguidores:
+            seguidores = st.number_input(
+                "👥 Seguidores totales",
+                min_value=0,
+                value=0,
+                step=10,
+                key="jap_manual_followers",
+                help="0 = no incluir seguidores en el reporte.",
+            )
+        with col_perfil:
+            perfil = st.text_input(
+                "Link del perfil (opcional, para seguidores)",
+                key="jap_manual_perfil",
+                placeholder="https://x.com/usuario",
+            )
+
+        cantidades = {
+            "likes": int(likes),
+            "retweets": int(retweets),
+            "comments": int(comentarios),
+            "views": int(vistas),
+            "followers": int(seguidores),
+        }
+        pedidos, errores = _plan_reporte_manual(links, cantidades, perfil)
+        if errores:
+            for error in errores:
+                st.warning(error)
+            return
+        if not pedidos:
+            st.info("No hay datos suficientes para generar el reporte.")
+            return
+
+        fecha_texto = (
+            fecha.isoformat()
+            if hasattr(fecha, "isoformat")
+            else str(fecha or "")
+        )
+        folio = f"MANUAL-{fecha_texto}" if fecha_texto else "MANUAL"
+        html = _contenido_reporte(
+            pedidos,
+            "html",
+            fecha=fecha_texto,
+            cliente=str(cliente or "").strip(),
+            campana=str(campana or "").strip(),
+            folio=folio,
+        )
+        csv_texto = _contenido_reporte(
+            pedidos,
+            "csv",
+            fecha=fecha_texto,
+            cliente=str(cliente or "").strip(),
+            campana=str(campana or "").strip(),
+            folio=folio,
+        )
+        st.download_button(
+            "📄 Reporte para el cliente (HTML)",
+            data=html,
+            file_name=_nombre_reporte(folio, "html"),
+            mime="text/html",
+            key="jap_dl_manual_html",
+        )
+        st.download_button(
+            "📊 Reporte (CSV)",
+            data=csv_texto,
+            file_name=_nombre_reporte(folio, "csv"),
+            mime="text/csv",
+            key="jap_dl_manual_csv",
+        )
+        st.caption(
+            "El reporte para el cliente no incluye proveedor, costos ni IDs "
+            "de servicio."
+        )
+        st.markdown("**Reporte para el cliente (sin proveedor)**")
+        _crear_sheet_cliente(
+            pedidos,
+            cliente=str(cliente or "").strip(),
+            campana=str(campana or "").strip(),
+            folio=folio,
+            fecha=fecha_texto,
+            key_prefix="jap_manual",
+        )
+
+
 def _tab_pedidos(disponible: bool):
     st.markdown("### 📦 Pedidos")
-    st.caption("Consulta el estado de tus pedidos, pide refill o cancela.")
+    st.caption(
+        "Consulta el estado de tus pedidos, pide refill o cancela. Más abajo "
+        "puedes descargar el reporte para el cliente."
+    )
 
     ids_texto = st.text_input(
         "IDs de pedido (separados por coma)",
@@ -1588,8 +2716,8 @@ def _tab_pedidos(disponible: bool):
         recientes = []
     if not recientes:
         st.info(
-            "Todavía no hay pedidos en esta sesión. Crea uno en "
-            "«🧮 Cotizador»."
+            "Todavía no hay pedidos en esta sesión. Compra un lote en "
+            "«🧮 Cotizador» para verlo aquí y descargar su reporte."
         )
     else:
         st.markdown("**Pedidos recientes de esta sesión**")
@@ -1641,6 +2769,9 @@ def _tab_pedidos(disponible: bool):
                 disabled=not (disponible and confirmo and order_id),
             ):
                 _accion_orden(order_id, "cancelar")
+
+    _seccion_reportes_cliente()
+    _seccion_reporte_manual()
 
     with st.expander("ℹ️ ¿Qué significan los estados?"):
         st.markdown(_ESTADOS_AYUDA)

@@ -6,6 +6,7 @@ from sqlalchemy import (
     Boolean,
     DateTime,
     Date,
+    Float,
     ForeignKey,
     JSON,
     LargeBinary,
@@ -419,3 +420,39 @@ class AppRelease(Base):
     tamano = Column(Integer, default=0)
     contenido = Column(LargeBinary, nullable=True)
     fecha = Column(DateTime, default=datetime.utcnow)
+
+
+class JAPPedido(Base):
+    """Resultado de UNA acción comprada para un lote de engagement.
+
+    Guarda solo lo necesario para el reporte del CLIENTE: folio del lote
+    (`lote_id`), numero de orden del panel (`order_id`), tipo de accion
+    (``likes``/``retweets``/``comments``/``views``/``followers``), enlace,
+    cantidad, costo interno, exito, estado y metadatos del cliente/campaña.
+    NO guarda la API key, el proveedor, el id de servicio ni el texto de los
+    comentarios: el reporte que se entrega al cliente nunca debe revelarlos
+    (ver core/jap_historial.py).
+
+    `lote_id` agrupa todas las acciones compradas en una misma operacion con un
+    folio tipo ``LOTE-YYYYmmdd-HHMMSS-xxxx``. `order_id` es 0 cuando el pedido
+    no llego a crearse (fallo). El costo se conserva para control interno y
+    NUNCA se incluye en los reportes.
+
+    Nota: la tabla se crea sola con `Base.metadata.create_all` (via `init_db`),
+    por lo que no requiere migracion ALTER en core/database.py."""
+
+    __tablename__ = "jap_pedido"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    lote_id = Column(String(40), default="", index=True)
+    order_id = Column(Integer, default=0)
+    tipo = Column(String(30), default="")
+    link = Column(Text, default="")
+    cantidad = Column(Integer, default=0)
+    costo = Column(Float, default=0.0)
+    exito = Column(Boolean, default=True)
+    estado = Column(String(30), default="")
+    fecha = Column(DateTime, default=datetime.utcnow)
+    cliente = Column(String(120), default="")
+    campana = Column(String(160), default="")
+    notas = Column(Text, default="")

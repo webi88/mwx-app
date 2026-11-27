@@ -24,7 +24,15 @@
   económico 9013/8860/8413/6601/9011 y seguro 10186/8861/8555/6602/8855.
   18 tweets: 50 likes+10 RT+5 comentarios+500 vistas = **$3.071**;
   100/20/5/1000 = **$3.364**; saldo **$3.5098**. No hay X-México.
-- Suite **6443/6443**; `compileall` OK. Rama `macos-build-1.1.4` fusionada a
+- Reportes: `JAPPedido` + `core/jap_historial.py` guardan cada lote; la página
+  genera reportes para el cliente (HTML/CSV/Google Sheet) **sin proveedor,
+  costos, saldo ni IDs de servicio**, y tiene Reporte manual para compras
+  anteriores. `core/google_sheets.py` crea el Sheet (Resumen/Detalle), lo
+  comparte por link o correo y devuelve la URL. Credenciales por
+  `GOOGLE_SERVICE_ACCOUNT_B64`/JSON/FILE o `data/google_service_account.json`.
+  **Aún sin credenciales de Google configuradas**: hay que crear la cuenta de
+  servicio y habilitar Sheets + Drive.
+- Suite **6657/6657**; `compileall` OK. Rama `macos-build-1.1.4` fusionada a
   `main` y publicada; release Mac construido desde esa rama.
 
 ## Próximo paso único

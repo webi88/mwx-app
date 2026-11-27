@@ -23,8 +23,15 @@ Cubre:
   (4) AppTest de compra del lote con `crear_orden` falso: sin confirmacion no
       llama a la API; con confirmacion crea los pedidos de los 2 links, deja
       el resumen persistente y limpia la confirmacion.
-  (5) AppTest sin API key (balance/catalogo con error): render sin excepciones,
-      instrucciones visibles y compra deshabilitada.
+  (5) Persistencia del lote: `core.jap_historial` se importa de forma
+      perezosa; `guardar_pedidos` recibe el folio, el cliente y la campana
+      (mock), el resumen guarda `lote_id` y aparecen los botones de reporte.
+  (6) Reportes: `generar_reporte_lote` se usa para el lote persistido,
+      `construir_reporte_html/csv` para el reporte manual, y los archivos no
+      mencionan al proveedor, costos, saldo, presets ni IDs de servicio.
+  (7) AppTest del reporte manual con cantidades (sin llamar a `crear_orden`)
+      y AppTest sin API key (balance/catalogo con error): render sin
+      excepciones, instrucciones visibles y compra deshabilitada.
 
 Uso:
     .venv/Scripts/python.exe tests/test_jap_web.py
@@ -32,6 +39,8 @@ Uso:
 from __future__ import annotations
 
 import ast
+import contextlib
+import re
 import sys
 from pathlib import Path
 from unittest import mock
@@ -353,6 +362,338 @@ def _costo_con_minimos(servicio, cantidad):
 
 
 # ---------------------------------------------------------------------------
+# Historial falso (`core.jap_historial`): nunca toca la BD real.
+# ---------------------------------------------------------------------------
+class FakeHistorial:
+    def __init__(self, lote_id="LOTE-TEST-001"):
+        self.lote_id = lote_id
+        self.lotes = {}
+        self.guardados = []
+        self.generados = []
+        self.construidos = []
+
+    def nuevo_lote_id(self):
+        return self.lote_id
+
+    def guardar_pedidos(
+        self, pedidos, lote_id="", cliente="", campana="", notas=""
+    ):
+        copia = [dict(pedido) for pedido in (pedidos or [])]
+        folio = str(lote_id or self.lote_id)
+        self.guardados.append(
+            {
+                "pedidos": copia,
+                "lote_id": folio,
+                "cliente": cliente,
+                "campana": campana,
+                "notas": notas,
+            }
+        )
+        self.lotes[folio] = copia
+        return {
+            "ok": True,
+            "lote_id": folio,
+            "guardados": len(copia),
+            "error": "",
+        }
+
+    def pedidos_de_lote(self, lote_id):
+        return [dict(pedido) for pedido in self.lotes.get(lote_id, [])]
+
+    def listar_lotes(self, limite=10):
+        filas = []
+        for indice, (folio, pedidos) in enumerate(
+            list(self.lotes.items())[: max(int(limite or 0), 0)]
+        ):
+            guardado = (
+                self.guardados[indice] if indice < len(self.guardados) else {}
+            )
+            links = {
+                pedido.get("link")
+                for pedido in pedidos
+                if pedido.get("link")
+            }
+            filas.append(
+                {
+                    "lote_id": folio,
+                    "fecha": "2026-11-27T10:00:00",
+                    "cliente": guardado.get("cliente") or "",
+                    "campana": guardado.get("campana") or "",
+                    "pedidos": len(pedidos),
+                    "acciones": len(pedidos),
+                    "links": len(links),
+                }
+            )
+        return filas
+
+    def generar_reporte_lote(self, lote_id, formato="html"):
+        self.generados.append((lote_id, formato))
+        if formato == "csv":
+            contenido = f"Tipo,Publicación,Cantidad\nLote,{lote_id},1\n"
+        else:
+            contenido = (
+                "<!DOCTYPE html><html><body><h1>MW Group</h1>"
+                f"<p>Reporte {lote_id}</p></body></html>"
+            )
+        return {
+            "ok": True,
+            "contenido": contenido,
+            "filename": f"reporte-{lote_id}.{formato}",
+            "error": "",
+        }
+
+    def construir_reporte_html(
+        self,
+        pedidos,
+        fecha="",
+        cliente="",
+        campana="",
+        folio="",
+        notas="",
+    ):
+        self.construidos.append(
+            ("html", [dict(p) for p in pedidos], cliente, campana, folio)
+        )
+        return (
+            "<!DOCTYPE html><html><body><h1>MW Group</h1>"
+            f"<p>{folio} · {cliente} · {campana}</p>"
+            f"<p>{len(pedidos)} acciones</p></body></html>"
+        )
+
+    def construir_reporte_csv(
+        self,
+        pedidos,
+        fecha="",
+        cliente="",
+        campana="",
+        folio="",
+        notas="",
+    ):
+        self.construidos.append(
+            ("csv", [dict(p) for p in pedidos], cliente, campana, folio)
+        )
+        return (
+            "Tipo,Publicación,Cantidad\n"
+            f"Lote,{folio},{len(pedidos)}\n"
+        )
+
+
+class FakeHistorialFallido(FakeHistorial):
+    """Historial que falla al guardar: la compra debe continuar igual."""
+
+    def guardar_pedidos(
+        self, pedidos, lote_id="", cliente="", campana="", notas=""
+    ):
+        return {
+            "ok": False,
+            "lote_id": str(lote_id or ""),
+            "guardados": 0,
+            "error": "Base no disponible",
+        }
+
+
+@contextlib.contextmanager
+def _historial_fake(fake):
+    """Inyecta `core.jap_historial` sin importar el modulo real."""
+    import core
+
+    existia = hasattr(core, "jap_historial")
+    anterior = getattr(core, "jap_historial", None)
+    with mock.patch.dict(sys.modules, {"core.jap_historial": fake}):
+        setattr(core, "jap_historial", fake)
+        try:
+            yield fake
+        finally:
+            if existia:
+                setattr(core, "jap_historial", anterior)
+            else:
+                try:
+                    delattr(core, "jap_historial")
+                except AttributeError:
+                    pass
+                sys.modules.pop("core.jap_historial", None)
+
+
+def _historial_real():
+    """Modulo real si esta disponible (sin efectos secundarios)."""
+    try:
+        from core import jap_historial as real
+
+        return real
+    except Exception:
+        return None
+
+
+def _reporte_manual_real_o_local(pedidos):
+    """(html, csv, origen) con el generador real si existe, si no el local."""
+    real = _historial_real()
+    if real is not None:
+        html_fn = getattr(real, "construir_reporte_html", None)
+        csv_fn = getattr(real, "construir_reporte_csv", None)
+        if callable(html_fn) and callable(csv_fn):
+            try:
+                html = html_fn(
+                    pedidos,
+                    fecha="2026-11-27",
+                    cliente="Cliente Demo",
+                    campana="Campaña Demo",
+                    folio="LOTE-DEMO",
+                )
+                csv_texto = csv_fn(
+                    pedidos,
+                    fecha="2026-11-27",
+                    cliente="Cliente Demo",
+                    campana="Campaña Demo",
+                    folio="LOTE-DEMO",
+                )
+                if isinstance(html, bytes):
+                    html = html.decode("utf-8", errors="replace")
+                if isinstance(csv_texto, bytes):
+                    csv_texto = csv_texto.decode("utf-8", errors="replace")
+                if str(html or "").strip() and str(csv_texto or "").strip():
+                    return str(html), str(csv_texto), "core.jap_historial"
+            except Exception:
+                pass
+    html = pagina._reporte_html_local(
+        pedidos,
+        fecha="2026-11-27",
+        cliente="Cliente Demo",
+        campana="Campaña Demo",
+        folio="LOTE-DEMO",
+    )
+    csv_texto = pagina._reporte_csv_local(
+        pedidos,
+        fecha="2026-11-27",
+        cliente="Cliente Demo",
+        campana="Campaña Demo",
+        folio="LOTE-DEMO",
+    )
+    return html, csv_texto, "local"
+
+
+class FakeGoogleSheets:
+    """Backend falso de `core.google_sheets` (sin red ni credenciales)."""
+
+    def __init__(self, disponible=True, email="reportes@mw-test.iam.gserviceaccount.com"):
+        self._disponible = bool(disponible)
+        self.email = email if self._disponible else ""
+        self.estado_llamadas = 0
+        self.crear_llamadas = []
+        self.guardados = []
+        self.error_guardar = ""
+        self.crear_ok = True
+        self.url = "https://docs.google.com/spreadsheets/d/SHEET-TEST-123/edit"
+        self.titulo = "Reporte de acciones realizadas"
+
+    def estado(self):
+        self.estado_llamadas += 1
+        return {
+            "disponible": self._disponible,
+            "motivo": "" if self._disponible else "Sin credenciales configuradas",
+            "fuente": "env" if self._disponible else "",
+            "email": self.email if self._disponible else "",
+        }
+
+    def disponible(self):
+        return self._disponible
+
+    def guardar_credenciales_json(self, contenido):
+        self.guardados.append(contenido)
+        if self.error_guardar:
+            return {"ok": False, "email": "", "error": self.error_guardar}
+        self._disponible = True
+        self.email = "reportes@mw-test.iam.gserviceaccount.com"
+        return {"ok": True, "email": self.email, "error": ""}
+
+    def crear_sheet_reporte(
+        self,
+        pedidos,
+        cliente="",
+        campana="",
+        fecha="",
+        folio="",
+        notas="",
+        compartir_publico=True,
+        email="",
+    ):
+        self.crear_llamadas.append(
+            {
+                "pedidos": [dict(p) for p in (pedidos or [])],
+                "cliente": cliente,
+                "campana": campana,
+                "fecha": fecha,
+                "folio": folio,
+                "compartir_publico": compartir_publico,
+                "email": email,
+            }
+        )
+        if not self.crear_ok:
+            return {
+                "ok": False,
+                "spreadsheet_id": "",
+                "url": "",
+                "titulo": "",
+                "compartido": False,
+                "error": "Sin permisos de Google",
+            }
+        return {
+            "ok": True,
+            "spreadsheet_id": "SHEET-TEST-123",
+            "url": self.url,
+            "titulo": self.titulo,
+            "compartido": True,
+            "error": "",
+        }
+
+
+@contextlib.contextmanager
+def _sheets_fake(fake):
+    """Inyecta `core.google_sheets` en la pagina (None = modulo ausente)."""
+    with mock.patch.object(pagina, "_sheets", lambda: fake):
+        yield fake
+
+
+JSON_CREDENCIALES = (
+    '{"type": "service_account", "project_id": "mw-test", '
+    '"private_key_id": "abc123secreto", "private_key": '
+    '"-----BEGIN PRIVATE KEY-----\\nMIIEvQIBADANBgkq\\n'
+    '-----END PRIVATE KEY-----\\n", '
+    '"client_email": "reportes@mw-test.iam.gserviceaccount.com"}'
+)
+
+
+def _textos_ui(at) -> str:
+    """Todo el texto visible de la pagina (para buscar fugas del JSON)."""
+    partes = []
+    for tipo in (
+        "markdown",
+        "caption",
+        "success",
+        "info",
+        "warning",
+        "error",
+        "code",
+    ):
+        try:
+            elementos = at.get(tipo)
+        except Exception:
+            continue
+        for elemento in elementos:
+            try:
+                valor = getattr(elemento, "value", "")
+                if isinstance(valor, str):
+                    partes.append(valor)
+            except Exception:
+                continue
+    for entrada in at.text_input:
+        try:
+            partes.append(str(entrada.value))
+        except Exception:
+            continue
+    return "\n".join(partes)
+
+
+# ---------------------------------------------------------------------------
 # Scripts de AppTest (SOLO ASCII: Streamlit los escribe con la codificacion
 # local de Windows). Reciben los fakes por kwargs.
 # ---------------------------------------------------------------------------
@@ -390,6 +731,27 @@ def _app_jap_sin_key(listar, balance, recomendados):
         jap, "obtener_balance", balance
     ), mock.patch.object(
         jap, "servicios_recomendados", recomendados
+    ), mock.patch.object(
+        jap, "disponible", lambda: False
+    ):
+        from web.operaciones.jap import render
+
+        render({"rol": "admin", "nombre": "Owner", "usuario": "admin"})
+
+
+def _app_jap_reporte_manual(listar, balance, recomendados, crear):
+    from unittest import mock
+
+    from integraciones import jap
+
+    with mock.patch.object(jap, "listar_servicios", listar), mock.patch.object(
+        jap, "obtener_balance", balance
+    ), mock.patch.object(
+        jap, "servicios_recomendados", recomendados
+    ), mock.patch.object(
+        jap, "crear_orden", crear
+    ), mock.patch.object(
+        jap, "estado_ordenes", lambda ids: {"ok": True, "ordenes": {}, "error": ""}
     ), mock.patch.object(
         jap, "disponible", lambda: False
     ):
@@ -440,6 +802,112 @@ def _app_jap_compra_lote(listar, balance, costo, recomendados, registro):
         jap, "estado_ordenes", lambda ids: {"ok": True, "ordenes": {}, "error": ""}
     ), mock.patch.object(
         jap, "disponible", lambda: True
+    ):
+        from web.operaciones.jap import render
+
+        render({"rol": "admin", "nombre": "Owner", "usuario": "admin"})
+
+
+def _app_jap_sheets_ultimo(listar, balance, recomendados, ordenes):
+    from unittest import mock
+
+    from integraciones import jap
+
+    def _crear(*args, **kwargs):
+        ordenes.append({"args": args, "kwargs": kwargs})
+        return {"ok": True, "order": 9001, "costo": 0.0, "error": ""}
+
+    with mock.patch.object(jap, "listar_servicios", listar), mock.patch.object(
+        jap, "obtener_balance", balance
+    ), mock.patch.object(
+        jap, "servicios_recomendados", recomendados
+    ), mock.patch.object(
+        jap, "crear_orden", _crear
+    ), mock.patch.object(
+        jap, "estado_ordenes", lambda ids: {"ok": True, "ordenes": {}, "error": ""}
+    ), mock.patch.object(
+        jap, "disponible", lambda: True
+    ):
+        import streamlit as st
+
+        st.session_state["jap_lote_resultados"] = {
+            "fecha": "2026-11-27T12:00:00",
+            "total_gastado": 0.5,
+            "exitosos": 2,
+            "fallidos": 0,
+            "pedidos": [
+                {
+                    "order": 9001,
+                    "tipo": "likes",
+                    "servicio": 9013,
+                    "servicio_nombre": "Twitter Likes 7D",
+                    "link": "https://x.com/a/status/1",
+                    "cantidad": 50,
+                    "costo": 0.25,
+                    "ok": True,
+                    "error": "",
+                },
+                {
+                    "order": 9002,
+                    "tipo": "retweets",
+                    "servicio": 8860,
+                    "servicio_nombre": "Twitter Retweets",
+                    "link": "https://x.com/a/status/2",
+                    "cantidad": 10,
+                    "costo": 0.25,
+                    "ok": True,
+                    "error": "",
+                },
+            ],
+            "lote_id": "LOTE-SHEET-001",
+            "cliente": "Cliente Demo",
+            "campana": "Campana Demo",
+            "historial_ok": False,
+            "historial_error": "",
+        }
+        from web.operaciones.jap import render
+
+        render({"rol": "admin", "nombre": "Owner", "usuario": "admin"})
+
+
+def _app_jap_sheets_lote(listar, balance, recomendados, ordenes):
+    from unittest import mock
+
+    from integraciones import jap
+
+    def _crear(*args, **kwargs):
+        ordenes.append({"args": args, "kwargs": kwargs})
+        return {"ok": True, "order": 9001, "costo": 0.0, "error": ""}
+
+    with mock.patch.object(jap, "listar_servicios", listar), mock.patch.object(
+        jap, "obtener_balance", balance
+    ), mock.patch.object(
+        jap, "servicios_recomendados", recomendados
+    ), mock.patch.object(
+        jap, "crear_orden", _crear
+    ), mock.patch.object(
+        jap, "estado_ordenes", lambda ids: {"ok": True, "ordenes": {}, "error": ""}
+    ), mock.patch.object(
+        jap, "disponible", lambda: False
+    ):
+        from web.operaciones.jap import render
+
+        render({"rol": "admin", "nombre": "Owner", "usuario": "admin"})
+
+
+def _app_jap_sheets_credenciales(listar, balance, recomendados):
+    from unittest import mock
+
+    from integraciones import jap
+
+    with mock.patch.object(jap, "listar_servicios", listar), mock.patch.object(
+        jap, "obtener_balance", balance
+    ), mock.patch.object(
+        jap, "servicios_recomendados", recomendados
+    ), mock.patch.object(
+        jap, "estado_ordenes", lambda ids: {"ok": True, "ordenes": {}, "error": ""}
+    ), mock.patch.object(
+        jap, "disponible", lambda: False
     ):
         from web.operaciones.jap import render
 
@@ -538,6 +1006,37 @@ def _metricas(at) -> dict:
     return {str(m.label): str(m.value) for m in at.metric}
 
 
+def _download_keys(at) -> list:
+    """Keys de los `st.download_button` renderizados (via proto.id)."""
+    claves = []
+    for elemento in at.get("download_button"):
+        try:
+            identificador = str(elemento.proto.id)
+            claves.append(identificador.rsplit("-", 1)[-1])
+        except Exception:
+            continue
+    return claves
+
+
+def _tiene_terminos_internos(texto) -> bool:
+    """True si el reporte menciona al proveedor, costos o datos internos."""
+    bajo = str(texto or "").lower()
+    terminos = (
+        "jap",
+        "just another panel",
+        "proveedor",
+        "costo",
+        "saldo",
+        "preset",
+        "compra",
+        "ids de servicio",
+        "id de servicio",
+    )
+    if any(termino in bajo for termino in terminos):
+        return True
+    return bool(re.search(r"\bapi\b", bajo))
+
+
 def _app_test_con_key() -> tuple[bool, str, dict]:
     from streamlit.testing.v1 import AppTest
 
@@ -558,6 +1057,9 @@ def _app_test_con_key() -> tuple[bool, str, dict]:
         "confirmo": False,
         "compra_deshabilitada": False,
         "estados": False,
+        "cliente_input": False,
+        "campana_input": False,
+        "manual_expander": False,
     }
     try:
         at = AppTest.from_function(
@@ -642,6 +1144,12 @@ def _app_test_con_key() -> tuple[bool, str, dict]:
         resultado["estados"] = any(
             t.key == "jap_btn_consultar" for t in at.button
         )
+        claves_inputs = {t.key for t in at.text_input}
+        resultado["cliente_input"] = "jap_lote_cliente" in claves_inputs
+        resultado["campana_input"] = "jap_lote_campana" in claves_inputs
+        resultado["manual_expander"] = any(
+            "Reporte manual" in str(expander.label) for expander in at.expander
+        )
         return True, "", resultado
     except Exception as exc:
         return False, f"{type(exc).__name__}: {exc}"[:300], resultado
@@ -690,10 +1198,11 @@ def _app_test_sin_key() -> tuple[bool, str, dict]:
         return False, f"{type(exc).__name__}: {exc}"[:300], resultado
 
 
-def _app_test_compra_lote() -> tuple[bool, str, dict]:
+def _app_test_compra_lote(fake=None) -> tuple[bool, str, dict]:
     from streamlit.testing.v1 import AppTest
 
     registro = []
+    fake = fake if fake is not None else FakeHistorial()
     resultado = {
         "sin_excepciones": False,
         "boton_existe": False,
@@ -707,77 +1216,499 @@ def _app_test_compra_lote() -> tuple[bool, str, dict]:
         "expander_resultados": False,
         "confirmacion_limpia": False,
         "pedidos_recientes": 0,
+        "lote_id": "",
+        "cliente": "",
+        "campana": "",
+        "historial_ok": False,
+        "guardados": [],
+        "reportes_lote": [],
+        "download_keys": [],
+        "persisted_table": False,
+        "selector_lote": False,
+        "warnings": [],
+    }
+    try:
+        with _historial_fake(fake):
+            at = AppTest.from_function(
+                _app_jap_compra_lote,
+                default_timeout=120,
+                kwargs={
+                    "listar": _fake_listar,
+                    "balance": _fake_balance,
+                    "costo": _fake_costo,
+                    "recomendados": _fake_recomendados,
+                    "registro": registro,
+                },
+            )
+            at.run()
+            if at.exception:
+                return False, str(at.exception[0].value)[:300], resultado
+
+            at.text_area(key="jap_quote_links").set_value(
+                "https://x.com/a/status/1\nhttps://x.com/a/status/2"
+            ).run()
+            at.number_input(key="jap_quote_likes").set_value(10).run()
+            at.number_input(key="jap_quote_rts").set_value(0).run()
+            at.number_input(key="jap_quote_comments").set_value(0).run()
+            at.number_input(key="jap_quote_views").set_value(0).run()
+            at.text_input(key="jap_lote_cliente").set_value(
+                "Cliente Demo"
+            ).run()
+            at.text_input(key="jap_lote_campana").set_value(
+                "Campaña Demo"
+            ).run()
+            if at.exception:
+                return False, str(at.exception[0].value)[:300], resultado
+
+            try:
+                boton = at.button(key="jap_btn_comprar_lote")
+            except Exception:
+                boton = None
+            resultado["boton_existe"] = boton is not None
+            resultado["deshabilitado_sin_confirmar"] = bool(
+                boton is not None and boton.disabled
+            )
+            resultado["llamadas_sin_confirmar"] = len(registro)
+
+            at.checkbox(key="jap_lote_confirmo").check().run()
+            if at.exception:
+                return False, str(at.exception[0].value)[:300], resultado
+            boton = at.button(key="jap_btn_comprar_lote")
+            resultado["habilitado_confirmado"] = not bool(boton.disabled)
+            boton.click().run()
+            if at.exception:
+                return False, str(at.exception[0].value)[:300], resultado
+
+            resultado["llamadas"] = len(registro)
+            resultado["servicios"] = [
+                llamada["servicio"] for llamada in registro
+            ]
+            resultado["links"] = [llamada["link"] for llamada in registro]
+            resultado["cantidades"] = [
+                llamada["cantidad"] for llamada in registro
+            ]
+            resultado["expander_resultados"] = any(
+                "Último pedido del lote" in str(expander.label)
+                for expander in at.expander
+            )
+            try:
+                resultado["confirmacion_limpia"] = not bool(
+                    at.checkbox(key="jap_lote_confirmo").value
+                )
+            except Exception:
+                resultado["confirmacion_limpia"] = False
+            try:
+                recientes = at.session_state["jap_pedidos_recientes"]
+                resultado["pedidos_recientes"] = len(recientes or [])
+            except Exception:
+                resultado["pedidos_recientes"] = 0
+            try:
+                lote = at.session_state["jap_lote_resultados"]
+            except Exception:
+                lote = {}
+            if isinstance(lote, dict):
+                resultado["lote_id"] = str(lote.get("lote_id") or "")
+                resultado["cliente"] = str(lote.get("cliente") or "")
+                resultado["campana"] = str(lote.get("campana") or "")
+                resultado["historial_ok"] = bool(lote.get("historial_ok"))
+            resultado["guardados"] = list(fake.guardados)
+            resultado["reportes_lote"] = list(fake.generados)
+            resultado["download_keys"] = _download_keys(at)
+            resultado["persisted_table"] = (
+                _tabla_con_columnas(
+                    at,
+                    [
+                        "Folio",
+                        "Fecha",
+                        "Cliente",
+                        "Campaña",
+                        "Pedidos",
+                        "Acciones",
+                        "Links",
+                    ],
+                )
+                is not None
+            )
+            try:
+                at.selectbox(key="jap_reporte_lote_sel")
+                resultado["selector_lote"] = True
+            except Exception:
+                resultado["selector_lote"] = False
+            resultado["warnings"] = [str(w.value) for w in at.warning]
+            resultado["sin_excepciones"] = True
+            return True, "", resultado
+    except Exception as exc:
+        return False, f"{type(exc).__name__}: {exc}"[:300], resultado
+
+
+def _app_test_reporte_manual() -> tuple[bool, str, dict]:
+    from streamlit.testing.v1 import AppTest
+
+    resultado = {
+        "sin_excepciones": False,
+        "download_keys": [],
+        "html": False,
+        "csv": False,
+        "caption_sin_proveedor": False,
     }
     try:
         at = AppTest.from_function(
-            _app_jap_compra_lote,
+            _app_jap_reporte_manual,
             default_timeout=120,
             kwargs={
-                "listar": _fake_listar,
-                "balance": _fake_balance,
-                "costo": _fake_costo,
-                "recomendados": _fake_recomendados,
-                "registro": registro,
+                "listar": _fake_listar_sin_key,
+                "balance": _fake_balance_sin_key,
+                "recomendados": _fake_recomendados_sin_key,
+                "crear": _sin_orden_real,
             },
         )
         at.run()
         if at.exception:
             return False, str(at.exception[0].value)[:300], resultado
-
-        at.text_area(key="jap_quote_links").set_value(
+        at.text_area(key="jap_manual_links").set_value(
             "https://x.com/a/status/1\nhttps://x.com/a/status/2"
         ).run()
-        at.number_input(key="jap_quote_likes").set_value(10).run()
-        at.number_input(key="jap_quote_rts").set_value(0).run()
-        at.number_input(key="jap_quote_comments").set_value(0).run()
-        at.number_input(key="jap_quote_views").set_value(0).run()
+        at.number_input(key="jap_manual_likes").set_value(50).run()
+        at.number_input(key="jap_manual_rts").set_value(0).run()
+        at.number_input(key="jap_manual_comments").set_value(5).run()
+        at.number_input(key="jap_manual_views").set_value(0).run()
+        at.number_input(key="jap_manual_followers").set_value(0).run()
+        at.text_input(key="jap_manual_cliente").set_value("Cliente Demo").run()
+        at.text_input(key="jap_manual_campana").set_value("Campaña Demo").run()
         if at.exception:
             return False, str(at.exception[0].value)[:300], resultado
-
-        try:
-            boton = at.button(key="jap_btn_comprar_lote")
-        except Exception:
-            boton = None
-        resultado["boton_existe"] = boton is not None
-        resultado["deshabilitado_sin_confirmar"] = bool(
-            boton is not None and boton.disabled
+        resultado["download_keys"] = _download_keys(at)
+        resultado["html"] = "jap_dl_manual_html" in resultado["download_keys"]
+        resultado["csv"] = "jap_dl_manual_csv" in resultado["download_keys"]
+        resultado["caption_sin_proveedor"] = any(
+            "no incluye proveedor" in str(caption.value)
+            for caption in at.caption
         )
-        resultado["llamadas_sin_confirmar"] = len(registro)
-
-        at.checkbox(key="jap_lote_confirmo").check().run()
-        if at.exception:
-            return False, str(at.exception[0].value)[:300], resultado
-        boton = at.button(key="jap_btn_comprar_lote")
-        resultado["habilitado_confirmado"] = not bool(boton.disabled)
-        boton.click().run()
-        if at.exception:
-            return False, str(at.exception[0].value)[:300], resultado
-
-        resultado["llamadas"] = len(registro)
-        resultado["servicios"] = [llamada["servicio"] for llamada in registro]
-        resultado["links"] = [llamada["link"] for llamada in registro]
-        resultado["cantidades"] = [
-            llamada["cantidad"] for llamada in registro
-        ]
-        resultado["expander_resultados"] = any(
-            "Último pedido del lote" in str(expander.label)
-            for expander in at.expander
-        )
-        try:
-            resultado["confirmacion_limpia"] = not bool(
-                at.checkbox(key="jap_lote_confirmo").value
-            )
-        except Exception:
-            resultado["confirmacion_limpia"] = False
-        try:
-            recientes = at.session_state["jap_pedidos_recientes"]
-            resultado["pedidos_recientes"] = len(recientes or [])
-        except Exception:
-            resultado["pedidos_recientes"] = 0
         resultado["sin_excepciones"] = True
         return True, "", resultado
     except Exception as exc:
         return False, f"{type(exc).__name__}: {exc}"[:300], resultado
+
+
+def _app_test_sheet_ultimo(fake, click=True) -> tuple[bool, str, dict]:
+    """AppTest del boton de Google Sheet del ultimo lote (fake inyectado)."""
+    from streamlit.testing.v1 import AppTest
+
+    ordenes = []
+    datos = {
+        "sin_excepciones": False,
+        "expander": False,
+        "instrucciones": False,
+        "boton_existe": False,
+        "llamadas": [],
+        "codes": [],
+        "success": [],
+        "captions": [],
+        "ordenes": [],
+        "bloqueo_sin_correo": False,
+    }
+    try:
+        with _sheets_fake(fake):
+            at = AppTest.from_function(
+                _app_jap_sheets_ultimo,
+                default_timeout=120,
+                kwargs={
+                    "listar": _fake_listar,
+                    "balance": _fake_balance,
+                    "recomendados": _fake_recomendados,
+                    "ordenes": ordenes,
+                },
+            )
+            at.run()
+            if at.exception:
+                return False, str(at.exception[0].value)[:300], datos
+            datos["expander"] = any(
+                "Conectar Google Sheets" in str(expander.label)
+                for expander in at.expander
+            )
+            textos = _textos_ui(at)
+            datos["instrucciones"] = all(
+                termino in textos
+                for termino in (
+                    "Google Sheets API",
+                    "Google Drive API",
+                    "GOOGLE_SERVICE_ACCOUNT_B64",
+                    "data/google_service_account.json",
+                )
+            )
+            clave_boton = pagina._clave_sheet("jap_lote_actual") + "_btn"
+            datos["boton_existe"] = any(
+                blabel.key == clave_boton for blabel in at.button
+            )
+            if click and datos["boton_existe"]:
+                at.button(key=clave_boton).click().run()
+                if at.exception:
+                    return False, str(at.exception[0].value)[:300], datos
+                clave_publico = (
+                    pagina._clave_sheet("jap_lote_actual") + "_publico"
+                )
+                try:
+                    at.checkbox(key=clave_publico).uncheck().run()
+                    boton_privado = at.button(key=clave_boton)
+                    datos["bloqueo_sin_correo"] = bool(
+                        boton_privado.disabled
+                    ) and any(
+                        "Indica un correo" in str(elemento.value)
+                        for elemento in at.error
+                    )
+                except Exception:
+                    datos["bloqueo_sin_correo"] = False
+            datos["llamadas"] = list(
+                getattr(fake, "crear_llamadas", None) or []
+            )
+            datos["codes"] = [str(codigo.value) for codigo in at.code]
+            datos["success"] = [str(s.value) for s in at.success]
+            datos["captions"] = [str(c.value) for c in at.caption]
+            datos["ordenes"] = list(ordenes)
+            datos["sin_excepciones"] = True
+            return True, "", datos
+    except Exception as exc:
+        return False, f"{type(exc).__name__}: {exc}"[:300], datos
+
+
+def _app_test_sheet_lote(fake) -> tuple[bool, str, dict]:
+    """AppTest del boton de Google Sheet de un lote persistido."""
+    from streamlit.testing.v1 import AppTest
+
+    ordenes = []
+    datos = {
+        "sin_excepciones": False,
+        "boton_existe": False,
+        "llamadas": [],
+        "codes": [],
+        "success": [],
+        "ordenes": [],
+    }
+    pedidos = [
+        {
+            "order": 9101,
+            "tipo": "likes",
+            "servicio": 9013,
+            "servicio_nombre": "Twitter Likes 7D",
+            "link": "https://x.com/b/status/1",
+            "cantidad": 25,
+            "costo": 0.1,
+            "ok": True,
+            "error": "",
+        },
+        {
+            "order": 9102,
+            "tipo": "comments",
+            "servicio": 6602,
+            "servicio_nombre": "USA Custom Comments",
+            "link": "https://x.com/b/status/2",
+            "cantidad": 5,
+            "costo": 0.2,
+            "ok": True,
+            "error": "",
+        },
+    ]
+    historial = FakeHistorial("LOTE-SHEET-002")
+    historial.lotes["LOTE-SHEET-002"] = pedidos
+    historial.guardados = [
+        {
+            "pedidos": pedidos,
+            "lote_id": "LOTE-SHEET-002",
+            "cliente": "Cliente Lote",
+            "campana": "Campana Lote",
+            "notas": "",
+        }
+    ]
+    try:
+        with _sheets_fake(fake), _historial_fake(historial):
+            at = AppTest.from_function(
+                _app_jap_sheets_lote,
+                default_timeout=120,
+                kwargs={
+                    "listar": _fake_listar_sin_key,
+                    "balance": _fake_balance_sin_key,
+                    "recomendados": _fake_recomendados_sin_key,
+                    "ordenes": ordenes,
+                },
+            )
+            at.run()
+            if at.exception:
+                return False, str(at.exception[0].value)[:300], datos
+            clave_boton = (
+                pagina._clave_sheet("jap_lote_LOTE-SHEET-002") + "_btn"
+            )
+            datos["boton_existe"] = any(
+                blabel.key == clave_boton for blabel in at.button
+            )
+            if datos["boton_existe"]:
+                at.button(key=clave_boton).click().run()
+                if at.exception:
+                    return False, str(at.exception[0].value)[:300], datos
+            datos["llamadas"] = list(fake.crear_llamadas)
+            datos["codes"] = [str(codigo.value) for codigo in at.code]
+            datos["success"] = [str(s.value) for s in at.success]
+            datos["ordenes"] = list(ordenes)
+            datos["sin_excepciones"] = True
+            return True, "", datos
+    except Exception as exc:
+        return False, f"{type(exc).__name__}: {exc}"[:300], datos
+
+
+def _app_test_sheet_manual(fake) -> tuple[bool, str, dict]:
+    """AppTest del boton de Google Sheet del reporte manual."""
+    from streamlit.testing.v1 import AppTest
+
+    ordenes = []
+
+    def _crear(*args, **kwargs):
+        ordenes.append({"args": args, "kwargs": kwargs})
+        return {"ok": False, "error": "no deberia crear ordenes"}
+
+    datos = {
+        "sin_excepciones": False,
+        "boton_existe": False,
+        "llamadas": [],
+        "codes": [],
+        "success": [],
+        "ordenes": [],
+    }
+    try:
+        with _sheets_fake(fake):
+            at = AppTest.from_function(
+                _app_jap_reporte_manual,
+                default_timeout=120,
+                kwargs={
+                    "listar": _fake_listar_sin_key,
+                    "balance": _fake_balance_sin_key,
+                    "recomendados": _fake_recomendados_sin_key,
+                    "crear": _crear,
+                },
+            )
+            at.run()
+            if at.exception:
+                return False, str(at.exception[0].value)[:300], datos
+            at.text_area(key="jap_manual_links").set_value(
+                "https://x.com/a/status/1\nhttps://x.com/a/status/2"
+            ).run()
+            at.number_input(key="jap_manual_likes").set_value(50).run()
+            at.number_input(key="jap_manual_rts").set_value(0).run()
+            at.number_input(key="jap_manual_comments").set_value(5).run()
+            at.number_input(key="jap_manual_views").set_value(0).run()
+            at.number_input(key="jap_manual_followers").set_value(0).run()
+            at.text_input(key="jap_manual_cliente").set_value(
+                "Cliente Manual"
+            ).run()
+            at.text_input(key="jap_manual_campana").set_value(
+                "Campana Manual"
+            ).run()
+            if at.exception:
+                return False, str(at.exception[0].value)[:300], datos
+            clave_boton = pagina._clave_sheet("jap_manual") + "_btn"
+            datos["boton_existe"] = any(
+                blabel.key == clave_boton for blabel in at.button
+            )
+            if datos["boton_existe"]:
+                at.button(key=clave_boton).click().run()
+                if at.exception:
+                    return False, str(at.exception[0].value)[:300], datos
+            datos["llamadas"] = list(fake.crear_llamadas)
+            datos["codes"] = [str(codigo.value) for codigo in at.code]
+            datos["success"] = [str(s.value) for s in at.success]
+            datos["ordenes"] = list(ordenes)
+            datos["sin_excepciones"] = True
+            return True, "", datos
+    except Exception as exc:
+        return False, f"{type(exc).__name__}: {exc}"[:300], datos
+
+
+def _app_test_sheets_credenciales(fake) -> tuple[bool, str, dict]:
+    """AppTest del expander de conexion y del guardado de credenciales."""
+    from streamlit.testing.v1 import AppTest
+
+    datos = {
+        "sin_excepciones": False,
+        "expander": False,
+        "password": False,
+        "guardados": [],
+        "valor_input": "",
+        "fuga_json": False,
+        "exito": False,
+        "email_visible": False,
+        "prueba_ok": False,
+        "crear_llamadas": 0,
+        "session_gs": {},
+    }
+    try:
+        with _sheets_fake(fake):
+            at = AppTest.from_function(
+                _app_jap_sheets_credenciales,
+                default_timeout=120,
+                kwargs={
+                    "listar": _fake_listar_sin_key,
+                    "balance": _fake_balance_sin_key,
+                    "recomendados": _fake_recomendados_sin_key,
+                },
+            )
+            at.run()
+            if at.exception:
+                return False, str(at.exception[0].value)[:300], datos
+            datos["expander"] = any(
+                "Conectar Google Sheets" in str(expander.label)
+                for expander in at.expander
+            )
+            entrada = at.text_input(key="jap_gs_json_input")
+            try:
+                from streamlit.proto.TextInput_pb2 import TextInput
+
+                datos["password"] = entrada.proto.type == TextInput.PASSWORD
+            except Exception:
+                datos["password"] = False
+            at.text_input(key="jap_gs_json_input").set_value(
+                JSON_CREDENCIALES
+            ).run()
+            at.button(key="jap_gs_btn_guardar").click().run()
+            if at.exception:
+                return False, str(at.exception[0].value)[:300], datos
+            datos["guardados"] = list(fake.guardados)
+            datos["valor_input"] = str(
+                at.text_input(key="jap_gs_json_input").value or ""
+            )
+            textos = _textos_ui(at)
+            datos["fuga_json"] = (
+                "private_key" in textos.lower()
+                or "abc123secreto" in textos
+            )
+            datos["exito"] = any(
+                "conectado" in str(s.value).lower()
+                or "credenciales guardadas" in str(s.value).lower()
+                for s in at.success
+            )
+            datos["email_visible"] = any(
+                "reportes@mw-test.iam.gserviceaccount.com" in str(s.value)
+                for s in at.success
+            )
+            try:
+                datos["session_gs"] = {
+                    str(clave_estado): str(
+                        at.session_state[clave_estado]
+                    )
+                    for clave_estado in at.session_state.filtered_state
+                    if "jap_gs" in str(clave_estado)
+                }
+            except Exception:
+                datos["session_gs"] = {}
+            at.button(key="jap_gs_btn_probar").click().run()
+            if at.exception:
+                return False, str(at.exception[0].value)[:300], datos
+            datos["prueba_ok"] = any(
+                "Conexión con Google Sheets OK" in str(s.value)
+                for s in at.success
+            )
+            datos["crear_llamadas"] = len(fake.crear_llamadas)
+            datos["sin_excepciones"] = True
+            return True, "", datos
+    except Exception as exc:
+        return False, f"{type(exc).__name__}: {exc}"[:300], datos
 
 
 # ---------------------------------------------------------------------------
@@ -1139,6 +2070,16 @@ def run(check):
         "jap: la pestana Pedidos tiene el boton de consultar estado",
         datos["estados"],
     )
+    check(
+        "jap: el cotizador tiene Cliente y Campaña para el reporte "
+        "(jap_lote_cliente / jap_lote_campana)",
+        datos["cliente_input"] and datos["campana_input"],
+        f"(cliente={datos['cliente_input']}, campana={datos['campana_input']})",
+    )
+    check(
+        "jap: la pestana Pedidos tiene el expander del reporte manual",
+        datos["manual_expander"],
+    )
 
     # ---------------- (4) AppTest de compra del lote ----------------
     ok_lote, detalle_lote, datos_lote = _app_test_compra_lote()
@@ -1174,7 +2115,242 @@ def run(check):
         str(datos_lote),
     )
 
-    # ---------------- (5) AppTest sin API key ----------------
+    # ---------------- (5) Persistencia del lote + reportes --------------
+    check(
+        "jap: guardar_pedidos recibe lote_id, cliente y campana al comprar",
+        len(datos_lote["guardados"]) == 1
+        and datos_lote["guardados"][0]["lote_id"] == "LOTE-TEST-001"
+        and datos_lote["guardados"][0]["cliente"] == "Cliente Demo"
+        and datos_lote["guardados"][0]["campana"] == "Campaña Demo"
+        and len(datos_lote["guardados"][0]["pedidos"]) == 2,
+        str(datos_lote["guardados"])[:400],
+    )
+    check(
+        "jap: el resumen del lote guarda lote_id/cliente/campaña",
+        datos_lote["lote_id"] == "LOTE-TEST-001"
+        and datos_lote["cliente"] == "Cliente Demo"
+        and datos_lote["campana"] == "Campaña Demo"
+        and datos_lote["historial_ok"],
+        str(
+            {
+                "lote_id": datos_lote["lote_id"],
+                "cliente": datos_lote["cliente"],
+                "campana": datos_lote["campana"],
+                "ok": datos_lote["historial_ok"],
+            }
+        ),
+    )
+    check(
+        "jap: tras la compra aparecen los reportes del lote (HTML y CSV)",
+        {"jap_dl_lote_html", "jap_dl_lote_csv"}.issubset(
+            set(datos_lote["download_keys"])
+        ),
+        str(datos_lote["download_keys"]),
+    )
+    check(
+        "jap: el lote persistido usa generar_reporte_lote (HTML y CSV)",
+        ("LOTE-TEST-001", "html") in datos_lote["reportes_lote"]
+        and ("LOTE-TEST-001", "csv") in datos_lote["reportes_lote"],
+        str(datos_lote["reportes_lote"]),
+    )
+    check(
+        "jap: Pedidos lista los lotes persistidos y permite elegir uno",
+        datos_lote["persisted_table"] and datos_lote["selector_lote"],
+        f"(tabla={datos_lote['persisted_table']}, "
+        f"selector={datos_lote['selector_lote']})",
+    )
+
+    fake_reporte = FakeHistorial()
+    with _historial_fake(fake_reporte):
+        html_lote, error_html_lote = pagina._reporte_lote_contenido(
+            "LOTE-TEST-001", "html"
+        )
+        csv_lote, error_csv_lote = pagina._reporte_lote_contenido(
+            "LOTE-TEST-001", "csv"
+        )
+    check(
+        "jap: _reporte_lote_contenido delega en generar_reporte_lote",
+        fake_reporte.generados
+        == [("LOTE-TEST-001", "html"), ("LOTE-TEST-001", "csv")]
+        and not error_html_lote
+        and not error_csv_lote
+        and "MW Group" in html_lote
+        and "LOTE-TEST-001" in csv_lote,
+        str(fake_reporte.generados),
+    )
+
+    pedidos_manual, errores_manual = pagina._plan_reporte_manual(
+        ["https://x.com/a/status/1", "https://x.com/a/status/2"],
+        {
+            "likes": 50,
+            "retweets": 0,
+            "comments": 5,
+            "views": 0,
+            "followers": 10,
+        },
+        "https://x.com/perfil",
+    )
+    check(
+        "jap: el reporte manual arma pedidos falsos (likes/comentarios/"
+        "seguidores) sin crear ordenes",
+        not errores_manual
+        and len(pedidos_manual) == 5
+        and all(pedido.get("ok") is True for pedido in pedidos_manual)
+        and [p["tipo"] for p in pedidos_manual]
+        == ["likes", "likes", "comments", "comments", "followers"],
+        str(pedidos_manual),
+    )
+
+    fake_manual = FakeHistorial()
+    with _historial_fake(fake_manual):
+        pagina._contenido_reporte(
+            pedidos_manual,
+            "html",
+            fecha="2026-11-27",
+            cliente="Cliente Demo",
+            campana="Campaña Demo",
+            folio="LOTE-DEMO",
+        )
+        pagina._contenido_reporte(
+            pedidos_manual,
+            "csv",
+            fecha="2026-11-27",
+            cliente="Cliente Demo",
+            campana="Campaña Demo",
+            folio="LOTE-DEMO",
+        )
+    check(
+        "jap: el reporte manual usa construir_reporte_html/csv cuando "
+        "el historial esta disponible",
+        [construido[0] for construido in fake_manual.construidos]
+        == ["html", "csv"]
+        and all(
+            construido[1] == pedidos_manual
+            for construido in fake_manual.construidos
+        ),
+        str([c[0] for c in fake_manual.construidos]),
+    )
+
+    with mock.patch.object(pagina, "_historial", lambda: None):
+        folio_local = pagina._nuevo_lote_id()
+        html_local = pagina._contenido_reporte(
+            pedidos_manual,
+            "html",
+            fecha="2026-11-27",
+            cliente="Cliente Demo",
+            campana="Campaña Demo",
+            folio="LOTE-DEMO",
+        )
+        csv_local = pagina._contenido_reporte(
+            pedidos_manual,
+            "csv",
+            fecha="2026-11-27",
+            cliente="Cliente Demo",
+            campana="Campaña Demo",
+            folio="LOTE-DEMO",
+        )
+    check(
+        "jap: sin core.jap_historial hay folio local y reporte de respaldo "
+        "(HTML/CSV) sin datos internos",
+        folio_local.startswith("LOTE-")
+        and "https://x.com/a/status/1" in html_local
+        and "https://x.com/a/status/2" in csv_local
+        and "mw group" in html_local.lower()
+        and not _tiene_terminos_internos(html_local)
+        and not _tiene_terminos_internos(csv_local),
+        f"(folio={folio_local})",
+    )
+
+    html_manual, csv_manual, origen_manual = _reporte_manual_real_o_local(
+        pedidos_manual
+    )
+    check(
+        "jap: el reporte manual incluye links y cantidades",
+        "https://x.com/a/status/1" in html_manual
+        and "https://x.com/a/status/2" in html_manual
+        and "50" in html_manual
+        and "5" in html_manual
+        and "https://x.com/a/status/1" in csv_manual
+        and "https://x.com/a/status/2" in csv_manual
+        and "50" in csv_manual
+        and "5" in csv_manual,
+        origen_manual,
+    )
+    check(
+        "jap: el reporte no menciona proveedor, costos, saldo, presets, "
+        "IDs de servicio ni 'compra'",
+        not _tiene_terminos_internos(html_manual)
+        and not _tiene_terminos_internos(csv_manual),
+        origen_manual,
+    )
+    check(
+        "jap: el reporte lleva el encabezado 'MW Group'",
+        "mw group" in html_manual.lower(),
+        origen_manual,
+    )
+    check(
+        "jap: los archivos del lote se llaman reporte-<lote_id>.html/.csv",
+        pagina._nombre_reporte("LOTE-TEST-001", "html")
+        == "reporte-LOTE-TEST-001.html"
+        and pagina._nombre_reporte("LOTE-TEST-001", "csv")
+        == "reporte-LOTE-TEST-001.csv",
+    )
+    sin_links, errores_sin_links = pagina._plan_reporte_manual(
+        [],
+        {"likes": 50, "retweets": 0, "comments": 0, "views": 0, "followers": 0},
+        "",
+    )
+    sin_cantidad, errores_sin_cantidad = pagina._plan_reporte_manual(
+        ["https://x.com/a/status/1"],
+        {"likes": 0, "retweets": 0, "comments": 0, "views": 0, "followers": 0},
+        "",
+    )
+    check(
+        "jap: el reporte manual exige links y al menos una cantidad > 0",
+        sin_links == []
+        and errores_sin_links
+        and sin_cantidad == []
+        and errores_sin_cantidad,
+        f"({errores_sin_links}, {errores_sin_cantidad})",
+    )
+
+    ok_manual, detalle_manual, datos_manual = _app_test_reporte_manual()
+    check(
+        "jap: el reporte manual renderiza, descarga HTML/CSV y no llama a "
+        "crear_orden (AppTest sin API key)",
+        ok_manual
+        and datos_manual["html"]
+        and datos_manual["csv"],
+        detalle_manual or str(datos_manual),
+    )
+    check(
+        "jap: el reporte manual muestra el aviso de que no incluye proveedor",
+        datos_manual["caption_sin_proveedor"],
+        str(datos_manual),
+    )
+
+    ok_fallo, detalle_fallo, datos_fallo = _app_test_compra_lote(
+        FakeHistorialFallido()
+    )
+    check(
+        "jap: si el historial falla la compra continua (2 pedidos) y avisa",
+        ok_fallo
+        and datos_fallo["llamadas"] == 2
+        and not datos_fallo["historial_ok"]
+        and any(
+            "Base no disponible" in aviso for aviso in datos_fallo["warnings"]
+        ),
+        detalle_fallo or str(datos_fallo["warnings"]),
+    )
+    check(
+        "jap: sin historial persistido el lote igual ofrece reporte local",
+        {"jap_dl_lote_html", "jap_dl_lote_csv"}.issubset(
+            set(datos_fallo["download_keys"])
+        ),
+        str(datos_fallo["download_keys"]),
+    )
+
+    # ---------------- (6) AppTest sin API key ----------------
     ok_sin, detalle_sin, datos_sin = _app_test_sin_key()
     check(
         "jap: renderiza sin API key y sin catalogo (AppTest, sin excepciones)",
@@ -1189,6 +2365,180 @@ def run(check):
     check(
         "jap: sin key la metrica dice 'No configurada'",
         datos_sin["key_no_configurada"],
+    )
+
+    # ---------------- (7) Google Sheets (link para el jefe) ----------------
+    sheets_ok = FakeGoogleSheets(disponible=True)
+    ok_sheet, detalle_sheet, datos_sheet = _app_test_sheet_ultimo(sheets_ok)
+    check(
+        "jap: Google Sheets - la pagina tiene el expander 'Conectar Google "
+        "Sheets' y renderiza sin excepciones",
+        ok_sheet and datos_sheet["expander"],
+        detalle_sheet or str(datos_sheet),
+    )
+    check(
+        "jap: Google Sheets - instrucciones con Sheets API, Drive API, "
+        "GOOGLE_SERVICE_ACCOUNT_B64 y el archivo local",
+        datos_sheet["instrucciones"],
+        str(datos_sheet["instrucciones"]),
+    )
+    llamada_ultimo = (
+        datos_sheet["llamadas"][0] if datos_sheet["llamadas"] else {}
+    )
+    check(
+        "jap: Google Sheets - el ultimo lote llama crear_sheet_reporte con "
+        "los pedidos y metadatos correctos",
+        datos_sheet["boton_existe"]
+        and len(datos_sheet["llamadas"]) == 1
+        and len(llamada_ultimo.get("pedidos") or []) == 2
+        and llamada_ultimo.get("cliente") == "Cliente Demo"
+        and llamada_ultimo.get("campana") == "Campana Demo"
+        and llamada_ultimo.get("folio") == "LOTE-SHEET-001"
+        and llamada_ultimo.get("fecha") == "2026-11-27T12:00:00"
+        and llamada_ultimo.get("compartir_publico") is True
+        and llamada_ultimo.get("email") == "",
+        str(llamada_ultimo)[:400],
+    )
+    check(
+        "jap: Google Sheets - muestra 'Google Sheet creado', el link y el "
+        "codigo copiable",
+        sheets_ok.url in datos_sheet["codes"]
+        and any(
+            "Google Sheet creado" in texto
+            for texto in datos_sheet["success"]
+        ),
+        f"(codes={datos_sheet['codes']}, success={datos_sheet['success']})",
+    )
+    check(
+        "jap: Google Sheets - crear el Sheet NO crea ordenes JAP",
+        datos_sheet["ordenes"] == [],
+        str(datos_sheet["ordenes"])[:300],
+    )
+    check(
+        "jap: Google Sheets - sin correo y sin permiso publico bloquea el "
+        "boton y pide un correo",
+        datos_sheet["bloqueo_sin_correo"],
+        str(datos_sheet["bloqueo_sin_correo"]),
+    )
+
+    sheets_off = FakeGoogleSheets(disponible=False)
+    ok_off, detalle_off, datos_off = _app_test_sheet_ultimo(sheets_off)
+    check(
+        "jap: sin Google Sheets conectado no hay boton de crear Sheet, no "
+        "llama a la API y muestra el aviso",
+        ok_off
+        and not datos_off["boton_existe"]
+        and datos_off["llamadas"] == []
+        and any(
+            "Conecta Google Sheets en la pestaña Pedidos" in texto
+            and "crear el link" in texto
+            for texto in datos_off["captions"]
+        ),
+        detalle_off or str(datos_off["captions"]),
+    )
+
+    ok_null, detalle_null, datos_null = _app_test_sheet_ultimo(None)
+    check(
+        "jap: sin core.google_sheets la pagina avisa y no intenta crear el "
+        "Sheet",
+        ok_null
+        and not datos_null["boton_existe"]
+        and datos_null["llamadas"] == []
+        and any(
+            "Conecta Google Sheets" in texto
+            for texto in datos_null["captions"]
+        ),
+        detalle_null or str(datos_null["captions"]),
+    )
+
+    sheets_lote = FakeGoogleSheets(disponible=True)
+    ok_sheet_lote, detalle_sheet_lote, datos_sheet_lote = (
+        _app_test_sheet_lote(sheets_lote)
+    )
+    llamada_lote = (
+        datos_sheet_lote["llamadas"][0]
+        if datos_sheet_lote["llamadas"]
+        else {}
+    )
+    check(
+        "jap: Google Sheets - el lote persistido llama con su cliente, "
+        "campana, folio y fecha",
+        ok_sheet_lote
+        and datos_sheet_lote["boton_existe"]
+        and len(datos_sheet_lote["llamadas"]) == 1
+        and len(llamada_lote.get("pedidos") or []) == 2
+        and llamada_lote.get("cliente") == "Cliente Lote"
+        and llamada_lote.get("campana") == "Campana Lote"
+        and llamada_lote.get("folio") == "LOTE-SHEET-002"
+        and llamada_lote.get("fecha") == "2026-11-27T10:00:00"
+        and sheets_lote.url in datos_sheet_lote["codes"]
+        and datos_sheet_lote["ordenes"] == [],
+        detalle_sheet_lote or str(llamada_lote)[:400],
+    )
+
+    sheets_manual = FakeGoogleSheets(disponible=True)
+    ok_sheet_manual, detalle_sheet_manual, datos_sheet_manual = (
+        _app_test_sheet_manual(sheets_manual)
+    )
+    llamada_manual = (
+        datos_sheet_manual["llamadas"][0]
+        if datos_sheet_manual["llamadas"]
+        else {}
+    )
+    check(
+        "jap: Google Sheets - el reporte manual usa los pedidos falsos, "
+        "metadatos y no crea ordenes",
+        ok_sheet_manual
+        and datos_sheet_manual["boton_existe"]
+        and len(datos_sheet_manual["llamadas"]) == 1
+        and len(llamada_manual.get("pedidos") or []) == 4
+        and all(
+            pedido.get("ok") is True
+            for pedido in llamada_manual.get("pedidos") or []
+        )
+        and llamada_manual.get("cliente") == "Cliente Manual"
+        and llamada_manual.get("campana") == "Campana Manual"
+        and str(llamada_manual.get("folio") or "").startswith("MANUAL-")
+        and llamada_manual.get("fecha")
+        == str(llamada_manual.get("folio") or "").replace("MANUAL-", "", 1)
+        and sheets_manual.url in datos_sheet_manual["codes"]
+        and datos_sheet_manual["ordenes"] == [],
+        detalle_sheet_manual or str(llamada_manual)[:400],
+    )
+
+    sheets_cred = FakeGoogleSheets(disponible=False)
+    ok_cred, detalle_cred, datos_cred = _app_test_sheets_credenciales(
+        sheets_cred
+    )
+    check(
+        "jap: Google Sheets - guardar credenciales usa "
+        "guardar_credenciales_json y muestra el email",
+        ok_cred
+        and datos_cred["guardados"] == [JSON_CREDENCIALES]
+        and datos_cred["exito"]
+        and datos_cred["email_visible"],
+        detalle_cred or str(datos_cred),
+    )
+    valores_sesion = " ".join(datos_cred["session_gs"].values()).lower()
+    check(
+        "jap: Google Sheets - el JSON de credenciales NO queda visible, en el "
+        "input ni en session_state despues de guardar",
+        datos_cred["password"]
+        and datos_cred["valor_input"] == ""
+        and not datos_cred["fuga_json"]
+        and "abc123secreto" not in valores_sesion
+        and "private_key" not in valores_sesion,
+        f"(input={datos_cred['valor_input'][:20]!r}, "
+        f"fuga={datos_cred['fuga_json']}, "
+        f"sesion={datos_cred['session_gs']})",
+    )
+    check(
+        "jap: Google Sheets - 'Probar conexion' solo consulta el estado (no "
+        "guarda ni crea Sheets)",
+        datos_cred["prueba_ok"]
+        and len(sheets_cred.guardados) == 1
+        and datos_cred["crear_llamadas"] == 0,
+        str(datos_cred),
     )
 
 
