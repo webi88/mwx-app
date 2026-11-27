@@ -12,14 +12,18 @@ Cubre:
       categorias quedan intactas.
   (2) Constantes y helpers puros: los 18 links exactos de @RedAMLOmx, los ids
       de comentarios 6601/6602, `_normalizar_links` (dedupe/numeracion/URLs
-      invalidas), `_parsear_ids`, `_etiqueta_servicio`, `_id_comentarios` y
-      `_calcular_lote` (total > 0 con precios simulados).
+      invalidas), `_parsear_ids`, `_id_comentarios`, `_calcular_lote` y el
+      plan de compra `_plan_pedidos_lote` (links/cantidades/seguidores/
+      comentarios personalizados y errores de minimo/maximo).
   (3) AppTest con backend mockeado (key configurada, saldo $3.51): render sin
-      excepciones, 4 pestanas, aviso visible de Mexico, metricas de saldo y
+      excepciones, 3 pestanas, aviso visible de Mexico, metricas de saldo y
       servicios X, catalogo con la columna "Precio/1K USD", boton de los 18
       links que los carga en el textarea, tabla del cotizador con total > 0 y
-      boton de compra deshabilitado sin la confirmacion.
-  (4) AppTest sin API key (balance/catalogo con error): render sin excepciones,
+      boton "Comprar lote" deshabilitado sin la confirmacion.
+  (4) AppTest de compra del lote con `crear_orden` falso: sin confirmacion no
+      llama a la API; con confirmacion crea los pedidos de los 2 links, deja
+      el resumen persistente y limpia la confirmacion.
+  (5) AppTest sin API key (balance/catalogo con error): render sin excepciones,
       instrucciones visibles y compra deshabilitada.
 
 Uso:
@@ -307,6 +311,47 @@ def _fake_guardar_key(key):
     return {"ok": True, "error": ""}
 
 
+SERVICIOS_PLAN = {
+    "likes": {"id": 9013, "nombre": "Twitter Likes 7D"},
+    "retweets": {"id": 8860, "nombre": "Twitter Retweets"},
+    "comments": {"id": 6602, "nombre": "USA Custom Comments"},
+    "views": {"id": 8413, "nombre": "Twitter Tweet Views"},
+    "followers": {"id": 9011, "nombre": "Twitter Followers"},
+}
+
+COMENTARIOS_5 = "\n".join(
+    [f"Comentario numero {numero} con texto propio" for numero in range(1, 6)]
+)
+
+
+def _costo_con_minimos(servicio, cantidad):
+    """`_fake_costo` + validacion real de min/max del catalogo simulado."""
+    resultado = dict(_fake_costo(servicio, cantidad))
+    info = _fake_servicio(
+        servicio.get("service") if isinstance(servicio, dict) else servicio
+    )
+    try:
+        unidades = int(cantidad)
+    except (TypeError, ValueError):
+        unidades = None
+    if info is not None and unidades is not None:
+        minimo = int(info["min"])
+        maximo = int(info["max"])
+        if 0 < unidades < minimo:
+            resultado.update(
+                ok=False,
+                costo=0.0,
+                error=f"La cantidad minima para este servicio es {minimo}",
+            )
+        elif maximo > 0 and unidades > maximo:
+            resultado.update(
+                ok=False,
+                costo=0.0,
+                error=f"La cantidad maxima para este servicio es {maximo}",
+            )
+    return resultado
+
+
 # ---------------------------------------------------------------------------
 # Scripts de AppTest (SOLO ASCII: Streamlit los escribe con la codificacion
 # local de Windows). Reciben los fakes por kwargs.
@@ -347,6 +392,54 @@ def _app_jap_sin_key(listar, balance, recomendados):
         jap, "servicios_recomendados", recomendados
     ), mock.patch.object(
         jap, "disponible", lambda: False
+    ):
+        from web.operaciones.jap import render
+
+        render({"rol": "admin", "nombre": "Owner", "usuario": "admin"})
+
+
+def _app_jap_compra_lote(listar, balance, costo, recomendados, registro):
+    from unittest import mock
+
+    from integraciones import jap
+
+    def _crear(
+        servicio,
+        link,
+        cantidad,
+        runs=0,
+        interval=0,
+        comments="",
+        **kwargs,
+    ):
+        calculo = costo(servicio, cantidad)
+        registro.append(
+            {
+                "servicio": servicio,
+                "link": link,
+                "cantidad": int(cantidad),
+                "comments": str(comments or ""),
+            }
+        )
+        return {
+            "ok": True,
+            "order": 9000 + len(registro),
+            "costo": calculo.get("costo") or 0.0,
+            "error": "",
+        }
+
+    with mock.patch.object(jap, "listar_servicios", listar), mock.patch.object(
+        jap, "obtener_balance", balance
+    ), mock.patch.object(
+        jap, "servicios_recomendados", recomendados
+    ), mock.patch.object(
+        jap, "calcular_costo", costo
+    ), mock.patch.object(
+        jap, "crear_orden", _crear
+    ), mock.patch.object(
+        jap, "estado_ordenes", lambda ids: {"ok": True, "ordenes": {}, "error": ""}
+    ), mock.patch.object(
+        jap, "disponible", lambda: True
     ):
         from web.operaciones.jap import render
 
@@ -461,6 +554,8 @@ def _app_test_con_key() -> tuple[bool, str, dict]:
         "links_cargados": 0,
         "tabla_cotizador": False,
         "total_lote": 0.0,
+        "seccion_compra": False,
+        "confirmo": False,
         "compra_deshabilitada": False,
         "estados": False,
     }
@@ -511,13 +606,6 @@ def _app_test_con_key() -> tuple[bool, str, dict]:
             except Exception:
                 resultado["catalogo_x"] = False
 
-        try:
-            resultado["compra_deshabilitada"] = bool(
-                at.button(key="jap_btn_comprar").disabled
-            )
-        except Exception:
-            resultado["compra_deshabilitada"] = False
-
         # Cargar los 18 links (callback) y recalcular el cotizador.
         at.button(key="jap_btn_cargar_18").click().run()
         if at.exception:
@@ -537,6 +625,20 @@ def _app_test_con_key() -> tuple[bool, str, dict]:
                 resultado["total_lote"] = float(tabla_cotizador["Total $"].sum())
             except Exception:
                 resultado["total_lote"] = 0.0
+        resultado["seccion_compra"] = any(
+            "pedido(s) · total estimado" in str(m.value) for m in at.markdown
+        )
+        try:
+            resultado["confirmo"] = at.checkbox(
+                key="jap_lote_confirmo"
+            ) is not None
+        except Exception:
+            resultado["confirmo"] = False
+        try:
+            boton_lote = at.button(key="jap_btn_comprar_lote")
+            resultado["compra_deshabilitada"] = bool(boton_lote.disabled)
+        except Exception:
+            resultado["compra_deshabilitada"] = False
         resultado["estados"] = any(
             t.key == "jap_btn_consultar" for t in at.button
         )
@@ -572,10 +674,10 @@ def _app_test_sin_key() -> tuple[bool, str, dict]:
         resultado["instrucciones"] = (
             "API key" in texto_info and "deshabilitadas" in texto_info
         )
-        # Sin catálogo no hay servicio que comprar: el botón puede no existir.
-        # Cualquiera de las dos formas (ausente o deshabilitado) impide gastar.
+        # Sin links/API key no se puede comprar: el botón debe estar
+        # deshabilitado (o ausente en versiones viejas de la pagina).
         botones = {b.key: b for b in at.button}
-        boton_compra = botones.get("jap_btn_comprar")
+        boton_compra = botones.get("jap_btn_comprar_lote")
         resultado["compra_deshabilitada"] = (
             boton_compra is None or bool(boton_compra.disabled)
         )
@@ -583,6 +685,96 @@ def _app_test_sin_key() -> tuple[bool, str, dict]:
         resultado["key_no_configurada"] = "No configurada" in metricas.get(
             "API key de JAP", ""
         )
+        return True, "", resultado
+    except Exception as exc:
+        return False, f"{type(exc).__name__}: {exc}"[:300], resultado
+
+
+def _app_test_compra_lote() -> tuple[bool, str, dict]:
+    from streamlit.testing.v1 import AppTest
+
+    registro = []
+    resultado = {
+        "sin_excepciones": False,
+        "boton_existe": False,
+        "deshabilitado_sin_confirmar": False,
+        "llamadas_sin_confirmar": 0,
+        "habilitado_confirmado": False,
+        "llamadas": 0,
+        "servicios": [],
+        "links": [],
+        "cantidades": [],
+        "expander_resultados": False,
+        "confirmacion_limpia": False,
+        "pedidos_recientes": 0,
+    }
+    try:
+        at = AppTest.from_function(
+            _app_jap_compra_lote,
+            default_timeout=120,
+            kwargs={
+                "listar": _fake_listar,
+                "balance": _fake_balance,
+                "costo": _fake_costo,
+                "recomendados": _fake_recomendados,
+                "registro": registro,
+            },
+        )
+        at.run()
+        if at.exception:
+            return False, str(at.exception[0].value)[:300], resultado
+
+        at.text_area(key="jap_quote_links").set_value(
+            "https://x.com/a/status/1\nhttps://x.com/a/status/2"
+        ).run()
+        at.number_input(key="jap_quote_likes").set_value(10).run()
+        at.number_input(key="jap_quote_rts").set_value(0).run()
+        at.number_input(key="jap_quote_comments").set_value(0).run()
+        at.number_input(key="jap_quote_views").set_value(0).run()
+        if at.exception:
+            return False, str(at.exception[0].value)[:300], resultado
+
+        try:
+            boton = at.button(key="jap_btn_comprar_lote")
+        except Exception:
+            boton = None
+        resultado["boton_existe"] = boton is not None
+        resultado["deshabilitado_sin_confirmar"] = bool(
+            boton is not None and boton.disabled
+        )
+        resultado["llamadas_sin_confirmar"] = len(registro)
+
+        at.checkbox(key="jap_lote_confirmo").check().run()
+        if at.exception:
+            return False, str(at.exception[0].value)[:300], resultado
+        boton = at.button(key="jap_btn_comprar_lote")
+        resultado["habilitado_confirmado"] = not bool(boton.disabled)
+        boton.click().run()
+        if at.exception:
+            return False, str(at.exception[0].value)[:300], resultado
+
+        resultado["llamadas"] = len(registro)
+        resultado["servicios"] = [llamada["servicio"] for llamada in registro]
+        resultado["links"] = [llamada["link"] for llamada in registro]
+        resultado["cantidades"] = [
+            llamada["cantidad"] for llamada in registro
+        ]
+        resultado["expander_resultados"] = any(
+            "Último pedido del lote" in str(expander.label)
+            for expander in at.expander
+        )
+        try:
+            resultado["confirmacion_limpia"] = not bool(
+                at.checkbox(key="jap_lote_confirmo").value
+            )
+        except Exception:
+            resultado["confirmacion_limpia"] = False
+        try:
+            recientes = at.session_state["jap_pedidos_recientes"]
+            resultado["pedidos_recientes"] = len(recientes or [])
+        except Exception:
+            resultado["pedidos_recientes"] = 0
+        resultado["sin_excepciones"] = True
         return True, "", resultado
     except Exception as exc:
         return False, f"{type(exc).__name__}: {exc}"[:300], resultado
@@ -640,7 +832,6 @@ def run(check):
         "jap_quote_comments",
         "jap_quote_views",
         "jap_quote_followers",
-        "jap_buy_cantidad",
     )
     check(
         "jap: sin minimo de pedido (0 = no comprar en todos los campos)",
@@ -692,21 +883,6 @@ def run(check):
         pagina._parsear_ids("12, 13; x, 12, #14") == [12, 13, 14],
         str(pagina._parsear_ids("12, 13; x, 12, #14")),
     )
-    check(
-        "jap: _etiqueta_servicio muestra ID/categoria/nombre/precio/min-max",
-        pagina._etiqueta_servicio(
-            {
-                "service": 9013,
-                "category": "Twitter Likes",
-                "name": "Twitter Likes 7D",
-                "rate": "0.275",
-                "min": "10",
-                "max": "2500",
-            }
-        )
-        == "9013 · Twitter Likes · Twitter Likes 7D · $0.2750/1K · 10-2500",
-    )
-
     with mock.patch.object(jap_mod, "calcular_costo", _fake_costo):
         filas, avisos = pagina._calcular_lote(
             pagina.LINKS_REDAMLO[:2],
@@ -743,16 +919,178 @@ def run(check):
         f"(total={total_cero}, avisos={avisos_cero})",
     )
 
+    # ---------------- (2b) Plan de compra del lote ----------------
+    dos_links = ["https://x.com/a/status/1", "https://x.com/a/status/2"]
+    cero = {
+        "likes": 0,
+        "retweets": 0,
+        "comments": 0,
+        "views": 0,
+        "followers": 0,
+    }
+    with mock.patch.object(jap_mod, "calcular_costo", _fake_costo):
+        pedidos_likes, errores_likes = pagina._plan_pedidos_lote(
+            dos_links,
+            {**cero, "likes": 10},
+            SERVICIOS_PLAN,
+            "",
+            "",
+        )
+    check(
+        "jap: _plan_pedidos_lote crea 1 pedido de likes por link (2 links)",
+        len(pedidos_likes) == 2
+        and not errores_likes
+        and all(
+            p["tipo"] == "likes"
+            and p["servicio"] == 9013
+            and p["cantidad"] == 10
+            for p in pedidos_likes
+        )
+        and {p["link"] for p in pedidos_likes} == set(dos_links),
+        str(pedidos_likes),
+    )
+
+    with mock.patch.object(jap_mod, "calcular_costo", _fake_costo):
+        pedidos_vacio, errores_vacio = pagina._plan_pedidos_lote(
+            dos_links, cero, SERVICIOS_PLAN, "", ""
+        )
+    check(
+        "jap: _plan_pedidos_lote con 0 en todo no crea pedidos",
+        pedidos_vacio == [] and errores_vacio == [],
+        f"(pedidos={pedidos_vacio}, errores={errores_vacio})",
+    )
+
+    with mock.patch.object(jap_mod, "calcular_costo", _fake_costo):
+        pedidos_custom, errores_custom = pagina._plan_pedidos_lote(
+            dos_links,
+            {**cero, "comments": 5},
+            SERVICIOS_PLAN,
+            "",
+            COMENTARIOS_5,
+        )
+    check(
+        "jap: comentarios con texto propio usan 6602 y llevan `comments`",
+        len(pedidos_custom) == 2
+        and not errores_custom
+        and all(
+            p["tipo"] == "comments"
+            and p["servicio"] == 6602
+            and p["comments"] == COMENTARIOS_5
+            for p in pedidos_custom
+        ),
+        str(pedidos_custom),
+    )
+
+    with mock.patch.object(jap_mod, "calcular_costo", _fake_costo):
+        pedidos_random, errores_random = pagina._plan_pedidos_lote(
+            dos_links,
+            {**cero, "comments": 5},
+            SERVICIOS_PLAN,
+            "",
+            "",
+        )
+    check(
+        "jap: comentarios sin texto usan 6601 y `comments` vacio",
+        len(pedidos_random) == 2
+        and not errores_random
+        and all(
+            p["tipo"] == "comments"
+            and p["servicio"] == 6601
+            and p["comments"] == ""
+            for p in pedidos_random
+        ),
+        str(pedidos_random),
+    )
+
+    with mock.patch.object(jap_mod, "calcular_costo", _fake_costo):
+        pedidos_followers, errores_followers = pagina._plan_pedidos_lote(
+            dos_links,
+            {**cero, "followers": 10},
+            SERVICIOS_PLAN,
+            "https://x.com/perfil",
+            "",
+        )
+    check(
+        "jap: seguidores se piden UNA sola vez al perfil",
+        len(pedidos_followers) == 1
+        and not errores_followers
+        and pedidos_followers[0]["tipo"] == "followers"
+        and pedidos_followers[0]["link"] == "https://x.com/perfil"
+        and pedidos_followers[0]["servicio"] == 9011,
+        str(pedidos_followers),
+    )
+    with mock.patch.object(jap_mod, "calcular_costo", _fake_costo):
+        pedidos_sin_perfil, errores_sin_perfil = pagina._plan_pedidos_lote(
+            dos_links,
+            {**cero, "followers": 10},
+            SERVICIOS_PLAN,
+            "",
+            "",
+        )
+    check(
+        "jap: seguidores sin link de perfil devuelven error y no crean pedido",
+        pedidos_sin_perfil == []
+        and any("perfil" in error.lower() for error in errores_sin_perfil),
+        str(errores_sin_perfil),
+    )
+
+    with mock.patch.object(jap_mod, "calcular_costo", _fake_costo):
+        pedidos_pocos, errores_pocos = pagina._plan_pedidos_lote(
+            dos_links,
+            {**cero, "comments": 5},
+            SERVICIOS_PLAN,
+            "",
+            "Comentario 1\nComentario 2\nComentario 3",
+        )
+    check(
+        "jap: comentarios personalizados insuficientes devuelven error",
+        pedidos_pocos == []
+        and any("Comentarios" in error for error in errores_pocos),
+        str(errores_pocos),
+    )
+
+    with mock.patch.object(jap_mod, "calcular_costo", _costo_con_minimos):
+        pedidos_min, errores_min = pagina._plan_pedidos_lote(
+            dos_links,
+            {**cero, "likes": 5},
+            SERVICIOS_PLAN,
+            "",
+            "",
+        )
+    check(
+        "jap: una cantidad debajo del minimo de JAP bloquea el plan",
+        pedidos_min == []
+        and any("minima" in error.lower() for error in errores_min),
+        str(errores_min),
+    )
+
+    muchos_links = [
+        f"https://x.com/a/status/{numero}" for numero in range(1, 35)
+    ]
+    with mock.patch.object(jap_mod, "calcular_costo", _fake_costo):
+        pedidos_grandes, errores_grandes = pagina._plan_pedidos_lote(
+            muchos_links,
+            {**cero, "likes": 10, "retweets": 10, "views": 100},
+            SERVICIOS_PLAN,
+            "",
+            "",
+        )
+    check(
+        "jap: mas de 100 pedidos en un lote devuelve error",
+        len(pedidos_grandes) == 102
+        and any("100" in error for error in errores_grandes),
+        f"(pedidos={len(pedidos_grandes)}, errores={errores_grandes})",
+    )
+
     # ---------------- (3) AppTest con backend mockeado ----------------
     ok, detalle, datos = _app_test_con_key()
     check("jap: renderiza sin excepciones (AppTest con mocks)", ok, detalle)
     check(
-        "jap: muestra las 4 pestanas esperadas",
+        "jap: muestra las 3 pestanas esperadas (sin 'Nuevo pedido')",
         datos["tabs"]
         == [
             "📊 Catálogo",
             "🧮 Cotizador (lote de tweets)",
-            "🚀 Nuevo pedido",
             "📦 Pedidos",
         ],
         str(datos["tabs"]),
@@ -789,7 +1127,12 @@ def run(check):
         f"(total={datos['total_lote']:.6f})",
     )
     check(
-        "jap: el boton de comprar esta deshabilitado sin la confirmacion",
+        "jap: el cotizador muestra la seccion de compra del lote",
+        datos["seccion_compra"] and datos["confirmo"],
+        f"(seccion={datos['seccion_compra']}, confirmo={datos['confirmo']})",
+    )
+    check(
+        "jap: el boton de comprar el lote esta deshabilitado sin confirmar",
         datos["compra_deshabilitada"],
     )
     check(
@@ -797,7 +1140,41 @@ def run(check):
         datos["estados"],
     )
 
-    # ---------------- (4) AppTest sin API key ----------------
+    # ---------------- (4) AppTest de compra del lote ----------------
+    ok_lote, detalle_lote, datos_lote = _app_test_compra_lote()
+    check(
+        "jap: AppTest de compra del lote renderiza sin excepciones",
+        ok_lote,
+        detalle_lote,
+    )
+    check(
+        "jap: sin confirmacion el boton del lote esta deshabilitado y no "
+        "llama a la API",
+        datos_lote["boton_existe"]
+        and datos_lote["deshabilitado_sin_confirmar"]
+        and datos_lote["llamadas_sin_confirmar"] == 0,
+        str(datos_lote),
+    )
+    check(
+        "jap: al confirmar se compra 1 pedido de likes por cada link",
+        datos_lote["habilitado_confirmado"]
+        and datos_lote["llamadas"] == 2
+        and datos_lote["servicios"] == [9013, 9013]
+        and datos_lote["links"]
+        == ["https://x.com/a/status/1", "https://x.com/a/status/2"]
+        and datos_lote["cantidades"] == [10, 10],
+        str(datos_lote),
+    )
+    check(
+        "jap: tras comprar aparece el resumen, se guardan los pedidos y la "
+        "confirmacion se limpia",
+        datos_lote["expander_resultados"]
+        and datos_lote["pedidos_recientes"] == 2
+        and datos_lote["confirmacion_limpia"],
+        str(datos_lote),
+    )
+
+    # ---------------- (5) AppTest sin API key ----------------
     ok_sin, detalle_sin, datos_sin = _app_test_sin_key()
     check(
         "jap: renderiza sin API key y sin catalogo (AppTest, sin excepciones)",

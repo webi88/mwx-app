@@ -18,13 +18,13 @@
   No se probó el reemplazo real en una Mac.
 - Local: rotación de cuentas por Chrome (intercala), proxies prevalidados en
   caché y `sin_imagenes=True` sin proxy.
-- JAP: `integraciones/jap.py` + página admin; presets económico
-  9013/8860/8413/6601/9011 y seguro 10186/8861/8555/6602/8855. La UI permite
-  **0 = no comprar** en likes/RT/comentarios/vistas/seguidores (sin mínimo de
-  pedido); si es >0, JAP aplica su mínimo real. 18 tweets:
-  50 likes+10 RT+5 comentarios+500 vistas = **$3.071**; 100/20/5/1000 =
-  **$3.364**; saldo **$3.5098**. No hay X-México.
-- Suite **6428/6428**; `compileall` OK. Rama `macos-build-1.1.4` fusionada a
+- JAP: `integraciones/jap.py` + página admin de 3 pestañas (Catálogo,
+  Cotizador, Pedidos). El cotizador permite **0 = no comprar** por tipo y
+  **compra el lote desde ahí** (confirmación, progreso y resumen). Presets
+  económico 9013/8860/8413/6601/9011 y seguro 10186/8861/8555/6602/8855.
+  18 tweets: 50 likes+10 RT+5 comentarios+500 vistas = **$3.071**;
+  100/20/5/1000 = **$3.364**; saldo **$3.5098**. No hay X-México.
+- Suite **6443/6443**; `compileall` OK. Rama `macos-build-1.1.4` fusionada a
   `main` y publicada; release Mac construido desde esa rama.
 
 ## Próximo paso único

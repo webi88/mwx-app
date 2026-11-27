@@ -26,11 +26,13 @@ Pestanas
 1. "📊 Catálogo": filtros por plataforma/tipo/texto y tabla ordenada por
    precio ascendente (maximo 300 filas visibles).
 2. "🧮 Cotizador (lote de tweets)": carga los 18 tweets de @RedAMLOmx,
-   calcula el costo por link con presets Economico/Seguro y avisa si el saldo
-   de JAP no alcanza. NO coloca pedidos.
-3. "🚀 Nuevo pedido": crea una orden real (checkbox de confirmacion
-   obligatorio) y la guarda en ``jap_pedidos_recientes``.
-4. "📦 Pedidos": consulta estados, refill y cancelacion con confirmacion.
+   calcula el costo por link con presets Economico/Seguro, avisa si el saldo
+   de JAP no alcanza y permite comprar el lote desde el propio cotizador
+   (checkbox de confirmacion obligatorio; 0 = no comprar ese tipo).
+3. "📦 Pedidos": consulta estados, refill y cancelacion con confirmacion.
+
+Los pedidos del lote se crean SECUENCIALMENTE desde el boton de compra: si uno
+falla, los demas continuan. Nada se envia solo por renderizar la pagina.
 
 Pruebas: ``tests/test_jap_web.py`` (AppTest + mocks, sin red real).
 """
@@ -76,13 +78,13 @@ SERVICIO_COMENTARIOS_SEGURO = 6602  # USA Custom Comments
 CLAVE_PEDIDOS = "jap_pedidos_recientes"
 CLAVE_CATALOGO = "jap_catalogo_cache"
 CLAVE_BALANCE = "jap_balance_cache"
-CLAVE_ULTIMO_PEDIDO = "jap_ultimo_pedido"
 CLAVE_ESTADOS = "jap_estados_consulta"
+CLAVE_LOTE_RESULTADOS = "jap_lote_resultados"
 
 TTL_CATALOGO_SEG = 3600
 TTL_BALANCE_SEG = 120
 MAX_FILAS_CATALOGO = 300
-MAX_SERVICIOS_PEDIDO = 100
+MAX_PEDIDOS_LOTE = 100
 MAX_PEDIDOS_SESION = 50
 
 PLATAFORMAS = [
@@ -285,28 +287,6 @@ def _plataforma_de(servicio: dict) -> str:
     if re.search(r"\bx\b", texto):
         return "X / Twitter"
     return "Otra"
-
-
-def _etiqueta_servicio(servicio: dict) -> str:
-    """'ID · categoría · nombre · $rate/1K · min-max' para selectboxes."""
-    servicio_id = _a_int(servicio.get("service"))
-    categoria = str(servicio.get("category") or "Sin categoría")
-    nombre = str(servicio.get("name") or "Sin nombre")
-    rate = _a_float(servicio.get("rate"))
-    minimo = _a_int(servicio.get("min")) or 0
-    maximo = _a_int(servicio.get("max")) or 0
-    return (
-        f"{servicio_id if servicio_id is not None else '—'} · {categoria} · "
-        f"{nombre} · ${rate if rate is not None else 0:.4f}/1K · "
-        f"{minimo}-{maximo}"
-    )
-
-
-def _es_custom(servicio: dict) -> bool:
-    texto = _norm(
-        f"{servicio.get('name') or ''} {servicio.get('type') or ''}"
-    )
-    return "custom" in texto
 
 
 # ---------------------------------------------------------------------------
@@ -746,7 +726,6 @@ def render(usuario: dict):
         [
             "📊 Catálogo",
             "🧮 Cotizador (lote de tweets)",
-            "🚀 Nuevo pedido",
             "📦 Pedidos",
         ]
     )
@@ -755,8 +734,6 @@ def render(usuario: dict):
     with tabs[1]:
         _tab_cotizador(disponible)
     with tabs[2]:
-        _tab_nuevo_pedido(disponible)
-    with tabs[3]:
         _tab_pedidos(disponible)
 
 
@@ -857,11 +834,18 @@ def _cargar_links_redamlo():
 
 
 def _tab_cotizador(disponible: bool):
+    # La confirmacion se limpia DESPUES de comprar (antes de instanciar el
+    # checkbox) para evitar una recompra accidental con el mismo clic.
+    if st.session_state.pop("jap_lote_limpiar_confirmacion", False):
+        st.session_state["jap_lote_confirmo"] = False
+
     st.markdown("### 🧮 Cotizador (lote de tweets)")
     st.caption(
-        "Calcula cuánto costaría comprar engagement para varios tweets. "
-        "Este cotizador NO coloca pedidos: solo estima el costo con JAP."
+        "Calcula cuánto costaría comprar engagement para varios tweets y "
+        "desde aquí mismo puedes comprar el lote. Pon 0 en lo que no quieras "
+        "comprar; los pedidos solo se envían al pulsar el botón y confirmar."
     )
+    _mostrar_ultimo_lote()
 
     st.button(
         "📥 Cargar los 18 tweets de @RedAMLOmx",
@@ -970,10 +954,17 @@ def _tab_cotizador(disponible: bool):
         placeholder="https://x.com/usuario",
     )
 
-    sid_comentarios = _id_comentarios(preset, personalizados)
+    if personalizados:
+        sid_comentarios = _id_comentarios(preset, True)
+    else:
+        # Sin texto propio JAP no puede publicar Custom Comments: se usa el
+        # servicio Random USA (6601) y no se manda `comments`.
+        sid_comentarios = SERVICIO_COMENTARIOS_ECONOMICO
     info_comentarios = _servicio_por_id(sid_comentarios)
     if not info_comentarios:
         info_comentarios = dict(presets.get(clave_preset, {}).get("comments") or {})
+        if _a_int(info_comentarios.get("id")) != sid_comentarios:
+            info_comentarios = {}
 
     st.markdown("**Servicios del preset seleccionado:**")
     resumen_preset = {
@@ -1003,19 +994,14 @@ def _tab_cotizador(disponible: bool):
             f"Necesitas al menos {int(comentarios)} por link si compras."
         )
 
-    if not links:
-        return
-
-    filas, avisos = _calcular_lote(
-        links,
-        {
-            "likes": int(likes),
-            "retweets": int(retweets),
-            "comments": int(comentarios),
-            "views": int(vistas),
-        },
-        resumen_preset,
-    )
+    cantidades = {
+        "likes": int(likes),
+        "retweets": int(retweets),
+        "comments": int(comentarios),
+        "views": int(vistas),
+        "followers": int(seguidores),
+    }
+    filas, avisos = _calcular_lote(links, cantidades, resumen_preset)
     total_lote = sum(fila["Total $"] for fila in filas)
 
     costo_seguidores, error_seguidores = 0.0, ""
@@ -1100,6 +1086,17 @@ def _tab_cotizador(disponible: bool):
             "pueden colocar pedidos."
         )
 
+    _seccion_comprar_lote(
+        links,
+        cantidades,
+        resumen_preset,
+        str(perfil or "").strip(),
+        texto_comentarios,
+        balance,
+        disponible,
+        avisos,
+    )
+
 
 def _calcular_lote(links, cantidades, servicios) -> tuple:
     """Filas (link, likes/RT/comentarios/vistas/total) y avisos únicos."""
@@ -1146,214 +1143,376 @@ def _calcular_lote(links, cantidades, servicios) -> tuple:
 
 
 # ---------------------------------------------------------------------------
-# Pestaña 3: Nuevo pedido
+# Compra del lote desde el cotizador
 # ---------------------------------------------------------------------------
-def _tab_nuevo_pedido(disponible: bool):
-    st.markdown("### 🚀 Nuevo pedido")
-    st.caption(
-        "Crea un pedido real. El costo se descuenta del saldo de JAP cuando "
-        "marques la confirmación."
-    )
+def _plan_pedidos_lote(links, cantidades, servicios, perfil, comentarios_texto):
+    """Plan de pedidos del lote (sin Streamlit ni red directa).
 
-    ultimo = st.session_state.get(CLAVE_ULTIMO_PEDIDO)
-    if isinstance(ultimo, dict) and ultimo.get("order"):
-        st.success(
-            f"✅ Pedido #{ultimo.get('order')} creado por "
-            f"${_a_float(ultimo.get('costo')) or 0.0:,.4f} "
-            f"({ultimo.get('servicio_nombre') or ultimo.get('servicio')})."
+    Devuelve ``(pedidos, errores)``. Cada pedido es un dict con ``tipo``,
+    ``servicio``, ``servicio_nombre``, ``link``, ``cantidad``, ``costo`` y
+    ``comments``. Con cantidad 0 NO se agrega pedido. Los seguidores se piden
+    UNA sola vez al perfil (no por link) y los comentarios personalizados se
+    repiten (el mismo texto) en cada link.
+    """
+    pedidos = []
+    errores = []
+    vistos = set()
+
+    def agregar_error(mensaje):
+        texto = str(mensaje or "").strip()
+        if texto and texto not in vistos:
+            vistos.add(texto)
+            errores.append(texto)
+
+    enlaces = [
+        str(link).strip() for link in (links or []) if str(link).strip()
+    ]
+    if not enlaces:
+        agregar_error(
+            "No hay links de tweets: pega al menos uno para comprar el lote."
+        )
+        return pedidos, errores
+
+    datos = cantidades if isinstance(cantidades, dict) else {}
+    cantidades_lote = {
+        tipo: _a_int(datos.get(tipo)) or 0
+        for tipo in ("likes", "retweets", "comments", "views", "followers")
+    }
+    texto = str(comentarios_texto or "")
+    lineas = [linea.strip() for linea in texto.splitlines() if linea.strip()]
+    personalizados = bool(lineas)
+
+    if (
+        cantidades_lote["comments"] > 0
+        and personalizados
+        and len(lineas) < cantidades_lote["comments"]
+    ):
+        agregar_error(
+            f"Comentarios: pediste {cantidades_lote['comments']} por link y "
+            f"solo hay {len(lineas)} comentario(s) personalizado(s); agrega "
+            "más líneas o baja la cantidad."
         )
 
-    col1, col2 = st.columns(2)
-    with col1:
-        plataforma_etiqueta = st.selectbox(
-            "Plataforma",
-            [etiqueta for etiqueta, _ in PLATAFORMAS],
-            key="jap_buy_plataforma",
-        )
-    with col2:
-        tipo_etiqueta = st.selectbox(
-            "Tipo",
-            ["Todas"] + TIPOS_SERVICIO,
-            key="jap_buy_tipo",
-        )
-
-    plataforma = _clave_plataforma(plataforma_etiqueta)
-    tipo = "" if tipo_etiqueta == "Todas" else tipo_etiqueta
-    datos = _servicios_filtrados(plataforma, tipo, "")
-    servicios = _por_precio(datos.get("servicios") or [])
-    if not servicios:
-        st.warning(
-            str(datos.get("error") or "No hay servicios para ese filtro.")
-        )
-        return
-    if datos.get("error"):
-        st.caption(f"⚠️ {datos.get('error')}")
-
-    opciones = servicios[:MAX_SERVICIOS_PEDIDO]
-    etiquetas = [_etiqueta_servicio(servicio) for servicio in opciones]
-    seleccion = st.selectbox(
-        f"Servicio ({len(opciones)} de {len(servicios)} · más baratos primero)",
-        etiquetas,
-    )
-    servicio = opciones[etiquetas.index(seleccion)]
-    servicio_id = _a_int(servicio.get("service"))
-    es_custom = _es_custom(servicio)
-
-    link = st.text_input(
-        "Link del post/perfil",
-        key="jap_buy_link",
-        placeholder="https://x.com/usuario/status/...",
-    )
-    cantidad = st.number_input(
-        "Cantidad",
-        min_value=0,
-        value=50,
-        step=10,
-        key="jap_buy_cantidad",
-        help=(
-            f"0 = no comprar. Si compras: mín "
-            f"{_a_int(servicio.get('min')) or 0} · máx "
-            f"{_a_int(servicio.get('max')) or 0}"
-        ),
-    )
-
-    comentarios = ""
-    if es_custom:
-        comentarios = st.text_area(
-            "Comentarios (uno por línea)",
-            key="jap_buy_comments",
-            height=120,
-            placeholder="Comentario 1\nComentario 2\n...",
-        )
-        lineas = len([l for l in str(comentarios).splitlines() if l.strip()])
-        if int(cantidad) > 0:
-            st.caption(
-                f"Necesitas al menos {int(cantidad)} línea(s) para este "
-                f"servicio Custom Comments (llevas {lineas}). Las cuentas son "
-                "USA aunque el texto sea en español."
+    for tipo in ("likes", "retweets", "comments", "views"):
+        cantidad = cantidades_lote[tipo]
+        if cantidad <= 0:
+            continue
+        info = (
+            servicios if isinstance(servicios, dict) else {}
+        ).get(tipo) or {}
+        servicio_id = _a_int(info.get("id"))
+        nombre = str(info.get("nombre") or "")
+        comments = ""
+        if tipo == "comments":
+            if personalizados:
+                # Con texto propio se usa el servicio del preset (Custom
+                # Comments 6602); el texto es el mismo para todos los links.
+                comments = texto
+            else:
+                # Sin texto no se puede publicar Custom Comments: Random USA.
+                if servicio_id != SERVICIO_COMENTARIOS_ECONOMICO:
+                    nombre = ""
+                servicio_id = SERVICIO_COMENTARIOS_ECONOMICO
+        if servicio_id is None:
+            agregar_error(
+                f"{tipo.capitalize()}: el servicio del preset no tiene id."
             )
+            continue
+        if tipo == "comments" and personalizados and len(lineas) < cantidad:
+            # El error de lineas insuficientes ya esta registrado.
+            continue
+        costo, error = _cotizar(servicio_id, cantidad)
+        if error:
+            agregar_error(
+                f"{tipo.capitalize()} (servicio {servicio_id}): {error}"
+            )
+            continue
+        for link in enlaces:
+            pedidos.append(
+                {
+                    "tipo": tipo,
+                    "servicio": servicio_id,
+                    "servicio_nombre": nombre,
+                    "link": link,
+                    "cantidad": cantidad,
+                    "costo": costo,
+                    "comments": comments,
+                }
+            )
+
+    if cantidades_lote["followers"] > 0:
+        info = (
+            servicios if isinstance(servicios, dict) else {}
+        ).get("followers") or {}
+        servicio_id = _a_int(info.get("id"))
+        nombre = str(info.get("nombre") or "")
+        enlace_perfil = str(perfil or "").strip()
+        if not enlace_perfil:
+            agregar_error(
+                "Seguidores: indica el link del perfil para poder comprarlos."
+            )
+        elif servicio_id is None:
+            agregar_error("Seguidores: el servicio del preset no tiene id.")
         else:
-            st.caption(
-                "Cantidad 0: no se usará este servicio de comentarios. Las "
-                "cuentas son USA aunque el texto sea en español."
+            costo, error = _cotizar(
+                servicio_id, cantidades_lote["followers"]
             )
+            if error:
+                agregar_error(
+                    f"Seguidores (servicio {servicio_id}): {error}"
+                )
+            else:
+                pedidos.append(
+                    {
+                        "tipo": "followers",
+                        "servicio": servicio_id,
+                        "servicio_nombre": nombre,
+                        "link": enlace_perfil,
+                        "cantidad": cantidades_lote["followers"],
+                        "costo": costo,
+                        "comments": "",
+                    }
+                )
 
-    costo, error_costo = _cotizar(servicio_id, int(cantidad))
-    balance = _balance()
-    m1, m2, m3 = st.columns(3)
-    with m1:
-        st.metric("Costo estimado", f"${costo:,.4f}" if servicio_id else "—")
-    with m2:
-        if balance.get("ok"):
-            st.metric(
-                "Saldo JAP",
-                f"${_a_float(balance.get('balance')) or 0.0:,.4f}",
-            )
-        else:
-            st.metric("Saldo JAP", "—")
-    with m3:
-        if error_costo:
-            st.metric("Validación", "⚠️ Revisa")
-        elif balance.get("ok") and costo > (
-            _a_float(balance.get("balance")) or 0.0
-        ):
-            st.metric("Validación", "❌ Saldo insuficiente")
-        else:
-            st.metric("Validación", "✅ Listo")
+    if len(pedidos) > MAX_PEDIDOS_LOTE:
+        agregar_error(
+            f"El lote tiene {len(pedidos)} pedidos y el máximo es "
+            f"{MAX_PEDIDOS_LOTE}; reduce las cantidades o los links."
+        )
+    return pedidos, errores
 
-    if error_costo:
-        st.warning(str(error_costo))
-    elif balance.get("ok"):
-        saldo = _a_float(balance.get("balance")) or 0.0
-        if costo > saldo:
-            st.error(
-                f"Saldo insuficiente: el pedido cuesta ${costo:,.4f} y tienes "
-                f"${saldo:,.4f}. Recarga saldo en el panel de JAP."
-            )
+
+def _seccion_comprar_lote(
+    links,
+    cantidades,
+    servicios,
+    perfil,
+    comentarios_texto,
+    balance,
+    disponible,
+    avisos,
+):
+    """Seccion '🧾 Comprar este lote' del cotizador (solo compra al pulsar)."""
+    st.markdown("---")
+    st.markdown("### 🧾 Comprar este lote")
+
+    pedidos, errores = _plan_pedidos_lote(
+        links, cantidades, servicios, perfil, comentarios_texto
+    )
+    bloqueos = []
+    for mensaje in list(errores) + list(avisos or []):
+        texto = str(mensaje or "").strip()
+        if texto and texto not in bloqueos:
+            bloqueos.append(texto)
+
+    total = sum(_a_float(pedido.get("costo")) or 0.0 for pedido in pedidos)
+    saldo_ok = bool(balance.get("ok"))
+    saldo = _a_float(balance.get("balance")) or 0.0
+    saldo_texto = f"${saldo:,.4f}" if saldo_ok else "—"
+    st.markdown(
+        f"**{len(pedidos)} pedido(s) · total estimado ${total:,.4f} · "
+        f"saldo {saldo_texto}**"
+    )
+
+    for mensaje in bloqueos:
+        st.error(mensaje)
+    if not pedidos and not bloqueos:
+        st.info(
+            "No hay nada que comprar: pon una cantidad mayor a 0 en likes, "
+            "retweets, comentarios, vistas o seguidores (0 = no comprar)."
+        )
+    if saldo_ok and total > saldo:
+        st.error(
+            f"Saldo insuficiente: el lote cuesta ${total:,.4f} y tienes "
+            f"${saldo:,.4f}. Recarga saldo en el panel de JAP."
+        )
+    if pedidos:
+        st.caption(
+            "Los pedidos se crean uno por uno en el orden anterior. Si uno "
+            "falla, los demás continúan."
+        )
 
     confirmo = st.checkbox(
-        "Confirmo que este pedido gasta saldo real de JAP",
-        key="jap_buy_confirmo",
+        "Confirmo que estos pedidos gastan saldo real de JAP",
+        key="jap_lote_confirmo",
     )
-    if int(cantidad) <= 0:
-        st.info(
-            "Cantidad 0: no se creará ningún pedido. Elige una cantidad "
-            "mayor a 0 si quieres comprar este servicio."
-        )
     puede_comprar = bool(
         disponible
-        and servicio_id
-        and int(cantidad) > 0
-        and str(link or "").strip()
-        and not error_costo
+        and links
+        and pedidos
+        and not bloqueos
+        and (not saldo_ok or total <= saldo)
         and confirmo
     )
     if st.button(
-        "💳 Comprar en JAP",
-        key="jap_btn_comprar",
+        f"💳 Comprar lote ({len(pedidos)} pedidos)",
+        key="jap_btn_comprar_lote",
         type="primary",
         disabled=not puede_comprar,
     ):
-        _comprar(servicio, int(cantidad), str(link or "").strip(), comentarios)
+        _comprar_lote(pedidos)
 
 
-def _comprar(servicio: dict, cantidad: int, link: str, comentarios: str):
-    """Crea la orden UNA vez y guarda el pedido en session_state."""
-    if st.session_state.get("jap_comprando"):
-        return
-    st.session_state["jap_comprando"] = True
-    servicio_id = _a_int(servicio.get("service"))
-    resultado = {"ok": False, "error": "No se pudo enviar el pedido"}
+def _crear_orden_pedido(jap, pedido: dict) -> dict:
+    """Crea UNA orden del plan. Nunca lanza (fallback sin `comments`)."""
+    servicio_id = _a_int(pedido.get("servicio"))
+    comments = str(pedido.get("comments") or "")
     try:
-        jap = _cliente()
-        if jap is None:
-            raise RuntimeError("El cliente de JAP no está disponible")
         try:
-            resultado = jap.crear_orden(
+            return jap.crear_orden(
                 servicio_id,
-                link,
-                cantidad,
-                comments=str(comentarios or ""),
+                pedido.get("link"),
+                pedido.get("cantidad"),
+                comments=comments,
             )
         except TypeError:
             # Backend viejo sin el kwarg `comments`.
-            resultado = jap.crear_orden(servicio_id, link, cantidad)
+            return jap.crear_orden(
+                servicio_id, pedido.get("link"), pedido.get("cantidad")
+            )
     except Exception as exc:
-        resultado = {"ok": False, "error": f"Error al crear el pedido: {exc}"}
-    finally:
-        st.session_state["jap_comprando"] = False
+        return {"ok": False, "error": f"Error al crear el pedido: {exc}"}
 
-    if not isinstance(resultado, dict) or not resultado.get("ok"):
-        error = (
-            resultado.get("error")
-            if isinstance(resultado, dict)
-            else "respuesta inesperada"
-        ) or "No se pudo crear el pedido"
-        st.error(f"No se pudo completar el pedido: {error}")
+
+def _comprar_lote(pedidos):
+    """Compra el lote SECUENCIALMENTE y guarda el resumen en session_state."""
+    if st.session_state.get("jap_lote_comprando"):
+        return
+    if not st.session_state.get("jap_lote_confirmo"):
+        # Defensa extra: jamas se compra sin la confirmacion explicita.
+        return
+    pedidos = [p for p in (pedidos or []) if isinstance(p, dict)]
+    if not pedidos:
+        return
+    jap = _cliente()
+    if jap is None:
+        st.error("El cliente de JAP no está disponible.")
         return
 
-    pedido = {
-        "order": _a_int(resultado.get("order")),
-        "servicio": servicio_id,
-        "servicio_nombre": str(servicio.get("name") or ""),
-        "link": link,
-        "cantidad": cantidad,
-        "costo": _a_float(resultado.get("costo")) or 0.0,
-        "comentarios": str(comentarios or ""),
-        "fecha": datetime.now().isoformat(timespec="seconds"),
-    }
+    st.session_state["jap_lote_comprando"] = True
+    resultados = []
+    total_gastado = 0.0
     recientes = st.session_state.get(CLAVE_PEDIDOS)
     if not isinstance(recientes, list):
         recientes = []
-    recientes.insert(0, pedido)
+    fecha = datetime.now().isoformat(timespec="seconds")
+    try:
+        barra = st.progress(0.0)
+        estado = st.empty()
+        total = len(pedidos)
+        for indice, pedido in enumerate(pedidos, start=1):
+            estado.caption(f"Pedido {indice}/{total}…")
+            resultado = _crear_orden_pedido(jap, pedido)
+            ok = isinstance(resultado, dict) and bool(resultado.get("ok"))
+            costo = (
+                _a_float(resultado.get("costo")) or 0.0 if ok else 0.0
+            )
+            error = ""
+            if not ok:
+                error = (
+                    resultado.get("error")
+                    if isinstance(resultado, dict)
+                    else "respuesta inesperada"
+                ) or "No se pudo crear el pedido"
+            order = _a_int(resultado.get("order")) if ok else None
+            registro = {
+                "order": order,
+                "tipo": pedido.get("tipo"),
+                "servicio": _a_int(pedido.get("servicio")),
+                "servicio_nombre": str(
+                    pedido.get("servicio_nombre") or ""
+                ),
+                "link": pedido.get("link"),
+                "cantidad": _a_int(pedido.get("cantidad")),
+                "costo": costo,
+                "comments": str(pedido.get("comments") or ""),
+                "ok": ok,
+                "error": error,
+            }
+            resultados.append(registro)
+            if ok:
+                total_gastado += costo
+                recientes.insert(
+                    0,
+                    {
+                        "order": order,
+                        "servicio": registro["servicio"],
+                        "servicio_nombre": registro["servicio_nombre"],
+                        "link": registro["link"],
+                        "cantidad": registro["cantidad"],
+                        "costo": costo,
+                        "comentarios": registro["comments"],
+                        "fecha": fecha,
+                    },
+                )
+            barra.progress(indice / total)
+        estado.caption(f"Pedidos procesados: {total}/{total}")
+    finally:
+        st.session_state["jap_lote_comprando"] = False
+
+    exitosos = sum(1 for r in resultados if r.get("ok"))
     st.session_state[CLAVE_PEDIDOS] = recientes[:MAX_PEDIDOS_SESION]
-    st.session_state[CLAVE_ULTIMO_PEDIDO] = pedido
+    st.session_state[CLAVE_LOTE_RESULTADOS] = {
+        "fecha": fecha,
+        "total_gastado": total_gastado,
+        "exitosos": exitosos,
+        "fallidos": len(resultados) - exitosos,
+        "pedidos": resultados,
+    }
     _cache_limpiar(CLAVE_BALANCE)
+    st.session_state["jap_lote_limpiar_confirmacion"] = True
     st.rerun()
 
 
+def _mostrar_ultimo_lote():
+    """Resumen persistente del ultimo lote comprado (con boton de limpiar)."""
+    resultados = st.session_state.get(CLAVE_LOTE_RESULTADOS)
+    if not isinstance(resultados, dict):
+        return
+    pedidos = [
+        p for p in (resultados.get("pedidos") or []) if isinstance(p, dict)
+    ]
+    exitosos = _a_int(resultados.get("exitosos")) or 0
+    fallidos = _a_int(resultados.get("fallidos")) or 0
+    total = _a_float(resultados.get("total_gastado")) or 0.0
+    with st.expander("Último pedido del lote", expanded=False):
+        st.markdown(
+            f"**{exitosos} exitoso(s) · {fallidos} fallido(s) · "
+            f"${total:,.4f} gastados**"
+        )
+        st.caption(f"Fecha: {resultados.get('fecha') or '—'}")
+        if pedidos:
+            st.dataframe(
+                [
+                    {
+                        "Pedido": p.get("order"),
+                        "Tipo": p.get("tipo"),
+                        "Servicio": p.get("servicio_nombre")
+                        or p.get("servicio"),
+                        "Link": p.get("link"),
+                        "Cantidad": p.get("cantidad"),
+                        "Costo": _a_float(p.get("costo")) or 0.0,
+                        "Estado": "✅" if p.get("ok") else "❌",
+                        "Error": str(p.get("error") or ""),
+                    }
+                    for p in pedidos
+                ],
+                hide_index=True,
+                use_container_width=True,
+                column_config={
+                    "Costo": st.column_config.NumberColumn(format="$%.4f"),
+                },
+            )
+        if st.button(
+            "🧹 Limpiar resumen",
+            key="jap_btn_limpiar_lote_resultados",
+        ):
+            st.session_state.pop(CLAVE_LOTE_RESULTADOS, None)
+            st.rerun()
+
+
 # ---------------------------------------------------------------------------
-# Pestaña 4: Pedidos
+# Pestaña 3: Pedidos
 # ---------------------------------------------------------------------------
 def _fila_estado(order_id, info: dict) -> dict:
     return {
@@ -1430,7 +1589,7 @@ def _tab_pedidos(disponible: bool):
     if not recientes:
         st.info(
             "Todavía no hay pedidos en esta sesión. Crea uno en "
-            "«🚀 Nuevo pedido»."
+            "«🧮 Cotizador»."
         )
     else:
         st.markdown("**Pedidos recientes de esta sesión**")
